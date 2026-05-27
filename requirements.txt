@@ -2,3 +2,5 @@ nicegui>=1.4.0
 httpx>=0.26.0
 pydantic-settings>=2.1.0
 sqlmodel>=0.0.8
+ffmpeg-python>=0.2.0
+huggingface_hub

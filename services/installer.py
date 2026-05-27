@@ -23,18 +23,37 @@ MODEL_REPOS = {
     "Whisper": "Systran/faster-whisper-small"
 }
 
-def check_dependencies(engine_name: str) -> dict:
+def check_dependencies(engine_name: str, device: str = "CPU") -> dict:
     """
     Checks if all packages for a given engine are installed in the environment.
-    Returns a dict with 'status' (bool) and 'missing' (list of str).
+    Differentiates between CPU (onnxruntime) and GPU (onnxruntime-gpu) packages
+    by inspecting package distribution metadata rather than top-level imports.
     """
-    reqs = ENGINE_REQUIREMENTS.get(engine_name, [])
+    reqs = []
+    runtime_pkg = None
+
+    if engine_name == "Parakeet ONNX":
+        reqs = ["onnx_asr", "soundfile"]
+        runtime_pkg = "onnxruntime-gpu" if device == "GPU/CUDA" else "onnxruntime"
+    else:
+        reqs = ENGINE_REQUIREMENTS.get(engine_name, [])
+
     missing = []
+    
+    # 1. Check standard module imports
     for package in reqs:
         try:
             importlib.import_module(package)
         except ImportError:
             missing.append(package)
+            
+    # 2. Check the specific distribution package metadata to avoid namespace overlap bugs
+    if runtime_pkg:
+        from importlib.metadata import version, PackageNotFoundError
+        try:
+            version(runtime_pkg)
+        except PackageNotFoundError:
+            missing.append(runtime_pkg)
             
     return {
         "status": len(missing) == 0,
@@ -46,12 +65,17 @@ def get_model_dir(engine_name: str) -> str:
     folder = "parakeet" if "ONNX" in engine_name else "whisper"
     return os.path.join(MODEL_STORAGE_DIR, folder)
 
-def check_model_downloaded(engine_name: str) -> bool:
-    """Checks if the crucial model weight files exist locally."""
+def check_model_downloaded(engine_name: str, device: str = "CPU") -> bool:
+    """Checks if all necessary model weight files exist locally based on target hardware."""
     model_dir = get_model_dir(engine_name)
     if "ONNX" in engine_name:
-        # Check for Parakeet's key encoder file
-        return os.path.exists(os.path.join(model_dir, "encoder-model.onnx"))
+        if device == "GPU/CUDA":
+            # GPU requires both config.json and the fp16 quantized encoder file
+            return os.path.exists(os.path.join(model_dir, "config.json")) and \
+                   os.path.exists(os.path.join(model_dir, "encoder-model.fp16.onnx"))
+        else:
+            # CPU only requires the standard fp32 encoder file
+            return os.path.exists(os.path.join(model_dir, "encoder-model.onnx"))
     else:
         # Check for Whisper's key model weights file
         return os.path.exists(os.path.join(model_dir, "model.bin"))
@@ -59,21 +83,43 @@ def check_model_downloaded(engine_name: str) -> bool:
 
 async def run_pip_install(packages: list, log_callback: Callable[[str], None]) -> bool:
     """
-    Runs pip install inside a background thread to bypass Windows event loop limitations,
-    and pipes stdout asynchronously and thread-safely back to NiceGUI.
+    Runs pip install inside a background thread to bypass Windows event loop limitations.
+    Uninstalls CPU/GPU conflicting packages on-the-fly before installation.
     """
     log_callback(f"Starting installation of: {', '.join(packages)}\n")
     
     q = queue.Queue()
     
     def pip_worker():
+        # Pre-uninstall conflicting packages to avoid broken onnxruntime installs
+        if "onnxruntime-gpu" in packages:
+            log_callback("Detected GPU/CUDA request. Cleaning CPU dependencies to prevent conflict...\n")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", "onnxruntime"], 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL
+            )
+        elif "onnxruntime" in packages:
+            log_callback("Detected CPU request. Cleaning GPU/CUDA dependencies to prevent conflict...\n")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", "onnxruntime-gpu"], 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL
+            )
+
+        # Set environment variable to force subprocess to output using UTF-8
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+
         cmd = [sys.executable, "-m", "pip", "install"] + packages
         try:
+            # Specifically using encoding="utf-8" and env=env to prevent Windows charmap decoder crashes
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
+                encoding="utf-8",
+                env=env,
                 bufsize=1
             )
             
@@ -106,50 +152,72 @@ async def run_pip_install(packages: list, log_callback: Callable[[str], None]) -
 
 async def download_model_weights(
     engine_name: str, 
+    device: str,
     progress_callback: Callable[[float], None],
     log_callback: Callable[[str], None]
 ) -> bool:
     """
-    Downloads the model files using huggingface-cli inside a background thread.
-    Pipes download logs and progress indicators live directly into NiceGUI.
+    Downloads model files using hf download inside a background thread.
+    If GPU/CUDA is active, downloads both base FP32 configs and quantized FP16 models
+    and merges them into your workspace to keep things 100% offline-compatible.
     """
-    repo_id = MODEL_REPOS.get(engine_name)
     local_dir = get_model_dir(engine_name)
     
-    if not repo_id:
-        log_callback(f"Error: No model repository ID defined for {engine_name}.\n")
+    # Map target repositories dynamically
+    repos = []
+    if engine_name == "Parakeet ONNX":
+        # Base files (config, vocabulary)
+        repos.append("istupakov/parakeet-tdt-0.6b-v3-onnx")
+        if device == "GPU/CUDA":
+            # FP16 quantized execution files
+            repos.append("grikdotnet/parakeet-tdt-0.6b-fp16")
+    else:
+        repo_id = MODEL_REPOS.get(engine_name)
+        if repo_id:
+            repos.append(repo_id)
+
+    if not repos:
+        log_callback(f"Error: No model repositories defined for {engine_name}.\n")
         return False
         
-    log_callback(f"Connecting to Hugging Face CLI... Downloading repository: {repo_id}\n")
     progress_callback(0.0)
-    
     q = queue.Queue()
     
     def download_worker():
-        # Executes huggingface-cli download within our active environment path.
-        # This handles resumes automatically and prints live parallel download progress bars.
-        cmd = [
-            "huggingface-cli", "download", 
-            repo_id, 
-            "--local-dir", local_dir
-        ]
-        try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
-            
-            for line in iter(process.stdout.readline, ""):
-                q.put(line)
+        # Force the spawned python-based "hf" executable to format its stdout streams as UTF-8
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        for i, repo_id in enumerate(repos):
+            log_callback(f"\n[{i+1}/{len(repos)}] Connecting to Hugging Face... Downloading repository: {repo_id}\n")
+            cmd = [
+                "hf", "download", 
+                repo_id, 
+                "--local-dir", local_dir
+            ]
+            try:
+                # Specifically using encoding="utf-8" and env=env to prevent Windows charmap decoder crashes
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    encoding="utf-8",
+                    env=env,
+                    bufsize=1
+                )
                 
-            process.wait()
-            q.put(process.returncode == 0)
-        except Exception as e:
-            q.put(f"\nCRITICAL DOWNLOAD PROCESS ERROR: {e}\n")
-            q.put(False)
+                for line in iter(process.stdout.readline, ""):
+                    q.put(line)
+                    
+                process.wait()
+                if process.returncode != 0:
+                    q.put(False)
+                    return
+            except Exception as e:
+                q.put(f"\nCRITICAL DOWNLOAD PROCESS ERROR: {e}\n")
+                q.put(False)
+                return
+        q.put(True)
 
     # Start the download worker thread
     thread = threading.Thread(target=download_worker, daemon=True)
@@ -168,7 +236,7 @@ async def download_model_weights(
             
     if success:
         progress_callback(1.0)
-        log_callback("\nRepository successfully downloaded!\n")
+        log_callback("\nAll necessary repositories successfully downloaded and merged locally!\n")
     else:
         log_callback("\nDownload encountered an error. Please retry.\n")
         

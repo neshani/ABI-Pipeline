@@ -29,8 +29,9 @@ class SettingsModal:
     def update_installation_statuses(self) -> None:
         """Query backend to check if chosen engine is fully installed and ready."""
         engine = self.settings.get("stt_engine", "Parakeet ONNX")
-        self.dep_status = check_dependencies(engine)
-        self.model_status = check_model_downloaded(engine)
+        device = self.settings.get("stt_device", "CPU")
+        self.dep_status = check_dependencies(engine, device)
+        self.model_status = check_model_downloaded(engine, device)
         self.update_ui_elements()
 
     def update_ui_elements(self) -> None:
@@ -73,6 +74,7 @@ class SettingsModal:
         self.progress_bar.set_value(0.0)
         
         engine = self.settings.get("stt_engine", "Parakeet ONNX")
+        device = self.settings.get("stt_device", "CPU")
         
         # Step 1: Install Python Libraries (if missing)
         if not self.dep_status["status"]:
@@ -87,6 +89,7 @@ class SettingsModal:
         if not self.model_status:
             success = await download_model_weights(
                 engine, 
+                device,
                 self.update_download_progress, 
                 self.write_to_terminal
             )
@@ -133,11 +136,17 @@ class SettingsModal:
             with ui.card().classes('w-full p-4 border bg-slate-50/50'):
                 ui.label('Transcription Setup').classes('text-sm font-bold text-slate-700')
                 
-                # Dropdown Selector
+                # Engine Dropdown Selector
                 ui.select(
                     options=['Parakeet ONNX', 'Whisper'], 
                     label='STT Engine'
                 ).bind_value(self.settings, 'stt_engine').on_value_change(self.update_installation_statuses).classes('w-full')
+                
+                # Hardware Target Dropdown Selector
+                ui.select(
+                    options=['GPU/CUDA', 'CPU'], 
+                    label='STT Device / Hardware'
+                ).bind_value(self.settings, 'stt_device').on_value_change(self.update_installation_statuses).classes('w-full mt-2')
                 
                 # Real-Time Status Indicators
                 with ui.column().classes('gap-1 mt-2'):
@@ -152,7 +161,7 @@ class SettingsModal:
             with ui.expansion('Installation Terminal Console', icon='terminal').classes('w-full border rounded-lg bg-slate-900 text-slate-100 font-mono text-xs'):
                 self.terminal_log = ui.log().classes('h-40 w-full bg-slate-950 p-2 text-emerald-400')
 
-            # ComfyUI and LLM settings (Simplified)
+            # ComfyUI and LLM settings
             with ui.expansion('Advanced Server Connections', icon='settings').classes('w-full border rounded-lg'):
                 ui.input('ComfyUI URL').bind_value(self.settings, 'comfy_url').classes('w-full p-2')
                 ui.input('Local Comfy Path').bind_value(self.settings, 'comfy_path').classes('w-full p-2')
