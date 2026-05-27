@@ -1,0 +1,33 @@
+# --- ABI-Pipeline Specific ---
+abi_pipeline.db
+.models/
+.docs/
+output/             # Ignore your local rendered book output folder
+projects/           # Ignore your local work directories for individual books
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.conda/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- IDEs / Editors ---
+.vscode/            # VS Code workspace settings
+.idea/              # PyCharm / IntelliJ settings
+*.swp               # Vim swap files
+
+# --- System / OS Junk ---
+Thumbs.db           # Windows image thumbnail cache
+ehthumbs.db
+Desktop.ini
+.DS_Store           # macOS directory metadata
+
+# --- Local Scripts / Extras ---
+zExportCodeForLLM.ps1
