@@ -17,8 +17,11 @@ import subprocess
 from ui.components.settings_modal import SettingsModal
 
 
-# --- Initialize SQLite Database ---
+# --- Initialize SQLite Database & Recovery Engines ---
 init_db()
+
+# Import the recovery utility
+from services.sync_engine import recover_from_temp_workspaces
 
 def reset_stuck_transcriptions():
     """Finds and resets any projects, books, or chapters that were stuck in a 'Transcribing' state on startup."""
@@ -43,7 +46,12 @@ def reset_stuck_transcriptions():
             
         session.commit()
 
+# Ensure stuck tasks are cleared
 reset_stuck_transcriptions()
+
+# Run workspace recovery to restore wiped database index entries
+with Session(engine) as session:
+    recover_from_temp_workspaces(session)
 
 # --- Programmatic App Restart Engine ---
 def restart_app():
@@ -81,7 +89,7 @@ DEFAULT_SETTINGS = {
     "llm_url": "http://127.0.0.1:11434",
     "stt_engine": "Parakeet ONNX",  # Parakeet ONNX or Whisper
     "stt_device": "GPU/CUDA",  # GPU/CUDA or CPU
-    "batch_size": 34,  # Hardware batch size (usually 8 is optimized for RTX 3090/4090 vram)
+    "batch_size": 30,  # Hardware batch size (usually 8 is optimized for RTX 3090/4090 vram)
     "output_dir": "./output"
 }
 

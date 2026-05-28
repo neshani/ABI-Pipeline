@@ -213,6 +213,8 @@ def transcribe_project_worker(project_id: int) -> None:
         session.commit()
 
         books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+        # Safe extraction of IDs to avoid passing detached objects
+        book_ids = [b.id for b in books]
 
     # 1. Initialize our STT engine based on UI Settings
     try:
@@ -239,11 +241,11 @@ def transcribe_project_worker(project_id: int) -> None:
         active_projects.discard(project_id)
         return
 
-    # 2. Transcribe books sequentially
-    for book in books:
+    # 2. Transcribe books sequentially using safe IDs
+    for book_id in book_ids:
         if project_id in cancelled_projects:
             break
-        transcribe_book(book.id, model, project_id)
+        transcribe_book(book_id, model, project_id)
 
     # 3. Release model execution session VRAM explicitly
     try:
@@ -274,10 +276,19 @@ def transcribe_project_worker(project_id: int) -> None:
 
 def transcribe_book(book_id: int, model, project_id: int) -> None:
     """Processes all chapters of an individual audiobook sequential track-by-track."""
+    import json
     with Session(engine) as session:
         book = session.get(Book, book_id)
         if not book or book.status == "Transcribed":
             return
+
+        # Safe extraction of properties while the session is active
+        book_name = book.name
+        book_path = book.path
+        
+        project = session.get(Project, project_id)
+        project_name = project.name if project else "Default_Project"
+        project_path = project.path if project else ""
 
         book.status = "Transcribing"
         session.add(book)
@@ -288,13 +299,29 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
         ).all()
         total_chapters = len(chapters)
 
-    # Output directory configuration
-    output_dir = Path(get_setting("output_dir", "./output")).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Base output directory configuration
+    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    # Structured path: output/<project_name>/<book_name>/
+    book_output_dir = base_output_dir / project_name / book_name
+    book_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Establish localized working folder
     working_dir = Path("./workspace_temp") / f"book_{book_id}"
     working_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write a crash-recovery metadata file in the temporary folder
+    try:
+        state_data = {
+            "project_name": project_name,
+            "project_path": project_path,
+            "book_name": book_name,
+            "book_path": book_path,
+            "audio_type": "multi_file" if any(c.type == 'file' for c in chapters) else "single_file"
+        }
+        with open(working_dir / "transcription_state.json", "w", encoding="utf-8") as sf:
+            json.dump(state_data, sf, indent=4)
+    except Exception as se:
+        print(f"[Sync-Engine] Failed to write transcription recovery state: {se}")
 
     # Transcribe chapters sequentially
     for chapter in chapters:
@@ -358,7 +385,23 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
 
     # Wrap up book state
     if project_id not in cancelled_projects:
-        combine_chapters(book.name, working_dir, output_dir)
+        combine_chapters(working_dir, book_output_dir)
+
+        # Write completed book metadata file inside its final output folder
+        try:
+            metadata_file = book_output_dir / "metadata.json"
+            meta_data = {
+                "project_name": project_name,
+                "project_path": project_path,
+                "book_name": book_name,
+                "book_path": book_path,
+                "audio_type": "multi_file" if any(c.type == 'file' for c in chapters) else "single_file"
+            }
+            with open(metadata_file, "w", encoding="utf-8") as mf:
+                json.dump(meta_data, mf, indent=4)
+        except Exception as me:
+            print(f"[Sync-Engine] Failed to write completed book metadata: {me}")
+
         with Session(engine) as session:
             db_book = session.get(Book, book_id)
             if db_book:
@@ -502,9 +545,9 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
     return " ".join([t for t in all_texts if t]).strip()
 
 
-def combine_chapters(book_title: str, working_dir: Path, output_dir: Path) -> None:
-    """Appends all temporary chapter text files into the final transcript."""
-    final_text_path = output_dir / f"{book_title}.txt"
+def combine_chapters(working_dir: Path, book_output_dir: Path) -> None:
+    """Appends all temporary chapter text files into the final transcript.txt inside the structured book directory."""
+    final_text_path = book_output_dir / "transcript.txt"
     chapter_files = sorted(
         list(working_dir.glob("chapter_*.txt")),
         key=lambda x: int(x.stem.split('_')[1])
