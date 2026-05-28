@@ -20,6 +20,31 @@ from ui.components.settings_modal import SettingsModal
 # --- Initialize SQLite Database ---
 init_db()
 
+def reset_stuck_transcriptions():
+    """Finds and resets any projects, books, or chapters that were stuck in a 'Transcribing' state on startup."""
+    with Session(engine) as session:
+        # Reset stuck projects
+        stuck_projects = session.exec(select(Project).where(Project.status == "Transcribing")).all()
+        for p in stuck_projects:
+            p.status = "Imported"
+            session.add(p)
+            
+        # Reset stuck books
+        stuck_books = session.exec(select(Book).where(Book.status == "Transcribing")).all()
+        for b in stuck_books:
+            b.status = "Imported"
+            session.add(b)
+            
+        # Reset stuck chapters
+        stuck_chapters = session.exec(select(Chapter).where(Chapter.status == "Transcribing")).all()
+        for c in stuck_chapters:
+            c.status = "Pending"
+            session.add(c)
+            
+        session.commit()
+
+reset_stuck_transcriptions()
+
 # --- Programmatic App Restart Engine ---
 def restart_app():
     """Kills the active Python web server and restarts a clean instance."""
@@ -56,7 +81,7 @@ DEFAULT_SETTINGS = {
     "llm_url": "http://127.0.0.1:11434",
     "stt_engine": "Parakeet ONNX",  # Parakeet ONNX or Whisper
     "stt_device": "GPU/CUDA",  # GPU/CUDA or CPU
-    "batch_size": 8,  # Hardware batch size (usually 8 is optimized for RTX 3090/4090 vram)
+    "batch_size": 34,  # Hardware batch size (usually 8 is optimized for RTX 3090/4090 vram)
     "output_dir": "./output"
 }
 
@@ -132,9 +157,10 @@ def stop_transcribing(project_id: int):
 
 # --- Background Polling Update Handler ---
 def check_for_active_transcriptions():
-    """Polls SQLite only when an active background thread is running to update bars."""
-    if active_projects:
-        refresh_dashboard()
+    """Polls SQLite to update progress bars, capturing the final transition when threads shut down."""
+    # Since SQLite is local and lightning-fast, we poll and refresh the UI to capture
+    # all status updates (including the final transition from 'Transcribing' back to 'Imported' on stop).
+    refresh_dashboard()
 
 
 # --- Main Dashboard Component ---

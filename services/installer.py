@@ -137,6 +137,8 @@ async def run_pip_install(packages: list, log_callback: Callable[[str], None]) -
     thread.start()
     
     success = False
+    access_denied_detected = False
+    
     while thread.is_alive() or not q.empty():
         try:
             item = q.get_nowait()
@@ -144,8 +146,26 @@ async def run_pip_install(packages: list, log_callback: Callable[[str], None]) -
                 success = item
             else:
                 log_callback(item)
+                if "Access is denied" in item or "WinError 5" in item:
+                    access_denied_detected = True
         except queue.Empty:
             await asyncio.sleep(0.1)
+            
+    if access_denied_detected:
+        log_callback(
+            "\n" + "="*75 + "\n"
+            "WINDOWS FILE LOCK DETECTED!\n"
+            "The active ABI-Pipeline app has already loaded 'onnxruntime' into memory.\n"
+            "Windows actively blocks pip from overwriting DLLs that are currently running.\n\n"
+            "To fix this and complete the installation, please:\n"
+            "1. Close your active ABI-Pipeline app and terminal window.\n"
+            "2. Open your miniconda command prompt and activate your environment:\n"
+            "   conda activate abi-pipeline\n"
+            f"3. Run the command manually:\n"
+            f"   pip install {' '.join(packages)}\n"
+            "4. Relaunch your ABI-Pipeline!\n"
+            "===========================================================================\n"
+        )
             
     return success
 
