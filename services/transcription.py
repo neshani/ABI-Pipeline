@@ -18,6 +18,28 @@ active_projects = set()
 cancelled_projects = set()
 
 
+def module_print(*args, **kwargs):
+    """
+    Overrides built-in print for this module to automatically mirror standard
+    terminal console prints straight into the NiceGUI state log queue.
+    """
+    import builtins
+    builtins.print(*args, **kwargs)
+    
+    sep = kwargs.get('sep', ' ')
+    msg = sep.join(str(arg) for arg in args)
+    msg_clean = msg.strip()
+    if msg_clean:
+        try:
+            from ui.state import add_console_log
+            add_console_log(msg_clean)
+        except Exception:
+            pass
+
+# Override standard print in the module's global namespace
+print = module_print
+
+
 def chunk_audio_with_ffmpeg(audio_path: Path, output_dir: Path) -> List[Path]:
     """
     Splits a 16kHz mono WAV file into ~60-second chunks using FFmpeg silence detection.
@@ -29,7 +51,6 @@ def chunk_audio_with_ffmpeg(audio_path: Path, output_dir: Path) -> List[Path]:
 
     chunk_paths = []
     try:
-        # Run ffmpeg silencedetect and capture stderr output
         command = [
             'ffmpeg', '-i', str(audio_path),
             '-af', f'silencedetect=n={SILENCE_THRESHOLD_DB}:d={SILENCE_DURATION_S}',
@@ -38,15 +59,12 @@ def chunk_audio_with_ffmpeg(audio_path: Path, output_dir: Path) -> List[Path]:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         stderr_output = result.stderr
 
-        # Extract safety silence cut-points
         silence_ends = re.findall(r"silence_end: (\d+\.?\d*)", stderr_output)
         cut_timestamps = [float(t) for t in silence_ends]
 
-        # Probe total audio duration
         probe = ffmpeg.probe(str(audio_path))
         duration = float(probe['format']['duration'])
 
-        # Group cuts to align chunks around our TARGET_CHUNK_S limit
         last_cut = 0.0
         final_cuts = [0.0]
         for t in cut_timestamps:
@@ -55,7 +73,6 @@ def chunk_audio_with_ffmpeg(audio_path: Path, output_dir: Path) -> List[Path]:
                 last_cut = t
         final_cuts.append(duration)
 
-        # Slice the audio file into segment chunks
         output_dir.mkdir(parents=True, exist_ok=True)
         for i in range(len(final_cuts) - 1):
             start = final_cuts[i]
@@ -88,12 +105,9 @@ def get_onnx_model():
     model_dir = os.path.abspath(".models/parakeet")
     device_setting = get_setting("stt_device", "GPU/CUDA")
     
-    # 1. Initialize global SessionOptions to stabilize memory usage across dynamic shapes
     sess_options = ort.SessionOptions()
-    sess_options.enable_mem_pattern = False      # Prevents caching of execution graph memory patterns
-    sess_options.enable_cpu_mem_arena = False    # Disables CPU allocator arena caching to prevent memory leaks
-    
-    # NEW: Force highest level of layer fusion and graph optimization
+    sess_options.enable_mem_pattern = False
+    sess_options.enable_cpu_mem_arena = False
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     
     def patch_onnx_asr_model(model):
@@ -109,8 +123,6 @@ def get_onnx_model():
                     
                     def patched_decoding(self, encodings, encodings_len, **kwargs):
                         import numpy as np
-                        # Fix: encodings shape is (batch_size, sequence_length, features). 
-                        # We must clamp to sequence_length (index 1), NOT batch_size (index 0)!
                         limit = encodings.shape[1]
                         
                         if isinstance(encodings_len, np.ndarray):
@@ -129,7 +141,6 @@ def get_onnx_model():
         return model
 
     if device_setting == "GPU/CUDA":
-        # Highly optimized hardware-level parameters for Nvidia GPUs
         gpu_options = {
             "device_id": "0",
             "arena_extend_strategy": "kNextPowerOfTwo",
@@ -160,7 +171,6 @@ def get_onnx_model():
             print(f"GPU FP16 initialization failed: {e}. Falling back gracefully to CPU Execution...")
             providers = ["CPUExecutionProvider"]
 
-    # CPU standard path
     print(f"Loading Parakeet ONNX model on CPU (Providers: {providers})")
     if os.path.exists(os.path.join(model_dir, "encoder-model.onnx")):
         model = onnx_asr.load_model(
@@ -213,10 +223,8 @@ def transcribe_project_worker(project_id: int) -> None:
         session.commit()
 
         books = session.exec(select(Book).where(Book.project_id == project_id)).all()
-        # Safe extraction of IDs to avoid passing detached objects
         book_ids = [b.id for b in books]
 
-    # 1. Initialize our STT engine based on UI Settings
     try:
         stt_engine = get_setting("stt_engine", "Parakeet ONNX")
         if stt_engine == "Whisper":
@@ -241,13 +249,11 @@ def transcribe_project_worker(project_id: int) -> None:
         active_projects.discard(project_id)
         return
 
-    # 2. Transcribe books sequentially using safe IDs
     for book_id in book_ids:
         if project_id in cancelled_projects:
             break
         transcribe_book(book_id, model, project_id)
 
-    # 3. Release model execution session VRAM explicitly
     try:
         if hasattr(model, 'asr'):
             if hasattr(model.asr, '_encoder'):
@@ -255,12 +261,11 @@ def transcribe_project_worker(project_id: int) -> None:
             if hasattr(model.asr, '_decoder_joint'):
                 model.asr._decoder_joint.set_providers([])
     except Exception as e:
-        pass # Whisper models or fully flushed ONNX sessions will naturally pass here
+        pass
 
     del model
     gc.collect()
 
-    # 4. Finalize project status
     with Session(engine) as session:
         project = session.get(Project, project_id)
         if project:
@@ -282,7 +287,6 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
         if not book or book.status == "Transcribed":
             return
 
-        # Safe extraction of properties while the session is active
         book_name = book.name
         book_path = book.path
         
@@ -299,17 +303,13 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
         ).all()
         total_chapters = len(chapters)
 
-    # Base output directory configuration
     base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
-    # Structured path: output/<project_name>/<book_name>/
     book_output_dir = base_output_dir / project_name / book_name
     book_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Establish localized working folder
     working_dir = Path("./workspace_temp") / f"book_{book_id}"
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write a crash-recovery metadata file in the temporary folder
     try:
         state_data = {
             "project_name": project_name,
@@ -323,13 +323,11 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
     except Exception as se:
         print(f"[Sync-Engine] Failed to write transcription recovery state: {se}")
 
-    # Transcribe chapters sequentially
     for chapter in chapters:
         if project_id in cancelled_projects:
             break
 
         if chapter.status == "Completed":
-            # Verify the output file actually exists before skipping
             chapter_txt = working_dir / f"chapter_{chapter.chapter_num}.txt"
             if chapter_txt.exists():
                 continue
@@ -341,7 +339,6 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
                 session.add(db_chapter)
                 session.commit()
 
-        # Run preprocessing, chunking, and model inference
         transcript_text = transcribe_chapter(chapter, model, working_dir)
 
         if transcript_text:
@@ -356,7 +353,6 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
                     session.add(db_chapter)
                     session.commit()
         else:
-            # Reset chapter back to Pending if transcription was unsuccessful
             with Session(engine) as session:
                 db_chapter = session.get(Chapter, chapter.id)
                 if db_chapter:
@@ -364,7 +360,6 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
                     session.add(db_chapter)
                     session.commit()
 
-        # Calculate and write back progress bar state
         with Session(engine) as session:
             completed_count = len(session.exec(
                 select(Chapter)
@@ -380,14 +375,11 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
                 session.add(db_book)
                 session.commit()
 
-        # Clean python references after each chapter
         gc.collect()
 
-    # Wrap up book state
     if project_id not in cancelled_projects:
         combine_chapters(working_dir, book_output_dir)
 
-        # Write completed book metadata file inside its final output folder
         try:
             metadata_file = book_output_dir / "metadata.json"
             meta_data = {
@@ -408,21 +400,18 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
                 db_book.status = "Transcribed"
                 session.add(db_book)
                 session.commit()
-        # Clean up working directory ONLY on fully successful pipeline run
         if working_dir.exists():
             try:
                 shutil.rmtree(working_dir)
             except Exception:
                 pass
     else:
-        # Reset the book status and any active chapters if cancelled mid-run
         with Session(engine) as session:
             db_book = session.get(Book, book_id)
             if db_book:
                 db_book.status = "Imported"
                 session.add(db_book)
                 
-            # Clean up active chapter statuses
             active_ch = session.exec(
                 select(Chapter)
                 .where(Chapter.book_id == book_id)
@@ -460,8 +449,6 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
         print(f"FFmpeg preprocessing failed for chapter {chapter.chapter_num}: {e}")
         return ""
 
-    # --- OPTIMIZED BYPASS: Faster-Whisper ---
-    # Whisper handles chunking and Voice Activity Detection (VAD) natively. 
     if type(model).__name__ == "WhisperModel":
         print(f"[ABI-Pipeline] Transcribing '{chapter.title}' with Faster-Whisper (built-in VAD)...")
         start_time = time.time()
@@ -472,7 +459,6 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
             vad_parameters=dict(min_silence_duration_ms=500)
         )
         
-        # Generator evaluation occurs here
         text = " ".join([segment.text for segment in segments])
         
         total_time = time.time() - start_time
@@ -483,7 +469,6 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
             
         return text.strip()
 
-    # --- FALLBACK: ONNX Parakeet ---
     temp_chunk_dir = working_dir / f"chapter_{chapter.chapter_num}_chunks"
     print(f"[ABI-Pipeline] Chunking with ffmpeg silence detection...")
     chunk_paths = chunk_audio_with_ffmpeg(preprocessed_wav, temp_chunk_dir)
