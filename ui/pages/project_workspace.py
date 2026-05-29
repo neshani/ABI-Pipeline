@@ -1,4 +1,7 @@
 import json
+import random
+from pathlib import Path
+from typing import Any, List, Optional, Dict
 from nicegui import ui
 from sqlmodel import Session
 from database.models import Project
@@ -56,6 +59,14 @@ def render_stepper(status: str):
             if idx < len(STAGES) - 1:
                 ui.icon('chevron_right', color='slate-300', size='xs')
 
+def open_large_image(img_base64: str, title: str):
+    """Opens a modal popup dialog displaying the full-size rendered image."""
+    with ui.dialog() as d, ui.card().classes('w-full max-w-3xl p-4 items-center bg-white rounded-xl shadow-lg'):
+        ui.label(title).classes('text-sm font-bold text-slate-800 mb-3 uppercase tracking-wider')
+        ui.image(img_base64).classes('w-full rounded-lg max-h-[75vh] object-contain cursor-zoom-out').on('click', d.close)
+        with ui.row().classes('w-full justify-end mt-3'):
+            ui.button('Close', on_click=d.close).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs')
+    d.open()
 
 def copy_results_to_clipboard():
     """Formats prompt configurations and outputs as markdown, copying to host clipboard safely."""
@@ -388,6 +399,385 @@ def render_recent_prompts_feed():
     state.recent_prompts_refresh = render_recent_prompts_feed.refresh
 
 
+# --- DYNAMIC STYLE PRESETS & WORKFLOW ANALYZER UTILITIES ---
+
+def list_available_workflows() -> list:
+    """Discovers .json workflows inside local './workflows' directory."""
+    workflows_dir = Path("./workflows")
+    workflows_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Search also in extra legacy folders to maintain consistency
+    legacy_dir = Path("./Comfy_Workflows")
+    
+    found = [f.name for f in workflows_dir.glob("*.json")]
+    if legacy_dir.exists():
+        found.extend([f.name for f in legacy_dir.glob("*.json")])
+        
+    if not found:
+        # Autogenerate a dummy local api file for testing purposes
+        dummy_workflow = {
+            "3": {
+                "inputs": {
+                    "seed": 0, "steps": 7, "cfg": 1, "sampler_name": "euler_ancestral", "scheduler": "beta",
+                    "model": ["20", 0], "positive": ["19", 0], "negative": ["7", 0], "latent_image": ["13", 0]
+                },
+                "class_type": "KSampler"
+            },
+            "6": { "inputs": { "text": "<prompt>" }, "class_type": "CLIPTextEncode" },
+            "7": { "inputs": { "text": "<negPrompt>" }, "class_type": "CLIPTextEncode" },
+            "13": { "inputs": { "width": 1024, "height": 1024 }, "class_type": "EmptySD3LatentImage" }
+        }
+        try:
+            with open(workflows_dir / "default_comfy_api.json", "w") as f:
+                json.dump(dummy_workflow, f, indent=2)
+            found.append("default_comfy_api.json")
+        except Exception:
+            pass
+            
+    return sorted(list(set(found)))
+
+
+def load_style_presets() -> list:
+    """Discovers .json files inside local styles directory."""
+    styles_dir = Path("./styles")
+    styles_dir.mkdir(parents=True, exist_ok=True)
+    presets = [f.stem for f in styles_dir.glob("*.json")]
+    if "default" not in presets:
+        presets.append("default")
+    return sorted(presets)
+
+
+def load_style_preset_by_name(name: str):
+    """Parses style json presets, seeding prompt/negative prompt UI textboxes."""
+    if name == "default":
+        state.style_prompt_prefix = "ArsMJStyle, 1890s Victorian illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. "
+        state.style_negative_prompt = "blurry, bad quality, text, watermark, photorealistic, photography"
+        state.style_workflow_overrides.clear()
+        return
+        
+    styles_dir = Path("./styles")
+    file_path = styles_dir / f"{name}.json"
+    if file_path.exists():
+        try:
+            with open(file_path, "r") as f:
+                data = json.load(f)
+                state.style_prompt_prefix = data.get("prompt_prefix", "")
+                state.style_negative_prompt = data.get("negative_prompt", "")
+                state.style_workflow_overrides = data.get("overrides", {})
+        except Exception:
+            pass
+            
+    render_workflow_overrides_ui.refresh()
+
+
+def save_style_preset_by_name(name: str):
+    """Saves style prefix & negative prompt variables into an on-disk style preset JSON file."""
+    name_clean = name.strip().replace(" ", "_")
+    if not name_clean:
+        ui.notify("Please enter a valid Style name.", type="negative")
+        return
+    styles_dir = Path("./styles")
+    styles_dir.mkdir(parents=True, exist_ok=True)
+    
+    data = {
+        "name": name,
+        "prompt_prefix": state.style_prompt_prefix,
+        "negative_prompt": state.style_negative_prompt,
+        "overrides": state.style_workflow_overrides
+    }
+    try:
+        with open(styles_dir / f"{name_clean}.json", "w") as f:
+            json.dump(data, f, indent=2)
+        ui.notify(f"Style preset '{name_clean}' saved successfully!", type="positive")
+    except Exception as e:
+        ui.notify(f"Failed to save preset: {str(e)}", type="negative")
+
+
+def update_override_state(node_id: str, key: str, value: Any):
+    """Triggers on manual slider adjustments, storing changes targeting specific Node IDs."""
+    if node_id not in state.style_workflow_overrides:
+        state.style_workflow_overrides[node_id] = {}
+    state.style_workflow_overrides[node_id][key] = value
+
+
+def handle_style_workflow_change(val: str):
+    """Reads a ComfyUI JSON, introspects active sampler/latents, and rebuilds dynamic UI sliders."""
+    if not val:
+        return
+    state.style_selected_workflow = val
+    
+    wf_path = Path("./workflows") / val
+    if not wf_path.exists():
+        wf_path = Path("./Comfy_Workflows") / val
+        
+    if wf_path.exists():
+        try:
+            with open(wf_path, "r") as f:
+                wf_json = json.load(f)
+            from services.comfy_client import ComfyClient
+            client = ComfyClient("127.0.0.1:8188")  # Mock address for analyzer pass
+            state.style_discovered_params = client.analyze_workflow(wf_json)
+            state.style_workflow_overrides.clear()  # Clear overrides upon swapping workflows
+            ui.notify(f"Analyzed workflow '{val}'. Discovered {len(state.style_discovered_params)} overrides.", type="info")
+        except Exception as e:
+            ui.notify(f"Failed to analyze workflow: {str(e)}", type="warning")
+            state.style_discovered_params.clear()
+            
+    render_workflow_overrides_ui.refresh()
+
+
+def fetch_real_prompts(project_name: str, book_name: str, count: int = 4, prompt_seed: int = 42) -> List[Dict[str, Any]]:
+    """Tries to read extracted prompts & quotes from project output directory, tracking full scene metadata [2]."""
+    import pandas as pd
+    
+    csv_paths = [
+        Path(f"./output/{project_name}/{book_name}/prompts.csv"),  # Exact nested directory match
+        Path(f"./output/{project_name}/{book_name}_prompts.csv"),
+        Path(f"./output/{project_name}/{book_name}/{book_name}_prompts.csv"),
+        Path(f"./output/{project_name}/{project_name}_prompts.csv"),
+        Path(f"./output/{project_name}_prompts.csv")
+    ]
+    
+    items = []
+    for path in csv_paths:
+        if path.exists():
+            try:
+                df = pd.read_csv(path, sep='|')
+                # Exclude missing or unfilled prompts
+                valid_df = df.dropna(subset=['prompt'])
+                valid_df = valid_df[valid_df['prompt'].str.strip().str.lower() != 'none']
+                valid_df = valid_df[valid_df['prompt'].str.strip() != '']
+                
+                if not valid_df.empty:
+                    sample_size = min(count, len(valid_df))
+                    # Sample consistently using the user-provided prompt seed
+                    sampled_df = valid_df.sample(n=sample_size, random_state=prompt_seed)
+                    
+                    for _, row in sampled_df.iterrows():
+                        items.append({
+                            "book": book_name,
+                            "chapter": int(row.get('chapter', 1)),
+                            "scene": int(row.get('scene', 1)),
+                            "prompt": str(row['prompt']).strip(),
+                            "quote": str(row.get('quote', '')).strip()
+                        })
+                    break
+            except Exception:
+                pass
+
+    # Fallback to standard raw text chunks if no CSV exists
+    if not items:
+        chunks = fetch_test_chunks(project_name, book_name, count=count, mode="Seeded Random")
+        if chunks:
+            for idx, chunk in enumerate(chunks):
+                items.append({
+                    "book": book_name,
+                    "chapter": 1,
+                    "scene": idx + 1,
+                    "prompt": f"Generating from raw passage fallback: {chunk[:80]}...",
+                    "quote": chunk
+                })
+                
+    return items
+
+
+def draw_style_test_sample(project_name: str, book_name: str):
+    """Pulls randomized visual prompt scenes using the active state.style_prompt_seed for consistency."""
+    state.style_test_prompts = fetch_real_prompts(
+        project_name=project_name,
+        book_name=book_name,
+        count=state.style_chunk_count,
+        prompt_seed=state.style_prompt_seed
+    )
+    
+    # Pre-populate static seeds
+    if state.style_use_random_image_seed:
+        state.style_test_seeds = [random.randint(100000, 999999) for _ in range(len(state.style_test_prompts))]
+    else:
+        state.style_test_seeds = [state.style_image_seed] * len(state.style_test_prompts)
+        
+    state.style_test_images = [None] * len(state.style_test_prompts)
+    render_style_playground_cards.refresh()
+
+
+async def execute_style_playground_batch(project_name: str):
+    """Executes the test batch against ComfyUI, passing the correct dynamic prompt key."""
+    if not state.style_selected_workflow:
+        ui.notify("Please select a workflow first.", type="warning")
+        return
+        
+    comfy_url = get_setting("comfy_url", "127.0.0.1:8188")
+    if "http" in comfy_url:
+        comfy_url = comfy_url.replace("http://", "").replace("https://", "").strip("/")
+        
+    wf_path = Path("./workflows") / state.style_selected_workflow
+    if not wf_path.exists():
+        wf_path = Path("./Comfy_Workflows") / state.style_selected_workflow
+        
+    if not wf_path.exists():
+        ui.notify(f"Workflow file '{state.style_selected_workflow}' not found.", type="negative")
+        return
+        
+    try:
+        with open(wf_path, "r") as f:
+            workflow_json = json.load(f)
+    except Exception as e:
+        ui.notify(f"Failed to load workflow JSON: {str(e)}", type="negative")
+        return
+
+    state.style_playground_loading = True
+    state.style_test_images = [None] * len(state.style_test_prompts)
+    render_style_playground_cards.refresh()
+
+    from services.comfy_client import ComfyClient
+    client = ComfyClient(comfy_url)
+
+    import asyncio
+    for idx, item in enumerate(state.style_test_prompts):
+        # Decide whether to use randomized noise seeds or a single locked image seed
+        if state.style_use_random_image_seed:
+            seed = state.style_test_seeds[idx]
+        else:
+            seed = state.style_image_seed
+            state.style_test_seeds[idx] = seed
+            
+        prompt_text = item["prompt"] if isinstance(item, dict) else item
+        
+        def run_image():
+            return client.generate_image_sync(
+                workflow_json=workflow_json,
+                prompt_text=prompt_text,
+                neg_prompt_text=state.style_negative_prompt,
+                seed=seed,
+                overrides=state.style_workflow_overrides,
+                prefix=state.style_prompt_prefix
+            )
+            
+        try:
+            img_bytes, logs = await asyncio.to_thread(run_image)
+            if img_bytes:
+                import base64
+                encoded = base64.b64encode(img_bytes).decode("utf-8")
+                state.style_test_images[idx] = f"data:image/png;base64,{encoded}"
+            
+            for line in logs.split("\n"):
+                state.add_console_log(line)
+        except Exception as e:
+            state.add_console_log(f"[Style-Playground] Exception generating sample card {idx+1}: {str(e)}")
+            
+        render_style_playground_cards.refresh()
+
+    state.style_playground_loading = False
+    render_style_playground_cards.refresh()
+    ui.notify("Visual test batch processing complete!", type="positive")
+
+
+@ui.refreshable
+def render_workflow_overrides_ui():
+    """Renders the self-introspecting overrides form dynamically."""
+    if not state.style_discovered_params:
+        ui.label("No customizable nodes discovered in this workflow.").classes('text-xs text-slate-400 italic')
+        return
+
+    with ui.column().classes('w-full gap-3 bg-slate-50 p-3 rounded-lg border mt-2'):
+        ui.label("Workflow Parameters (Auto-Discovered)").classes('text-xs font-bold text-slate-700')
+        
+        for node_id, data in state.style_discovered_params.items():
+            node_title = data["title"]
+            node_type = data["type"]
+            params = data["params"]
+            
+            with ui.expansion(f"{node_title} (ID: {node_id})").classes('w-full border rounded bg-white text-xs'):
+                with ui.column().classes('w-full p-3 gap-3'):
+                    if node_type == "sampler":
+                        ui.number(
+                            label="Steps",
+                            value=params["steps"],
+                            min=1, max=150, step=1,
+                            on_change=lambda e, nid=node_id: update_override_state(nid, "steps", e.value)
+                        ).classes('w-full')
+                        ui.number(
+                            label="CFG Scale",
+                            value=params["cfg"],
+                            min=0.0, max=30.0, step=0.1,
+                            on_change=lambda e, nid=node_id: update_override_state(nid, "cfg", e.value)
+                        ).classes('w-full')
+                    elif node_type == "resolution":
+                        ui.number(
+                            label="Width",
+                            value=params["width"],
+                            min=128, max=4096, step=64,
+                            on_change=lambda e, nid=node_id: update_override_state(nid, "width", e.value)
+                        ).classes('w-full')
+                        ui.number(
+                            label="Height",
+                            value=params["height"],
+                            min=128, max=4096, step=64,
+                            on_change=lambda e, nid=node_id: update_override_state(nid, "height", e.value)
+                        ).classes('w-full')
+                    elif node_type == "lora_loader":
+                        ui.input(
+                            label="LoRA Filename",
+                            value=params["lora_name"],
+                            on_change=lambda e, nid=node_id: update_override_state(nid, "lora_name", e.value)
+                        ).classes('w-full')
+                        ui.number(
+                            label="Strength",
+                            value=params["strength_model"],
+                            min=0.0, max=2.0, step=0.1,
+                            on_change=lambda e, nid=node_id: update_override_state(nid, "strength_model", e.value)
+                        ).classes('w-full')
+
+
+@ui.refreshable
+def render_style_playground_cards():
+    """Renders test scene cards showing detailed book identifiers, visual prompt, and click-to-expand image modal."""
+    if not state.style_test_prompts:
+        with ui.column().classes('w-full items-center justify-center p-12 text-slate-400 border border-dashed rounded-xl bg-slate-50'):
+            ui.icon('brush', size='lg', color='slate-300')
+            ui.label("Visual Playground is empty. Use the settings panel above to draw or customize test scenes.").classes('text-xs text-center max-w-sm')
+        return
+
+    with ui.grid(columns='1fr 1fr').classes('w-full gap-4'):
+        for idx, item in enumerate(state.style_test_prompts):
+            img_data = state.style_test_images[idx] if idx < len(state.style_test_images) else None
+            
+            is_dict = isinstance(item, dict)
+            chapter = item.get("chapter", 1) if is_dict else 1
+            scene_num = item.get("scene", idx + 1) if is_dict else idx + 1
+            book_title = item.get("book", "Novel") if is_dict else "Novel"
+            prompt_str = item.get("prompt", "") if is_dict else item
+
+            # Fetch active image seed cleanly
+            seed = state.style_test_seeds[idx] if idx < len(state.style_test_seeds) else state.style_image_seed
+
+            card_title = f"Ch {chapter}, Scene {scene_num}"
+            full_title_header = f"{card_title} • {book_title}"
+
+            with ui.card().classes('w-full border p-4 rounded-xl shadow-xs gap-3 bg-white'):
+                with ui.row().classes('w-full justify-between items-center pb-1 border-b border-dashed'):
+                    with ui.column().classes('gap-0'):
+                        ui.label(card_title).classes('text-xs font-black text-slate-700 uppercase')
+                        ui.label(book_title).classes('text-[9px] text-slate-400 truncate max-w-[150px]')
+                    ui.badge(f"Seed: {seed}", color="slate").classes('text-[9px] font-bold')
+
+                if img_data:
+                    ui.image(img_data).classes('w-full h-48 rounded-lg object-cover border shadow-sm cursor-zoom-in hover:brightness-95 transition-all') \
+                        .on('click', lambda _, img=img_data, title=full_title_header: open_large_image(img, title))
+                elif state.style_playground_loading:
+                    with ui.column().classes('w-full h-48 items-center justify-center bg-slate-50 rounded-lg border border-dashed'):
+                        ui.spinner(size='md', color='blue')
+                        ui.label("Rendering...").classes('text-[9px] text-slate-400 mt-1')
+                else:
+                    with ui.column().classes('w-full h-48 items-center justify-center bg-slate-50 rounded-lg border border-dashed text-slate-400'):
+                        ui.icon('photo_library', size='md', color='slate-300')
+                        ui.label("Awaiting Style Generation").classes('text-[10px]')
+
+                with ui.column().classes('gap-1 bg-emerald-50/20 p-2.5 rounded border border-emerald-50/50 w-full'):
+                    ui.label("Extracted Image Prompt:").classes('text-[8px] font-black text-slate-400 uppercase tracking-wider')
+                    ui.label(prompt_str[:160] + "..." if len(prompt_str) > 160 else prompt_str).classes('text-xs font-semibold text-slate-700 leading-normal')
+
+
 def render_project_tabs(
     project: Project, 
     books: list, 
@@ -452,6 +842,19 @@ def render_project_tabs(
                         options=available_templates,
                         value=state.playground_selected_template,
                         on_change=lambda e: handle_dashboard_template_change(e.value)
+                    ).classes('w-56 bg-white').props('outlined dense')
+
+                # Active Style Preset Selection Row
+                with ui.row().classes('w-full items-center gap-3 mb-4 bg-slate-50 p-3 rounded-lg border'):
+                    ui.icon('brush', size='sm', color='slate-500')
+                    with ui.column().classes('gap-0 flex-1'):
+                        ui.label('Active Visual Style Preset').classes('text-xs font-bold text-slate-700')
+                        ui.label('The preset used to decorate and render image prompts in ComfyUI.').classes('text-[10px] text-slate-500')
+                    
+                    ui.select(
+                        options=load_style_presets(),
+                        value=state.style_selected_preset,
+                        on_change=lambda e: (setattr(state, 'style_selected_preset', e.value), load_style_preset_by_name(e.value))
                     ).classes('w-56 bg-white').props('outlined dense')
 
                 # Render context-aware action buttons inside their own container
@@ -526,9 +929,116 @@ def render_project_tabs(
             render_recent_prompts_feed()
                         
         with ui.tab_panel(tab_style):
-            with ui.card().classes('w-full border p-5 shadow-sm bg-white'):
-                ui.label('Visual Style & Workflow Configurations').classes('text-sm font-bold text-slate-800')
-                ui.label('Placeholder scaffolding for style selections and ComfyUI definitions. (Phase 2)').classes('text-xs text-slate-500')
+            with ui.grid(columns='420px 1fr').classes('w-full gap-6 items-start'):
+                # LEFT CONFIG PANEL
+                with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
+                    ui.label('Style Preset & Workflow Config').classes('text-sm font-bold text-slate-800')
+                    
+                    # Workflow selection
+                    available_workflows = list_available_workflows()
+                    if not state.style_selected_workflow or state.style_selected_workflow not in available_workflows:
+                        if available_workflows:
+                            state.style_selected_workflow = available_workflows[0]
+                            handle_style_workflow_change(available_workflows[0])
+                            
+                    ui.select(
+                        options=available_workflows,
+                        label="ComfyUI Base Workflow (.json)",
+                        value=state.style_selected_workflow,
+                        on_change=lambda e: handle_style_workflow_change(e.value)
+                    ).classes('w-full')
+                    
+                    # Style presets selection dropdown
+                    available_styles = load_style_presets()
+                    preset_dropdown = ui.select(
+                        options=available_styles,
+                        label="Saved Style Preset",
+                        value=state.style_selected_preset,
+                        on_change=lambda e: (setattr(state, 'style_selected_preset', e.value), load_style_preset_by_name(e.value))
+                    ).classes('w-full')
+                    
+                    # Quick save row
+                    with ui.row().classes('w-full items-end gap-2'):
+                        custom_style_name = ui.input(placeholder="Preset Name", label="Save Style Preset").classes('flex-1')
+                        ui.button(
+                            icon="save",
+                            on_click=lambda: (
+                                save_style_preset_by_name(custom_style_name.value),
+                                setattr(preset_dropdown, 'options', load_style_presets()),
+                                preset_dropdown.update()
+                            )
+                        ).props('outline').classes('h-10 text-blue-600')
+
+                    ui.separator()
+                    
+                    # Active prompt modification text areas
+                    ui.textarea(
+                        label="Style Prompt Prefix",
+                        value=state.style_prompt_prefix,
+                        on_change=lambda e: setattr(state, 'style_prompt_prefix', e.value)
+                    ).classes('w-full h-24 text-xs').props('outlined')
+                    
+                    ui.textarea(
+                        label="Style Negative Prompt",
+                        value=state.style_negative_prompt,
+                        on_change=lambda e: setattr(state, 'style_negative_prompt', e.value)
+                    ).classes('w-full h-24 text-xs').props('outlined')
+                    
+                    # Discovered parameters expansion grid container
+                    render_workflow_overrides_ui()
+                    
+                # RIGHT: Visual Style Playground Grid
+                with ui.column().classes('w-full gap-4'):
+                    with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
+                        with ui.row().classes('w-full items-center gap-2'):
+                            ui.icon('brush', size='sm', color='blue-500')
+                            ui.label('Style Visual Playground Settings').classes('text-sm font-bold text-slate-800')
+                            
+                        with ui.row().classes('items-end justify-between gap-4 w-full bg-slate-50 p-4 rounded-lg border'):
+                            # Dynamic image count
+                            ui.number(
+                                label="Num Images",
+                                value=state.style_chunk_count,
+                                min=1, max=8, step=1,
+                                on_change=lambda e: (setattr(state, 'style_chunk_count', int(e.value)) if e.value is not None else None, draw_style_test_sample(project.name, state.playground_book_selection))
+                            ).classes('w-20')
+
+                            # Prompt selection seed (determines which scenes are drawn)
+                            with ui.row().classes('items-end gap-1'):
+                                prompt_seed_input = ui.number(
+                                    label="Prompt Seed",
+                                    value=state.style_prompt_seed,
+                                    precision=0,
+                                    on_change=lambda e: (setattr(state, 'style_prompt_seed', int(e.value)) if e.value is not None else None, draw_style_test_sample(project.name, state.playground_book_selection))
+                                ).classes('w-24')
+                                
+                                ui.button(
+                                    icon="casino",
+                                    on_click=lambda: (
+                                        setattr(state, 'style_prompt_seed', random.randint(100000, 999999)),
+                                        prompt_seed_input.set_value(state.style_prompt_seed)
+                                    )
+                                ).props('outline dense').classes('h-10 text-slate-500')
+
+                            # Generation/Noise Seed toggles
+                            ui.switch("Random Image Seeds").bind_value(state, 'style_use_random_image_seed').classes('text-xs mb-2')
+                            
+                            ui.number(
+                                label="Image Seed",
+                                precision=0
+                            ).bind_value(state, 'style_image_seed').classes('w-28').bind_visibility_from(
+                                state, 'style_use_random_image_seed', value=False
+                            )
+
+                            # Launch Batch Execution
+                            ui.button(
+                                'Test Style Preset',
+                                icon='bolt',
+                                on_click=lambda: execute_style_playground_batch(project.name)
+                            ).classes('bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-5 h-10')
+                    
+                    # Cards grid
+                    render_style_playground_cards()
                 
         with ui.tab_panel(tab_play):
             with ui.grid(columns='380px 1fr').classes('w-full gap-6 items-start'):

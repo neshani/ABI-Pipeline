@@ -51,3 +51,22 @@ playground_results: List[Dict[str, Any]] = []  # [{"chunk": "", "quote": "", "pr
 recent_prompts: List[Dict[str, Any]] = []  # Stores last 5 generated prompts: [{"book": "", "chapter": 1, "scene": 1, "prompt": "", "quote": "", "status": ""}]
 prompt_gen_active: bool = False
 cancel_prompt_gen_flag: bool = False
+
+# --- Style Playground & Workflow Analyzer Bindings ---
+style_selected_preset: str = "default"
+style_selected_workflow: str = ""
+style_prompt_prefix: str = "ArsMJStyle, 1890s Victorian illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. "
+style_negative_prompt: str = "blurry, bad quality, text, watermark, photorealistic, photography"
+style_test_prompts: List[Dict[str, Any]] = []
+style_test_images: List[Optional[str]] = []  # List of Base64-encoded strings or None
+style_test_seeds: List[int] = []
+style_lock_samples: bool = False
+style_playground_loading: bool = False
+style_discovered_params: Dict[str, Any] = {}  # Dynamic structures found by introspection
+style_workflow_overrides: Dict[str, Any] = {}  # {node_id: {field_name: value}}
+
+# Seeds and controls for Prompt Playground matching
+style_prompt_seed: int = 42
+style_image_seed: int = 42
+style_use_random_image_seed: bool = True
+style_chunk_count: int = 4
