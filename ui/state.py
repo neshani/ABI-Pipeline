@@ -35,3 +35,14 @@ def add_console_log(message: str):
     console_logs.append(message)
     if len(console_logs) > 500:
         console_logs.pop(0)
+
+# --- Playgrounds & Prompt Settings bindings ---
+playground_template: str = ""
+playground_selected_template: str = "default"
+playground_book_selection: Optional[str] = None
+playground_chunk_count: int = 1
+playground_start_index: int = 30           # Defaulting to 30 to skip intros
+playground_seed: int = 42                 # Seeded random default
+playground_selection_mode: str = "Seeded Random"
+playground_loading: bool = False
+playground_results: List[Dict[str, Any]] = []  # [{"chunk": "", "quote": "", "prompt": "", "status": ""}]

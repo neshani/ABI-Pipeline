@@ -73,6 +73,7 @@ DEFAULT_SETTINGS = {
     "comfy_path": "F:/AI/ComfyUI/ComfyUI",
     "llm_provider": "Ollama",
     "llm_url": "http://127.0.0.1:11434",
+    "llm_model": "unsloth/gemma-4-e4b-it",              # Added default local LLM model name
     "stt_engine": "Parakeet ONNX",
     "stt_device": "GPU/CUDA",
     "batch_size": 30,
@@ -87,7 +88,6 @@ for key, default_val in DEFAULT_SETTINGS.items():
         app_settings[key] = default_val
     else:
         app_settings[key] = db_val
-
 
 # --- Navigation State Control Handlers ---
 def select_project(project_id: int):
@@ -149,6 +149,68 @@ def stop_transcribing(project_id: int):
         state.action_buttons_refresh()
     from ui.pages.project_workspace import render_stepper
     render_stepper.refresh("Imported")
+
+
+def start_prompt_generation(project_id: int):
+    """
+    Temporary scaffolding callback to transition the project and books 
+    from 'Transcribed' to 'Prompts Created'.
+    """
+    state.add_console_log(f"[Prompt-Gen] Initiating local LLM prompt generation for Project ID {project_id}...")
+    state.add_console_log("[Prompt-Gen] Chunking files and sending instructions to local LLM endpoint...")
+    
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if project:
+            project.status = "Prompts Created"
+            session.add(project)
+            
+            books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+            for b in books:
+                b.status = "Prompts Created"
+                session.add(b)
+            session.commit()
+            
+    state.add_console_log("[Prompt-Gen] Process Complete: Prompts written to prompts.csv! (Scaffold Model)")
+    ui.notify("Mock Prompt Generation completed!", type="success")
+    
+    # Refresh local state variables
+    state.project_status = "Prompts Created"
+    if hasattr(state, 'action_buttons_refresh'):
+        state.action_buttons_refresh()
+    from ui.pages.project_workspace import render_stepper
+    render_stepper.refresh("Prompts Created")
+
+
+def start_image_generation(project_id: int):
+    """
+    Temporary scaffolding callback to transition the project and books 
+    from 'Prompts Created' to 'Images Created'.
+    """
+    state.add_console_log(f"[Image-Gen] Connecting to ComfyUI at {get_setting('comfy_url')}...")
+    state.add_console_log("[Image-Gen] Queueing prompt generation sequences...")
+    
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if project:
+            project.status = "Images Created"
+            session.add(project)
+            
+            books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+            for b in books:
+                b.status = "Images Created"
+                session.add(b)
+            session.commit()
+            
+    state.add_console_log("[Image-Gen] Process Complete: PNGs successfully rendered! (Scaffold Model)")
+    ui.notify("Mock Image Generation completed!", type="success")
+    
+    # Refresh local state variables
+    state.project_status = "Images Created"
+    if hasattr(state, 'action_buttons_refresh'):
+        state.action_buttons_refresh()
+    from ui.pages.project_workspace import render_stepper
+    render_stepper.refresh("Images Created")
 
 
 # --- Dynamic WebSocket State-Updater (No full page refreshes!) ---
@@ -260,7 +322,14 @@ def render_split_panel_shell(project_id: int):
         # RIGHT WORKSPACE ROUTER
         with ui.column().classes('w-full gap-4'):
             if state.active_book_id is None:
-                render_project_tabs(project, books, start_transcribing, stop_transcribing)
+                render_project_tabs(
+                    project, 
+                    books, 
+                    start_transcribing, 
+                    stop_transcribing,
+                    start_prompt_generation,
+                    start_image_generation
+                )
             else:
                 render_book_tabs(state.active_book_id)
 

@@ -36,3 +36,4 @@ zExportCodeForLLM.ps1
 workspace_temp/
 output/
 file-sets.txt
+prompt_templates/
