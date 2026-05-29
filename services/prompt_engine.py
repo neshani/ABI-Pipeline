@@ -2,9 +2,11 @@ import httpx
 import re
 import os
 import random
+import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from database.connection import get_setting
+from ui import state
 
 REFUSAL_KEYWORDS = [
     "i cannot", "i can't", "i apologize", "i'm sorry", "im sorry", 
@@ -117,7 +119,12 @@ async def get_llm_response(prompt: str, llm_url: str, model_name: str) -> str:
     elif endpoint.endswith("/v1"):
         endpoint = f"{endpoint}/chat/completions"
 
+    # Retrieve and apply API authorization header if available
+    api_key = get_setting("llm_api_key", "")
     headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
     payload = {
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
@@ -247,3 +254,433 @@ def fetch_test_chunks(
         # Seeded Random selection for deterministic, reusable random samples
         r = random.Random(int(seed))
         return r.sample(all_chunks, min(count, len(all_chunks)))
+
+
+async def unload_llm_model(llm_url: str, model_name: str) -> bool:
+    """
+    Attempts to programmatically unload the active LLM from the host's VRAM.
+    Supports both LM Studio native unload endpoints and Ollama api/generate cache evictions.
+    Useful for freeing up maximum VRAM headroom before starting heavy local workflows like ComfyUI.
+    """
+    base_url = llm_url.rstrip("/")
+    headers = {"Content-Type": "application/json"}
+    
+    # Retrieve API key if any is saved
+    api_key = get_setting("llm_api_key", "")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    async with httpx.AsyncClient() as client:
+        # 1. Attempt LM Studio native unload endpoint
+        try:
+            unload_url = f"{base_url}/api/v1/models/unload"
+            payload = {"instance_id": model_name}
+            resp = await client.post(unload_url, json=payload, headers=headers, timeout=10.0)
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+
+        # 2. Fallback to Ollama immediate eviction payload
+        try:
+            ollama_url = f"{base_url}/api/generate"
+            payload = {
+                "model": model_name,
+                "keep_alive": 0
+            }
+            resp = await client.post(ollama_url, json=payload, timeout=10.0)
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+async def generate_prompt_for_chunk_async(
+    task: dict, 
+    llm_url: str, 
+    model_name: str, 
+    template: str, 
+    semaphore: asyncio.Semaphore
+) -> dict:
+    """Generates prompt for a single chunk using a concurrency semaphore."""
+    async with semaphore:
+        final_prompt = template.replace("<text>", task["chunk"])
+        raw_response = await get_llm_response(final_prompt, llm_url, model_name)
+        parsed = parse_llm_response(raw_response)
+        return {
+            "chapter": task["chapter_num"],
+            "scene": task["scene_num"],
+            "quote": parsed["quote"],
+            "prompt": parsed["prompt"],
+            "status": parsed["status"],
+            "raw": parsed["raw"]
+        }
+
+
+def cancel_prompt_generation(project_id: int):
+    """Flags active prompt generation to cancel."""
+    state.cancel_prompt_gen_flag = True
+    state.add_console_log(f"[Prompt-Gen] Cancellation signal sent to Project ID {project_id}...")
+
+
+def sort_csv_by_chapter_scene(csv_path: Path):
+    """Sorts the final prompts.csv file numerically by chapter and scene."""
+    if not csv_path.exists():
+        return
+    try:
+        import csv
+        rows = []
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter="|")
+            header = next(reader)
+            for row in reader:
+                if len(row) >= 2:
+                    rows.append(row)
+        
+        # Sort rows numerically by chapter (index 0) and scene (index 1)
+        rows.sort(key=lambda r: (int(r[0]), int(r[1])))
+        
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter="|")
+            writer.writerow(header)
+            writer.writerows(rows)
+    except Exception as ex:
+        print(f"Error sorting prompts.csv: {str(ex)}")
+
+
+async def start_project_prompt_gen(project_id: int):
+    """
+    Orchestrates sequential resumable prompt generation for all books in a project.
+    Processes chapters and chunks in parallel using asyncio Semaphores.
+    """
+    import csv
+    import asyncio
+    from sqlmodel import Session, select
+    from database.models import Project, Book
+    from database.connection import engine, get_setting
+
+    if state.prompt_gen_active:
+        state.add_console_log("[Prompt-Gen] Warning: A prompt generation task is already active.")
+        return
+
+    state.prompt_gen_active = True
+    state.cancel_prompt_gen_flag = False
+    state.recent_prompts.clear()
+    
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if not project:
+            state.add_console_log("[Prompt-Gen] Error: Project not found.")
+            state.prompt_gen_active = False
+            return
+            
+        project.status = "Generating Prompts"
+        session.add(project)
+        
+        books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+        
+        # Extract properties to standard types before commit to avoid DetachedInstanceError
+        project_name = project.name
+        books_data = []
+        for b in books:
+            b.status = "Generating Prompts"
+            session.add(b)
+            books_data.append({
+                "id": b.id,
+                "name": b.name
+            })
+        session.commit()
+        
+    state.add_console_log(f"[Prompt-Gen] Starting generation for Project: {project_name}")
+
+    try:
+        # Load LLM connection configurations
+        llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
+        model_name = get_setting("llm_model", "local-model")
+        chunk_size_words = int(get_setting("batch_size", 30)) * 10
+        if chunk_size_words <= 0:
+            chunk_size_words = 300
+
+        # Load Prompt Template
+        template_name = state.playground_selected_template or "default"
+        template_text = load_template_by_name(template_name)
+        if not template_text:
+            template_text = load_template_by_name("default")
+
+        base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+
+        for book_dict in books_data:
+            book_id = book_dict["id"]
+            book_name = book_dict["name"]
+
+            if state.cancel_prompt_gen_flag:
+                state.add_console_log("[Prompt-Gen] Process interrupted by user.")
+                break
+
+            state.add_console_log(f"[Prompt-Gen] Processing Book: {book_name}")
+            
+            transcript_path = base_output_dir / project_name / book_name / "transcript.txt"
+            output_csv_path = base_output_dir / project_name / book_name / "prompts.csv"
+
+            if not transcript_path.exists():
+                state.add_console_log(f"[Prompt-Gen] Missing transcript for {book_name}. Skipping.")
+                continue
+
+            # 1. Load Existing Progress for Resuming
+            completed_scenes = set()
+            if output_csv_path.exists():
+                try:
+                    with open(output_csv_path, "r", encoding="utf-8") as csv_f:
+                        reader = csv.DictReader(csv_f, delimiter="|")
+                        for row in reader:
+                            if "chapter" in row and "scene" in row:
+                                completed_scenes.add((int(row["chapter"]), int(row["scene"])))
+                except Exception as ex:
+                    state.add_console_log(f"[Prompt-Gen] Warning reading existing prompts.csv: {str(ex)}")
+
+            if completed_scenes:
+                state.add_console_log(f"[Prompt-Gen] Found {len(completed_scenes)} existing prompts. Resuming where left off...")
+
+            # 2. Segment transcript into chapters & chunks
+            with open(transcript_path, "r", encoding="utf-8") as f:
+                full_text = f.read()
+
+            chapters = [ch for ch in full_text.split("==CHAPTER==") if ch.strip()]
+            
+            tasks = []
+            for i, chapter_text in enumerate(chapters):
+                chapter_num = i + 1
+                chunks = smart_chunk_text(chapter_text, chunk_size_words)
+                for j, chunk_text in enumerate(chunks):
+                    scene_num = j + 1
+                    if (chapter_num, scene_num) not in completed_scenes:
+                        tasks.append({
+                            "chunk": chunk_text,
+                            "chapter_num": chapter_num,
+                            "scene_num": scene_num
+                        })
+
+            total_chunks = len(completed_scenes) + len(tasks)
+            state.add_console_log(f"[Prompt-Gen] Total chunks/scenes: {total_chunks} ({len(tasks)} pending)")
+
+            # Save total count in SQLite for metrics tracking
+            with Session(engine) as session:
+                db_book = session.get(Book, book_id)
+                if db_book:
+                    db_book.total_images = total_chunks
+                    db_book.completed_images = len(completed_scenes)
+                    db_book.progress = len(completed_scenes) / total_chunks if total_chunks > 0 else 0.0
+                    session.add(db_book)
+                    session.commit()
+
+            if not tasks:
+                state.add_console_log(f"[Prompt-Gen] All scenes for {book_name} are already generated.")
+                with Session(engine) as session:
+                    db_book = session.get(Book, book_id)
+                    if db_book:
+                        db_book.status = "Prompts Created"
+                        session.add(db_book)
+                        session.commit()
+                continue
+
+            # Ensure CSV file header exists
+            if not output_csv_path.exists():
+                output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(output_csv_path, "w", encoding="utf-8", newline="") as csv_f:
+                    writer = csv.writer(csv_f, delimiter="|")
+                    writer.writerow(["chapter", "scene", "prompt", "quote"])
+
+            # 3. Warm-Up (First Prompt) Sequential Loading Phase
+            first_task = tasks[0]
+            state.add_console_log(f"[Prompt-Gen] Sending sequential warm-up request to load the model into VRAM (Ch {first_task['chapter_num']}, Scene {first_task['scene_num']})...")
+            
+            warm_up_success = False
+            warm_up_res = None
+            warm_up_sem = asyncio.Semaphore(1)
+            
+            # Allow up to 3 warm-up attempts to handle GPU allocation spikes
+            for attempt in range(3):
+                if state.cancel_prompt_gen_flag:
+                    break
+                try:
+                    res = await generate_prompt_for_chunk_async(first_task, llm_url, model_name, template_text, warm_up_sem)
+                    if res and res["status"] != "error":
+                        warm_up_success = True
+                        warm_up_res = res
+                        state.add_console_log("[Prompt-Gen] Warm-up successful. Model is loaded and active.")
+                        break
+                    else:
+                        state.add_console_log(f"[Prompt-Gen] Warm-up attempt {attempt+1} returned API error. Retrying...")
+                except Exception as e:
+                    state.add_console_log(f"[Prompt-Gen] Warm-up attempt {attempt+1} failed: {str(e)}. Retrying...")
+                await asyncio.sleep(2.5)
+
+            if state.cancel_prompt_gen_flag:
+                state.add_console_log("[Prompt-Gen] Process interrupted by user during warm-up.")
+                break
+
+            if not warm_up_success:
+                state.add_console_log("[Prompt-Gen] Error: Model warm-up failed. Suspending generation to prevent concurrent load errors.")
+                state.cancel_prompt_gen_flag = True
+                break
+
+            # Persist sequential Warm-up result
+            if warm_up_res:
+                if warm_up_res["status"] == "refusal":
+                    ref_log_path = base_output_dir / project_name / book_name / "refusals.log"
+                    ref_log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(ref_log_path, "a", encoding="utf-8") as ref_f:
+                        ref_f.write(f"Chapter {warm_up_res['chapter']}, Scene {warm_up_res['scene']}:\n{warm_up_res['raw']}\n\n{'-'*40}\n\n")
+                    warm_up_res["prompt"] = "REFUSAL"
+                    warm_up_res["quote"] = first_task["chunk"]
+
+                with open(output_csv_path, "a", encoding="utf-8", newline="") as csv_f:
+                    writer = csv.writer(csv_f, delimiter="|")
+                    writer.writerow([warm_up_res["chapter"], warm_up_res["scene"], warm_up_res["prompt"], warm_up_res["quote"]])
+
+                with Session(engine) as session:
+                    db_book = session.get(Book, book_id)
+                    if db_book:
+                        db_book.completed_images = (db_book.completed_images or 0) + 1
+                        db_book.progress = db_book.completed_images / db_book.total_images if db_book.total_images > 0 else 0.0
+                        session.add(db_book)
+                        session.commit()
+
+                state.recent_prompts.append({
+                    "book": book_name,
+                    "chapter": warm_up_res["chapter"],
+                    "scene": warm_up_res["scene"],
+                    "prompt": warm_up_res["prompt"],
+                    "quote": warm_up_res["quote"],
+                    "status": warm_up_res["status"]
+                })
+
+            # Exclude the first task and process the rest of the queue concurrently
+            remaining_tasks = tasks[1:]
+            if not remaining_tasks:
+                # If there were no other tasks, sort the completed CSV
+                sort_csv_by_chapter_scene(output_csv_path)
+                with Session(engine) as session:
+                    db_book = session.get(Book, book_id)
+                    if db_book:
+                        db_book.status = "Prompts Created"
+                        session.add(db_book)
+                        session.commit()
+                continue
+
+            # 4. Dynamic Parallel Processing via Semaphores & Cancellable Tasks
+            semaphore = asyncio.Semaphore(4)  # Limit concurrent API requests to 4
+            
+            async def run_and_save_task(task_data):
+                if state.cancel_prompt_gen_flag:
+                    return None
+
+                try:
+                    res = await generate_prompt_for_chunk_async(task_data, llm_url, model_name, template_text, semaphore)
+                    
+                    if state.cancel_prompt_gen_flag:
+                        return None
+
+                    # Treat refusals and failures gracefully
+                    if res["status"] == "refusal":
+                        ref_log_path = base_output_dir / project_name / book_name / "refusals.log"
+                        ref_log_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(ref_log_path, "a", encoding="utf-8") as ref_f:
+                            ref_f.write(f"Chapter {res['chapter']}, Scene {res['scene']}:\n{res['raw']}\n\n{'-'*40}\n\n")
+                        
+                        # Store refusal in CSV with a placeholder for grid highlighting in Phase 5
+                        res["prompt"] = "REFUSAL"
+                        res["quote"] = task_data["chunk"]
+
+                    # Append results to prompts.csv immediately
+                    with open(output_csv_path, "a", encoding="utf-8", newline="") as csv_f:
+                        writer = csv.writer(csv_f, delimiter="|")
+                        writer.writerow([res["chapter"], res["scene"], res["prompt"], res["quote"]])
+
+                    # Update database progress in-place
+                    with Session(engine) as session:
+                        db_book = session.get(Book, book_id)
+                        if db_book:
+                            db_book.completed_images = (db_book.completed_images or 0) + 1
+                            db_book.progress = db_book.completed_images / db_book.total_images if db_book.total_images > 0 else 0.0
+                            session.add(db_book)
+                            session.commit()
+
+                    # Push metadata details to our live UI feed
+                    ui_item = {
+                        "book": book_name,
+                        "chapter": res["chapter"],
+                        "scene": res["scene"],
+                        "prompt": res["prompt"],
+                        "quote": res["quote"],
+                        "status": res["status"]
+                    }
+                    state.recent_prompts.append(ui_item)
+                    if len(state.recent_prompts) > 5:
+                        state.recent_prompts.pop(0)
+
+                    return res
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    state.add_console_log(f"[Prompt-Gen] Chunk S{task_data['scene_num']} processing error: {str(ex)}")
+                    return None
+
+            # Wrap tasks as explicit task handles inside the event loop
+            active_tasks = [asyncio.create_task(run_and_save_task(t)) for t in remaining_tasks]
+            
+            # Active Loop Monitor
+            while not all(t.done() for t in active_tasks):
+                if state.cancel_prompt_gen_flag:
+                    state.add_console_log("[Prompt-Gen] Cancelling active background LLM requests...")
+                    for task in active_tasks:
+                        if not task.done():
+                            task.cancel()
+                    break
+                await asyncio.sleep(0.5)
+
+            # Force synchronization and await active tasks to let cancellation unwind cleanly
+            await asyncio.gather(*active_tasks, return_exceptions=True)
+
+            # Sort prompts.csv and update book status to final if completed fully and not interrupted
+            if not state.cancel_prompt_gen_flag:
+                sort_csv_by_chapter_scene(output_csv_path)
+                with Session(engine) as session:
+                    db_book = session.get(Book, book_id)
+                    if db_book:
+                        db_book.status = "Prompts Created"
+                        session.add(db_book)
+                        session.commit()
+
+        # Update Project Status upon completing loop
+        if not state.cancel_prompt_gen_flag:
+            with Session(engine) as session:
+                db_project = session.get(Project, project_id)
+                if db_project:
+                    db_project.status = "Prompts Created"
+                    session.add(db_project)
+                    session.commit()
+            state.add_console_log("[Prompt-Gen] Success! All prompts generated.")
+        else:
+            state.add_console_log("[Prompt-Gen] Prompt generation suspended successfully.")
+
+    except Exception as ex:
+        state.add_console_log(f"[Prompt-Gen] Critical Error: {str(ex)}")
+    finally:
+        state.prompt_gen_active = False
+        
+        # Bulletproof fallback to ensure statuses revert on any interrupt, cancellation, or exception
+        with Session(engine) as session:
+            db_project = session.get(Project, project_id)
+            if db_project and db_project.status == "Generating Prompts":
+                db_project.status = "Transcribed"
+                session.add(db_project)
+                
+            for b_data in books_data:
+                b_id = b_data["id"]
+                db_book = session.get(Book, b_id)
+                if db_book and db_book.status == "Generating Prompts":
+                    db_book.status = "Transcribed"
+                    session.add(db_book)
+            session.commit()

@@ -22,16 +22,17 @@ from ui.pages import render_portal_view, render_project_tabs, render_book_tabs, 
 init_db()
 
 def reset_stuck_transcriptions():
-    """Finds and resets any projects, books, or chapters that were stuck in a 'Transcribing' state on startup."""
+    """Finds and resets any projects, books, or chapters that were stuck in a 'Transcribing' or 'Generating Prompts' state on startup."""
     with Session(engine) as session:
-        stuck_projects = session.exec(select(Project).where(Project.status == "Transcribing")).all()
+        stuck_projects = session.exec(select(Project).where(Project.status.in_(["Transcribing", "Generating Prompts"]))).all()
         for p in stuck_projects:
-            p.status = "Imported"
+            # Revert to Transcribed if it was generating prompts, otherwise revert to Imported
+            p.status = "Transcribed" if p.status == "Generating Prompts" else "Imported"
             session.add(p)
             
-        stuck_books = session.exec(select(Book).where(Book.status == "Transcribing")).all()
+        stuck_books = session.exec(select(Book).where(Book.status.in_(["Transcribing", "Generating Prompts"]))).all()
         for b in stuck_books:
-            b.status = "Imported"
+            b.status = "Transcribed" if b.status == "Generating Prompts" else "Imported"
             session.add(b)
             
         stuck_chapters = session.exec(select(Chapter).where(Chapter.status == "Transcribing")).all()
@@ -71,9 +72,9 @@ async def async_restart():
 DEFAULT_SETTINGS = {
     "comfy_url": "http://127.0.0.1:8188",
     "comfy_path": "F:/AI/ComfyUI/ComfyUI",
-    "llm_provider": "Ollama",
     "llm_url": "http://127.0.0.1:11434",
-    "llm_model": "unsloth/gemma-4-e4b-it",              # Added default local LLM model name
+    "llm_api_key": "",
+    "llm_model": "unsloth/gemma-4-e4b-it",
     "stt_engine": "Parakeet ONNX",
     "stt_device": "GPU/CUDA",
     "batch_size": 30,
@@ -140,46 +141,36 @@ def start_transcribing(project_id: int):
 
 
 def stop_transcribing(project_id: int):
-    cancel_project_transcription(project_id)
-    ui.notify("Stopping transcription process...", type="warning")
+    if state.project_status == "Transcribing":
+        cancel_project_transcription(project_id)
+        ui.notify("Stopping transcription process...", type="warning")
+        state.project_status = "Imported"
+    elif state.project_status == "Generating Prompts":
+        from services.prompt_engine import cancel_prompt_generation
+        cancel_prompt_generation(project_id)
+        ui.notify("Stopping prompt generation process...", type="warning")
+        state.project_status = "Transcribed"
     
     # Fast trigger to update action buttons and stepper layout
-    state.project_status = "Imported"
     if hasattr(state, 'action_buttons_refresh'):
         state.action_buttons_refresh()
     from ui.pages.project_workspace import render_stepper
-    render_stepper.refresh("Imported")
+    render_stepper.refresh(state.project_status)
 
 
 def start_prompt_generation(project_id: int):
     """
-    Temporary scaffolding callback to transition the project and books 
-    from 'Transcribed' to 'Prompts Created'.
+    Launches the asynchronous, interruptible, and resumable prompt generation process.
     """
-    state.add_console_log(f"[Prompt-Gen] Initiating local LLM prompt generation for Project ID {project_id}...")
-    state.add_console_log("[Prompt-Gen] Chunking files and sending instructions to local LLM endpoint...")
+    from services.prompt_engine import start_project_prompt_gen
+    asyncio.create_task(start_project_prompt_gen(project_id))
+    ui.notify("Background prompt generation sequences initiated!", type="positive")
     
-    with Session(engine) as session:
-        project = session.get(Project, project_id)
-        if project:
-            project.status = "Prompts Created"
-            session.add(project)
-            
-            books = session.exec(select(Book).where(Book.project_id == project_id)).all()
-            for b in books:
-                b.status = "Prompts Created"
-                session.add(b)
-            session.commit()
-            
-    state.add_console_log("[Prompt-Gen] Process Complete: Prompts written to prompts.csv! (Scaffold Model)")
-    ui.notify("Mock Prompt Generation completed!", type="success")
-    
-    # Refresh local state variables
-    state.project_status = "Prompts Created"
+    state.project_status = "Generating Prompts"
     if hasattr(state, 'action_buttons_refresh'):
         state.action_buttons_refresh()
     from ui.pages.project_workspace import render_stepper
-    render_stepper.refresh("Prompts Created")
+    render_stepper.refresh("Generating Prompts")
 
 
 def start_image_generation(project_id: int):
@@ -250,6 +241,13 @@ def check_for_active_transcriptions():
                 for line in new_logs:
                     state.active_log_widget.push(line)
                 state.logs_pushed_index = len(state.console_logs)
+            except Exception:
+                pass
+
+        # 4. Refresh the live Prompt Generation Feed dynamically
+        if hasattr(state, 'recent_prompts_refresh'):
+            try:
+                state.recent_prompts_refresh()
             except Exception:
                 pass
 

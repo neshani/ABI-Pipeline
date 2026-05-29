@@ -46,3 +46,8 @@ playground_seed: int = 42                 # Seeded random default
 playground_selection_mode: str = "Seeded Random"
 playground_loading: bool = False
 playground_results: List[Dict[str, Any]] = []  # [{"chunk": "", "quote": "", "prompt": "", "status": ""}]
+
+# --- Dynamic Prompt Generation Task States ---
+recent_prompts: List[Dict[str, Any]] = []  # Stores last 5 generated prompts: [{"book": "", "chapter": 1, "scene": 1, "prompt": "", "quote": "", "status": ""}]
+prompt_gen_active: bool = False
+cancel_prompt_gen_flag: bool = False

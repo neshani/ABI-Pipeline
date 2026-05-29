@@ -279,11 +279,21 @@ async def execute_playground_test(project_name: str):
     render_playground_results_container.refresh()
     ui.notify("Playground test iteration complete!", type="positive")
 
+def handle_dashboard_template_change(val: str):
+    """Updates the active template state and pre-loads its text contents globally."""
+    if not val:
+        return
+    state.playground_selected_template = val
+    loaded = load_template_by_name(val)
+    if loaded:
+        state.playground_template = loaded
+        ui.notify(f"Active Prompt Template changed to: {val}", type="info")
 
 def handle_template_dropdown_selection(val: str, prompt_editor_widget):
     """Loads a named prompt template and updates the text editor binding."""
     if not val:
         return
+    state.playground_selected_template = val
     loaded = load_template_by_name(val)
     if loaded:
         state.playground_template = loaded
@@ -300,9 +310,82 @@ def handle_save_custom_template(custom_name: str, template_dropdown):
     save_template_by_name(name_clean, state.playground_template)
     ui.notify(f"Template '{name_clean}' saved successfully!", type="positive")
     
-    # Reload dropdown items
+    # Reload dropdown items, update active value, and trigger UI update
     template_dropdown.options = list_stored_templates()
+    template_dropdown.value = name_clean
+    template_dropdown.update()
     state.playground_selected_template = name_clean
+
+
+def handle_delete_template(template_dropdown, prompt_editor_widget):
+    """Deletes the active template and resets the dropdown to 'default'."""
+    target_name = state.playground_selected_template
+    if not target_name:
+        ui.notify("No template selected for deletion.", type="warning")
+        return
+    if target_name == "default":
+        ui.notify("The default template cannot be deleted.", type="negative")
+        return
+
+    from pathlib import Path
+    templates_dir = Path("./prompt_templates")
+    target_file = templates_dir / f"{target_name}.txt"
+    if target_file.exists():
+        try:
+            target_file.unlink()
+            ui.notify(f"Deleted template: {target_name}", type="positive")
+        except Exception as ex:
+            ui.notify(f"Error deleting template file: {str(ex)}", type="negative")
+            return
+    else:
+        ui.notify(f"Template file '{target_name}.txt' not found.", type="warning")
+
+    # Reload dropdown options, reset value, and trigger UI update
+    all_templates = list_stored_templates()
+    template_dropdown.options = all_templates
+    template_dropdown.value = "default"
+    template_dropdown.update()
+    
+    # Reset internal playground state variables
+    state.playground_selected_template = "default"
+    loaded_default = load_template_by_name("default")
+    state.playground_template = loaded_default
+    prompt_editor_widget.set_value(loaded_default)
+
+@ui.refreshable
+def render_recent_prompts_feed():
+    """Renders the last 5 generated prompts dynamically in-place during pipeline execution."""
+    with ui.card().classes('w-full border p-5 shadow-sm bg-white mt-4 gap-3'):
+        with ui.row().classes('items-center gap-2'):
+            ui.icon('auto_awesome', size='sm', color='blue-500')
+            ui.label('Live Prompt Generation Feed (Most Recent)').classes('text-sm font-bold text-slate-800')
+            
+        # Conditionally show descriptive placeholder states based on stage progress
+        if state.project_status in ("Imported", "Transcribing"):
+            with ui.column().classes('w-full items-center justify-center p-6 bg-slate-50 border border-dashed rounded-lg text-slate-400'):
+                ui.icon('lock', size='md', color='slate-300')
+                ui.label('Feed is currently locked. Complete transcription to unlock prompt generation.').classes('text-xs text-center')
+        elif not state.recent_prompts:
+            with ui.column().classes('w-full items-center justify-center p-6 bg-slate-50 border border-dashed rounded-lg text-slate-400'):
+                ui.icon('science', size='md', color='slate-300')
+                ui.label('Feed is currently empty. Start prompt generation to stream live prompts here...').classes('text-xs text-center')
+        else:
+            with ui.column().classes('w-full gap-2'):
+                for item in reversed(state.recent_prompts):
+                    is_refusal = item["status"] == "refusal" or item["prompt"] == "REFUSAL"
+                    bg_color = "bg-red-50/40 border-red-100" if is_refusal else "bg-slate-50/50 border-slate-100"
+                    badge_label = "Refused" if is_refusal else "Success"
+                    badge_color = "rose" if is_refusal else "emerald"
+                    
+                    with ui.card().classes(f'w-full border p-3 rounded-lg shadow-xs {bg_color}'):
+                        with ui.row().classes('w-full justify-between items-center'):
+                            ui.label(f"{item['book']} — Ch {item['chapter']}, Scene {item['scene']}").classes('text-[10px] font-bold text-slate-500 uppercase')
+                            ui.badge(badge_label, color=badge_color).classes('text-[9px]')
+                        ui.label(f'Quote: "{item["quote"][:220]}..."' if len(item["quote"]) > 220 else f'Quote: "{item["quote"]}"').classes('text-xs italic text-slate-600 leading-normal')
+                        ui.label(f'Prompt: {item["prompt"]}').classes('text-xs font-semibold text-blue-700 leading-normal')
+
+    # Register refresh callback globally so background updates bind successfully
+    state.recent_prompts_refresh = render_recent_prompts_feed.refresh
 
 
 def render_project_tabs(
@@ -316,12 +399,17 @@ def render_project_tabs(
     # Prepare directory configurations
     ensure_templates_directory()
     available_templates = list_stored_templates()
-    if available_templates and not state.playground_template:
-        state.playground_template = load_template_by_name("default")
+    
+    # Safeguard template values on page rendering
+    if not state.playground_selected_template or state.playground_selected_template not in available_templates:
         state.playground_selected_template = "default"
+    
+    if not state.playground_template:
+        state.playground_template = load_template_by_name(state.playground_selected_template)
 
-    # Pre-select first book if nothing is set
-    if books and not state.playground_book_selection:
+    # Safeguard selected book value on project workspace change to avoid NiceGUI ValueError
+    book_names = [b.name for b in books]
+    if books and (not state.playground_book_selection or state.playground_book_selection not in book_names):
         state.playground_book_selection = books[0].name
 
     # Render Dynamic Stepper inside its container
@@ -353,13 +441,26 @@ def render_project_tabs(
                 ui.label('Sequential Process Orchestration').classes('text-sm font-bold text-slate-800 mb-2')
                 ui.label('Configure styling rules and workflows in the settings tab prior to launching processing.').classes('text-xs text-slate-400 mb-4')
                 
+                # Active Prompt Template Selection Row
+                with ui.row().classes('w-full items-center gap-3 mb-4 bg-slate-50 p-3 rounded-lg border'):
+                    ui.icon('psychology', size='sm', color='slate-500')
+                    with ui.column().classes('gap-0 flex-1'):
+                        ui.label('Active Prompt Instructions Template').classes('text-xs font-bold text-slate-700')
+                        ui.label('The set of guidelines that the LLM will follow during generation.').classes('text-[10px] text-slate-500')
+                    
+                    ui.select(
+                        options=available_templates,
+                        value=state.playground_selected_template,
+                        on_change=lambda e: handle_dashboard_template_change(e.value)
+                    ).classes('w-56 bg-white').props('outlined dense')
+
                 # Render context-aware action buttons inside their own container
                 @ui.refreshable
                 def action_buttons():
                     with ui.row().classes('items-center gap-3'):
                         status = state.project_status
                         
-                        if status == "Transcribing":
+                        if status in ("Transcribing", "Generating Prompts"):
                             ui.spinner(size='md', color='blue')
                             ui.button(
                                 'Stop Execution', 
@@ -420,6 +521,9 @@ def render_project_tabs(
                 
                 state.active_log_widget = log_widget
                 state.logs_pushed_index = len(state.console_logs)
+            
+            # Live Feed of generated prompt cards
+            render_recent_prompts_feed()
                         
         with ui.tab_panel(tab_style):
             with ui.card().classes('w-full border p-5 shadow-sm bg-white'):
@@ -439,7 +543,7 @@ def render_project_tabs(
                         value=state.playground_book_selection
                     ).bind_value(state, 'playground_book_selection').classes('w-full')
 
-                    # Prompt template selection & save row
+                    # Prompt template selection, delete button, & save row
                     with ui.row().classes('w-full items-center gap-2'):
                         template_dropdown = ui.select(
                             options=available_templates,
@@ -447,6 +551,14 @@ def render_project_tabs(
                             value=state.playground_selected_template,
                             on_change=lambda e: handle_template_dropdown_selection(e.value, prompt_editor)
                         ).classes('flex-1')
+                        
+                        # Flat red delete button only visible when a custom template is chosen
+                        ui.button(
+                            icon="delete",
+                            on_click=lambda: handle_delete_template(template_dropdown, prompt_editor)
+                        ).props('flat color=red').classes('h-10').bind_visibility_from(
+                            state, 'playground_selected_template', backward=lambda val: val not in ('default', '')
+                        )
                     
                     # Custom Template Name saver row
                     with ui.row().classes('w-full items-end gap-2'):
