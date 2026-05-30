@@ -60,13 +60,11 @@ def render_stepper(status: str):
                 ui.icon('chevron_right', color='slate-300', size='xs')
 
 def open_large_image(img_base64: str, title: str):
-    """Opens a modal popup dialog displaying the full-size rendered image."""
-    with ui.dialog() as d, ui.card().classes('w-full max-w-3xl p-4 items-center bg-white rounded-xl shadow-lg'):
-        ui.label(title).classes('text-sm font-bold text-slate-800 mb-3 uppercase tracking-wider')
-        ui.image(img_base64).classes('w-full rounded-lg max-h-[75vh] object-contain cursor-zoom-out').on('click', d.close)
-        with ui.row().classes('w-full justify-end mt-3'):
-            ui.button('Close', on_click=d.close).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs')
-    d.open()
+    """Opens a modal popup dialog displaying the full-size rendered image using stable global references."""
+    state.preview_image_title = title
+    state.preview_image_src = img_base64
+    if hasattr(state, 'global_preview_dialog') and state.global_preview_dialog:
+        state.global_preview_dialog.open()
 
 def copy_results_to_clipboard():
     """Formats prompt configurations and outputs as markdown, copying to host clipboard safely."""
@@ -364,6 +362,31 @@ def handle_delete_template(template_dropdown, prompt_editor_widget):
     prompt_editor_widget.set_value(loaded_default)
 
 @ui.refreshable
+def render_recent_images_feed():
+    """Renders a real-time horizontal strip of the 5 most recent generated images."""
+    with ui.card().classes('w-full border p-5 shadow-sm bg-white mt-4 gap-3'):
+        with ui.row().classes('items-center gap-2'):
+            ui.icon('photo_library', size='sm', color='blue-500')
+            ui.label('Live Rendered Images Feed (Most Recent)').classes('text-sm font-bold text-slate-800')
+            
+        if not state.recent_rendered_images:
+            with ui.column().classes('w-full items-center justify-center p-6 bg-slate-50 border border-dashed rounded-lg text-slate-400'):
+                ui.icon('image', size='md', color='slate-300')
+                ui.label('Images will stream here in real-time as they are completed by ComfyUI...').classes('text-xs text-center')
+        else:
+            with ui.row().classes('w-full gap-4 items-start overflow-x-auto pb-2 flex-nowrap'):
+                for item in reversed(state.recent_rendered_images):
+                    with ui.card().classes('w-44 border p-2 rounded-lg shadow-xs bg-slate-50 flex-shrink-0 cursor-pointer') \
+                            .on('click', lambda _, img=item['base64'], title=f"Ch {item['chapter']}, Scene {item['scene']}": open_large_image(img, title)):
+                        ui.image(item['base64']).classes('w-full h-28 rounded object-cover border')
+                        with ui.column().classes('gap-0 mt-1'):
+                            ui.label(f"Ch {item['chapter']}, Scene {item['scene']}").classes('text-[10px] font-bold text-slate-700')
+                            ui.label(item['prompt'][:40] + "...").classes('text-[8px] text-slate-500 leading-tight')
+
+    # Register refresh callback globally so background updates bind successfully
+    state.recent_images_refresh = render_recent_images_feed.refresh
+
+@ui.refreshable
 def render_recent_prompts_feed():
     """Renders the last 5 generated prompts dynamically in-place during pipeline execution."""
     with ui.card().classes('w-full border p-5 shadow-sm bg-white mt-4 gap-3'):
@@ -453,6 +476,7 @@ def load_style_preset_by_name(name: str):
         state.style_prompt_prefix = "ArsMJStyle, 1890s Victorian illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. "
         state.style_negative_prompt = "blurry, bad quality, text, watermark, photorealistic, photography"
         state.style_workflow_overrides.clear()
+        render_workflow_overrides_ui.refresh()
         return
         
     styles_dir = Path("./styles")
@@ -461,6 +485,12 @@ def load_style_preset_by_name(name: str):
         try:
             with open(file_path, "r") as f:
                 data = json.load(f)
+                
+                # Associated workflow loading logic
+                associated_wf = data.get("workflow")
+                if associated_wf:
+                    handle_style_workflow_change(associated_wf, clear_overrides=False)
+                    
                 state.style_prompt_prefix = data.get("prompt_prefix", "")
                 state.style_negative_prompt = data.get("negative_prompt", "")
                 state.style_workflow_overrides = data.get("overrides", {})
@@ -481,6 +511,7 @@ def save_style_preset_by_name(name: str):
     
     data = {
         "name": name,
+        "workflow": state.style_selected_workflow,
         "prompt_prefix": state.style_prompt_prefix,
         "negative_prompt": state.style_negative_prompt,
         "overrides": state.style_workflow_overrides
@@ -500,7 +531,7 @@ def update_override_state(node_id: str, key: str, value: Any):
     state.style_workflow_overrides[node_id][key] = value
 
 
-def handle_style_workflow_change(val: str):
+def handle_style_workflow_change(val: str, clear_overrides: bool = True):
     """Reads a ComfyUI JSON, introspects active sampler/latents, and rebuilds dynamic UI sliders."""
     if not val:
         return
@@ -517,7 +548,8 @@ def handle_style_workflow_change(val: str):
             from services.comfy_client import ComfyClient
             client = ComfyClient("127.0.0.1:8188")  # Mock address for analyzer pass
             state.style_discovered_params = client.analyze_workflow(wf_json)
-            state.style_workflow_overrides.clear()  # Clear overrides upon swapping workflows
+            if clear_overrides:
+                state.style_workflow_overrides.clear()  # Clear overrides upon swapping workflows
             ui.notify(f"Analyzed workflow '{val}'. Discovered {len(state.style_discovered_params)} overrides.", type="info")
         except Exception as e:
             ui.notify(f"Failed to analyze workflow: {str(e)}", type="warning")
@@ -690,40 +722,49 @@ def render_workflow_overrides_ui():
             with ui.expansion(f"{node_title} (ID: {node_id})").classes('w-full border rounded bg-white text-xs'):
                 with ui.column().classes('w-full p-3 gap-3'):
                     if node_type == "sampler":
+                        current_steps = state.style_workflow_overrides.get(node_id, {}).get("steps", params["steps"])
+                        current_cfg = state.style_workflow_overrides.get(node_id, {}).get("cfg", params["cfg"])
+                        
                         ui.number(
                             label="Steps",
-                            value=params["steps"],
+                            value=current_steps,
                             min=1, max=150, step=1,
                             on_change=lambda e, nid=node_id: update_override_state(nid, "steps", e.value)
                         ).classes('w-full')
                         ui.number(
                             label="CFG Scale",
-                            value=params["cfg"],
+                            value=current_cfg,
                             min=0.0, max=30.0, step=0.1,
                             on_change=lambda e, nid=node_id: update_override_state(nid, "cfg", e.value)
                         ).classes('w-full')
                     elif node_type == "resolution":
+                        current_width = state.style_workflow_overrides.get(node_id, {}).get("width", params["width"])
+                        current_height = state.style_workflow_overrides.get(node_id, {}).get("height", params["height"])
+                        
                         ui.number(
                             label="Width",
-                            value=params["width"],
+                            value=current_width,
                             min=128, max=4096, step=64,
                             on_change=lambda e, nid=node_id: update_override_state(nid, "width", e.value)
                         ).classes('w-full')
                         ui.number(
                             label="Height",
-                            value=params["height"],
+                            value=current_height,
                             min=128, max=4096, step=64,
                             on_change=lambda e, nid=node_id: update_override_state(nid, "height", e.value)
                         ).classes('w-full')
                     elif node_type == "lora_loader":
+                        current_lora_name = state.style_workflow_overrides.get(node_id, {}).get("lora_name", params["lora_name"])
+                        current_strength_model = state.style_workflow_overrides.get(node_id, {}).get("strength_model", params["strength_model"])
+                        
                         ui.input(
                             label="LoRA Filename",
-                            value=params["lora_name"],
+                            value=current_lora_name,
                             on_change=lambda e, nid=node_id: update_override_state(nid, "lora_name", e.value)
                         ).classes('w-full')
                         ui.number(
                             label="Strength",
-                            value=params["strength_model"],
+                            value=current_strength_model,
                             min=0.0, max=2.0, step=0.1,
                             on_change=lambda e, nid=node_id: update_override_state(nid, "strength_model", e.value)
                         ).classes('w-full')
@@ -784,7 +825,8 @@ def render_project_tabs(
     start_transcribe_cb, 
     stop_transcribe_cb,
     start_prompt_gen_cb=None,
-    start_image_gen_cb=None
+    start_image_gen_cb=None,
+    save_project_settings_cb=None  # New callback parameter
 ):
     # Prepare directory configurations
     ensure_templates_directory()
@@ -801,6 +843,16 @@ def render_project_tabs(
     book_names = [b.name for b in books]
     if books and (not state.playground_book_selection or state.playground_book_selection not in book_names):
         state.playground_book_selection = books[0].name
+
+    # Instantiate a stable page-level dialog once (outside of any refreshable loops)
+    with ui.dialog() as global_preview_dialog:
+        with ui.card().classes('w-full max-w-3xl p-4 items-center bg-white rounded-xl shadow-lg'):
+            ui.label().classes('text-sm font-bold text-slate-800 mb-3 uppercase tracking-wider').bind_text_from(state, 'preview_image_title')
+            ui.image().classes('w-full rounded-lg max-h-[75vh] object-contain cursor-zoom-out').bind_source_from(state, 'preview_image_src').on('click', global_preview_dialog.close)
+            with ui.row().classes('w-full justify-end mt-3'):
+                ui.button('Close', on_click=global_preview_dialog.close).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs')
+                
+    state.global_preview_dialog = global_preview_dialog
 
     # Render Dynamic Stepper inside its container
     render_stepper(state.project_status)
@@ -863,7 +915,7 @@ def render_project_tabs(
                     with ui.row().classes('items-center gap-3'):
                         status = state.project_status
                         
-                        if status in ("Transcribing", "Generating Prompts"):
+                        if status in ("Transcribing", "Generating Prompts", "Rendering Images"):
                             ui.spinner(size='md', color='blue')
                             ui.button(
                                 'Stop Execution', 
@@ -910,6 +962,9 @@ def render_project_tabs(
                 action_buttons()
                 state.action_buttons_refresh = action_buttons.refresh
             
+            # --- Real-Time Render Feed placement ---
+            render_recent_images_feed()
+            
             # Stable Live Console Log Output Widget (Created ONCE)
             with ui.card().classes('w-full border p-5 shadow-sm bg-white mt-4 gap-3'):
                 with ui.row().classes('w-full justify-between items-center'):
@@ -944,18 +999,16 @@ def render_project_tabs(
                     ui.select(
                         options=available_workflows,
                         label="ComfyUI Base Workflow (.json)",
-                        value=state.style_selected_workflow,
                         on_change=lambda e: handle_style_workflow_change(e.value)
-                    ).classes('w-full')
+                    ).classes('w-full').bind_value(state, 'style_selected_workflow')
                     
                     # Style presets selection dropdown
                     available_styles = load_style_presets()
                     preset_dropdown = ui.select(
                         options=available_styles,
                         label="Saved Style Preset",
-                        value=state.style_selected_preset,
-                        on_change=lambda e: (setattr(state, 'style_selected_preset', e.value), load_style_preset_by_name(e.value))
-                    ).classes('w-full')
+                        on_change=lambda e: load_style_preset_by_name(e.value)
+                    ).classes('w-full').bind_value(state, 'style_selected_preset')
                     
                     # Quick save row
                     with ui.row().classes('w-full items-end gap-2'):
@@ -969,20 +1022,23 @@ def render_project_tabs(
                             )
                         ).props('outline').classes('h-10 text-blue-600')
 
+                    # Persistent project settings save action (using safe modular callback)
+                    ui.button(
+                        'Save Project Settings',
+                        icon='settings_backup_restore',
+                        on_click=lambda: save_project_settings_cb(project.id) if save_project_settings_cb else None
+                    ).classes('w-full bg-slate-100 text-slate-700 hover:bg-slate-200 text-xs font-semibold py-1.5 h-10 border')
+
                     ui.separator()
                     
-                    # Active prompt modification text areas
+                    # Active prompt modification text areas (Synchronized in real-time)
                     ui.textarea(
-                        label="Style Prompt Prefix",
-                        value=state.style_prompt_prefix,
-                        on_change=lambda e: setattr(state, 'style_prompt_prefix', e.value)
-                    ).classes('w-full h-24 text-xs').props('outlined')
+                        label="Style Prompt Prefix"
+                    ).classes('w-full h-24 text-xs').props('outlined').bind_value(state, 'style_prompt_prefix')
                     
                     ui.textarea(
-                        label="Style Negative Prompt",
-                        value=state.style_negative_prompt,
-                        on_change=lambda e: setattr(state, 'style_negative_prompt', e.value)
-                    ).classes('w-full h-24 text-xs').props('outlined')
+                        label="Style Negative Prompt"
+                    ).classes('w-full h-24 text-xs').props('outlined').bind_value(state, 'style_negative_prompt')
                     
                     # Discovered parameters expansion grid container
                     render_workflow_overrides_ui()

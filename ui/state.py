@@ -52,6 +52,10 @@ recent_prompts: List[Dict[str, Any]] = []  # Stores last 5 generated prompts: [{
 prompt_gen_active: bool = False
 cancel_prompt_gen_flag: bool = False
 
+# --- Dynamic Image Generation Task States ---
+image_gen_active: bool = False
+cancel_image_gen_flag: bool = False
+
 # --- Style Playground & Workflow Analyzer Bindings ---
 style_selected_preset: str = "default"
 style_selected_workflow: str = ""
@@ -70,3 +74,12 @@ style_prompt_seed: int = 42
 style_image_seed: int = 42
 style_use_random_image_seed: bool = True
 style_chunk_count: int = 4
+
+# --- Live Rendered Images Feed States ---
+recent_rendered_images: List[Dict[str, Any]] = []  # [{"filename": "", "base64": "", "chapter": 1, "scene": 1, "quote": "", "prompt": ""}]
+recent_images_refresh: Optional[Any] = None
+
+# --- Persistent Image Preview Dialog Bindings ---
+preview_image_src: str = ""
+preview_image_title: str = ""
+global_preview_dialog: Optional[Any] = None

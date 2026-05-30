@@ -1,0 +1,11 @@
+{
+  "name": "Sidney_sci-fi",
+  "workflow": "z_image_pencil_baked.json",
+  "prompt_prefix": "ArsMJStyle, sci-fi illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. ",
+  "negative_prompt": "blurry, bad quality, text, watermark, photorealistic, photography",
+  "overrides": {
+    "3": {
+      "steps": 6.0
+    }
+  }
+}

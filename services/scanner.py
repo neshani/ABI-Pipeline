@@ -250,5 +250,9 @@ def ingest_project(scan_result: Dict[str, Any], custom_project_name: str) -> int
                 session=session
             )
 
+            # 4. Instant scan for any pre-existing output files on disk
+            from services.sync_engine import sync_book_from_disk
+            sync_book_from_disk(book.id, session)
+
         session.commit()
         return project.id

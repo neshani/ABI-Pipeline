@@ -7,10 +7,46 @@ from sqlmodel import Session, select
 from database.connection import engine, get_setting
 from database.models import Project, Book, Chapter
 
+def sync_project_status(project_id: int, session: Session) -> None:
+    """
+    Dynamically calculates and updates the parent Project status
+    based on the status of all of its child Books.
+    """
+    project = session.get(Project, project_id)
+    if not project:
+        return
+
+    books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+    if not books:
+        return
+
+    book_statuses = [b.status for b in books]
+
+    # Priority status hierarchy to determine the bottleneck state
+    if "Rendering Images" in book_statuses:
+        project.status = "Rendering Images"
+    elif "Transcribing" in book_statuses:
+        project.status = "Transcribing"
+    elif "Generating Prompts" in book_statuses:
+        project.status = "Generating Prompts"
+    elif "Prompts Created" in book_statuses:
+        project.status = "Prompts Created"
+    elif "Transcribed" in book_statuses:
+        project.status = "Transcribed"
+    elif "Images Created" in book_statuses:
+        project.status = "Images Created"
+    else:
+        project.status = "Imported"
+
+    session.add(project)
+    session.flush()
+
+
 def sync_book_from_disk(book_id: int, session: Session) -> None:
     """
     Parses compiled transcript.txt and prompts.csv to update 
     the SQLite database index metrics (word counts, total/completed images)
+    and status (Imported, Transcribed, Prompts Created, Images Created)
     for a book and its chapters on demand.
     """
     book = session.get(Book, book_id)
@@ -26,8 +62,11 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
     transcript_file = book_output_dir / "transcript.txt"
     prompts_file = book_output_dir / "prompts.csv"
 
+    has_transcript = transcript_file.exists()
+    has_prompts = prompts_file.exists()
+
     # 1. Update Word Count Metrics from transcript.txt
-    if transcript_file.exists():
+    if has_transcript:
         try:
             with open(transcript_file, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -45,16 +84,20 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
             ).all()
 
             for idx, ch in enumerate(chapters):
+                ch.status = "Completed"  # Mark transcription complete
                 if idx < len(cleaned_sections):
                     ch.word_count = len(cleaned_sections[idx].split())
-                    session.add(ch)
+                session.add(ch)
             
             session.add(book)
         except Exception as e:
             print(f"Error parsing word count for book '{book.name}': {e}")
 
     # 2. Update Image Counters from prompts.csv and generated images on disk
-    if prompts_file.exists():
+    global_completed = 0
+    global_total = 0
+
+    if has_prompts:
         try:
             # High-speed list lookup: find all PNGs in book's output structure
             images_dir = book_output_dir / "images"
@@ -66,26 +109,60 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
 
             chapter_totals = {}     # chapter_num -> expected prompts
             chapter_completed = {}  # chapter_num -> completed images
-            global_completed = 0
-            global_total = 0
 
             with open(prompts_file, "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                for row in reader:
-                    if not row or len(row) < 1:
+                reader = csv.reader(f, delimiter="|")
+                rows = list(reader)
+
+            if rows:
+                header = rows[0]
+                header_clean = [h.strip().lower() for h in header]
+                
+                # Dynamically resolve columns by name or index fallback
+                if "chapter" in header_clean or "prompt" in header_clean:
+                    data_rows = rows[1:]
+                    try:
+                        ch_idx = header_clean.index("chapter")
+                    except ValueError:
+                        ch_idx = 0
+                    try:
+                        sc_idx = header_clean.index("scene")
+                    except ValueError:
+                        sc_idx = 1
+                    try:
+                        pr_idx = header_clean.index("prompt")
+                    except ValueError:
+                        pr_idx = 3
+                else:
+                    data_rows = rows
+                    ch_idx = 0
+                    sc_idx = 1
+                    pr_idx = 3
+
+                for row in data_rows:
+                    if not row or len(row) <= max(ch_idx, sc_idx):
                         continue
                     
-                    scene_id = row[0].strip()
-                    # Extract chapter number prefix (e.g., "01_03_slug" -> 1)
-                    try:
-                        chapter_num = int(scene_id.split('_')[0])
-                    except (ValueError, IndexError):
+                    prompt_text = row[pr_idx].strip() if len(row) > pr_idx else ""
+                    # Ignore unpopulated, NONE, or skipped refusal prompts in rendering counts
+                    if not prompt_text or prompt_text.lower() == "none" or prompt_text.lower() == "refusal":
                         continue
 
-                    # Scan the high-speed set to see if this scene ID is rendered
+                    try:
+                        chapter_num = int(float(row[ch_idx].strip()))
+                    except (ValueError, TypeError):
+                        chapter_num = 1
+                    try:
+                        scene_num = int(float(row[sc_idx].strip()))
+                    except (ValueError, TypeError):
+                        scene_num = 1
+
+                    scene_prefix = f"{chapter_num:02d}_{scene_num:02d}"
+
+                    # Scan the high-speed set to see if this scene prefix is rendered
                     image_found = False
                     for img_name in all_existing_images:
-                        if img_name.startswith(scene_id.lower()) and img_name.endswith(".png"):
+                        if img_name.startswith(scene_prefix.lower()) and img_name.endswith(".png"):
                             image_found = True
                             break
 
@@ -111,7 +188,24 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
         except Exception as e:
             print(f"Error counting images in prompts.csv for '{book.name}': {e}")
 
+    # 3. Dynamic stage status recovery based on file existence and completion values
+    if has_transcript:
+        if has_prompts:
+            if global_total > 0 and global_completed == global_total:
+                book.status = "Images Created"
+            else:
+                book.status = "Prompts Created"
+        else:
+            book.status = "Transcribed"
+    else:
+        book.status = "Imported"
+
+    session.add(book)
     session.flush()
+
+    # Cascade the state update to recalculate the project's overall stage status
+    if book.project_id:
+        sync_project_status(book.project_id, session)
 
 
 def recover_from_temp_workspaces(session: Session) -> None:
@@ -157,7 +251,7 @@ def recover_from_temp_workspaces(session: Session) -> None:
 
     print(f"[Sync-Engine] Found {len(meta_items)} project tracking records to synchronize.")
 
-    # 3. Reconstruct missing projects using lightning scanner
+    # 3. Reconstruct parent Projects using lightning scanner
     for item in meta_items:
         project_name = item.get("project_name")
         project_path = item.get("project_path")
@@ -180,7 +274,6 @@ def recover_from_temp_workspaces(session: Session) -> None:
             except Exception as e:
                 print(f"[Sync-Engine] Could not re-ingest parent project '{proj_name}': {e}")
 
-    # Refresh database references
     session.commit()
 
     # 4. Map and restore status indicators for each book
@@ -200,26 +293,15 @@ def recover_from_temp_workspaces(session: Session) -> None:
         if not book:
             continue
 
-        chapters = session.exec(
-            select(Chapter).where(Chapter.book_id == book.id)
-        ).all()
-
         if source_type == "output":
-            # Book is fully complete
-            book.status = "Transcribed"
-            book.progress = 1.0
-            session.add(book)
-
-            for ch in chapters:
-                ch.status = "Completed"
-                session.add(ch)
-
-            session.commit()
-            # Perform disk file audit (word counts, image metrics)
+            # Book has a completed transcript on disk, let sync perform audit to resolve correct step
             sync_book_from_disk(book.id, session)
 
         elif source_type == "temp":
-            # Book is in-progress
+            # Book transcription was in-progress, restore temp segments
+            chapters = session.exec(
+                select(Chapter).where(Chapter.book_id == book.id)
+            ).all()
             working_dir = Path(item["working_dir"])
             for ch in chapters:
                 ch_txt = working_dir / f"chapter_{ch.chapter_num}.txt"
@@ -241,5 +323,9 @@ def recover_from_temp_workspaces(session: Session) -> None:
                     book.status = "Imported"
             session.add(book)
             session.commit()
+            
+            # Recalculate project overall status
+            if book.project_id:
+                sync_project_status(book.project_id, session)
 
     print("[Sync-Engine] Database state recovery sequence complete.")
