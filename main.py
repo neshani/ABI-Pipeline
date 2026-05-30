@@ -192,7 +192,7 @@ def select_project(project_id: int):
     
     # Fast load settings from project folder
     load_project_settings_from_disk(project_id)
-    
+    header_controls.refresh()
     main_layout.refresh()
 
 
@@ -207,6 +207,7 @@ def exit_to_portal():
     state.active_project_id = None
     state.active_book_id = None
     state.active_log_widget = None
+    header_controls.refresh()
     main_layout.refresh()
 
 
@@ -231,10 +232,9 @@ def start_transcribing(project_id: int):
     
     # Fast trigger to update action buttons and stepper layout
     state.project_status = "Transcribing"
-    if hasattr(state, 'action_buttons_refresh'):
+    if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
         state.action_buttons_refresh()
-    from ui.pages.project_workspace import render_stepper
-    render_stepper.refresh("Transcribing")
+    header_controls.refresh()
 
 
 def stop_transcribing(project_id: int):
@@ -254,25 +254,21 @@ def stop_transcribing(project_id: int):
         state.project_status = "Prompts Created"
     
     # Fast trigger to update action buttons and stepper layout
-    if hasattr(state, 'action_buttons_refresh'):
+    if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
         state.action_buttons_refresh()
-    from ui.pages.project_workspace import render_stepper
-    render_stepper.refresh(state.project_status)
+    header_controls.refresh()
 
 
 def start_prompt_generation(project_id: int):
-    """
-    Launches the asynchronous, interruptible, and resumable prompt generation process.
-    """
+    """Launches the asynchronous, interruptible, and resumable prompt generation process."""
     from services.prompt_engine import start_project_prompt_gen
     asyncio.create_task(start_project_prompt_gen(project_id))
     ui.notify("Background prompt generation sequences initiated!", type="positive")
     
     state.project_status = "Generating Prompts"
-    if hasattr(state, 'action_buttons_refresh'):
+    if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
         state.action_buttons_refresh()
-    from ui.pages.project_workspace import render_stepper
-    render_stepper.refresh("Generating Prompts")
+    header_controls.refresh()
 
 
 # --- Image Generation Pipeline & Metadata Baker Utilities ---
@@ -574,10 +570,9 @@ async def run_project_image_gen(project_id: int):
         state.cancel_image_gen_flag = False
         
         state.add_console_log("[Image-Gen] Rendering task finished.")
-        if hasattr(state, 'action_buttons_refresh'):
+        if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
             state.action_buttons_refresh()
-        from ui.pages.project_workspace import render_stepper
-        render_stepper.refresh(state.project_status)
+        header_controls.refresh()
 
 
 def start_image_generation(project_id: int):
@@ -605,10 +600,9 @@ def start_image_generation(project_id: int):
                 session.add(b)
             session.commit()
     
-    if hasattr(state, 'action_buttons_refresh'):
+    if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
         state.action_buttons_refresh()
-    from ui.pages.project_workspace import render_stepper
-    render_stepper.refresh("Rendering Images")
+    header_controls.refresh()
 
     asyncio.create_task(run_project_image_gen(project_id))
     ui.notify("Background image rendering sequences initiated!", type="positive")
@@ -624,16 +618,15 @@ def check_for_active_transcriptions():
                 state.project_status = project.status
                 
                 # Check if we need to update the action button spinner
-                if hasattr(state, 'action_buttons_refresh'):
+                if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
                     try:
                         state.action_buttons_refresh()
                     except Exception:
                         pass
                 
-                # Re-render ONLY the isolated Horizontal Stepper
-                from ui.pages.project_workspace import render_stepper
+                # Re-render ONLY the isolated Horizontal Stepper inside header
                 try:
-                    render_stepper.refresh(project.status)
+                    header_controls.refresh()
                 except Exception:
                     pass
 
@@ -675,7 +668,7 @@ def render_split_panel_shell(project_id: int):
     # Seed static binding dictionaries on initial layout rendering
     state.project_status = project.status
 
-    with ui.grid(columns='250px 1fr').classes('w-full gap-6 items-start'):
+    with ui.grid(columns='260px 1fr').classes('w-full gap-6 items-start'):
         # LEFT NAVIGATION SIDEBAR
         with ui.column().classes('bg-white border rounded-xl p-4 gap-4 shadow-sm h-[calc(100vh-140px)] sticky top-24'):
             ui.button(
@@ -684,19 +677,33 @@ def render_split_panel_shell(project_id: int):
                 on_click=exit_to_portal
             ).props('flat dense').classes('text-slate-600 text-xs self-start -ml-2 mb-2')
             
-            # Active Project Switcher Row
-            project_bg = 'bg-blue-50 border border-blue-100' if state.active_book_id is None else 'hover:bg-slate-50'
-            with ui.row().classes(f'w-full p-2 rounded-lg cursor-pointer items-center justify-between transition-colors {project_bg}') \
+            # --- Project Global Header Card ---
+            total_books = len(books)
+            overall_progress = sum(b.progress for b in books) / total_books if total_books > 0 else 0.0
+            
+            # Dynamically style the project card if it is currently selected (when active_book_id is None)
+            project_card_bg = 'bg-blue-50/70 border-blue-100/50 text-blue-700 font-bold' if state.active_book_id is None else 'bg-slate-50/50 hover:bg-slate-100'
+
+            with ui.card().classes(f'w-full border p-3 rounded-lg shadow-xs gap-2 cursor-pointer transition-all {project_card_bg}') \
                     .on('click', lambda: select_project(project.id)):
-                with ui.row().classes('items-center gap-2'):
+                with ui.row().classes('items-center gap-2 w-full justify-between'):
                     ui.icon('folder' if project.is_batch else 'menu_book', size='sm', color='slate-700')
-                    ui.label(project.name).classes('text-sm font-bold text-slate-800 truncate max-w-[150px]')
-                ui.icon('settings', size='xs', color='slate-400')
+                    # Dynamic Project Status Badge
+                    ui.badge(
+                        state.project_status
+                    ).classes('px-2 py-0.5 text-[10px] font-bold rounded-full').bind_text_from(state, 'project_status')
+                    
+                ui.label(project.name).classes('text-sm font-bold text-slate-800 leading-tight truncate')
                 
+                with ui.column().classes('w-full gap-0.5 mt-1'):
+                    ui.label(f'Batch Progress ({int(overall_progress*100)}%)').classes('text-[9px] font-bold text-slate-500 uppercase tracking-wide')
+                    # Overall visual progress bar
+                    ui.linear_progress(value=overall_progress, show_value=False).classes('w-full h-1.5 rounded-full')
+            
             ui.separator()
             ui.label('Books & Volumes').classes('text-[10px] font-bold text-slate-400 tracking-wider uppercase px-1')
             
-            with ui.column().classes('w-full gap-1 overflow-y-auto flex-1'):
+            with ui.column().classes('w-full gap-2 overflow-y-auto flex-1'):
                 for book in books:
                     # Seed bindings
                     if book.id not in state.books_progress:
@@ -706,26 +713,37 @@ def render_split_panel_shell(project_id: int):
                     if book.id not in state.books_subtitle:
                         state.books_subtitle[book.id] = f"{book.status} • {int(book.progress * 100)}%"
 
-                    book_bg = 'bg-blue-50/70 border border-blue-100/50 text-blue-700' if state.active_book_id == book.id else 'hover:bg-slate-50 text-slate-700'
+                    book_bg = 'bg-blue-50/70 border border-blue-100/50 text-blue-700 font-bold' if state.active_book_id == book.id else 'hover:bg-slate-50 text-slate-700'
                     with ui.row().classes(f'w-full p-2 rounded-lg cursor-pointer items-center justify-between transition-colors {book_bg}') \
                             .on('click', lambda b_id=book.id: select_book(b_id)):
-                        with ui.row().classes('items-center gap-2 truncate'):
+                        with ui.row().classes('items-center gap-2 truncate flex-1'):
                             if book.cover_path:
-                                ui.image(book.cover_path).classes('w-6 h-6 rounded object-cover shadow-xs border')
+                                ui.image(book.cover_path).classes('w-7 h-7 rounded object-cover shadow-xs border flex-shrink-0')
                             else:
                                 ui.icon('library_books', size='xs', color='slate-400')
                             
-                            with ui.column().classes('gap-0 truncate'):
+                            with ui.column().classes('gap-0 truncate flex-1'):
                                 ui.label(book.name).classes('text-xs font-semibold truncate max-w-[120px]')
                                 # BIND TEXT REACTIVELY (Updates only this label, zero page redraws!)
                                 ui.label('').classes('text-[9px] font-medium text-slate-500 truncate max-w-[120px]') \
                                     .bind_text_from(state.books_subtitle, book.id)
                         
-                        # Compact sidebar visual status indicator
-                        status_dot = ui.element('div').classes('w-2 h-2 rounded-full')
-                        # Reactive style bindings: map class changes programmatically
-                        status_dot.bind_visibility_from(state.books_status, book.id, backward=lambda val: val == "Transcribing")
-                        status_dot.classes('bg-blue-500 animate-pulse')
+                        # --- Compact Dynamic Processing Indicators ---
+                        # Standardized visual processing dots
+                        with ui.row().classes('items-center gap-1 flex-shrink-0'):
+                            # Render checkmark on completion
+                            ui.icon('check_circle', color='emerald-500', size='14px') \
+                                .bind_visibility_from(state.books_status, book.id, backward=lambda val: val in ("Images Created", "Finished"))
+                            
+                            # Render pulsing indicators depending on which step the book is undergoing
+                            ui.element('div').classes('w-2 h-2 rounded-full bg-blue-500 animate-pulse') \
+                                .bind_visibility_from(state.books_status, book.id, backward=lambda val: val in ("Transcribing",))
+                                
+                            ui.element('div').classes('w-2 h-2 rounded-full bg-purple-500 animate-pulse') \
+                                .bind_visibility_from(state.books_status, book.id, backward=lambda val: val in ("Generating Prompts",))
+                                
+                            ui.element('div').classes('w-2 h-2 rounded-full bg-amber-500 animate-pulse') \
+                                .bind_visibility_from(state.books_status, book.id, backward=lambda val: val in ("Rendering Images",))
 
         # RIGHT WORKSPACE ROUTER
         with ui.column().classes('w-full gap-4'):
@@ -737,7 +755,7 @@ def render_split_panel_shell(project_id: int):
                     stop_transcribing,
                     start_prompt_generation,
                     start_image_generation,
-                    save_project_settings_to_disk  # Pass callback here
+                    save_project_settings_to_disk
                 )
             else:
                 render_book_tabs(state.active_book_id)
@@ -758,23 +776,64 @@ register_main_layout(main_layout)
 # Initialize settings modal
 settings_modal = SettingsModal(app_settings, restart_app)
 
-# --- Header & Top Bar Navigation ---
+
+# --- TOPBAR HEADERS & CONTROLS ---
+
+def render_topbar_stepper(status: str):
+    """Compacts the horizontal pipeline progress stepper to fit beautifully inside the global sticky header."""
+    from ui.pages.project_workspace import STAGES, get_active_stage_idx
+    current_stage_idx = get_active_stage_idx(status)
+    
+    with ui.row().classes('items-center gap-3 bg-slate-700/40 px-4 py-1.5 rounded-lg border border-slate-600/30 text-xs'):
+        for idx, stage_name in enumerate(STAGES):
+            is_completed = idx < current_stage_idx
+            is_active = idx == current_stage_idx
+            
+            with ui.row().classes('items-center gap-1'):
+                if is_completed:
+                    ui.icon('check_circle', color='emerald-400', size='15px')
+                    ui.label(stage_name).classes('text-emerald-300 font-bold')
+                elif is_active:
+                    ui.icon('radio_button_checked', color='blue-400', size='15px').classes('animate-pulse')
+                    ui.label(stage_name).classes('text-blue-300 font-black')
+                else:
+                    ui.icon('radio_button_unchecked', color='slate-400', size='15px')
+                    ui.label(stage_name).classes('text-slate-400 font-medium')
+                    
+            if idx < len(STAGES) - 1:
+                ui.icon('chevron_right', color='slate-500', size='12px')
+
+
+@ui.refreshable
+def header_controls():
+    """Reactive layout container that swaps search bars for pipeline steppers based on navigation state."""
+    if state.active_project_id is None:
+        with ui.row().classes('items-center gap-4 bg-slate-700/50 p-1 rounded-lg border border-slate-600/30'):
+            ui.input(
+                placeholder='Search projects...',
+                value=state.search_query,
+                on_change=lambda e: (setattr(state, 'search_query', e.value), refresh_dashboard())
+            ).props('dark borderless dense').classes('w-48 px-2')
+            
+            ui.select(
+                options=['All', 'Single', 'Batch'],
+                value=state.selected_project_type,
+                on_change=lambda e: (setattr(state, 'selected_project_type', e.value), refresh_dashboard())
+            ).props('dark borderless dense').classes('w-24 text-sm')
+    else:
+        render_topbar_stepper(state.project_status)
+
+# Export callback so workspace settings can trigger reactive header updates
+state.active_header_refresh = header_controls.refresh
+
+
+# --- Header & Top Bar Navigation Layout ---
 with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justify-between items-center'):
     with ui.row().classes('items-center gap-3'):
         ui.icon('auto_awesome', size='md').classes('text-blue-400')
-        ui.label('ABI-Pipeline').classes('text-xl font-bold tracking-tight')
+        ui.label('ABI-Pipeline').classes('text-xl font-bold tracking-tight cursor-pointer').on('click', exit_to_portal)
 
-    with ui.row().classes('items-center gap-4 bg-slate-700/50 p-1 rounded-lg border border-slate-600/30'):
-        ui.input(
-            placeholder='Search projects...',
-            on_change=lambda e: (setattr(state, 'search_query', e.value), refresh_dashboard())
-        ).props('dark borderless dense').classes('w-48 px-2')
-        
-        ui.select(
-            options=['All', 'Single', 'Batch'],
-            value='All',
-            on_change=lambda e: (setattr(state, 'selected_project_type', e.value), refresh_dashboard())
-        ).props('dark borderless dense').classes('w-24 text-sm')
+    header_controls()
 
     with ui.row().classes('items-center gap-3'):
         with ui.button(icon='construction', color='slate-600') as tools_btn:

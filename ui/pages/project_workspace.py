@@ -1,10 +1,12 @@
 import json
 import random
+import datetime
+import asyncio
 from pathlib import Path
 from typing import Any, List, Optional, Dict
 from nicegui import ui
-from sqlmodel import Session
-from database.models import Project
+from sqlmodel import Session, select
+from database.models import Project, Book
 from ui import state
 from services.prompt_engine import (
     list_stored_templates,
@@ -15,7 +17,7 @@ from services.prompt_engine import (
     parse_llm_response,
     ensure_templates_directory
 )
-from database.connection import get_setting
+from database.connection import get_setting, engine
 
 # Unified Pipeline Steps
 STAGES = ["Imported", "Transcription", "Prompt Gen", "Image Gen", "Proofreading", "Finished"]
@@ -35,29 +37,282 @@ def get_active_stage_idx(status: str) -> int:
     return mapping.get(status, 0)
 
 
-@ui.refreshable
-def render_stepper(status: str):
-    """Isolated stepper layout container that refreshes extremely fast with zero DOM flashing."""
-    current_stage_idx = get_active_stage_idx(status)
+# --- DATABASE AND DISK ROLLBACK HELPERS ---
+
+import datetime
+from sqlmodel import select
+
+def backup_and_cleanup_files(project_id: int, target_status: str):
+    """Safely renames directories and csv/txt files to prevent loss and reset pipeline states on disk."""
+    from sqlmodel import Session
+    from database.connection import engine
+    from database.models import Project, Book
     
-    with ui.row().classes('w-full justify-between items-center bg-white border rounded-xl p-4 shadow-sm mb-2'):
-        for idx, stage_name in enumerate(STAGES):
-            is_completed = idx < current_stage_idx
-            is_active = idx == current_stage_idx
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if not project:
+            state.add_console_log("[Rollback-Engine] Error: Project not found.")
+            return
+        project_name = project.name
+        books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+        
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_base = Path(get_setting("output_dir", "./output")).resolve()
+    
+    state.add_console_log(f"[Rollback-Engine] Initiating file archiver for project: {project_name}")
+    
+    for book in books:
+        book_dir = output_base / project_name / book.name
+        if not book_dir.exists():
+            state.add_console_log(f"[Rollback-Engine] Directory not found for book: {book.name}")
+            continue
             
-            with ui.row().classes('items-center gap-1.5'):
-                if is_completed:
-                    ui.icon('check_circle', color='emerald-500', size='18px')
-                    ui.label(stage_name).classes('text-xs font-bold text-emerald-600')
-                elif is_active:
-                    ui.icon('radio_button_checked', color='blue-600', size='18px').classes('animate-pulse')
-                    ui.label(stage_name).classes('text-xs font-black text-blue-700')
-                else:
-                    ui.icon('radio_button_unchecked', color='slate-300', size='18px')
-                    ui.label(stage_name).classes('text-xs font-semibold text-slate-400')
+        state.add_console_log(f"[Rollback-Engine] Archiving files in book directory: {book.name}")
+            
+        if target_status == "Imported":
+            # Transcription rollback: Move transcript.txt, prompts.csv, images/
+            transcript_path = book_dir / "transcript.txt"
+            if transcript_path.exists():
+                new_transcript = book_dir / f"transcript_backup_{timestamp}.txt"
+                try:
+                    transcript_path.rename(new_transcript)
+                    state.add_console_log(f"[Rollback-Engine] Archived transcript to: {new_transcript.name}")
+                except Exception as e:
+                    state.add_console_log(f"[Rollback-Engine] Error archiving transcript.txt: {str(e)}")
                     
-            if idx < len(STAGES) - 1:
-                ui.icon('chevron_right', color='slate-300', size='xs')
+            prompts_path = book_dir / "prompts.csv"
+            if prompts_path.exists():
+                new_prompts = book_dir / f"prompts_backup_{timestamp}.csv"
+                try:
+                    prompts_path.rename(new_prompts)
+                    state.add_console_log(f"[Rollback-Engine] Archived prompts to: {new_prompts.name}")
+                except Exception as e:
+                    state.add_console_log(f"[Rollback-Engine] Error archiving prompts.csv: {str(e)}")
+                    
+            images_dir = book_dir / "images"
+            if images_dir.exists() and images_dir.is_dir():
+                new_images = book_dir / f"images_backup_{timestamp}"
+                try:
+                    images_dir.rename(new_images)
+                    state.add_console_log(f"[Rollback-Engine] Archived images folder to: {new_images.name}")
+                except Exception as e:
+                    state.add_console_log(f"[Rollback-Engine] Error archiving images folder: {str(e)}")
+                    
+        elif target_status == "Transcribed":
+            # Prompt gen rollback: Keep transcript.txt, but archive prompts.csv and images/
+            prompts_path = book_dir / "prompts.csv"
+            if prompts_path.exists():
+                new_prompts = book_dir / f"prompts_backup_{timestamp}.csv"
+                try:
+                    prompts_path.rename(new_prompts)
+                    state.add_console_log(f"[Rollback-Engine] Archived prompts to: {new_prompts.name}")
+                except Exception as e:
+                    state.add_console_log(f"[Rollback-Engine] Error archiving prompts.csv: {str(e)}")
+                    
+            images_dir = book_dir / "images"
+            if images_dir.exists() and images_dir.is_dir():
+                new_images = book_dir / f"images_backup_{timestamp}"
+                try:
+                    images_dir.rename(new_images)
+                    state.add_console_log(f"[Rollback-Engine] Archived images folder to: {new_images.name}")
+                except Exception as e:
+                    state.add_console_log(f"[Rollback-Engine] Error archiving images folder: {str(e)}")
+                    
+        elif target_status == "Prompts Created":
+            # Image Gen rollback: Keep transcript.txt & prompts.csv, but archive images/
+            images_dir = book_dir / "images"
+            if images_dir.exists() and images_dir.is_dir():
+                new_images = book_dir / f"images_backup_{timestamp}"
+                try:
+                    images_dir.rename(new_images)
+                    state.add_console_log(f"[Rollback-Engine] Archived images folder to: {new_images.name}")
+                except Exception as e:
+                    state.add_console_log(f"[Rollback-Engine] Error archiving images folder: {str(e)}")
+                    
+    state.add_console_log("[Rollback-Engine] State rollback file archival step complete.")
+
+
+def rollback_project_status(project_id: int, target_status: str, refresh_callback) -> None:
+    """Safely shifts project and book statuses backwards to allow pipeline step re-runs."""
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if not project:
+            return
+        project.status = target_status
+        session.add(project)
+        
+        books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+        for b in books:
+            b.status = target_status
+            if target_status == "Imported":
+                b.progress = 0.0
+            elif target_status == "Transcribed":
+                b.progress = 0.0
+            session.add(b)
+            
+        session.commit()
+        
+    state.project_status = target_status
+    ui.notify(f"Project rolled back to: {target_status}", type="warning")
+    refresh_callback()
+    
+    # Refresh global topbar progress stepper
+    if hasattr(state, 'active_header_refresh') and state.active_header_refresh:
+        state.active_header_refresh()
+
+
+# --- STEP-AWARE COMPACT DASHBOARD VIEWS ---
+
+def render_transcription_step_view(project, books, start_transcribe_cb, stop_transcribe_cb):
+    with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-3'):
+        with ui.row().classes('items-center gap-2'):
+            ui.icon('record_voice_over', size='sm', color='blue-500')
+            ui.label('Phase 1: Speech-to-Text Transcription').classes('text-sm font-bold text-slate-800')
+            
+        ui.label('The local STT pipeline scans and transcribes audiobook track files into chapter-level transcript.txt files.').classes('text-xs text-slate-500')
+        
+        with ui.row().classes('items-center gap-4 bg-blue-50/50 p-3 rounded-lg border border-blue-100/50 w-full mt-1'):
+            ui.icon('info', color='blue', size='sm')
+            ui.label(f'Active STT Config: {get_setting("stt_engine", "Parakeet ONNX")} | Device: {get_setting("stt_device", "GPU/CUDA")}').classes('text-xs font-semibold text-slate-700')
+            
+        with ui.row().classes('w-full justify-between items-center mt-2 pt-2 border-t border-slate-100'):
+            if state.project_status == "Transcribing":
+                with ui.row().classes('items-center gap-2'):
+                    ui.spinner(size='sm', color='blue')
+                    ui.label('Transcribing audio files in background...').classes('text-xs font-semibold text-blue-700 animate-pulse')
+                ui.button(
+                    'Stop Transcription', 
+                    icon='stop', 
+                    color='red', 
+                    on_click=lambda: stop_transcribe_cb(project.id)
+                ).classes('px-4 font-semibold text-xs')
+            else:
+                ui.label('Awaiting transcription pipeline initiation.').classes('text-xs font-semibold text-slate-400')
+                ui.button(
+                    'Start Transcription', 
+                    icon='play_arrow', 
+                    on_click=lambda: start_transcribe_cb(project.id)
+                ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs px-5')
+
+
+def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb, trigger_rollback_cb):
+    available_templates = list_stored_templates()
+    
+    with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-3'):
+        with ui.row().classes('w-full justify-between items-center'):
+            with ui.row().classes('items-center gap-2'):
+                ui.icon('psychology', size='sm', color='purple-500')
+                ui.label('Phase 2: LLM Prompt Generation & Extraction').classes('text-sm font-bold text-slate-800')
+            
+            ui.button(
+                'Rollback to Transcription',
+                icon='history',
+                on_click=lambda: trigger_rollback_cb("Imported")
+            ).classes('text-[10px] text-slate-500 hover:text-red-600').props('flat dense')
+            
+        ui.label('Transcription passages are processed through a local LLM to extract key quotes and generate visual rendering prompts.').classes('text-xs text-slate-500')
+        
+        with ui.row().classes('w-full items-center gap-3 bg-slate-50 p-3 rounded-lg border mt-1'):
+            ui.icon('description', size='sm', color='slate-500')
+            with ui.column().classes('gap-0 flex-1'):
+                ui.label('Active Guidelines Prompt Template').classes('text-xs font-bold text-slate-700')
+                ui.label('Select template rules. Customize rules or add templates inside the Playground tab.').classes('text-[9px] text-slate-500')
+            
+            ui.select(
+                options=available_templates,
+                value=state.playground_selected_template,
+                on_change=lambda e: handle_dashboard_template_change(e.value)
+            ).classes('w-48 bg-white').props('outlined dense')
+
+        with ui.row().classes('w-full justify-between items-center mt-2 pt-2 border-t border-slate-100'):
+            if state.project_status == "Generating Prompts":
+                with ui.row().classes('items-center gap-2'):
+                    ui.spinner(size='sm', color='purple')
+                    ui.label('Generating prompts in background...').classes('text-xs font-semibold text-purple-700 animate-pulse')
+                ui.button(
+                    'Stop Prompt Gen', 
+                    icon='stop', 
+                    color='red', 
+                    on_click=lambda: stop_transcribe_cb(project.id)
+                ).classes('px-4 font-semibold text-xs')
+            else:
+                ui.label('Guidelines configured. Ready to run local prompt generation.').classes('text-xs font-semibold text-slate-400')
+                ui.button(
+                    'Generate Prompts', 
+                    icon='bolt', 
+                    on_click=lambda: start_prompt_gen_cb(project.id) if start_prompt_gen_cb else None
+                ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-5')
+
+
+def render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb, trigger_rollback_cb):
+    with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-3'):
+        with ui.row().classes('w-full justify-between items-center'):
+            with ui.row().classes('items-center gap-2'):
+                ui.icon('image', size='sm', color='amber-500')
+                ui.label('Phase 3: ComfyUI Image Generation').classes('text-sm font-bold text-slate-800')
+            
+            ui.button(
+                'Rollback to Prompt Gen',
+                icon='history',
+                on_click=lambda: trigger_rollback_cb("Transcribed")
+            ).classes('text-[10px] text-slate-500 hover:text-red-600').props('flat dense')
+            
+        ui.label('Render image batches via ComfyUI. Visual style settings and base workflows can be adjusted inside the Style & Workflows tab.').classes('text-xs text-slate-500')
+        
+        with ui.row().classes('w-full items-center gap-3 bg-slate-50 p-3 rounded-lg border mt-1'):
+            ui.icon('brush', size='sm', color='slate-500')
+            with ui.column().classes('gap-0 flex-1'):
+                ui.label('Active Visual Style Preset').classes('text-xs font-bold text-slate-700')
+                ui.label('Prefixes and details applied globally onto active image prompts.').classes('text-[9px] text-slate-500')
+            
+            ui.select(
+                options=load_style_presets(),
+                value=state.style_selected_preset,
+                on_change=lambda e: (setattr(state, 'style_selected_preset', e.value), load_style_preset_by_name(e.value))
+            ).classes('w-48 bg-white').props('outlined dense')
+
+        with ui.row().classes('w-full justify-between items-center mt-2 pt-2 border-t border-slate-100'):
+            if state.project_status == "Rendering Images":
+                with ui.row().classes('items-center gap-2'):
+                    ui.spinner(size='sm', color='amber')
+                    ui.label('Rendering images in background...').classes('text-xs font-semibold text-amber-700 animate-pulse')
+                ui.button(
+                    'Stop Rendering', 
+                    icon='stop', 
+                    color='red', 
+                    on_click=lambda: stop_transcribe_cb(project.id)
+                ).classes('px-4 font-semibold text-xs')
+            else:
+                ui.label('Batch prompts ready. Initiates automated image renderings.').classes('text-xs font-semibold text-slate-400')
+                ui.button(
+                    'Render Images', 
+                    icon='play_circle_filled', 
+                    on_click=lambda: start_image_gen_cb(project.id) if start_image_gen_cb else None
+                ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-5')
+
+
+def render_completed_step_view(project, books, trigger_rollback_cb):
+    with ui.card().classes('w-full border p-5 shadow-sm bg-emerald-50/10 gap-3'):
+        with ui.row().classes('w-full justify-between items-center'):
+            with ui.row().classes('items-center gap-2'):
+                ui.icon('task_alt', size='sm', color='emerald-500')
+                ui.label('Automatic Execution Phases Completed!').classes('text-sm font-bold text-slate-800')
+            
+            ui.button(
+                'Rollback to Image Gen',
+                icon='history',
+                on_click=lambda: trigger_rollback_cb("Prompts Created")
+            ).classes('text-[10px] text-slate-500 hover:text-red-600').props('flat dense')
+            
+        ui.label('All automatic generation steps have completed. You can now proofread chapters, tune image prompts, and bake description metadata.').classes('text-xs text-slate-500')
+        
+        with ui.row().classes('w-full gap-4 items-center bg-white p-4 rounded-lg border mt-2'):
+            ui.icon('info', color='emerald')
+            with ui.column().classes('gap-0 flex-1'):
+                ui.label('Next Step: Workspace Proofreader').classes('text-xs font-bold text-slate-700')
+                ui.label('Select a specific book in the left sidebar to open the Proofreader & Interactive Editor Grid.').classes('text-[10px] text-slate-500')
+
+# --- PREVIEWS & CLIPBOARD ---
 
 def open_large_image(img_base64: str, title: str):
     """Opens a modal popup dialog displaying the full-size rendered image using stable global references."""
@@ -65,6 +320,7 @@ def open_large_image(img_base64: str, title: str):
     state.preview_image_src = img_base64
     if hasattr(state, 'global_preview_dialog') and state.global_preview_dialog:
         state.global_preview_dialog.open()
+
 
 def copy_results_to_clipboard():
     """Formats prompt configurations and outputs as markdown, copying to host clipboard safely."""
@@ -288,6 +544,7 @@ async def execute_playground_test(project_name: str):
     render_playground_results_container.refresh()
     ui.notify("Playground test iteration complete!", type="positive")
 
+
 def handle_dashboard_template_change(val: str):
     """Updates the active template state and pre-loads its text contents globally."""
     if not val:
@@ -297,6 +554,7 @@ def handle_dashboard_template_change(val: str):
     if loaded:
         state.playground_template = loaded
         ui.notify(f"Active Prompt Template changed to: {val}", type="info")
+
 
 def handle_template_dropdown_selection(val: str, prompt_editor_widget):
     """Loads a named prompt template and updates the text editor binding."""
@@ -361,6 +619,7 @@ def handle_delete_template(template_dropdown, prompt_editor_widget):
     state.playground_template = loaded_default
     prompt_editor_widget.set_value(loaded_default)
 
+
 @ui.refreshable
 def render_recent_images_feed():
     """Renders a real-time horizontal strip of the 5 most recent generated images."""
@@ -385,6 +644,7 @@ def render_recent_images_feed():
 
     # Register refresh callback globally so background updates bind successfully
     state.recent_images_refresh = render_recent_images_feed.refresh
+
 
 @ui.refreshable
 def render_recent_prompts_feed():
@@ -826,7 +1086,7 @@ def render_project_tabs(
     stop_transcribe_cb,
     start_prompt_gen_cb=None,
     start_image_gen_cb=None,
-    save_project_settings_cb=None  # New callback parameter
+    save_project_settings_cb=None
 ):
     # Prepare directory configurations
     ensure_templates_directory()
@@ -854,11 +1114,61 @@ def render_project_tabs(
                 
     state.global_preview_dialog = global_preview_dialog
 
-    # Render Dynamic Stepper inside its container
-    render_stepper(state.project_status)
+    # Reusable rollback confirmation dialog
+    with ui.dialog() as rollback_dialog, ui.card().classes('w-full max-w-md p-6 rounded-xl gap-4'):
+        ui.label('Confirm State Rollback').classes('text-lg font-bold text-slate-800')
+        
+        # Dynamic warning descriptions
+        warning_msg = ui.label().classes('text-xs text-slate-600 leading-relaxed')
+        backup_details = ui.markdown().classes('text-[10px] text-slate-500 bg-slate-50 p-2.5 rounded border border-slate-200 font-mono leading-normal w-full')
+        
+        rollback_target = {"status": "Imported"} # Mutable state wrapper
+        
+        async def confirm_action():
+            target = rollback_target["status"]
+            
+            # Execute background file-safety backup tasks
+            ui.notify("Archiving and renaming on-disk folders...", type="info")
+            await asyncio.to_thread(backup_and_cleanup_files, project.id, target)
+            
+            # Update active pipeline database references
+            rollback_project_status(project.id, target, render_dynamic_step_dashboard.refresh)
+            rollback_dialog.close()
+            
+        with ui.row().classes('w-full justify-end gap-3 mt-2'):
+            ui.button('Cancel', on_click=rollback_dialog.close).props('flat color=slate').classes('text-xs font-semibold')
+            ui.button('Confirm & Rollback', on_click=confirm_action, color='red').classes('text-xs font-bold text-white')
 
-    # Header Row
-    ui.label(f'Project Settings: {project.name}').classes('text-lg font-bold text-slate-800 mt-2')
+    def trigger_rollback_prompt(target_status: str):
+        rollback_target["status"] = target_status
+        if target_status == "Imported":
+            warning_msg.set_text("You are rolling back to the Transcription phase. This will archive active transcripts, prompt files, and rendered images so transcription can be executed fresh.")
+            backup_details.set_content(
+                "**Action items:**\n"
+                "- Rename `transcript.txt` ➔ `transcript_backup_*.txt`\n"
+                "- Rename `prompts.csv` ➔ `prompts_backup_*.csv`\n"
+                "- Rename `images/` ➔ `images_backup_*`"
+            )
+        elif target_status == "Transcribed":
+            warning_msg.set_text("You are rolling back to the Prompt Generation phase. This will keep transcripts intact, but archive your active prompt list and rendered images so scene prompts can be generated fresh.")
+            backup_details.set_content(
+                "**Action items:**\n"
+                "- Rename `prompts.csv` ➔ `prompts_backup_*.csv`\n"
+                "- Rename `images/` ➔ `images_backup_*`"
+            )
+        elif target_status == "Prompts Created":
+            warning_msg.set_text("You are rolling back to the Image Generation phase. This will keep transcripts and prompt files intact, but archive your rendered images folder so you can clean render the entire visual list.")
+            backup_details.set_content(
+                "**Action items:**\n"
+                "- Rename `images/` ➔ `images_backup_*`"
+            )
+        rollback_dialog.open()
+
+    # Workspace Navigation Layout
+    with ui.row().classes('w-full justify-between items-center mb-1'):
+        with ui.column().classes('gap-0'):
+            ui.label('Project Workspace Controls').classes('text-base font-bold text-slate-800')
+            ui.label('Configure orchestration guidelines and render dynamic style models.').classes('text-xs text-slate-500')
     
     with ui.tabs().classes('w-full border-b') as project_tabs:
         tab_dash = ui.tab('Dashboard', icon='dashboard')
@@ -869,100 +1179,26 @@ def render_project_tabs(
         
     with ui.tab_panels(project_tabs, value=state.active_project_tab).classes('w-full bg-transparent p-0'):
         with ui.tab_panel(tab_dash):
-            # Dynamic stats panels utilizing stable reactive text bindings
-            with ui.row().classes('w-full gap-4'):
-                with ui.card().classes('flex-1 border p-4 shadow-sm bg-white'):
-                    ui.label('Project Status').classes('text-xs font-semibold text-slate-500')
-                    ui.label('').classes('text-xl font-bold text-slate-800').bind_text_from(state, 'project_status')
-                with ui.card().classes('flex-1 border p-4 shadow-sm bg-white'):
-                    ui.label('Discovered Books').classes('text-xs font-semibold text-slate-500')
-                    ui.label(str(len(books))).classes('text-xl font-bold text-slate-800')
-                    
-            # Process Control Card
-            with ui.card().classes('w-full border p-5 shadow-sm bg-white mt-4'):
-                ui.label('Sequential Process Orchestration').classes('text-sm font-bold text-slate-800 mb-2')
-                ui.label('Configure styling rules and workflows in the settings tab prior to launching processing.').classes('text-xs text-slate-400 mb-4')
-                
-                # Active Prompt Template Selection Row
-                with ui.row().classes('w-full items-center gap-3 mb-4 bg-slate-50 p-3 rounded-lg border'):
-                    ui.icon('psychology', size='sm', color='slate-500')
-                    with ui.column().classes('gap-0 flex-1'):
-                        ui.label('Active Prompt Instructions Template').classes('text-xs font-bold text-slate-700')
-                        ui.label('The set of guidelines that the LLM will follow during generation.').classes('text-[10px] text-slate-500')
-                    
-                    ui.select(
-                        options=available_templates,
-                        value=state.playground_selected_template,
-                        on_change=lambda e: handle_dashboard_template_change(e.value)
-                    ).classes('w-56 bg-white').props('outlined dense')
-
-                # Active Style Preset Selection Row
-                with ui.row().classes('w-full items-center gap-3 mb-4 bg-slate-50 p-3 rounded-lg border'):
-                    ui.icon('brush', size='sm', color='slate-500')
-                    with ui.column().classes('gap-0 flex-1'):
-                        ui.label('Active Visual Style Preset').classes('text-xs font-bold text-slate-700')
-                        ui.label('The preset used to decorate and render image prompts in ComfyUI.').classes('text-[10px] text-slate-500')
-                    
-                    ui.select(
-                        options=load_style_presets(),
-                        value=state.style_selected_preset,
-                        on_change=lambda e: (setattr(state, 'style_selected_preset', e.value), load_style_preset_by_name(e.value))
-                    ).classes('w-56 bg-white').props('outlined dense')
-
-                # Render context-aware action buttons inside their own container
+            # --- Dynamic Step-Aware Dashboard ---
+            with ui.column().classes('w-full gap-4'):
                 @ui.refreshable
-                def action_buttons():
-                    with ui.row().classes('items-center gap-3'):
-                        status = state.project_status
+                def render_dynamic_step_dashboard():
+                    status = state.project_status
+                    
+                    if status in ("Imported", "Transcribing"):
+                        render_transcription_step_view(project, books, start_transcribe_cb, stop_transcribe_cb)
+                    elif status in ("Transcribed", "Generating Prompts"):
+                        render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb, trigger_rollback_prompt)
+                    elif status in ("Prompts Created", "Rendering Images"):
+                        render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb, trigger_rollback_prompt)
+                    else:
+                        # Images Created, Proofreading, or Finished
+                        render_completed_step_view(project, books, trigger_rollback_prompt)
                         
-                        if status in ("Transcribing", "Generating Prompts", "Rendering Images"):
-                            ui.spinner(size='md', color='blue')
-                            ui.button(
-                                'Stop Execution', 
-                                icon='stop', 
-                                color='red', 
-                                on_click=lambda: stop_transcribe_cb(project.id)
-                            ).classes('px-4 font-semibold')
-                        elif status == "Imported":
-                            ui.button(
-                                'Start Transcription', 
-                                icon='play_arrow', 
-                                color='green', 
-                                on_click=lambda: start_transcribe_cb(project.id)
-                            ).classes('px-4 font-semibold')
-                        elif status == "Transcribed":
-                            ui.button(
-                                'Generate Prompts', 
-                                icon='psychology', 
-                                color='purple', 
-                                on_click=lambda: start_prompt_gen_cb(project.id) if start_prompt_gen_cb else None
-                            ).classes('px-4 font-semibold text-white')
-                        elif status == "Prompts Created":
-                            ui.button(
-                                'Render Images', 
-                                icon='image', 
-                                color='amber', 
-                                on_click=lambda: start_image_gen_cb(project.id) if start_image_gen_cb else None
-                            ).classes('px-4 font-semibold text-white')
-                        elif status in ("Images Created", "Proofreading"):
-                            ui.button(
-                                'Open Proofreader Grid', 
-                                icon='edit_note', 
-                                color='blue', 
-                                on_click=lambda: ui.notify("Proofreader and editor workspace selected.", type="info")
-                            ).classes('px-4 font-semibold text-white')
-                        else:
-                            ui.button(
-                                'Start Processing', 
-                                icon='play_arrow', 
-                                color='green', 
-                                on_click=lambda: start_transcribe_cb(project.id)
-                            ).classes('px-4 font-semibold')
-                
-                action_buttons()
-                state.action_buttons_refresh = action_buttons.refresh
-            
-            # --- Real-Time Render Feed placement ---
+                render_dynamic_step_dashboard()
+                state.action_buttons_refresh = render_dynamic_step_dashboard.refresh
+
+            # Live Render Feed placements
             render_recent_images_feed()
             
             # Stable Live Console Log Output Widget (Created ONCE)
