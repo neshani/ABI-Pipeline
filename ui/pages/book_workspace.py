@@ -2,7 +2,7 @@ import csv
 import os
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-
+import asyncio
 from nicegui import ui, app
 from sqlmodel import Session
 from database.connection import engine
@@ -654,19 +654,27 @@ def render_book_tabs(book_id: int):
             # --- Pipeline Restart Control Action ---
             
             async def trigger_batch_restart():
-                import main
-                ui.notify("Initiating ComfyUI pipeline restart sequence...", type="info")
+                # Avoid importing main to prevent NiceGUI RuntimeError. Use registered state callbacks instead.
+                start_fn = getattr(state, 'start_image_generation_cb', None)
                 
-                # If background loop is currently running, flag cancel and wait for the loop block to exit safely
+                if not start_fn:
+                    ui.notify("Pipeline process control callbacks are not fully registered in state.", type="negative")
+                    return
+
+                # If background loop is currently running, flag cancel and wait gracefully for the active image to finish
                 if state.project_status == "Rendering Images" or state.image_gen_active:
+                    ui.notify("Waiting for current image to finish rendering before restarting...", type="info", timeout=2.0)
                     state.cancel_image_gen_flag = True
-                    await asyncio.sleep(1.5) # Safe sleep buffer to let the running image write finish
                     
+                    # Wait gracefully for the background task to finish its active generation pass and exit
+                    while state.image_gen_active:
+                        await asyncio.sleep(0.5)
+                        
                 state.cancel_image_gen_flag = False
                 state.image_gen_active = False
                 
                 # Kickstart generation fresh
-                main.start_image_generation(project.id)
+                start_fn(project.id)
 
             # --- Top Interface Toolbar ---
             

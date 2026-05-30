@@ -237,6 +237,26 @@ def start_transcribing(project_id: int):
     header_controls.refresh()
 
 
+def interrupt_comfy_execution():
+    """Tells ComfyUI to immediately abort active generation and clear the pending queue."""
+    comfy_url = get_setting("comfy_url", "127.0.0.1:8188")
+    if "http" in comfy_url:
+        comfy_url = comfy_url.replace("http://", "").replace("https://", "").strip("/")
+    
+    import requests
+    try:
+        # Interrupt the active workflow execution
+        requests.post(f"http://{comfy_url}/interrupt", timeout=5.0)
+    except Exception as e:
+        state.add_console_log(f"[Comfy-API] Failed to send interrupt command: {str(e)}")
+        
+    try:
+        # Clear the queue of pending jobs
+        requests.post(f"http://{comfy_url}/queue", json={"clear": True}, timeout=5.0)
+    except Exception as e:
+        state.add_console_log(f"[Comfy-API] Failed to send clear queue command: {str(e)}")
+
+
 def stop_transcribing(project_id: int):
     """Interrupts active pipeline subprocesses and state tasks gracefully."""
     if state.project_status == "Transcribing":
@@ -250,7 +270,7 @@ def stop_transcribing(project_id: int):
         state.project_status = "Transcribed"
     elif state.project_status == "Rendering Images":
         state.cancel_image_gen_flag = True
-        ui.notify("Stopping image generation process...", type="warning")
+        ui.notify("Stopping after the current image finishes...", type="info")
         state.project_status = "Prompts Created"
     
     # Fast trigger to update action buttons and stepper layout
@@ -606,6 +626,10 @@ def start_image_generation(project_id: int):
 
     asyncio.create_task(run_project_image_gen(project_id))
     ui.notify("Background image rendering sequences initiated!", type="positive")
+
+# Register global pipeline control callbacks onto state to prevent circular imports
+state.start_image_generation_cb = start_image_generation
+state.stop_image_generation_cb = stop_transcribing
 
 
 # --- Dynamic WebSocket State-Updater (No full page refreshes!) ---
