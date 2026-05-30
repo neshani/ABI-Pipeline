@@ -256,46 +256,6 @@ def fetch_test_chunks(
         return r.sample(all_chunks, min(count, len(all_chunks)))
 
 
-async def unload_llm_model(llm_url: str, model_name: str) -> bool:
-    """
-    Attempts to programmatically unload the active LLM from the host's VRAM.
-    Supports both LM Studio native unload endpoints and Ollama api/generate cache evictions.
-    Useful for freeing up maximum VRAM headroom before starting heavy local workflows like ComfyUI.
-    """
-    base_url = llm_url.rstrip("/")
-    headers = {"Content-Type": "application/json"}
-    
-    # Retrieve API key if any is saved
-    api_key = get_setting("llm_api_key", "")
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    async with httpx.AsyncClient() as client:
-        # 1. Attempt LM Studio native unload endpoint
-        try:
-            unload_url = f"{base_url}/api/v1/models/unload"
-            payload = {"instance_id": model_name}
-            resp = await client.post(unload_url, json=payload, headers=headers, timeout=10.0)
-            if resp.status_code == 200:
-                return True
-        except Exception:
-            pass
-
-        # 2. Fallback to Ollama immediate eviction payload
-        try:
-            ollama_url = f"{base_url}/api/generate"
-            payload = {
-                "model": model_name,
-                "keep_alive": 0
-            }
-            resp = await client.post(ollama_url, json=payload, timeout=10.0)
-            if resp.status_code == 200:
-                return True
-        except Exception:
-            pass
-
-    return False
-
 async def generate_prompt_for_chunk_async(
     task: dict, 
     llm_url: str, 
@@ -643,9 +603,15 @@ async def start_project_prompt_gen(project_id: int):
             # Force synchronization and await active tasks to let cancellation unwind cleanly
             await asyncio.gather(*active_tasks, return_exceptions=True)
 
-            # Sort prompts.csv and update book status to final if completed fully and not interrupted
+            # Sort prompts.csv, run timing synchronization, and update book status to final
             if not state.cancel_prompt_gen_flag:
                 sort_csv_by_chapter_scene(output_csv_path)
+                
+                # Trigger Phase C Timing Sync Pipeline automatically
+                state.add_console_log(f"[Prompt-Gen] Initiating fuzzy timing alignment for {book_name}...")
+                from services.timing_sync import sync_book_timing
+                await asyncio.to_thread(sync_book_timing, book_id, project_name, book_name, state.add_console_log)
+                
                 with Session(engine) as session:
                     db_book = session.get(Book, book_id)
                     if db_book:
@@ -661,7 +627,7 @@ async def start_project_prompt_gen(project_id: int):
                     db_project.status = "Prompts Created"
                     session.add(db_project)
                     session.commit()
-            state.add_console_log("[Prompt-Gen] Success! All prompts generated.")
+            state.add_console_log("[Prompt-Gen] Success! All prompts generated and synced with timestamps.")
         else:
             state.add_console_log("[Prompt-Gen] Prompt generation suspended successfully.")
 

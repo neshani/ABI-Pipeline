@@ -638,30 +638,31 @@ def check_for_active_transcriptions():
         with Session(engine) as session:
             project = session.get(Project, state.active_project_id)
             if project:
-                # 1. Update bound labels/values dynamically
+                # Detect structural transitions to prevent constant polling redraws
+                status_changed = (project.status != state.project_status)
                 state.project_status = project.status
                 
                 # Check if we need to update the action button spinner
-                if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
+                if status_changed and hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
                     try:
                         state.action_buttons_refresh()
                     except Exception:
                         pass
                 
-                # Re-render ONLY the isolated Horizontal Stepper inside header
+                # Re-render the isolated Horizontal Stepper inside header
                 try:
                     header_controls.refresh()
                 except Exception:
                     pass
 
-            # 2. Update bound Book statuses and progress values in-place
+            # Update bound Book statuses and progress values in-place via clean data-bindings
             books = session.exec(select(Book).where(Book.project_id == state.active_project_id)).all()
             for b in books:
                 state.books_progress[b.id] = b.progress
                 state.books_status[b.id] = b.status
                 state.books_subtitle[b.id] = f"{b.status} • {int(b.progress * 100)}%"
 
-        # 3. Stream newly added log lines to stable log widget (Leaves scrollbar untouched!)
+        # Stream newly added log lines to stable log widget (Leaves scrollbar untouched!)
         if state.active_log_widget:
             try:
                 new_logs = state.console_logs[state.logs_pushed_index:]
@@ -805,7 +806,7 @@ settings_modal = SettingsModal(app_settings, restart_app)
 
 def render_topbar_stepper(status: str):
     """Compacts the horizontal pipeline progress stepper to fit beautifully inside the global sticky header."""
-    from ui.pages.project_workspace import STAGES, get_active_stage_idx
+    from ui.pages.project import STAGES, get_active_stage_idx
     current_stage_idx = get_active_stage_idx(status)
     
     with ui.row().classes('items-center gap-3 bg-slate-700/40 px-4 py-1.5 rounded-lg border border-slate-600/30 text-xs'):

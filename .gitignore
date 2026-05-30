@@ -37,3 +37,5 @@ workspace_temp/
 output/
 file-sets.txt
 prompt_templates/
+styles/
+workflows/
