@@ -2,6 +2,7 @@ import json
 import random
 import datetime
 import asyncio
+import os
 from pathlib import Path
 from typing import Any, List, Optional, Dict
 from nicegui import ui
@@ -1104,7 +1105,7 @@ def render_project_tabs(
     if books and (not state.playground_book_selection or state.playground_book_selection not in book_names):
         state.playground_book_selection = books[0].name
 
-    # Instantiate a stable page-level dialog once (outside of any refreshable loops)
+    # Instantiate a stable page-level dialog once
     with ui.dialog() as global_preview_dialog:
         with ui.card().classes('w-full max-w-3xl p-4 items-center bg-white rounded-xl shadow-lg'):
             ui.label().classes('text-sm font-bold text-slate-800 mb-3 uppercase tracking-wider').bind_text_from(state, 'preview_image_title')
@@ -1118,20 +1119,15 @@ def render_project_tabs(
     with ui.dialog() as rollback_dialog, ui.card().classes('w-full max-w-md p-6 rounded-xl gap-4'):
         ui.label('Confirm State Rollback').classes('text-lg font-bold text-slate-800')
         
-        # Dynamic warning descriptions
         warning_msg = ui.label().classes('text-xs text-slate-600 leading-relaxed')
         backup_details = ui.markdown().classes('text-[10px] text-slate-500 bg-slate-50 p-2.5 rounded border border-slate-200 font-mono leading-normal w-full')
         
-        rollback_target = {"status": "Imported"} # Mutable state wrapper
+        rollback_target = {"status": "Imported"}
         
         async def confirm_action():
             target = rollback_target["status"]
-            
-            # Execute background file-safety backup tasks
             ui.notify("Archiving and renaming on-disk folders...", type="info")
             await asyncio.to_thread(backup_and_cleanup_files, project.id, target)
-            
-            # Update active pipeline database references
             rollback_project_status(project.id, target, render_dynamic_step_dashboard.refresh)
             rollback_dialog.close()
             
@@ -1164,11 +1160,34 @@ def render_project_tabs(
             )
         rollback_dialog.open()
 
-    # Workspace Navigation Layout
+    # Workspace Navigation Layout with Folder Shortcut
     with ui.row().classes('w-full justify-between items-center mb-1'):
-        with ui.column().classes('gap-0'):
-            ui.label('Project Workspace Controls').classes('text-base font-bold text-slate-800')
-            ui.label('Configure orchestration guidelines and render dynamic style models.').classes('text-xs text-slate-500')
+        with ui.row().classes('items-center gap-3'):
+            with ui.column().classes('gap-0'):
+                ui.label('Project Workspace Controls').classes('text-base font-bold text-slate-800')
+                ui.label('Configure orchestration guidelines and render dynamic style models.').classes('text-xs text-slate-500')
+            
+            def open_project_folder():
+                import platform
+                import subprocess
+                base_dir = Path(get_setting("output_dir", "./output")).resolve()
+                proj_dir = base_dir / project.name
+                proj_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    if platform.system() == "Windows":
+                        os.startfile(proj_dir)
+                    elif platform.system() == "Darwin":
+                        subprocess.Popen(["open", str(proj_dir)])
+                    else:
+                        subprocess.Popen(["xdg-open", str(proj_dir)])
+                except Exception as ex:
+                    ui.notify(f"Failed to open project folder: {str(ex)}", type="negative")
+
+            ui.button(
+                'Open Folder', 
+                icon='folder_open', 
+                on_click=open_project_folder
+            ).props('flat dense').classes('text-xs text-slate-600')
     
     with ui.tabs().classes('w-full border-b') as project_tabs:
         tab_dash = ui.tab('Dashboard', icon='dashboard')
@@ -1192,14 +1211,19 @@ def render_project_tabs(
                     elif status in ("Prompts Created", "Rendering Images"):
                         render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb, trigger_rollback_prompt)
                     else:
-                        # Images Created, Proofreading, or Finished
                         render_completed_step_view(project, books, trigger_rollback_prompt)
                         
                 render_dynamic_step_dashboard()
-                state.action_buttons_refresh = render_dynamic_step_dashboard.refresh
 
-            # Live Render Feed placements
-            render_recent_images_feed()
+            # Dynamic visibility container for conditional dashboard feeds
+            @ui.refreshable
+            def render_conditional_feeds():
+                status = state.project_status
+                # Live Render Feed - visible only from image gen stage onwards
+                if status not in ("Imported", "Transcribing", "Transcribed", "Generating Prompts"):
+                    render_recent_images_feed()
+                    
+            render_conditional_feeds()
             
             # Stable Live Console Log Output Widget (Created ONCE)
             with ui.card().classes('w-full border p-5 shadow-sm bg-white mt-4 gap-3'):
@@ -1215,9 +1239,23 @@ def render_project_tabs(
                 
                 state.active_log_widget = log_widget
                 state.logs_pushed_index = len(state.console_logs)
-            
-            # Live Feed of generated prompt cards
-            render_recent_prompts_feed()
+
+            # Dynamic visibility container for generated prompt feed
+            @ui.refreshable
+            def render_conditional_prompt_feed():
+                status = state.project_status
+                # Live Prompt Feed - visible only from prompt gen stage onwards
+                if status not in ("Imported", "Transcribing"):
+                    render_recent_prompts_feed()
+                    
+            render_conditional_prompt_feed()
+
+            # Sync the action_buttons_refresh callback to update all dynamically changing parts
+            state.action_buttons_refresh = lambda: (
+                render_dynamic_step_dashboard.refresh(), 
+                render_conditional_feeds.refresh(), 
+                render_conditional_prompt_feed.refresh()
+            )
                         
         with ui.tab_panel(tab_style):
             with ui.grid(columns='420px 1fr').classes('w-full gap-6 items-start'):
@@ -1258,7 +1296,6 @@ def render_project_tabs(
                             )
                         ).props('outline').classes('h-10 text-blue-600')
 
-                    # Persistent project settings save action (using safe modular callback)
                     ui.button(
                         'Save Project Settings',
                         icon='settings_backup_restore',
@@ -1267,7 +1304,6 @@ def render_project_tabs(
 
                     ui.separator()
                     
-                    # Active prompt modification text areas (Synchronized in real-time)
                     ui.textarea(
                         label="Style Prompt Prefix"
                     ).classes('w-full h-24 text-xs').props('outlined').bind_value(state, 'style_prompt_prefix')
@@ -1276,7 +1312,6 @@ def render_project_tabs(
                         label="Style Negative Prompt"
                     ).classes('w-full h-24 text-xs').props('outlined').bind_value(state, 'style_negative_prompt')
                     
-                    # Discovered parameters expansion grid container
                     render_workflow_overrides_ui()
                     
                 # RIGHT: Visual Style Playground Grid
@@ -1287,7 +1322,6 @@ def render_project_tabs(
                             ui.label('Style Visual Playground Settings').classes('text-sm font-bold text-slate-800')
                             
                         with ui.row().classes('items-end justify-between gap-4 w-full bg-slate-50 p-4 rounded-lg border'):
-                            # Dynamic image count
                             ui.number(
                                 label="Num Images",
                                 value=state.style_chunk_count,
@@ -1295,7 +1329,6 @@ def render_project_tabs(
                                 on_change=lambda e: (setattr(state, 'style_chunk_count', int(e.value)) if e.value is not None else None, draw_style_test_sample(project.name, state.playground_book_selection))
                             ).classes('w-20')
 
-                            # Prompt selection seed (determines which scenes are drawn)
                             with ui.row().classes('items-end gap-1'):
                                 prompt_seed_input = ui.number(
                                     label="Prompt Seed",
@@ -1312,7 +1345,6 @@ def render_project_tabs(
                                     )
                                 ).props('outline dense').classes('h-10 text-slate-500')
 
-                            # Generation/Noise Seed toggles
                             ui.switch("Random Image Seeds").bind_value(state, 'style_use_random_image_seed').classes('text-xs mb-2')
                             
                             ui.number(
@@ -1322,14 +1354,12 @@ def render_project_tabs(
                                 state, 'style_use_random_image_seed', value=False
                             )
 
-                            # Launch Batch Execution
                             ui.button(
                                 'Test Style Preset',
                                 icon='bolt',
                                 on_click=lambda: execute_style_playground_batch(project.name)
                             ).classes('bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-5 h-10')
                     
-                    # Cards grid
                     render_style_playground_cards()
                 
         with ui.tab_panel(tab_play):
@@ -1338,14 +1368,12 @@ def render_project_tabs(
                 with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
                     ui.label('Testing Configuration').classes('text-sm font-bold text-slate-800')
                     
-                    # Target Book Dropdown
                     ui.select(
                         options=[b.name for b in books],
                         label="Select Book Volume",
                         value=state.playground_book_selection
                     ).bind_value(state, 'playground_book_selection').classes('w-full')
 
-                    # Prompt template selection, delete button, & save row
                     with ui.row().classes('w-full items-center gap-2'):
                         template_dropdown = ui.select(
                             options=available_templates,
@@ -1354,7 +1382,6 @@ def render_project_tabs(
                             on_change=lambda e: handle_template_dropdown_selection(e.value, prompt_editor)
                         ).classes('flex-1')
                         
-                        # Flat red delete button only visible when a custom template is chosen
                         ui.button(
                             icon="delete",
                             on_click=lambda: handle_delete_template(template_dropdown, prompt_editor)
@@ -1362,7 +1389,6 @@ def render_project_tabs(
                             state, 'playground_selected_template', backward=lambda val: val not in ('default', '')
                         )
                     
-                    # Custom Template Name saver row
                     with ui.row().classes('w-full items-end gap-2'):
                         custom_name_input = ui.input(placeholder="Template Name", label="Save Custom Name").classes('flex-1')
                         ui.button(
@@ -1370,14 +1396,12 @@ def render_project_tabs(
                             on_click=lambda: handle_save_custom_template(custom_name_input.value, template_dropdown)
                         ).props('outline').classes('h-10 text-blue-600')
 
-                    # Editor textbox
                     prompt_editor = ui.textarea(
                         label="Prompt Instructions (contains <text>)",
                         value=state.playground_template,
                         on_change=lambda e: setattr(state, 'playground_template', e.value)
                     ).classes('w-full h-64 font-mono text-xs leading-relaxed').props('outlined')
 
-                    # Count & Sampling Mode controllers
                     with ui.row().classes('w-full gap-3 justify-between items-end'):
                         ui.number(
                             label="Chunk Count", 
@@ -1392,7 +1416,6 @@ def render_project_tabs(
                             value=state.playground_selection_mode
                         ).bind_value_to(state, 'playground_selection_mode').classes('flex-1')
 
-                    # Start Index (Only visible when Static Segment is selected)
                     ui.number(
                         label="Start Chunk Index",
                         value=state.playground_start_index,
@@ -1402,7 +1425,6 @@ def render_project_tabs(
                         state, 'playground_selection_mode', value='Static Segment'
                     )
 
-                    # Random Seed (Only visible when Seeded Random is selected)
                     ui.number(
                         label="Random Seed",
                         value=state.playground_seed,
@@ -1411,7 +1433,6 @@ def render_project_tabs(
                         state, 'playground_selection_mode', value='Seeded Random'
                     )
 
-                    # Launch Testing Button
                     ui.button(
                         'Test Prompt Template', 
                         icon='bolt', 

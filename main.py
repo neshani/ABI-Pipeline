@@ -851,6 +851,160 @@ def header_controls():
 state.active_header_refresh = header_controls.refresh
 
 
+# --- Process Control and VRAM Clearing Utilities (Phase B) ---
+
+def launch_comfyui():
+    """Launches ComfyUI in a non-blocking background subprocess, auto-detecting standalone portable installations."""
+    comfy_path_str = get_setting("comfy_path", "F:/AI/ComfyUI/ComfyUI")
+    if not comfy_path_str:
+        ui.notify("ComfyUI path is not configured in settings.", type="warning")
+        return
+        
+    comfy_dir = Path(comfy_path_str).resolve()
+    
+    # Auto-resolve path: if they pointed to the inner 'ComfyUI' folder, promote to the parent standalone folder
+    if comfy_dir.name.lower() == "comfyui" and (comfy_dir.parent / "run_nvidia_gpu.bat").exists():
+        comfy_dir = comfy_dir.parent
+        state.add_console_log(f"[Comfy-Launcher] Auto-resolved ComfyUI root directory to: {comfy_dir}")
+
+    # If the folder still does not exist
+    if not comfy_dir.exists():
+        ui.notify(f"ComfyUI directory not found: {comfy_dir}", type="negative")
+        return
+
+    bat_file = comfy_dir / "run_nvidia_gpu.bat"
+    sh_file = comfy_dir / "run_nvidia_gpu.sh"
+    python_file = comfy_dir / "main.py"
+    inner_python_file = comfy_dir / "ComfyUI" / "main.py"
+    
+    # Locate embedded python installations in portable packages
+    embedded_py_win = comfy_dir / "python_embeded" / "python.exe"
+    embedded_py_unix = comfy_dir / "python_embeded" / "bin" / "python"
+    
+    try:
+        if os.name == 'nt':  # Windows
+            if bat_file.exists():
+                subprocess.Popen([str(bat_file)], cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
+                ui.notify("Launching ComfyUI via run_nvidia_gpu.bat...", type="info")
+            elif embedded_py_win.exists() and inner_python_file.exists():
+                # Direct fallback running main.py using the embedded python executable rather than system python
+                subprocess.Popen([str(embedded_py_win), "-s", "ComfyUI\\main.py", "--windows-standalone-build"], cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
+                ui.notify("Launching ComfyUI via embedded python...", type="info")
+            elif python_file.exists():
+                venv_python = comfy_dir / "venv" / "Scripts" / "python.exe"
+                py_exec = str(venv_python) if venv_python.exists() else sys.executable
+                subprocess.Popen([py_exec, "main.py"], cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
+                ui.notify(f"Launching ComfyUI via Python interpreter ({py_exec})...", type="info")
+            else:
+                ui.notify("Could not locate run_nvidia_gpu.bat, embedded python, or main.py.", type="warning")
+        else:  # Linux / macOS
+            if sh_file.exists():
+                subprocess.Popen(["bash", str(sh_file)], cwd=str(comfy_dir))
+                ui.notify("Launching ComfyUI via shell script...", type="info")
+            elif embedded_py_unix.exists() and inner_python_file.exists():
+                subprocess.Popen([str(embedded_py_unix), "-s", "ComfyUI/main.py"], cwd=str(comfy_dir))
+                ui.notify("Launching ComfyUI via embedded python...", type="info")
+            elif python_file.exists():
+                venv_python = comfy_dir / "venv" / "bin" / "python"
+                py_exec = str(venv_python) if venv_python.exists() else sys.executable
+                subprocess.Popen([py_exec, "main.py"], cwd=str(comfy_dir))
+                ui.notify("Launching ComfyUI via Python interpreter...", type="info")
+            else:
+                ui.notify("Could not locate shell script, embedded python, or main.py.", type="warning")
+    except Exception as e:
+        ui.notify(f"Failed to launch ComfyUI process: {str(e)}", type="negative")
+
+
+def free_all_memory():
+    """Unloads model weights and clears memory caches from both ComfyUI and LM Studio/Ollama."""
+    ui.notify("Dispatching VRAM/RAM clearance commands...", type="info")
+    
+    # 1. Clear ComfyUI Cache and Unload Models
+    comfy_url = get_setting("comfy_url", "127.0.0.1:8188")
+    if "http" in comfy_url:
+        comfy_url = comfy_url.replace("http://", "").replace("https://", "").strip("/")
+        
+    import requests
+    try:
+        resp = requests.post(
+            f"http://{comfy_url}/free", 
+            json={"unload_models": True, "free_memory": True}, 
+            timeout=4.0
+        )
+        if resp.status_code == 200:
+            state.add_console_log("[Memory-Engine] Successfully requested ComfyUI model unload and cache clear.")
+        else:
+            state.add_console_log(f"[Memory-Engine] ComfyUI free returned status code: {resp.status_code}")
+    except Exception as e:
+        state.add_console_log(f"[Memory-Engine] ComfyUI clearance skipped or host offline: {str(e)}")
+
+    # 2. Clear LM Studio / Ollama Model Weights
+    llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
+    model_name = get_setting("llm_model", "local-model")
+    
+    # Resolve the root host address to avoid trailing paths (e.g., "http://127.0.0.1:1234/v1" -> "http://127.0.0.1:1234")
+    import urllib.parse
+    try:
+        parsed_url = urllib.parse.urlparse(llm_url)
+        base_host_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    except Exception:
+        base_host_url = llm_url
+
+    if "11434" in llm_url:  # Ollama Server
+        try:
+            resp = requests.post(
+                f"{base_host_url}/api/generate", 
+                json={"model": model_name, "keep_alive": 0, "prompt": ""}, 
+                timeout=4.0
+            )
+            if resp.status_code == 200:
+                state.add_console_log(f"[Memory-Engine] Successfully requested Ollama to unload model '{model_name}'.")
+        except Exception as e:
+            state.add_console_log(f"[Memory-Engine] Ollama clearance skipped or host offline: {str(e)}")
+    else:  # LM Studio Server
+        try:
+            # Query models to fetch active model instance IDs
+            models_resp = requests.get(f"{base_host_url}/api/v1/models", timeout=4.0)
+            if models_resp.status_code == 200:
+                models_data = models_resp.json()
+                models_list = models_data.get("models", [])
+                if not models_list and "data" in models_data:
+                    models_list = models_data.get("data", [])
+                
+                unloaded_count = 0
+                for model in models_list:
+                    # In LM Studio v1 REST API, loaded instances reside inside 'loaded_instances' list of each model
+                    loaded_instances = model.get("loaded_instances", [])
+                    for instance in loaded_instances:
+                        instance_id = instance.get("id")
+                        if instance_id:
+                            unload_resp = requests.post(
+                                f"{base_host_url}/api/v1/models/unload",
+                                json={"instance_id": instance_id},
+                                timeout=4.0
+                            )
+                            if unload_resp.status_code == 200:
+                                state.add_console_log(f"[Memory-Engine] Successfully unloaded LM Studio model instance: {instance_id}")
+                                unloaded_count += 1
+                            else:
+                                state.add_console_log(f"[Memory-Engine] Unload command failed for instance {instance_id} with status: {unload_resp.status_code}")
+                                
+                if unloaded_count == 0:
+                    state.add_console_log("[Memory-Engine] No active model instances discovered in LM Studio's loaded cache.")
+            else:
+                # Direct fallback unload trigger using configured setting name as a generic ID
+                requests.post(
+                    f"{base_host_url}/api/v1/models/unload", 
+                    json={"instance_id": model_name}, 
+                    timeout=4.0
+                )
+                state.add_console_log(f"[Memory-Engine] Dispatched generic LM Studio unload request for model: {model_name}")
+        except Exception as e:
+            state.add_console_log(f"[Memory-Engine] LM Studio clearance skipped or host offline: {str(e)}")
+
+    ui.notify("VRAM and RAM clearance commands successfully sent!", type="positive")
+
+
 # --- Header & Top Bar Navigation Layout ---
 with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justify-between items-center'):
     with ui.row().classes('items-center gap-3'):
@@ -860,6 +1014,20 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
     header_controls()
 
     with ui.row().classes('items-center gap-3'):
+        # Launch Comfy Button (Universal Shortcut)
+        ui.button(
+            'Launch Comfy', 
+            icon='bolt', 
+            on_click=launch_comfyui
+        ).props('flat dense').classes('text-xs text-blue-400 hover:text-blue-300 font-bold px-2 py-1 bg-slate-700/50 rounded border border-slate-600/30')
+        
+        # Free VRAM Button (Universal Shortcut)
+        ui.button(
+            'Free VRAM', 
+            icon='memory', 
+            on_click=free_all_memory
+        ).props('flat dense').classes('text-xs text-rose-400 hover:text-rose-300 font-bold px-2 py-1 bg-slate-700/50 rounded border border-slate-600/30')
+
         with ui.button(icon='construction', color='slate-600') as tools_btn:
             tools_btn.classes('text-white text-sm capitalize rounded-lg')
             with ui.menu() as menu:
