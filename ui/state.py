@@ -85,3 +85,8 @@ recent_images_refresh: Optional[Any] = None
 preview_image_src: str = ""
 preview_image_title: str = ""
 global_preview_dialog: Optional[Any] = None
+
+# --- Real-Time Batch Process Telemetry ---
+batch_start_time: Optional[float] = None
+batch_elapsed_sec: float = 0.0
+batch_eta_label: str = "ETA: Estimating..."

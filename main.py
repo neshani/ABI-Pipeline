@@ -31,6 +31,91 @@ from ui.pages import render_portal_view, render_project_tabs, render_book_tabs, 
 # --- Initialize SQLite Database & Recovery Engines ---
 init_db()
 
+# --- Cache-Busted On-Disk Volume Statistics Engine ---
+_stats_cache = {}
+
+def get_book_stats(project_name: str, book_name: str) -> dict:
+    """Computes fast on-disk statistics for a book volume without database queries."""
+    stats = {
+        "has_transcript": False,
+        "char_count": 0,
+        "word_count": 0,
+        "total_prompts": 0,
+        "approved_prompts": 0,
+        "generated_images": 0,
+        "estimated_scenes": 0
+    }
+    
+    book_dir = Path(f"./output/{project_name}/{book_name}")
+    transcript_path = book_dir / "transcript.txt"
+    prompts_path = book_dir / "prompts.csv"
+    images_dir = book_dir / "images"
+    
+    # 1. Transcript Stats
+    if transcript_path.exists():
+        stats["has_transcript"] = True
+        try:
+            txt = transcript_path.read_text(encoding="utf-8", errors="ignore")
+            stats["char_count"] = len(txt)
+            stats["word_count"] = len(txt.split())
+            stats["estimated_scenes"] = max(1, stats["char_count"] // 1500)
+        except Exception:
+            pass
+            
+    # 2. Prompts CSV Stats
+    if prompts_path.exists():
+        try:
+            with open(prompts_path, mode='r', encoding='utf-8') as f:
+                reader = csv.DictReader(f, delimiter='|')
+                rows = list(reader)
+                stats["total_prompts"] = len(rows)
+                approved_count = 0
+                for r in rows:
+                    app_val = r.get("approved") or r.get("Approved") or "False"
+                    if app_val.strip().lower() == "true":
+                        approved_count += 1
+                stats["approved_prompts"] = approved_count
+        except Exception:
+            pass
+            
+    # 3. Generated Images
+    for d in [images_dir, book_dir]:
+        if d.exists() and d.is_dir():
+            try:
+                png_count = len([f for f in os.listdir(d) if f.lower().endswith('.png')])
+                if png_count > 0:
+                    stats["generated_images"] = png_count
+                    break
+            except Exception:
+                pass
+                
+    return stats
+
+
+def get_book_stats_cached(project_name: str, book_name: str) -> dict:
+    """Checks timestamps on disk before parsing, preventing I/O overhead on polling ticks."""
+    book_dir = Path(f"./output/{project_name}/{book_name}")
+    transcript_path = book_dir / "transcript.txt"
+    prompts_path = book_dir / "prompts.csv"
+    images_dir = book_dir / "images"
+    
+    # Build signature based on file modified times
+    sig = ""
+    for p in [transcript_path, prompts_path, images_dir]:
+        if p.exists():
+            sig += f"{p.name}:{p.stat().st_mtime}|"
+            
+    cache_key = f"{project_name}:{book_name}"
+    if cache_key in _stats_cache:
+        cached_sig, cached_data = _stats_cache[cache_key]
+        if cached_sig == sig:
+            return cached_data
+            
+    # Parse fresh and cache
+    stats = get_book_stats(project_name, book_name)
+    _stats_cache[cache_key] = (sig, stats)
+    return stats
+
 def reset_stuck_transcriptions():
     """Finds and resets any projects, books, or chapters that were stuck in a 'Transcribing' or 'Generating Prompts' state on startup."""
     with Session(engine) as session:
@@ -349,6 +434,20 @@ def read_prompts_from_csv(csv_path: Path) -> List[Dict[str, Any]]:
             rows.append({k: v.strip() if v else "" for k, v in row.items()})
     return rows
 
+def format_eta(seconds: float) -> str:
+    """Formats a remaining duration in seconds into a human-readable telemetry string."""
+    if seconds <= 0:
+        return "Completed"
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    elif m > 0:
+        return f"{m}m {s}s"
+    else:
+        return f"{s}s"
+
 
 async def async_run_project_image_gen_logic(project_id: int):
     """Background rendering processor using the selected style settings & ComfyUI API."""
@@ -396,6 +495,27 @@ async def async_run_project_image_gen_logic(project_id: int):
     state.add_console_log(f"[Image-Gen] Starting generation for project '{project_name}'...")
     state.add_console_log(f"[Image-Gen] Target ComfyUI API Address: {comfy_url}")
 
+    # --- Pre-scan all books to establish Global Batch Progress metrics ---
+    global_total_prompts = 0
+    global_completed_prompts = 0
+    actual_render_durations = []
+
+    for b_info in books_info:
+        csv_path = find_prompts_csv(project_name, b_info["name"])
+        if csv_path:
+            try:
+                rows = read_prompts_from_csv(csv_path)
+                valid_count = 0
+                for r in rows:
+                    p_text = r.get("prompt", "").strip()
+                    if p_text and p_text.lower() != "none" and p_text.lower() != "refusal":
+                        valid_count += 1
+                global_total_prompts += valid_count
+            except Exception:
+                pass
+
+    state.add_console_log(f"[Image-Gen] Global Project Batch Master Prompt Count: {global_total_prompts}")
+
     for b_info in books_info:
         book_id = b_info["id"]
         book_name = b_info["name"]
@@ -436,7 +556,7 @@ async def async_run_project_image_gen_logic(project_id: int):
                     session.commit()
             continue
 
-        state.add_console_log(f"[Image-Gen] Discovered {total_prompts} scenes to process.")
+        state.add_console_log(f"[Image-Gen] Discovered {total_prompts} scenes to process inside {book_name}.")
         
         # Nested target directory initialization
         parent_dir = Path(f"./output/{project_name}/{book_name}")
@@ -471,7 +591,18 @@ async def async_run_project_image_gen_logic(project_id: int):
             if existing_files:
                 state.add_console_log(f"[Image-Gen] Resume Skip: Ch {chapter}, Scene {scene} already rendered.")
                 completed_prompts += 1
+                global_completed_prompts += 1
                 
+                # Update Global project ETA dynamically on resume skips
+                global_remaining = max(0, global_total_prompts - global_completed_prompts)
+                if actual_render_durations:
+                    avg_render_time = sum(actual_render_durations) / len(actual_render_durations)
+                    eta_sec = avg_render_time * global_remaining
+                else:
+                    eta_sec = 10.0 * global_remaining  # fallback guess
+
+                state.batch_eta_label = f"ETA: {format_eta(eta_sec)}"
+
                 progress_val = completed_prompts / total_prompts
                 with Session(engine) as session:
                     db_book = session.get(Book, book_id)
@@ -489,6 +620,10 @@ async def async_run_project_image_gen_logic(project_id: int):
 
             state.add_console_log(f"[Image-Gen] Rendering Ch {chapter}, Scene {scene} with seed {seed}...")
             
+            # Start timer for actual render block execution
+            import time
+            render_start_t = time.time()
+
             # Execute synchronous workflow API block inside background worker thread
             def render_block():
                 return client.generate_image_sync(
@@ -502,6 +637,10 @@ async def async_run_project_image_gen_logic(project_id: int):
 
             img_bytes, logs = await asyncio.to_thread(render_block)
             
+            # Save rendering speed duration
+            render_dur = time.time() - render_start_t
+            actual_render_durations.append(render_dur)
+
             for log_line in logs.split("\n"):
                 if log_line.strip():
                     state.add_console_log(log_line)
@@ -545,8 +684,16 @@ async def async_run_project_image_gen_logic(project_id: int):
                 state.add_console_log(f"[Image-Gen] Failed to retrieve image for Ch {chapter}, Scene {scene}.")
 
             completed_prompts += 1
-            progress_val = completed_prompts / total_prompts
+            global_completed_prompts += 1
             
+            # Update dynamic Global Project Batch ETA predictions
+            global_remaining = max(0, global_total_prompts - global_completed_prompts)
+            avg_render_time = sum(actual_render_durations) / len(actual_render_durations)
+            eta_sec = avg_render_time * global_remaining
+
+            state.batch_eta_label = f"ETA: {format_eta(eta_sec)}"
+
+            progress_val = completed_prompts / total_prompts
             with Session(engine) as session:
                 db_book = session.get(Book, book_id)
                 if db_book:
@@ -563,7 +710,7 @@ async def async_run_project_image_gen_logic(project_id: int):
                     session.add(db_book)
                     session.commit()
 
-
+                    
 async def run_project_image_gen(project_id: int):
     """Wrapper task handling state cleanup, database transitions, and step updating."""
     try:
@@ -618,6 +765,12 @@ def start_image_generation(project_id: int):
     # Auto-save current configurations to disk before starting
     save_project_settings_to_disk(project_id)
 
+    # Initialize Telemetry Clock
+    import time
+    state.batch_start_time = time.time()
+    state.batch_elapsed_sec = 0.0
+    state.batch_eta_label = "ETA: Estimating..."
+
     state.image_gen_active = True
     state.cancel_image_gen_flag = False
     state.project_status = "Rendering Images"
@@ -650,47 +803,66 @@ state.stop_image_generation_cb = stop_transcribing
 # --- Dynamic WebSocket State-Updater (No full page refreshes!) ---
 def check_for_active_transcriptions():
     if state.active_project_id is not None:
-        display_mapping = {
-            "Imported": "Transcription",
-            "Transcribing": "Transcription",
-            "Transcribed": "Prompt Gen",
-            "Generating Prompts": "Prompt Gen",
-            "Prompts Created": "Image Gen",
-            "Rendering Images": "Image Gen",
-            "Images Created": "Finished",
-            "Proofreading": "Finished",
-            "Finished": "Finished"
-        }
-        
         with Session(engine) as session:
             project = session.get(Project, state.active_project_id)
-            if project:
-                # Detect structural transitions to prevent constant polling redraws
-                status_changed = (project.status != state.project_status)
-                state.project_status = project.status
+            if not project:
+                return
                 
-                # Check if we need to update the action button spinner
-                if status_changed and hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
-                    try:
-                        state.action_buttons_refresh()
-                    except Exception:
-                        pass
-                
-                # Re-render the isolated Horizontal Stepper inside header
+            status_changed = (project.status != state.project_status)
+            state.project_status = project.status
+            
+            if status_changed and hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
                 try:
-                    header_controls.refresh()
+                    state.action_buttons_refresh()
                 except Exception:
                     pass
+            
+            try:
+                header_controls.refresh()
+            except Exception:
+                pass
 
-            # Update bound Book statuses and progress values in-place via clean data-bindings
+            # Update timing statistics
+            import time
+            if state.image_gen_active and state.batch_start_time:
+                state.batch_elapsed_sec = time.time() - state.batch_start_time
+
             books = session.exec(select(Book).where(Book.project_id == state.active_project_id)).all()
             for b in books:
                 state.books_progress[b.id] = b.progress
                 state.books_status[b.id] = b.status
-                display_status = display_mapping.get(b.status, b.status)
-                state.books_subtitle[b.id] = f"{display_status} • {int(b.progress * 100)}%"
+                
+                # Fetch step-aware statistics on disk
+                stats = get_book_stats_cached(project.name, b.name)
+                
+                # Dynamic subtitle based on project step status
+                if project.status in ("Imported", "Transcribing"):
+                    if b.status == "Transcribing":
+                        state.books_subtitle[b.id] = f"Transcribing... {int(b.progress * 100)}%"
+                    elif stats["has_transcript"]:
+                        state.books_subtitle[b.id] = f"{stats['word_count']:,} words • {stats['estimated_scenes']} est. scenes"
+                    else:
+                        state.books_subtitle[b.id] = "Awaiting transcription"
+                        
+                elif project.status in ("Transcribed", "Generating Prompts"):
+                    if b.status == "Generating Prompts":
+                        state.books_subtitle[b.id] = f"Generating prompts... {int(b.progress * 100)}%"
+                    elif stats["total_prompts"] > 0:
+                        state.books_subtitle[b.id] = f"{stats['total_prompts']} scene prompts ready"
+                    elif stats["has_transcript"]:
+                        state.books_subtitle[b.id] = f"{stats['word_count']:,} words • Ready"
+                    else:
+                        state.books_subtitle[b.id] = "Awaiting prompts"
+                        
+                else:  # Image Generation, Finished, or Proofreading states
+                    total_scenes = stats["total_prompts"] or stats["estimated_scenes"] or 1
+                    if b.status == "Rendering Images":
+                        state.books_subtitle[b.id] = f"Rendering: {stats['generated_images']} / {total_scenes} ({int(b.progress * 100)}%)"
+                    elif stats["approved_prompts"] == total_scenes and total_scenes > 0:
+                        state.books_subtitle[b.id] = f"All Approved! • {total_scenes} scenes"
+                    else:
+                        state.books_subtitle[b.id] = f"Rendered: {stats['generated_images']}/{total_scenes} ({stats['approved_prompts']} approved)"
 
-            # Re-calculate project-level overall progress reactively
             if books:
                 avg_progress = sum(b.progress for b in books) / len(books)
             else:
@@ -698,7 +870,6 @@ def check_for_active_transcriptions():
             state.project_progress = avg_progress
             state.project_progress_label = f"Batch Progress ({int(avg_progress * 100)}%)"
 
-        # Stream newly added log lines to stable log widget (Leaves scrollbar untouched!)
         if state.active_log_widget:
             try:
                 new_logs = state.console_logs[state.logs_pushed_index:]
@@ -708,7 +879,6 @@ def check_for_active_transcriptions():
             except Exception:
                 pass
 
-        # Refresh the live Prompt Generation Feed dynamically
         if hasattr(state, 'recent_prompts_refresh'):
             try:
                 state.recent_prompts_refresh()
@@ -757,7 +927,6 @@ def render_split_panel_shell(project_id: int):
             ).props('flat dense').classes('text-slate-600 text-xs self-start -ml-2 mb-2')
             
             # --- Project Global Header Card ---
-            # Dynamically style the project card if it is currently selected (when active_book_id is None)
             project_card_bg = 'bg-blue-50/70 border-blue-100/50 text-blue-700 font-bold' if state.active_book_id is None else 'bg-slate-50/50 hover:bg-slate-100'
 
             with ui.card().classes(f'w-full border p-3 rounded-lg shadow-xs gap-2 cursor-pointer transition-all {project_card_bg}') \
@@ -771,11 +940,19 @@ def render_split_panel_shell(project_id: int):
                 ui.label(project.name).classes('text-sm font-bold text-slate-800 leading-tight truncate')
                 
                 with ui.column().classes('w-full gap-0.5 mt-1'):
-                    # BIND TEXT AND VALUE REACTIVELY (Updates dynamically with zero page redraws!)
                     ui.label('').classes('text-[9px] font-bold text-slate-500 uppercase tracking-wide') \
                         .bind_text_from(state, 'project_progress_label')
                     ui.linear_progress(show_value=False).classes('w-full h-1.5 rounded-full') \
                         .bind_value_from(state, 'project_progress')
+
+            # --- Project Real-Time Telemetry telemetry ---
+            with ui.card().classes('w-full bg-slate-50 border p-2.5 rounded-lg gap-1') \
+                    .bind_visibility_from(state, 'image_gen_active'):
+                with ui.row().classes('w-full justify-between items-center text-[9px] font-black text-slate-500 uppercase tracking-wider'):
+                    ui.label('Batch Telemetry')
+                    ui.label().classes('text-blue-600 font-bold').bind_text_from(state, 'batch_eta_label')
+                with ui.row().classes('w-full justify-between items-center text-[9px] font-semibold text-slate-400'):
+                    ui.label().bind_text_from(state, 'batch_elapsed_sec', backward=lambda s: f"Elapsed: {int(s//60)}m {int(s%60)}s")
             
             ui.separator()
             ui.label('Books & Volumes').classes('text-[10px] font-bold text-slate-400 tracking-wider uppercase px-1')
@@ -788,40 +965,29 @@ def render_split_panel_shell(project_id: int):
                     if book.id not in state.books_status:
                         state.books_status[book.id] = book.status
                     if book.id not in state.books_subtitle:
-                        display_status = display_mapping.get(book.status, book.status)
-                        state.books_subtitle[book.id] = f"{display_status} • {int(book.progress * 100)}%"
+                        # Fetch initial stats
+                        stats = get_book_stats_cached(project.name, book.name)
+                        total_scenes = stats["total_prompts"] or stats["estimated_scenes"] or 1
+                        state.books_subtitle[book.id] = f"Rendered: {stats['generated_images']}/{total_scenes}"
 
                     book_bg = 'bg-blue-50/70 border border-blue-100/50 text-blue-700 font-bold' if state.active_book_id == book.id else 'hover:bg-slate-50 text-slate-700'
                     with ui.row().classes(f'w-full p-2 rounded-lg cursor-pointer items-center justify-between transition-colors {book_bg}') \
                             .on('click', lambda b_id=book.id: select_book(b_id)):
-                        with ui.row().classes('items-center gap-2 truncate flex-1'):
+                        with ui.row().classes('items-center gap-3 truncate flex-1'):
+                            # Upgrade cover sizes to beautiful standard 2:3 aspect ratio (w-10 h-14)
                             if book.cover_path:
-                                ui.image(book.cover_path).classes('w-7 h-7 rounded object-cover shadow-xs border flex-shrink-0')
+                                ui.image(book.cover_path).classes('w-10 h-14 rounded object-cover shadow-sm border flex-shrink-0')
                             else:
-                                ui.icon('library_books', size='xs', color='slate-400')
+                                with ui.column().classes('w-10 h-14 bg-slate-50 border border-dashed rounded items-center justify-center flex-shrink-0 text-slate-400'):
+                                    ui.icon('library_books', size='16px')
                             
-                            with ui.column().classes('gap-0 truncate flex-1'):
-                                ui.label(book.name).classes('text-xs font-semibold truncate max-w-[120px]')
-                                # BIND TEXT REACTIVELY (Updates only this label, zero page redraws!)
-                                ui.label('').classes('text-[9px] font-medium text-slate-500 truncate max-w-[120px]') \
+                            # Multi-line column container: allows subtitles to wrap gracefully without truncating
+                            with ui.column().classes('gap-0.5 flex-1 min-w-0'):
+                                ui.label(book.name).classes('text-xs font-semibold truncate leading-tight')
+                                # BIND TEXT REACTIVELY (Supports multi-line wraps cleanly!)
+                                ui.label('').classes('text-[9px] font-medium text-slate-500 leading-normal break-words') \
                                     .bind_text_from(state.books_subtitle, book.id)
-                        
-                        # --- Compact Dynamic Processing Indicators ---
-                        # Standardized visual processing dots
-                        with ui.row().classes('items-center gap-1 flex-shrink-0'):
-                            # Render checkmark on completion
-                            ui.icon('check_circle', color='emerald-500', size='14px') \
-                                .bind_visibility_from(state.books_status, book.id, backward=lambda val: val in ("Images Created", "Finished"))
-                            
-                            # Render pulsing indicators depending on which step the book is undergoing
-                            ui.element('div').classes('w-2 h-2 rounded-full bg-blue-500 animate-pulse') \
-                                .bind_visibility_from(state.books_status, book.id, backward=lambda val: val in ("Transcribing",))
                                 
-                            ui.element('div').classes('w-2 h-2 rounded-full bg-purple-500 animate-pulse') \
-                                .bind_visibility_from(state.books_status, book.id, backward=lambda val: val in ("Generating Prompts",))
-                                
-                            ui.element('div').classes('w-2 h-2 rounded-full bg-amber-500 animate-pulse') \
-                                .bind_visibility_from(state.books_status, book.id, backward=lambda val: val in ("Rendering Images",))
 
         # RIGHT WORKSPACE ROUTER
         with ui.column().classes('w-full gap-4'):

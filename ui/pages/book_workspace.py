@@ -650,7 +650,13 @@ def render_book_tabs(book_id: int):
 
     # --- Gallery Grid View Rendering ---
     
+    # Memory dictionary to cache DOM references of grid cards for fluid in-place updates
+    grid_card_references: Dict[tuple, Dict[str, Any]] = {}
+
     def render_grid_view(filtered_list: list):
+        """Renders the gallery layout once, establishing DOM references for smooth updates."""
+        grid_card_references.clear()
+        
         def switch_to_theatre(idx_val: int):
             view_mode.value = "Theatre"
             state.book_active_scene_idx = idx_val
@@ -668,28 +674,43 @@ def render_book_tabs(book_id: int):
                     
                 img_url = images_cache.get((ch, sc))
                 
+                # Standardize initial styles
                 if not img_url:
                     border_style = "border-red-300 bg-red-50/10"
-                    status_color = "red-500"
+                    status_color = "bg-red-500"
                 elif is_approved:
                     border_style = "border-emerald-300 bg-emerald-50/10"
-                    status_color = "emerald-500"
+                    status_color = "bg-emerald-500"
                 else:
                     border_style = "border-amber-300 bg-amber-50/10"
-                    status_color = "amber-500"
+                    status_color = "bg-amber-500"
                     
                 with ui.card().classes(f'border rounded-lg shadow-sm p-2 cursor-pointer hover:shadow-md transition-all {border_style}') \
-                        .on('click', lambda _, idx_val=idx: switch_to_theatre(idx_val)):
-                    if img_url:
-                        ui.image(img_url).classes('w-full aspect-square rounded object-cover border')
-                    else:
-                        with ui.column().classes('w-full aspect-square items-center justify-center bg-slate-100 rounded border border-dashed text-slate-400'):
-                            ui.icon('photo_library', size='sm')
-                            ui.label('Missing').classes('text-[9px]')
+                        .on('click', lambda _, idx_val=idx: switch_to_theatre(idx_val)) as card_el:
+                    
+                    # Both elements are built once; we toggle visibility in-place
+                    img_el = ui.image(img_url or "").classes('w-full aspect-square rounded object-cover border')
+                    img_el.visible = bool(img_url)
+                    
+                    placeholder_el = ui.column().classes('w-full aspect-square items-center justify-center bg-slate-100 rounded border border-dashed text-slate-400')
+                    with placeholder_el:
+                        ui.icon('photo_library', size='sm')
+                        ui.label('Missing').classes('text-[9px]')
+                    placeholder_el.visible = not img_url
                             
                     with ui.row().classes('w-full justify-between items-center mt-1 px-1'):
                         ui.label(f"Ch {item.get('chapter')}, Sc {item.get('scene')}").classes('text-[10px] font-bold text-slate-700')
-                        ui.element('div').classes(f'w-2 h-2 rounded-full bg-{status_color}')
+                        dot_el = ui.element('div').classes(f'w-2 h-2 rounded-full {status_color}')
+                        
+                # Store references for fluid updates
+                grid_card_references[(ch, sc)] = {
+                    "card": card_el,
+                    "image": img_el,
+                    "placeholder": placeholder_el,
+                    "dot": dot_el,
+                    "item": item
+                }
+
 
     # --- Parent Workspace Loader ---
     
@@ -709,6 +730,7 @@ def render_book_tabs(book_id: int):
             render_theatre_view(filtered, current_idx)
         else:
             render_grid_view(filtered)
+
 
     # --- Centralized Key Bindings Handler ---
     
@@ -742,19 +764,16 @@ def render_book_tabs(book_id: int):
             ui.notify("Pipeline process control callbacks are not fully registered in state.", type="negative")
             return
 
-        # If background loop is currently running, flag cancel and wait gracefully for the active image to finish
         if state.project_status == "Rendering Images" or state.image_gen_active:
             ui.notify("Waiting for current image to finish rendering before restarting...", type="info", timeout=2.0)
             state.cancel_image_gen_flag = True
             
-            # Wait gracefully for the background task to finish its active generation pass and exit
             while state.image_gen_active:
                 await asyncio.sleep(0.5)
                 
         state.cancel_image_gen_flag = False
         state.image_gen_active = False
         
-        # Kickstart generation fresh
         start_fn(project.id)
 
     # --- Top Interface Toolbar ---
@@ -811,10 +830,41 @@ def render_book_tabs(book_id: int):
     # Initial render
     render_content()
 
-    # --- Real-Time Background Image Pop-in Timer (Optimized) ---
+
+    # --- Real-Time Background Image Pop-in Timer (Optimized In-Place!) ---
     
     last_file_count = [len(images_cache)]
     
+    def update_grid_views_in_place():
+        """Updates rendering frames, cards, and dots in-place with zero layout shifts."""
+        for (ch, sc), ref in grid_card_references.items():
+            img_url = images_cache.get((ch, sc))
+            is_approved = ref["item"].get("approved", "False").strip().lower() == "true"
+            
+            # Formulate class lists dynamically
+            if not img_url:
+                border_style = "border-red-300 bg-red-50/10"
+                dot_color = "bg-red-500"
+            elif is_approved:
+                border_style = "border-emerald-300 bg-emerald-50/10"
+                dot_color = "bg-emerald-500"
+            else:
+                border_style = "border-amber-300 bg-amber-50/10"
+                dot_color = "bg-amber-500"
+                
+            # Perform targeted, non-destructive WebSockets updates
+            ref["card"].classes(replace=f"border rounded-lg shadow-sm p-2 cursor-pointer hover:shadow-md transition-all {border_style}")
+            ref["dot"].classes(replace=f"w-2 h-2 rounded-full {dot_color}")
+            
+            if img_url:
+                ref["image"].set_source(img_url)
+                ref["image"].visible = True
+                ref["placeholder"].visible = False
+            else:
+                ref["image"].visible = False
+                ref["placeholder"].visible = True
+
+
     def check_for_image_updates():
         if state.active_book_id is None:
             return
@@ -831,15 +881,15 @@ def render_book_tabs(book_id: int):
         if count != last_file_count[0]:
             last_file_count[0] = count
             
-            # Reload the memory URL cache
+            # Reload only the fast memory lookup dict
             nonlocal images_cache
             images_cache = get_book_images_cache(project_name, book_name)
             
-            # Localized refreshes
+            # Update active view using non-destructive, zero-shift refreshes
             if view_mode.value == "Theatre":
                 update_active_scene_ui()
             else:
-                render_content.refresh()
+                update_grid_views_in_place()
             
     # Check for newly generated images every 3 seconds
     ui.timer(3.0, check_for_image_updates)
