@@ -282,6 +282,21 @@ def stop_transcribing(project_id: int):
 def start_prompt_generation(project_id: int):
     """Launches the asynchronous, interruptible, and resumable prompt generation process."""
     from services.prompt_engine import start_project_prompt_gen
+    
+    # Reset all books to start prompt generation at 0% progress
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if project:
+            project.status = "Generating Prompts"
+            session.add(project)
+            
+            books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+            for b in books:
+                b.status = "Generating Prompts"
+                b.progress = 0.0
+                session.add(b)
+            session.commit()
+            
     asyncio.create_task(start_project_prompt_gen(project_id))
     ui.notify("Background prompt generation sequences initiated!", type="positive")
     
@@ -304,8 +319,7 @@ def save_image_with_metadata(img_bytes: bytes, output_path: Path, quote: str):
     """Uses Pillow to write the target quote text into description metadata chunk of the PNG."""
     image = Image.open(io.BytesIO(img_bytes))
     metadata = PngInfo()
-    metadata.add_text("Description", quote)
-    metadata.add_text("TargetQuote", quote)
+    metadata.add_text("Quote", quote)
     image.save(output_path, "PNG", pnginfo=metadata)
 
 
@@ -617,6 +631,7 @@ def start_image_generation(project_id: int):
             books = session.exec(select(Book).where(Book.project_id == project_id)).all()
             for b in books:
                 b.status = "Rendering Images"
+                b.progress = 0.0  # Reset progress to start rendering fresh visually
                 session.add(b)
             session.commit()
     
@@ -635,6 +650,18 @@ state.stop_image_generation_cb = stop_transcribing
 # --- Dynamic WebSocket State-Updater (No full page refreshes!) ---
 def check_for_active_transcriptions():
     if state.active_project_id is not None:
+        display_mapping = {
+            "Imported": "Transcription",
+            "Transcribing": "Transcription",
+            "Transcribed": "Prompt Gen",
+            "Generating Prompts": "Prompt Gen",
+            "Prompts Created": "Image Gen",
+            "Rendering Images": "Image Gen",
+            "Images Created": "Proofreading",
+            "Proofreading": "Proofreading",
+            "Finished": "Finished"
+        }
+        
         with Session(engine) as session:
             project = session.get(Project, state.active_project_id)
             if project:
@@ -660,7 +687,16 @@ def check_for_active_transcriptions():
             for b in books:
                 state.books_progress[b.id] = b.progress
                 state.books_status[b.id] = b.status
-                state.books_subtitle[b.id] = f"{b.status} • {int(b.progress * 100)}%"
+                display_status = display_mapping.get(b.status, b.status)
+                state.books_subtitle[b.id] = f"{display_status} • {int(b.progress * 100)}%"
+
+            # Re-calculate project-level overall progress reactively
+            if books:
+                avg_progress = sum(b.progress for b in books) / len(books)
+            else:
+                avg_progress = 0.0
+            state.project_progress = avg_progress
+            state.project_progress_label = f"Batch Progress ({int(avg_progress * 100)}%)"
 
         # Stream newly added log lines to stable log widget (Leaves scrollbar untouched!)
         if state.active_log_widget:
@@ -672,7 +708,7 @@ def check_for_active_transcriptions():
             except Exception:
                 pass
 
-        # 4. Refresh the live Prompt Generation Feed dynamically
+        # Refresh the live Prompt Generation Feed dynamically
         if hasattr(state, 'recent_prompts_refresh'):
             try:
                 state.recent_prompts_refresh()
@@ -690,8 +726,26 @@ def render_split_panel_shell(project_id: int):
             return
         books = session.exec(select(Book).where(Book.project_id == project.id)).all()
 
-    # Seed static binding dictionaries on initial layout rendering
+    # Seed static binding dictionaries and initial progress on initial layout rendering
     state.project_status = project.status
+    if books:
+        initial_avg = sum(b.progress for b in books) / len(books)
+    else:
+        initial_avg = 0.0
+    state.project_progress = initial_avg
+    state.project_progress_label = f"Batch Progress ({int(initial_avg * 100)}%)"
+
+    display_mapping = {
+        "Imported": "Transcription",
+        "Transcribing": "Transcription",
+        "Transcribed": "Prompt Gen",
+        "Generating Prompts": "Prompt Gen",
+        "Prompts Created": "Image Gen",
+        "Rendering Images": "Image Gen",
+        "Images Created": "Proofreading",
+        "Proofreading": "Proofreading",
+        "Finished": "Finished"
+    }
 
     with ui.grid(columns='260px 1fr').classes('w-full gap-6 items-start'):
         # LEFT NAVIGATION SIDEBAR
@@ -703,9 +757,6 @@ def render_split_panel_shell(project_id: int):
             ).props('flat dense').classes('text-slate-600 text-xs self-start -ml-2 mb-2')
             
             # --- Project Global Header Card ---
-            total_books = len(books)
-            overall_progress = sum(b.progress for b in books) / total_books if total_books > 0 else 0.0
-            
             # Dynamically style the project card if it is currently selected (when active_book_id is None)
             project_card_bg = 'bg-blue-50/70 border-blue-100/50 text-blue-700 font-bold' if state.active_book_id is None else 'bg-slate-50/50 hover:bg-slate-100'
 
@@ -713,17 +764,18 @@ def render_split_panel_shell(project_id: int):
                     .on('click', lambda: select_project(project.id)):
                 with ui.row().classes('items-center gap-2 w-full justify-between'):
                     ui.icon('folder' if project.is_batch else 'menu_book', size='sm', color='slate-700')
-                    # Dynamic Project Status Badge
-                    ui.badge(
-                        state.project_status
-                    ).classes('px-2 py-0.5 text-[10px] font-bold rounded-full').bind_text_from(state, 'project_status')
+                    # Dynamic Project Status Badge mapped to active step
+                    ui.badge().classes('px-2 py-0.5 text-[10px] font-bold rounded-full bg-blue-100 text-blue-800') \
+                        .bind_text_from(state, 'project_status', backward=lambda val: display_mapping.get(val, val))
                     
                 ui.label(project.name).classes('text-sm font-bold text-slate-800 leading-tight truncate')
                 
                 with ui.column().classes('w-full gap-0.5 mt-1'):
-                    ui.label(f'Batch Progress ({int(overall_progress*100)}%)').classes('text-[9px] font-bold text-slate-500 uppercase tracking-wide')
-                    # Overall visual progress bar
-                    ui.linear_progress(value=overall_progress, show_value=False).classes('w-full h-1.5 rounded-full')
+                    # BIND TEXT AND VALUE REACTIVELY (Updates dynamically with zero page redraws!)
+                    ui.label('').classes('text-[9px] font-bold text-slate-500 uppercase tracking-wide') \
+                        .bind_text_from(state, 'project_progress_label')
+                    ui.linear_progress(show_value=False).classes('w-full h-1.5 rounded-full') \
+                        .bind_value_from(state, 'project_progress')
             
             ui.separator()
             ui.label('Books & Volumes').classes('text-[10px] font-bold text-slate-400 tracking-wider uppercase px-1')
@@ -736,7 +788,8 @@ def render_split_panel_shell(project_id: int):
                     if book.id not in state.books_status:
                         state.books_status[book.id] = book.status
                     if book.id not in state.books_subtitle:
-                        state.books_subtitle[book.id] = f"{book.status} • {int(book.progress * 100)}%"
+                        display_status = display_mapping.get(book.status, book.status)
+                        state.books_subtitle[book.id] = f"{display_status} • {int(book.progress * 100)}%"
 
                     book_bg = 'bg-blue-50/70 border border-blue-100/50 text-blue-700 font-bold' if state.active_book_id == book.id else 'hover:bg-slate-50 text-slate-700'
                     with ui.row().classes(f'w-full p-2 rounded-lg cursor-pointer items-center justify-between transition-colors {book_bg}') \

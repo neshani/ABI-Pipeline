@@ -8,16 +8,28 @@ from services.scanner import scan_directory, ingest_project
 from ui import state
 
 def get_status_badge(status: str):
+    display_mapping = {
+        "Imported": "Transcription",
+        "Transcribing": "Transcription",
+        "Transcribed": "Prompt Gen",
+        "Generating Prompts": "Prompt Gen",
+        "Prompts Created": "Image Gen",
+        "Rendering Images": "Image Gen",
+        "Images Created": "Proofreading",
+        "Proofreading": "Proofreading",
+        "Finished": "Finished"
+    }
+    display_status = display_mapping.get(status, status)
+    
     styles = {
-        "Imported": "bg-slate-200 text-slate-700",
-        "Transcribing": "bg-blue-100 text-blue-800 border-blue-200",
-        "Transcribed": "bg-emerald-100 text-emerald-800 border-emerald-200",
-        "Prompts Created": "bg-purple-100 text-purple-800 border-purple-200",
-        "Images Created": "bg-amber-100 text-amber-800 border-amber-200",
+        "Transcription": "bg-slate-200 text-slate-700",
+        "Prompt Gen": "bg-blue-100 text-blue-800 border-blue-200",
+        "Image Gen": "bg-purple-100 text-purple-800 border-purple-200",
+        "Proofreading": "bg-amber-100 text-amber-800 border-amber-200",
         "Finished": "bg-emerald-100 text-emerald-800 border-emerald-200"
     }
-    style = styles.get(status, "bg-slate-100 text-slate-800")
-    return ui.badge(status).classes(f'px-3 py-1 text-xs rounded-full font-medium {style}')
+    style = styles.get(display_status, "bg-slate-100 text-slate-800")
+    return ui.badge(display_status).classes(f'px-3 py-1 text-xs rounded-full font-medium {style}')
 
 
 @ui.refreshable

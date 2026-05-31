@@ -128,9 +128,7 @@ def rollback_project_status(project_id: int, target_status: str, refresh_callbac
         books = session.exec(select(Book).where(Book.project_id == project_id)).all()
         for b in books:
             b.status = target_status
-            if target_status == "Imported":
-                b.progress = 0.0
-            elif target_status == "Transcribed":
+            if target_status in ("Imported", "Transcribed", "Prompts Created"):
                 b.progress = 0.0
             session.add(b)
             

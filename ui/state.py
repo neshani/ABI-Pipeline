@@ -19,9 +19,11 @@ custom_project_name_value: str = ""
 
 # --- Stable UI Binding Stores (Dictionaried mapped by ID) ---
 project_status: str = "Imported"
+project_progress: float = 0.0
+project_progress_label: str = "Batch Progress (0%)"
 books_progress: Dict[int, float] = {}  # {book_id: float}
 books_status: Dict[int, str] = {}      # {book_id: status}
-books_subtitle: Dict[int, str] = {}    # {book_id: "status • percentage%"}
+books_subtitle: Dict[int, str] = {}    # {book_id: "status â€¢ percentage%"}
 
 # --- Stable Live Logger Tracker ---
 console_logs: List[str] = [
