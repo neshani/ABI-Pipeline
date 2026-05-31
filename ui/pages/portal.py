@@ -15,8 +15,8 @@ def get_status_badge(status: str):
         "Generating Prompts": "Prompt Gen",
         "Prompts Created": "Image Gen",
         "Rendering Images": "Image Gen",
-        "Images Created": "Proofreading",
-        "Proofreading": "Proofreading",
+        "Images Created": "Finished",
+        "Proofreading": "Finished",
         "Finished": "Finished"
     }
     display_status = display_mapping.get(status, status)
@@ -25,7 +25,6 @@ def get_status_badge(status: str):
         "Transcription": "bg-slate-200 text-slate-700",
         "Prompt Gen": "bg-blue-100 text-blue-800 border-blue-200",
         "Image Gen": "bg-purple-100 text-purple-800 border-purple-200",
-        "Proofreading": "bg-amber-100 text-amber-800 border-amber-200",
         "Finished": "bg-emerald-100 text-emerald-800 border-emerald-200"
     }
     style = styles.get(display_status, "bg-slate-100 text-slate-800")

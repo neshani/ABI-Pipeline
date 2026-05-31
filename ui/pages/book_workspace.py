@@ -761,11 +761,11 @@ def render_book_tabs(book_id: int):
     
     with ui.row().classes('w-full justify-between items-center bg-white p-3 border rounded-xl shadow-xs mb-4'):
         with ui.row().classes('items-center gap-4'):
-            # View toggle
+            # View toggle (Bi-directionally bound to sync top buttons on grid-click!)
             ui.toggle(
-                options=["Theatre", "Gallery Grid"], 
-                on_change=lambda e: (setattr(view_mode, 'value', e.value), render_content.refresh())
-            ).classes('text-xs').bind_value_to(view_mode, 'value')
+                options=["Theatre", "Gallery Grid"],
+                on_change=lambda e: render_content.refresh()
+            ).classes('text-xs').bind_value(view_mode, 'value')
             
             # Filtering selector
             ui.select(
@@ -780,6 +780,23 @@ def render_book_tabs(book_id: int):
                 icon='refresh', 
                 on_click=trigger_batch_restart
             ).classes('bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 h-10')
+
+            # --- A3: Stop image generation button ---
+            # Automatically appears if ComfyUI renders are currently running in the background
+            def trigger_stop_rendering():
+                stop_fn = getattr(state, 'stop_image_generation_cb', None)
+                if stop_fn:
+                    stop_fn(project.id)
+                    ui.notify("Stop signal dispatched. Halting after active image completes...", type="warning")
+                else:
+                    ui.notify("Stop callback is not registered.", type="negative")
+
+            ui.button(
+                'Stop Rendering',
+                icon='stop',
+                on_click=trigger_stop_rendering
+            ).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 h-10') \
+             .bind_visibility_from(state, 'image_gen_active')
             
         # Shortcuts Reminder Label
         with ui.row().classes('items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-lg border text-[11px] font-semibold text-slate-500'):

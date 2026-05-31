@@ -657,8 +657,8 @@ def check_for_active_transcriptions():
             "Generating Prompts": "Prompt Gen",
             "Prompts Created": "Image Gen",
             "Rendering Images": "Image Gen",
-            "Images Created": "Proofreading",
-            "Proofreading": "Proofreading",
+            "Images Created": "Finished",
+            "Proofreading": "Finished",
             "Finished": "Finished"
         }
         
@@ -742,8 +742,8 @@ def render_split_panel_shell(project_id: int):
         "Generating Prompts": "Prompt Gen",
         "Prompts Created": "Image Gen",
         "Rendering Images": "Image Gen",
-        "Images Created": "Proofreading",
-        "Proofreading": "Proofreading",
+        "Images Created": "Finished",
+        "Proofreading": "Finished",
         "Finished": "Finished"
     }
 

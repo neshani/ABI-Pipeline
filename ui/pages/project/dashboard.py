@@ -11,7 +11,7 @@ from database.connection import get_setting, engine
 from ui.pages.project.style_playground import render_style_playground_tab, open_style_chooser_modal_globally
 from ui.pages.project.prompt_playground import render_prompt_playground_tab, list_stored_templates, load_template_by_name
 
-STAGES = ["Imported", "Transcription", "Prompt Gen", "Image Gen", "Proofreading", "Finished"]
+STAGES = ["Imported", "Transcription", "Prompt Gen", "Image Gen", "Finished"]
 
 def get_active_stage_idx(status: str) -> int:
     mapping = {
@@ -23,7 +23,7 @@ def get_active_stage_idx(status: str) -> int:
         "Rendering Images": 3,
         "Images Created": 4,
         "Proofreading": 4,
-        "Finished": 5
+        "Finished": 4
     }
     return mapping.get(status, 0)
 
@@ -204,6 +204,10 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
                 loaded = load_template_by_name(val)
                 if loaded:
                     state.playground_template = loaded
+                    # Auto-persist chosen template layout settings immediately
+                    from main import save_project_settings_to_disk
+                    if state.active_project_id:
+                        save_project_settings_to_disk(state.active_project_id)
                     ui.notify(f"Active Prompt Template changed to: {val}", type="info")
 
             ui.select(

@@ -289,6 +289,12 @@ class StyleChooserModal:
 
     def apply_selection(self):
         """Fires the client callback applying this style selection, then closes the dialog."""
+        # A5: Write applied metadata selections directly back to the global state bindings
+        state.style_selected_preset = self.selected_style
+        state.style_prompt_prefix = self.style_prefix
+        state.style_negative_prompt = self.style_negative
+        state.style_selected_workflow = self.style_workflow
+        
         self.on_apply(self.selected_style)
         if self.dialog:
             self.dialog.close()
