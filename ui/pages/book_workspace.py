@@ -13,7 +13,7 @@ from ui import state
 try:
     app.add_static_files('/output_media', './output')
 except Exception:
-    pass # Already registered globally
+    pass
 
 
 # --- Robust CSV Loading & Saving Utilities ---
@@ -49,7 +49,6 @@ def load_prompts_csv(project_name: str, book_name: str) -> List[Dict[str, Any]]:
                     if k:
                         cleaned_row[k.strip().lower()] = v.strip() if v else ""
                 
-                # Back-fill approved column if it was never created
                 if "approved" not in cleaned_row:
                     cleaned_row["approved"] = "False"
                 rows.append(cleaned_row)
@@ -89,10 +88,7 @@ def save_prompts_csv(project_name: str, book_name: str, rows: List[Dict[str, Any
 # --- High Performance Directory Caching & Parsing ---
 
 def get_book_images_cache(project_name: str, book_name: str) -> Dict[tuple, str]:
-    """
-    Scans directories once using fast system listings.
-    Returns a fast lookup dictionary mapping {(chapter, scene): static_url_path_with_timestamp}.
-    """
+    """Scans directories once. Returns a fast lookup dict mapping {(chapter, scene): static_url}."""
     cache = {}
     out_dirs = [
         (Path(f"./output/{project_name}/{book_name}/images"), f"/output_media/{project_name}/{book_name}/images"),
@@ -112,7 +108,6 @@ def get_book_images_cache(project_name: str, book_name: str) -> Dict[tuple, str]
                         try:
                             ch = int(parts[0])
                             sc = int(parts[1])
-                            # Perfect cache busting: append modification time to target URL
                             mtime = int(item_path.stat().st_mtime)
                             cache[(ch, sc)] = f"{url_prefix}/{filename}?t={mtime}"
                         except ValueError:
@@ -140,7 +135,6 @@ def delete_scene_image_file(project_name: str, book_name: str, chapter_str: str,
     for d in out_dirs:
         if not d.exists():
             continue
-        # Standard glob matches are safe during singular user action deletion
         matches = list(d.glob(f"{chapter:02d}_{scene:02d}_*.png")) or list(d.glob(f"{chapter:02d}_{scene:02d}.png"))
         for m in matches:
             try:
@@ -170,11 +164,9 @@ def find_quote_context(project_name: str, book_name: str, quote: str) -> str:
     text_lower = text.lower()
     quote_lower = quote.lower()
     
-    # Primary lookup
     idx = text_lower.find(quote_lower)
     match_len = len(quote)
     
-    # Fallback to fuzzy substring matches
     if idx == -1 and len(quote_lower) > 25:
         idx = text_lower.find(quote_lower[:25])
         match_len = 25
@@ -223,7 +215,7 @@ def render_book_tabs(book_id: int):
     project_name = project.name
     book_name = book.name
 
-    # Initialize shortcuts configuration in state
+    # Initialize shortcuts and key tracking in state
     if not hasattr(state, 'key_approve'):
         state.key_approve = 'a'
     if not hasattr(state, 'key_delete'):
@@ -232,18 +224,20 @@ def render_book_tabs(book_id: int):
         state.key_next = 'f'
     if not hasattr(state, 'key_prev'):
         state.key_prev = 's'
+    if not hasattr(state, 'book_active_chapter'):
+        state.book_active_chapter = 1
+    if not hasattr(state, 'book_active_scene'):
+        state.book_active_scene = 1
 
-    # Lazy-load prompts
+    # Lazy-load prompts and scan directories once at load
     prompts = load_prompts_csv(project_name, book_name)
-
-    # Scans directory ONCE at page load
     images_cache = get_book_images_cache(project_name, book_name)
 
-    # Scoped book index
     if not hasattr(state, 'book_active_scene_idx'):
         state.book_active_scene_idx = 0
 
-    # Cross-Platform Directory Opening Helper
+    # --- 1. NESTED HANDLERS DEFINED FIRST (Prevents UnboundLocalErrors) ---
+
     def open_directory(path: Path):
         abs_path = path.resolve()
         if not abs_path.exists():
@@ -258,18 +252,330 @@ def render_book_tabs(book_id: int):
         except Exception as e:
             ui.notify(f"Failed to open directory: {str(e)}", type="negative")
 
-    # Clean Header Panel with Explorer Button
-    with ui.row().classes('w-full justify-between items-center mb-2 border-b pb-2'):
-        with ui.row().classes('items-center gap-2'):
-            ui.icon('library_books', size='sm', color='slate-700')
-            ui.label(f'Volume: {book_name}').classes('text-lg font-bold text-slate-800')
-        ui.button(
-            'Open Folder', 
-            icon='folder_open', 
-            on_click=lambda: open_directory(Path(f"./output/{project_name}/{book_name}"))
-        ).props('flat dense').classes('text-xs text-slate-600')
+    def get_filtered_prompts():
+        filtered = []
+        for p in prompts:
+            is_approved = p.get("approved", "False").strip().lower() == "true"
+            try:
+                ch = int(float(p.get("chapter", "1")))
+                sc = int(float(p.get("scene", "1")))
+            except ValueError:
+                ch, sc = 1, 1
+            has_image = (ch, sc) in images_cache
+            
+            if filter_mode.value == "Unapproved Only":
+                if has_image and not is_approved:
+                    filtered.append(p)
+            elif filter_mode.value == "Missing Only":
+                if not has_image:
+                    filtered.append(p)
+            else:
+                filtered.append(p)
+        return filtered
 
-    # Awaiting Generation Panel (Shown only when prompts are missing)
+    def update_prompt_text(val: str, row_dict: dict):
+        if row_dict:
+            row_dict["prompt"] = val.strip()
+            save_prompts_csv(project_name, book_name, prompts)
+            try:
+                ch = int(float(row_dict.get("chapter", "1")))
+                sc = int(float(row_dict.get("scene", "1")))
+                if (ch, sc) in grid_card_references:
+                    grid_card_references[(ch, sc)]["item"]["prompt"] = val.strip()
+            except ValueError:
+                pass
+
+    def get_current_filtered_index(filtered_list: list) -> int:
+        for idx, p in enumerate(filtered_list):
+            try:
+                ch = int(float(p.get("chapter", "1")))
+                sc = int(float(p.get("scene", "1")))
+            except ValueError:
+                ch, sc = 1, 1
+            if ch == state.book_active_chapter and sc == state.book_active_scene:
+                return idx
+        return 0
+
+    def update_active_scene_ui():
+        filtered = get_filtered_prompts()
+        if not filtered:
+            return
+            
+        current_scene = None
+        for p in filtered:
+            try:
+                ch = int(float(p.get("chapter", "1")))
+                sc = int(float(p.get("scene", "1")))
+            except ValueError:
+                ch, sc = 1, 1
+            if ch == state.book_active_chapter and sc == state.book_active_scene:
+                current_scene = p
+                break
+                
+        # Fallback if the active item was filtered out (e.g. approved)
+        if not current_scene:
+            current_scene = filtered[0]
+            try:
+                state.book_active_chapter = int(float(current_scene.get("chapter", "1")))
+                state.book_active_scene = int(float(current_scene.get("scene", "1")))
+            except ValueError:
+                state.book_active_chapter, state.book_active_scene = 1, 1
+                
+        active_row_ref[0] = current_scene
+        current_idx = get_current_filtered_index(filtered)
+        
+        try:
+            ch = int(float(current_scene.get("chapter", "1")))
+            sc = int(float(current_scene.get("scene", "1")))
+        except ValueError:
+            ch, sc = 1, 1
+            
+        img_url = images_cache.get((ch, sc))
+        is_approved = current_scene.get("approved", "False").strip().lower() == "true"
+        
+        # Update Modal Content In-place
+        if modal_img_el:
+            if img_url:
+                modal_img_el.set_source(img_url)
+                modal_img_el.visible = True
+            else:
+                modal_img_el.visible = False
+                
+        if modal_placeholder:
+            modal_placeholder.visible = not img_url
+            
+        if modal_quote_el:
+            modal_quote_el.set_text(f'"{current_scene.get("quote", "")}"')
+            
+        if modal_prompt_input:
+            modal_prompt_input.set_value(current_scene.get("prompt", ""))
+            
+        if modal_context_html:
+            modal_context_html.set_content(find_quote_context(project_name, book_name, current_scene.get("quote", "")))
+            
+        if modal_title_el:
+            modal_title_el.set_text(f"Chapter {current_scene.get('chapter')}, Scene {current_scene.get('scene')}")
+            
+        if modal_subtitle_el:
+            modal_subtitle_el.set_text(f"Review Scene: {current_idx + 1} of {len(filtered)}")
+            
+        # Modal Badge updates
+        if modal_badge_missing:
+            modal_badge_missing.visible = not img_url
+        if modal_badge_approved:
+            modal_badge_approved.visible = bool(img_url and is_approved)
+        if modal_badge_review:
+            modal_badge_review.visible = bool(img_url and not is_approved)
+
+        # Highlight background Grid Card (Keeping highlight, but removed the scrap-scrolling JS call)
+        for (grid_ch, grid_sc), ref in grid_card_references.items():
+            ref["card"].classes(remove="ring-4 ring-blue-500 ring-offset-2")
+            
+        if (ch, sc) in grid_card_references:
+            target_ref = grid_card_references[(ch, sc)]
+            target_ref["card"].classes(add="ring-4 ring-blue-500 ring-offset-2")
+
+    def next_scene():
+        filtered = get_filtered_prompts()
+        if not filtered:
+            return
+        idx = get_current_filtered_index(filtered)
+        next_idx = min(idx + 1, len(filtered) - 1)
+        next_scene_obj = filtered[next_idx]
+        try:
+            state.book_active_chapter = int(float(next_scene_obj.get("chapter", "1")))
+            state.book_active_scene = int(float(next_scene_obj.get("scene", "1")))
+        except ValueError:
+            pass
+        update_active_scene_ui()
+
+    def prev_scene():
+        filtered = get_filtered_prompts()
+        if not filtered:
+            return
+        idx = get_current_filtered_index(filtered)
+        prev_idx = max(idx - 1, 0)
+        prev_scene_obj = filtered[prev_idx]
+        try:
+            state.book_active_chapter = int(float(prev_scene_obj.get("chapter", "1")))
+            state.book_active_scene = int(float(prev_scene_obj.get("scene", "1")))
+        except ValueError:
+            pass
+        update_active_scene_ui()
+
+    def approve_current():
+        filtered = get_filtered_prompts()
+        if not filtered:
+            return
+            
+        row = None
+        for p in filtered:
+            try:
+                ch = int(float(p.get("chapter", "1")))
+                sc = int(float(p.get("scene", "1")))
+            except ValueError:
+                ch, sc = 1, 1
+            if ch == state.book_active_chapter and sc == state.book_active_scene:
+                row = p
+                break
+                
+        if not row:
+            return
+            
+        row["approved"] = "True"
+        save_prompts_csv(project_name, book_name, prompts)
+        
+        try:
+            ch = int(float(row.get("chapter", "1")))
+            sc = int(float(row.get("scene", "1")))
+            if (ch, sc) in grid_card_references:
+                grid_card_references[(ch, sc)]["item"]["approved"] = "True"
+        except ValueError:
+            pass
+            
+        update_grid_views_in_place()
+        ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('scene')} Approved!", type="positive", timeout=1.0)
+        next_scene()
+
+    def delete_current():
+        filtered = get_filtered_prompts()
+        if not filtered:
+            return
+            
+        row = None
+        for p in filtered:
+            try:
+                ch = int(float(p.get("chapter", "1")))
+                sc = int(float(p.get("scene", "1")))
+            except ValueError:
+                ch, sc = 1, 1
+            if ch == state.book_active_chapter and sc == state.book_active_scene:
+                row = p
+                break
+                
+        if not row:
+            return
+            
+        row["approved"] = "False"
+        save_prompts_csv(project_name, book_name, prompts)
+        
+        was_deleted = delete_scene_image_file(project_name, book_name, row.get("chapter", "1"), row.get("scene", "1"))
+        
+        try:
+            ch = int(float(row.get("chapter", "1")))
+            sc = int(float(row.get("scene", "1")))
+            images_cache.pop((ch, sc), None)
+            if (ch, sc) in grid_card_references:
+                grid_card_references[(ch, sc)]["item"]["approved"] = "False"
+        except ValueError:
+            pass
+            
+        update_grid_views_in_place()
+        
+        if was_deleted:
+            ui.notify(f"Deleted image for Ch {row.get('chapter')}, Sc {row.get('scene')}!", type="warning", timeout=1.0)
+        else:
+            ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('scene')} file was already missing.", type="info", timeout=1.0)
+        
+        next_scene()
+
+    def handle_modal_close():
+        pass
+
+    async def trigger_batch_restart():
+        start_fn = getattr(state, 'start_image_generation_cb', None)
+        if not start_fn:
+            ui.notify("Pipeline process control callbacks are not fully registered in state.", type="negative")
+            return
+
+        if state.project_status == "Rendering Images" or state.image_gen_active:
+            ui.notify("Waiting for current image to finish rendering before restarting...", type="info", timeout=2.0)
+            state.cancel_image_gen_flag = True
+            
+            while state.image_gen_active:
+                await asyncio.sleep(0.5)
+                
+        state.cancel_image_gen_flag = False
+        state.image_gen_active = False
+        start_fn(project.id)
+
+    def trigger_stop_rendering():
+        stop_fn = getattr(state, 'stop_image_generation_cb', None)
+        if stop_fn:
+            stop_fn(project.id)
+            ui.notify("Stop signal dispatched. Halting after active image completes...", type="warning")
+        else:
+            ui.notify("Stop callback is not registered.", type="negative")
+
+    def update_grid_views_in_place():
+        """Updates rendering frames, cards, and dots in-place with zero layout shifts."""
+        for (ch, sc), ref in grid_card_references.items():
+            img_url = images_cache.get((ch, sc))
+            is_approved = ref["item"].get("approved", "False").strip().lower() == "true"
+            has_image = bool(img_url)
+            
+            # Determine if this card matches the active filter criteria
+            should_be_visible = True
+            if filter_mode.value == "Unapproved Only":
+                # Show only if it has a rendered image but hasn't been approved yet
+                should_be_visible = bool(has_image and not is_approved)
+            elif filter_mode.value == "Missing Only":
+                # Show only if it is missing its image file
+                should_be_visible = not has_image
+                
+            ref["card"].visible = should_be_visible
+            
+            # If the card is filtered out, skip heavy element manipulation to save cycles
+            if not should_be_visible:
+                continue
+            
+            if not img_url:
+                border_style = "border-red-300 bg-red-50/10"
+                dot_color = "bg-red-500"
+            elif is_approved:
+                border_style = "border-emerald-300 bg-emerald-50/10"
+                dot_color = "bg-emerald-500"
+            else:
+                border_style = "border-amber-300 bg-amber-50/10"
+                dot_color = "bg-amber-500"
+                
+            ref["card"].classes(replace=f"border rounded-lg shadow-sm p-2 cursor-pointer hover:shadow-md transition-all {border_style}")
+            ref["dot"].classes(replace=f"w-2 h-2 rounded-full {dot_color}")
+            
+            if img_url:
+                ref["image"].set_source(img_url)
+                ref["image"].visible = True
+                ref["placeholder"].visible = False
+            else:
+                ref["image"].visible = False
+                ref["placeholder"].visible = True
+
+    def check_for_image_updates():
+        if state.active_book_id is None:
+            return
+            
+        img_dir = Path(f"./output/{project_name}/{book_name}/images")
+        parent_dir = Path(f"./output/{project_name}/{book_name}")
+        
+        count = 0
+        if img_dir.exists():
+            count += len(os.listdir(img_dir))
+        if parent_dir.exists():
+            count += len(os.listdir(parent_dir))
+            
+        if count != last_file_count[0]:
+            last_file_count[0] = count
+            
+            nonlocal images_cache
+            images_cache = get_book_images_cache(project_name, book_name)
+            
+            update_grid_views_in_place()
+            if theater_dialog.value:
+                update_active_scene_ui()
+
+    # --- 2. LAYOUT RENDERING COMPONENT DECLARATIONS ---
+
+    # Awaiting Generation Panel (Only loaded if prompts are completely missing)
     if not prompts:
         transcript_path = Path(f"./output/{project_name}/{book_name}/transcript.txt")
         has_transcript = transcript_path.exists()
@@ -291,7 +597,6 @@ def render_book_tabs(book_id: int):
                     ui.label('Complete the initial setup phases to start image proofing.').classes('text-xs text-slate-500')
             
             with ui.grid(columns='1fr 1fr').classes('w-full gap-4'):
-                # Stats Card
                 with ui.column().classes('gap-3 bg-slate-50 p-4 rounded-xl border border-dashed'):
                     ui.label('Volume Statistics').classes('text-xs font-bold text-slate-700 uppercase tracking-wide')
                     
@@ -315,23 +620,19 @@ def render_book_tabs(book_id: int):
                         est_scenes = max(1, char_count // 1500) if char_count > 0 else 0
                         ui.label(f"~ {est_scenes} scenes").classes('font-bold text-slate-700')
 
-                # Instructions card
                 with ui.column().classes('gap-3 bg-slate-50 p-4 rounded-xl border border-dashed'):
                     ui.label('Orchestration Guide').classes('text-xs font-bold text-slate-700 uppercase tracking-wide')
                     
-                    # Step 1
                     with ui.row().classes('items-center gap-2 text-xs'):
                         ui.icon('check_circle' if has_transcript else 'radio_button_unchecked', color='emerald' if has_transcript else 'slate', size='16px')
                         ui.label('Step 1: Transcription').classes('font-bold ' + ('text-slate-400 line-through' if has_transcript else 'text-slate-700'))
                         
-                    # Step 2
                     with ui.row().classes('items-center gap-2 text-xs'):
                         is_step_2_active = has_transcript and not prompts
                         icon_color = 'purple' if is_step_2_active else 'slate'
                         ui.icon('radio_button_checked' if is_step_2_active else 'radio_button_unchecked', color=icon_color, size='16px')
                         ui.label('Step 2: Generate Prompts').classes('font-bold ' + ('text-purple-700 animate-pulse' if is_step_2_active else 'text-slate-700'))
                         
-                    # Step 3
                     with ui.row().classes('items-center gap-2 text-xs'):
                         ui.icon('radio_button_unchecked', color='slate', size='16px')
                         ui.label('Step 3: Render Images').classes('font-bold text-slate-500')
@@ -340,327 +641,160 @@ def render_book_tabs(book_id: int):
                 ui.label("Switch to the 'Dashboard' tab on the project workspace to run these steps.").classes('text-[11px] text-slate-500 italic')
         return
 
-    # Proofreader Panel elements
+    # Hidden filter reference
     filter_mode = ui.select(
         options=["All", "Unapproved Only", "Missing Only"], 
         value="All"
     ).classes('hidden')
-    
-    view_mode = ui.select(
-        options=["Theatre", "Gallery Grid"], 
-        value="Theatre"
-    ).classes('hidden')
 
-    # --- Persistent References for In-place Updates ---
-    large_image = None
-    placeholder_frame = None
-    floating_link = None
-    quote_label = None
-    prompt_input = None
-    context_html = None
-    header_label = None
-    position_label = None
-    badge_missing = None
-    badge_approved = None
-    badge_review = None
+    # --- Top Interface Toolbar (Placed at the TOP of the Workspace) ---
+    with ui.row().classes('w-full justify-between items-center bg-white p-3 border rounded-xl shadow-xs mb-4'):
+        with ui.row().classes('items-center gap-4'):
+            # Filtering selector
+            ui.select(
+                options=["All", "Unapproved Only", "Missing Only"],
+                label="Filter Scenes",
+                on_change=lambda e: (setattr(filter_mode, 'value', e.value), render_content.refresh())
+            ).classes('w-44 bg-white').props('outlined dense').bind_value_to(filter_mode, 'value')
+            
+            # Direct batch reboot action (Hoisted trigger_batch_restart is fully bound safely!)
+            ui.button(
+                'Restart Batch / Regen', 
+                icon='refresh', 
+                on_click=trigger_batch_restart
+            ).classes('bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 h-10')
+
+            # Stop image generation button (appears dynamically if generation active)
+            ui.button(
+                'Stop Rendering',
+                icon='stop',
+                on_click=trigger_stop_rendering
+            ).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 h-10') \
+             .bind_visibility_from(state, 'image_gen_active')
+            
+        # Shortcuts Reminder Label (Active inside theater modal)
+        with ui.row().classes('items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-lg border text-[11px] font-semibold text-slate-500'):
+            ui.icon('keyboard', size='xs')
+            ui.label(
+                f"Shortcuts: [{state.key_approve.upper()}] Approve  |  "
+                f"[{state.key_delete.upper()}] Delete  |  "
+                f"[{state.key_next.upper()}] Next  |  "
+                f"[{state.key_prev.upper()}] Prev"
+            )
+
+    # --- Persistent References for Modal In-place Updates ---
+    modal_img_el = None
+    modal_placeholder = None
+    modal_quote_el = None
+    modal_prompt_input = None
+    modal_context_html = None
+    modal_title_el = None
+    modal_subtitle_el = None
     
-    # Mutable wrapper holding active row data reference
+    modal_badge_missing = None
+    modal_badge_approved = None
+    modal_badge_review = None
+    
     active_row_ref = [None]
-
-    # --- Internal Helper Layout Functions ---
-    
-    def get_filtered_prompts():
-        filtered = []
-        for p in prompts:
-            is_approved = p.get("approved", "False").strip().lower() == "true"
-            
-            try:
-                ch = int(float(p.get("chapter", "1")))
-                sc = int(float(p.get("scene", "1")))
-            except ValueError:
-                ch, sc = 1, 1
-                
-            has_image = (ch, sc) in images_cache
-            
-            if filter_mode.value == "Unapproved Only":
-                if has_image and not is_approved:
-                    filtered.append(p)
-            elif filter_mode.value == "Missing Only":
-                if not has_image:
-                    filtered.append(p)
-            else:
-                filtered.append(p)
-        return filtered
-
-    def update_prompt_text(val: str, row_dict: dict):
-        if row_dict:
-            row_dict["prompt"] = val.strip()
-            save_prompts_csv(project_name, book_name, prompts)
-
-    # --- Smooth In-Place Updater (No Page Shifting!) ---
-    def update_active_scene_ui():
-        filtered = get_filtered_prompts()
-        if not filtered:
-            return
-        current_idx = min(max(0, state.book_active_scene_idx), len(filtered) - 1)
-        state.book_active_scene_idx = current_idx
-        current_scene = filtered[current_idx]
-        active_row_ref[0] = current_scene
-        
-        try:
-            ch = int(float(current_scene.get("chapter", "1")))
-            sc = int(float(current_scene.get("scene", "1")))
-        except ValueError:
-            ch, sc = 1, 1
-            
-        img_url = images_cache.get((ch, sc))
-        is_approved = current_scene.get("approved", "False").strip().lower() == "true"
-        
-        # In-place value updates
-        if large_image:
-            if img_url:
-                large_image.set_source(img_url)
-                large_image.visible = True
-            else:
-                large_image.visible = False
-                
-        if placeholder_frame:
-            placeholder_frame.visible = not img_url
-                
-        if floating_link:
-            if img_url:
-                floating_link._props['href'] = img_url
-                floating_link.update()
-                floating_link.visible = True
-            else:
-                floating_link.visible = False
-                
-        if quote_label:
-            quote_label.set_text(f'"{current_scene.get("quote", "")}"')
-            
-        if prompt_input:
-            prompt_input.set_value(current_scene.get("prompt", ""))
-            
-        if context_html:
-            context_html.set_content(find_quote_context(project_name, book_name, current_scene.get("quote", "")))
-            
-        if header_label:
-            header_label.set_text(f"Chapter {current_scene.get('chapter')}, Scene {current_scene.get('scene')}")
-            
-        if position_label:
-            position_label.set_text(f"Position: {current_idx + 1} of {len(filtered)}")
-            
-        # Update badges
-        if badge_missing:
-            badge_missing.visible = not img_url
-        if badge_approved:
-            badge_approved.visible = bool(img_url and is_approved)
-        if badge_review:
-            badge_review.visible = bool(img_url and not is_approved)
-            
-        # Refresh filmstrip card cleanly without shifting page viewport
-        render_filmstrip.refresh(filtered, current_idx)
-
-    def next_scene():
-        filtered = get_filtered_prompts()
-        if not filtered:
-            return
-        state.book_active_scene_idx = min(state.book_active_scene_idx + 1, len(filtered) - 1)
-        update_active_scene_ui()
-
-    def prev_scene():
-        state.book_active_scene_idx = max(state.book_active_scene_idx - 1, 0)
-        update_active_scene_ui()
-
-    def approve_current():
-        filtered = get_filtered_prompts()
-        if not filtered or state.book_active_scene_idx >= len(filtered):
-            return
-        row = filtered[state.book_active_scene_idx]
-        row["approved"] = "True"
-        save_prompts_csv(project_name, book_name, prompts)
-        ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('scene')} Marked Approved!", type="positive", timeout=1.0)
-        next_scene()
-
-    def delete_current():
-        filtered = get_filtered_prompts()
-        if not filtered or state.book_active_scene_idx >= len(filtered):
-            return
-        row = filtered[state.book_active_scene_idx]
-        row["approved"] = "False"
-        save_prompts_csv(project_name, book_name, prompts)
-        
-        was_deleted = delete_scene_image_file(project_name, book_name, row.get("chapter", "1"), row.get("scene", "1"))
-        
-        # Instantly remove file from cached directory mapping
-        try:
-            ch = int(float(row.get("chapter", "1")))
-            sc = int(float(row.get("scene", "1")))
-            images_cache.pop((ch, sc), None)
-        except ValueError:
-            pass
-            
-        if was_deleted:
-            ui.notify(f"Deleted image file for Ch {row.get('chapter')}, Sc {row.get('scene')}!", type="warning", timeout=1.0)
-        else:
-            ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('scene')} file was already missing.", type="info", timeout=1.0)
-        
-        next_scene()
-
-    # --- Isolated Filmstrip Refresh Container ---
-    
-    @ui.refreshable
-    def render_filmstrip(filtered_list: list, current_idx: int):
-        start = max(0, current_idx - 2)
-        end = min(len(filtered_list), current_idx + 4)
-        
-        with ui.row().classes('w-full gap-2 items-center overflow-x-auto pb-2 flex-nowrap mt-4 justify-center bg-slate-50 p-2.5 rounded-lg border border-dashed'):
-            for idx in range(start, end):
-                item = filtered_list[idx]
-                is_active = (idx == current_idx)
-                is_approved = item.get("approved", "False").strip().lower() == "true"
-                
-                try:
-                    ch = int(float(item.get("chapter", "1")))
-                    sc = int(float(item.get("scene", "1")))
-                except ValueError:
-                    ch, sc = 1, 1
-                    
-                thumb_url = images_cache.get((ch, sc))
-                
-                if is_active:
-                    border_style = "border-blue-500 bg-blue-50 text-blue-700 ring-2 ring-blue-400"
-                elif not thumb_url:
-                    border_style = "border-red-300 text-red-500 bg-white hover:bg-slate-50"
-                elif is_approved:
-                    border_style = "border-emerald-300 text-emerald-600 bg-white hover:bg-slate-50"
-                else:
-                    border_style = "border-amber-300 text-amber-600 bg-white hover:bg-slate-50"
-                    
-                def set_active(idx_val=idx):
-                    state.book_active_scene_idx = idx_val
-                    update_active_scene_ui()
-                    
-                with ui.card().classes(f'w-24 border p-1 rounded cursor-pointer flex-shrink-0 transition-all {border_style}') \
-                        .on('click', lambda _, idx_val=idx: set_active(idx_val)):
-                    if thumb_url:
-                        ui.image(thumb_url).classes('w-full h-14 rounded object-cover mb-1')
-                    else:
-                        with ui.column().classes('w-full h-14 items-center justify-center bg-slate-100 rounded text-slate-400 mb-1'):
-                            ui.icon('photo_library', size='xs')
-                    ui.label(f"Ch {item.get('chapter')}, Sc {item.get('scene')}").classes('text-[9px] font-bold text-center truncate w-full')
-
-    # --- Theatre View Rendering ---
-    
-    def render_theatre_view(filtered_list: list, current_idx: int):
-        nonlocal large_image, placeholder_frame, floating_link, quote_label, prompt_input, context_html
-        nonlocal header_label, position_label, badge_missing, badge_approved, badge_review
-        
-        current_scene = filtered_list[current_idx]
-        active_row_ref[0] = current_scene
-        
-        try:
-            ch = int(float(current_scene.get("chapter", "1")))
-            sc = int(float(current_scene.get("scene", "1")))
-        except ValueError:
-            ch, sc = 1, 1
-            
-        img_url = images_cache.get((ch, sc))
-        is_approved = current_scene.get("approved", "False").strip().lower() == "true"
-        
-        with ui.grid(columns='1fr 350px').classes('w-full gap-6 items-start'):
-            # LEFT: Image Viewport
-            with ui.column().classes('w-full gap-2 items-center'):
-                with ui.card().classes('w-full aspect-square border rounded-xl overflow-hidden shadow-sm flex items-center justify-center bg-slate-900 relative p-0'):
-                    with ui.column().classes('items-center justify-center text-slate-400 w-full h-full') as placeholder_frame:
-                        ui.icon('photo_library', size='lg').classes('mb-2 text-slate-500 animate-pulse')
-                        ui.label("Awaiting ComfyUI Generation...").classes('text-xs font-semibold text-slate-400')
-                        ui.label("Scene will load automatically once rendered.").classes('text-[10px] text-slate-500')
-                        
-                    large_image = ui.image(img_url or "").classes('w-full h-full object-contain')
-                    large_image.visible = bool(img_url)
-                    placeholder_frame.visible = not img_url
-                    
-                    # Float overlay badges
-                    badge_missing = ui.badge("Missing", color="red").classes('absolute top-4 left-4 font-bold text-xs')
-                    badge_missing.visible = not img_url
-                    
-                    badge_approved = ui.badge("Approved", color="emerald").classes('absolute top-4 left-4 font-bold text-xs')
-                    badge_approved.visible = bool(img_url and is_approved)
-                    
-                    badge_review = ui.badge("Needs Review", color="amber").classes('absolute top-4 left-4 font-bold text-xs')
-                    badge_review.visible = bool(img_url and not is_approved)
-                    
-                    with ui.link(target=img_url or "", new_tab=True).classes('absolute top-3 right-3') as floating_link:
-                        ui.button(icon='zoom_in').props('flat fab-mini color=white').classes('bg-slate-900/60 hover:bg-slate-900/80')
-                    floating_link.visible = bool(img_url)
-                        
-                # Action Row
-                with ui.row().classes('w-full justify-between items-center bg-slate-100 p-3 rounded-lg border border-dashed mt-2'):
-                    ui.button(
-                        'Prev', 
-                        icon='chevron_left', 
-                        on_click=prev_scene
-                    ).props('flat dense').classes('text-xs font-bold text-slate-600')
-                    
-                    with ui.row().classes('gap-3'):
-                        ui.button(
-                            'Delete Image', 
-                            icon='delete', 
-                            on_click=delete_current
-                        ).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold px-4')
-                        
-                        ui.button(
-                            'Approve', 
-                            icon='check', 
-                            on_click=approve_current
-                        ).classes('bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-5')
-                        
-                    ui.button(
-                        'Next', 
-                        icon='chevron_right', 
-                        on_click=next_scene
-                    ).props('flat dense').classes('text-xs font-bold text-slate-600')
-                    
-                # Embed isolated refreshed filmstrip
-                render_filmstrip(filtered_list, current_idx)
-
-            # RIGHT: Sidebar Details Panel
-            with ui.card().classes('w-full border p-4 shadow-sm bg-white gap-4'):
-                with ui.row().classes('w-full justify-between items-center border-b pb-2'):
-                    with ui.column().classes('gap-0'):
-                        header_label = ui.label(f"Chapter {current_scene.get('chapter')}, Scene {current_scene.get('scene')}").classes('text-sm font-bold text-slate-800')
-                        position_label = ui.label(f"Position: {current_idx + 1} of {len(filtered_list)}").classes('text-[10px] text-slate-400')
-                        
-                with ui.column().classes('w-full gap-2 bg-slate-50 p-3 rounded border border-dashed'):
-                    ui.label("Target Narration Quote").classes('text-[9px] font-black text-slate-400 uppercase tracking-wider')
-                    quote_label = ui.label(f'"{current_scene.get("quote", "")}"').classes('text-xs italic text-slate-700 leading-relaxed font-serif')
-                    
-                prompt_input = ui.textarea(
-                    label="Style-Ready Visual Prompt",
-                    value=current_scene.get("prompt", "")
-                ).classes('w-full h-36 text-xs leading-relaxed').props('outlined')
-                
-                prompt_input.on('blur', lambda: update_prompt_text(prompt_input.value, active_row_ref[0]))
-                
-                with ui.expansion('Narrative Context (transcript.txt)').classes('w-full border rounded bg-slate-50 text-xs'):
-                    context_html = ui.html(
-                        find_quote_context(project_name, book_name, current_scene.get("quote", ""))
-                    ).classes('p-3 leading-relaxed text-slate-700 bg-white font-serif')
-
-    # --- Gallery Grid View Rendering ---
-    
-    # Memory dictionary to cache DOM references of grid cards for fluid in-place updates
     grid_card_references: Dict[tuple, Dict[str, Any]] = {}
 
+    # --- High Performance Theater Modal ---
+    with ui.dialog() as theater_dialog:
+        # Tighter card padding (p-4), maximum height (90vh), and full-width stretch to prioritize image size
+        with ui.card().classes('w-full max-w-[95vw] lg:max-w-7xl h-[90vh] p-4 rounded-xl bg-white flex flex-col items-stretch overflow-hidden gap-0'):
+            
+            # Left: Full-Height Image Viewport (1fr), Right: Informative Sidebar (380px)
+            with ui.grid(columns='1fr 380px').classes('w-full h-full gap-4 items-stretch overflow-hidden min-h-0'):
+                
+                # LEFT IMAGE VIEWPORT (Occupies 100% of vertical height, completely maximized)
+                with ui.column().classes('w-full h-full justify-center min-h-0 relative'):
+                    with ui.card().classes('w-full h-full border rounded-xl overflow-hidden shadow-sm flex items-center justify-center bg-slate-900 relative p-0 m-0'):
+                        modal_placeholder = ui.column().classes('items-center justify-center text-slate-400 w-full h-full')
+                        with modal_placeholder:
+                            ui.icon('photo_library', size='lg').classes('mb-2 text-slate-500 animate-pulse')
+                            ui.label("Awaiting ComfyUI Generation...").classes('text-xs font-semibold text-slate-400')
+                            
+                        # High-performance fit=contain representation
+                        modal_img_el = ui.image("").classes('w-full h-full bg-transparent').props('fit=contain')
+                        
+                        # overlays
+                        modal_badge_missing = ui.badge("Missing", color="red").classes('absolute top-4 left-4 font-bold text-xs')
+                        modal_badge_approved = ui.badge("Approved", color="emerald").classes('absolute top-4 left-4 font-bold text-xs')
+                        modal_badge_review = ui.badge("Needs Review", color="amber").classes('absolute top-4 left-4 font-bold text-xs')
+                        
+                # RIGHT DETAILS COLUMN (Holds header details, action grid, prompt inputs)
+                with ui.column().classes('w-full h-full gap-4 overflow-y-auto min-h-0 flex-nowrap pr-1'):
+                    
+                    # Consolidated Top Header & Close Row with hover shortcut discovery helper
+                    with ui.row().classes('w-full items-center justify-between border-b pb-2 flex-shrink-0'):
+                        with ui.column().classes('gap-0'):
+                            modal_title_el = ui.label("").classes('text-base font-bold text-slate-800 leading-none')
+                            modal_subtitle_el = ui.label("").classes('text-[11px] text-slate-400 mt-1')
+                        with ui.row().classes('items-center gap-1'):
+                            # Help Button with hovering keyboard shortcuts tooltip
+                            with ui.button(icon='help_outline').props('flat round dense').classes('text-slate-400'):
+                                with ui.tooltip().classes('bg-slate-800 text-white text-xs p-3 rounded-lg gap-1 flex flex-col shadow-lg'):
+                                    ui.label('Keyboard Shortcuts').classes('font-bold border-b pb-1 text-blue-400')
+                                    ui.label(f'[{state.key_approve.upper()}] Approve Scene')
+                                    ui.label(f'[{state.key_delete.upper()}] Delete Image')
+                                    ui.label(f'[{state.key_next.upper()}] Next Scene')
+                                    ui.label(f'[{state.key_prev.upper()}] Prev Scene')
+                            ui.button(icon='close', on_click=theater_dialog.close).props('flat round dense').classes('text-slate-400')
+                    
+                    # Condensed Navigation and State Actions
+                    with ui.column().classes('w-full gap-2 bg-slate-100 p-3 rounded-lg border border-dashed flex-shrink-0'):
+                        with ui.row().classes('w-full gap-2 items-center justify-between'):
+                            ui.button('Prev', icon='chevron_left', on_click=prev_scene).props('flat dense').classes('text-xs font-bold text-slate-600 flex-1 py-1.5 bg-white border rounded')
+                            ui.button('Next', icon='chevron_right', on_click=next_scene).props('flat dense').classes('text-xs font-bold text-slate-600 flex-1 py-1.5 bg-white border rounded')
+                        with ui.row().classes('w-full gap-2'):
+                            ui.button('Delete Image', icon='delete', on_click=delete_current).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold flex-1 py-2')
+                            ui.button('Approve', icon='check', on_click=approve_current).classes('bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex-1 py-2')
+
+                    # Target Narration Quote
+                    with ui.column().classes('w-full gap-2 bg-slate-50 p-3 rounded border border-dashed flex-shrink-0'):
+                        ui.label("Target Narration Quote").classes('text-[9px] font-black text-slate-400 uppercase tracking-wider')
+                        modal_quote_el = ui.label("").classes('text-xs italic text-slate-700 leading-relaxed font-serif')
+                        
+                    # Style-Ready Visual Prompt Textarea
+                    modal_prompt_input = ui.textarea(
+                        label="Style-Ready Visual Prompt"
+                    ).classes('w-full h-32 text-xs leading-relaxed flex-shrink-0').props('outlined')
+                    
+                    modal_prompt_input.on('blur', lambda: update_prompt_text(modal_prompt_input.value, active_row_ref[0]))
+                    
+                    # Narrative Context expansion panel
+                    with ui.expansion('Narrative Context (transcript.txt)').classes('w-full border rounded bg-slate-50 text-xs flex-shrink-0'):
+                        modal_context_html = ui.html("").classes('p-3 leading-relaxed text-slate-700 bg-white font-serif')
+
+    theater_dialog.on('close', handle_modal_close)
+
+    # Keyboard shortcut listener (Fires only when the active theater dialog is open, and ignores inputs naturally)
+    def handle_key(e):
+        if not theater_dialog.value:
+            return
+        if e.action.keydown and not e.action.repeat:
+            k = e.key.name.lower()
+            if k == state.key_approve:
+                approve_current()
+            elif k == state.key_delete:
+                delete_current()
+            elif k == state.key_next:
+                next_scene()
+            elif k == state.key_prev:
+                prev_scene()
+
+    ui.keyboard(on_key=handle_key)
+
+    # --- Gallery Grid View Rendering ---
     def render_grid_view(filtered_list: list):
         """Renders the gallery layout once, establishing DOM references for smooth updates."""
         grid_card_references.clear()
         
-        def switch_to_theatre(idx_val: int):
-            view_mode.value = "Theatre"
-            state.book_active_scene_idx = idx_val
-            render_content.refresh()
+        def launch_theater(ch_val: int, sc_val: int):
+            state.book_active_chapter = ch_val
+            state.book_active_scene = sc_val
+            theater_dialog.open()
+            update_active_scene_ui()
             
         with ui.grid(columns='repeat(auto-fill, minmax(180px, 1fr))').classes('w-full gap-4'):
             for idx, item in enumerate(filtered_list):
@@ -674,7 +808,6 @@ def render_book_tabs(book_id: int):
                     
                 img_url = images_cache.get((ch, sc))
                 
-                # Standardize initial styles
                 if not img_url:
                     border_style = "border-red-300 bg-red-50/10"
                     status_color = "bg-red-500"
@@ -686,9 +819,8 @@ def render_book_tabs(book_id: int):
                     status_color = "bg-amber-500"
                     
                 with ui.card().classes(f'border rounded-lg shadow-sm p-2 cursor-pointer hover:shadow-md transition-all {border_style}') \
-                        .on('click', lambda _, idx_val=idx: switch_to_theatre(idx_val)) as card_el:
+                        .on('click', lambda _, ch_val=ch, sc_val=sc: launch_theater(ch_val, sc_val)) as card_el:
                     
-                    # Both elements are built once; we toggle visibility in-place
                     img_el = ui.image(img_url or "").classes('w-full aspect-square rounded object-cover border')
                     img_el.visible = bool(img_url)
                     
@@ -702,7 +834,6 @@ def render_book_tabs(book_id: int):
                         ui.label(f"Ch {item.get('chapter')}, Sc {item.get('scene')}").classes('text-[10px] font-bold text-slate-700')
                         dot_el = ui.element('div').classes(f'w-2 h-2 rounded-full {status_color}')
                         
-                # Store references for fluid updates
                 grid_card_references[(ch, sc)] = {
                     "card": card_el,
                     "image": img_el,
@@ -711,9 +842,7 @@ def render_book_tabs(book_id: int):
                     "item": item
                 }
 
-
     # --- Parent Workspace Loader ---
-    
     @ui.refreshable
     def render_content():
         filtered = get_filtered_prompts()
@@ -723,173 +852,13 @@ def render_book_tabs(book_id: int):
                 ui.label("No scenes match your active filter.").classes('text-sm text-center font-semibold')
             return
             
-        current_idx = min(max(0, state.book_active_scene_idx), len(filtered) - 1)
-        state.book_active_scene_idx = current_idx
-        
-        if view_mode.value == "Theatre":
-            render_theatre_view(filtered, current_idx)
-        else:
-            render_grid_view(filtered)
-
-
-    # --- Centralized Key Bindings Handler ---
-    
-    def handle_key(e):
-        if state.active_book_id is None:
-            return
-        if view_mode.value != "Theatre":
-            return
-            
-        if e.action.keydown and not e.action.repeat:
-            key_name = e.key.name.lower()
-            
-            if key_name == state.key_approve:
-                approve_current()
-            elif key_name == state.key_delete:
-                delete_current()
-            elif key_name == state.key_next:
-                next_scene()
-            elif key_name == state.key_prev:
-                prev_scene()
-
-    # Register key bindings
-    ui.keyboard(on_key=handle_key)
-
-    # --- Pipeline Restart Control Action ---
-    
-    async def trigger_batch_restart():
-        start_fn = getattr(state, 'start_image_generation_cb', None)
-        
-        if not start_fn:
-            ui.notify("Pipeline process control callbacks are not fully registered in state.", type="negative")
-            return
-
-        if state.project_status == "Rendering Images" or state.image_gen_active:
-            ui.notify("Waiting for current image to finish rendering before restarting...", type="info", timeout=2.0)
-            state.cancel_image_gen_flag = True
-            
-            while state.image_gen_active:
-                await asyncio.sleep(0.5)
-                
-        state.cancel_image_gen_flag = False
-        state.image_gen_active = False
-        
-        start_fn(project.id)
-
-    # --- Top Interface Toolbar ---
-    
-    with ui.row().classes('w-full justify-between items-center bg-white p-3 border rounded-xl shadow-xs mb-4'):
-        with ui.row().classes('items-center gap-4'):
-            # View toggle (Bi-directionally bound to sync top buttons on grid-click!)
-            ui.toggle(
-                options=["Theatre", "Gallery Grid"],
-                on_change=lambda e: render_content.refresh()
-            ).classes('text-xs').bind_value(view_mode, 'value')
-            
-            # Filtering selector
-            ui.select(
-                options=["All", "Unapproved Only", "Missing Only"],
-                label="Filter Scenes",
-                on_change=lambda e: (setattr(filter_mode, 'value', e.value), render_content.refresh())
-            ).classes('w-44 bg-white').props('outlined dense').bind_value_to(filter_mode, 'value')
-            
-            # Direct batch reboot action
-            ui.button(
-                'Restart Batch / Regen', 
-                icon='refresh', 
-                on_click=trigger_batch_restart
-            ).classes('bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 h-10')
-
-            # --- A3: Stop image generation button ---
-            # Automatically appears if ComfyUI renders are currently running in the background
-            def trigger_stop_rendering():
-                stop_fn = getattr(state, 'stop_image_generation_cb', None)
-                if stop_fn:
-                    stop_fn(project.id)
-                    ui.notify("Stop signal dispatched. Halting after active image completes...", type="warning")
-                else:
-                    ui.notify("Stop callback is not registered.", type="negative")
-
-            ui.button(
-                'Stop Rendering',
-                icon='stop',
-                on_click=trigger_stop_rendering
-            ).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 h-10') \
-             .bind_visibility_from(state, 'image_gen_active')
-            
-        # Shortcuts Reminder Label
-        with ui.row().classes('items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-lg border text-[11px] font-semibold text-slate-500'):
-            ui.icon('keyboard', size='xs')
-            ui.label(
-                f"Shortcuts: [{state.key_approve.upper()}] Approve  |  "
-                f"[{state.key_delete.upper()}] Delete  |  "
-                f"[{state.key_next.upper()}] Next  |  "
-                f"[{state.key_prev.upper()}] Prev"
-            )
+        render_grid_view(filtered)
 
     # Initial render
     render_content()
 
-
     # --- Real-Time Background Image Pop-in Timer (Optimized In-Place!) ---
-    
     last_file_count = [len(images_cache)]
     
-    def update_grid_views_in_place():
-        """Updates rendering frames, cards, and dots in-place with zero layout shifts."""
-        for (ch, sc), ref in grid_card_references.items():
-            img_url = images_cache.get((ch, sc))
-            is_approved = ref["item"].get("approved", "False").strip().lower() == "true"
-            
-            # Formulate class lists dynamically
-            if not img_url:
-                border_style = "border-red-300 bg-red-50/10"
-                dot_color = "bg-red-500"
-            elif is_approved:
-                border_style = "border-emerald-300 bg-emerald-50/10"
-                dot_color = "bg-emerald-500"
-            else:
-                border_style = "border-amber-300 bg-amber-50/10"
-                dot_color = "bg-amber-500"
-                
-            # Perform targeted, non-destructive WebSockets updates
-            ref["card"].classes(replace=f"border rounded-lg shadow-sm p-2 cursor-pointer hover:shadow-md transition-all {border_style}")
-            ref["dot"].classes(replace=f"w-2 h-2 rounded-full {dot_color}")
-            
-            if img_url:
-                ref["image"].set_source(img_url)
-                ref["image"].visible = True
-                ref["placeholder"].visible = False
-            else:
-                ref["image"].visible = False
-                ref["placeholder"].visible = True
-
-
-    def check_for_image_updates():
-        if state.active_book_id is None:
-            return
-            
-        img_dir = Path(f"./output/{project_name}/{book_name}/images")
-        parent_dir = Path(f"./output/{project_name}/{book_name}")
-        
-        count = 0
-        if img_dir.exists():
-            count += len(os.listdir(img_dir))
-        if parent_dir.exists():
-            count += len(os.listdir(parent_dir))
-            
-        if count != last_file_count[0]:
-            last_file_count[0] = count
-            
-            # Reload only the fast memory lookup dict
-            nonlocal images_cache
-            images_cache = get_book_images_cache(project_name, book_name)
-            
-            # Update active view using non-destructive, zero-shift refreshes
-            if view_mode.value == "Theatre":
-                update_active_scene_ui()
-            else:
-                update_grid_views_in_place()
-            
     # Check for newly generated images every 3 seconds
     ui.timer(3.0, check_for_image_updates)
