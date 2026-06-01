@@ -546,12 +546,14 @@ def render_workflow_overrides_ui():
                     if node_type == "sampler":
                         current_steps = state.style_workflow_overrides.get(node_id, {}).get("steps", params["steps"])
                         current_cfg = state.style_workflow_overrides.get(node_id, {}).get("cfg", params["cfg"])
+                        current_sampler = state.style_workflow_overrides.get(node_id, {}).get("sampler_name", params.get("sampler_name", "euler"))
+                        current_scheduler = state.style_workflow_overrides.get(node_id, {}).get("scheduler", params.get("scheduler", "normal"))
                         
                         ui.number(
                             label="Steps",
                             value=current_steps,
                             min=1, max=150, step=1,
-                            on_change=lambda e, nid=node_id: update_override_state(nid, "steps", e.value)
+                            on_change=lambda e, nid=node_id: update_override_state(nid, "steps", int(e.value) if e.value is not None else None)
                         ).classes('w-full')
                         ui.number(
                             label="CFG Scale",
@@ -559,6 +561,17 @@ def render_workflow_overrides_ui():
                             min=0.0, max=30.0, step=0.1,
                             on_change=lambda e, nid=node_id: update_override_state(nid, "cfg", e.value)
                         ).classes('w-full')
+                        ui.input(
+                            label="Sampler Name",
+                            value=current_sampler,
+                            on_change=lambda e, nid=node_id: update_override_state(nid, "sampler_name", e.value)
+                        ).classes('w-full')
+                        ui.input(
+                            label="Scheduler",
+                            value=current_scheduler,
+                            on_change=lambda e, nid=node_id: update_override_state(nid, "scheduler", e.value)
+                        ).classes('w-full')
+                        
                     elif node_type == "resolution":
                         current_width = state.style_workflow_overrides.get(node_id, {}).get("width", params["width"])
                         current_height = state.style_workflow_overrides.get(node_id, {}).get("height", params["height"])
@@ -567,14 +580,15 @@ def render_workflow_overrides_ui():
                             label="Width",
                             value=current_width,
                             min=128, max=4096, step=64,
-                            on_change=lambda e, nid=node_id: update_override_state(nid, "width", e.value)
+                            on_change=lambda e, nid=node_id: update_override_state(nid, "width", int(e.value) if e.value is not None else None)
                         ).classes('w-full')
                         ui.number(
                             label="Height",
                             value=current_height,
                             min=128, max=4096, step=64,
-                            on_change=lambda e, nid=node_id: update_override_state(nid, "height", e.value)
+                            on_change=lambda e, nid=node_id: update_override_state(nid, "height", int(e.value) if e.value is not None else None)
                         ).classes('w-full')
+                        
                     elif node_type == "lora_loader":
                         current_lora_name = state.style_workflow_overrides.get(node_id, {}).get("lora_name", params["lora_name"])
                         current_strength_model = state.style_workflow_overrides.get(node_id, {}).get("strength_model", params["strength_model"])
@@ -589,6 +603,35 @@ def render_workflow_overrides_ui():
                             value=current_strength_model,
                             min=0.0, max=2.0, step=0.1,
                             on_change=lambda e, nid=node_id: update_override_state(nid, "strength_model", e.value)
+                        ).classes('w-full')
+
+                    elif node_type == "model_loader":
+                        param_key = params.get("model_param_key", "ckpt_name")
+                        current_model_name = state.style_workflow_overrides.get(node_id, {}).get(param_key, params.get(param_key, ""))
+                        
+                        ui.input(
+                            label=f"Model Filename ({param_key})",
+                            value=current_model_name,
+                            on_change=lambda e, nid=node_id, pk=param_key: update_override_state(nid, pk, e.value)
+                        ).classes('w-full')
+
+                    elif node_type == "clip_loader":
+                        param_key = params.get("clip_param_key", "clip_name")
+                        current_clip_name = state.style_workflow_overrides.get(node_id, {}).get(param_key, params.get(param_key, ""))
+                        
+                        ui.input(
+                            label=f"CLIP Filename ({param_key})",
+                            value=current_clip_name,
+                            on_change=lambda e, nid=node_id, pk=param_key: update_override_state(nid, pk, e.value)
+                        ).classes('w-full')
+
+                    elif node_type == "vae_loader":
+                        current_vae_name = state.style_workflow_overrides.get(node_id, {}).get("vae_name", params.get("vae_name", ""))
+                        
+                        ui.input(
+                            label="VAE Filename",
+                            value=current_vae_name,
+                            on_change=lambda e, nid=node_id: update_override_state(nid, "vae_name", e.value)
                         ).classes('w-full')
 
 
@@ -714,13 +757,14 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
             
             ui.textarea(
                 label="Style Prompt Prefix"
-            ).classes('w-full h-24 text-xs').props('outlined').bind_value(state, 'style_prompt_prefix')
+            ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_prompt_prefix')
             
             ui.textarea(
                 label="Style Negative Prompt"
-            ).classes('w-full h-24 text-xs').props('outlined').bind_value(state, 'style_negative_prompt')
+            ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_negative_prompt')
             
             render_workflow_overrides_ui()
+            
             
         # RIGHT: Visual Style Playground Grid
         with ui.column().classes('w-full gap-4'):

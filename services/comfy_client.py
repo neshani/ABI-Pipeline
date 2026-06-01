@@ -52,10 +52,11 @@ class ComfyClient:
                     "title": title,
                     "class_type": class_type,
                     "params": {
+                        "model_param_key": model_param,
                         model_param: inputs.get(model_param, "")
                     }
                 }
-            elif class_type == "LoraLoader":
+            elif class_type in ["LoraLoader", "LoraLoaderModelOnly"]:
                 discovered[node_id] = {
                     "type": "lora_loader",
                     "title": title,
@@ -63,6 +64,26 @@ class ComfyClient:
                     "params": {
                         "lora_name": inputs.get("lora_name", ""),
                         "strength_model": inputs.get("strength_model", 1.0)
+                    }
+                }
+            elif class_type in ["CLIPLoader", "DualCLIPLoader"]:
+                clip_param = "clip_name1" if "clip_name1" in inputs else "clip_name"
+                discovered[node_id] = {
+                    "type": "clip_loader",
+                    "title": title,
+                    "class_type": class_type,
+                    "params": {
+                        "clip_param_key": clip_param,
+                        clip_param: inputs.get(clip_param, "")
+                    }
+                }
+            elif class_type == "VAELoader":
+                discovered[node_id] = {
+                    "type": "vae_loader",
+                    "title": title,
+                    "class_type": class_type,
+                    "params": {
+                        "vae_name": inputs.get("vae_name", "")
                     }
                 }
         return discovered
