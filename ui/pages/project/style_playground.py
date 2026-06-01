@@ -1,11 +1,179 @@
 import json
 import random
+import io
+import base64
 from pathlib import Path
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Optional
+from PIL import Image, ImageDraw, ImageFont
 from nicegui import ui
 from database.connection import get_setting
 from ui import state
 from ui.components.style_chooser_modal import StyleChooserModal
+
+# Module-level dialog and state holders
+contact_sheet_dialog_ref = None
+contact_sheet_base64 = ""
+
+
+def create_contact_sheet(base64_list: list) -> Optional[bytes]:
+    """Stitches completed base64 image strings into a single PNG grid stamped with 1A, 1B coordinate labels."""
+    images = []
+    for img_str in base64_list:
+        if not img_str:
+            continue
+        try:
+            if "," in img_str:
+                img_str = img_str.split(",", 1)[1]
+            img_data = base64.b64decode(img_str)
+            img = Image.open(io.BytesIO(img_data))
+            images.append(img)
+        except Exception:
+            pass
+
+    if not images:
+        return None
+
+    # Determine optimal grid layout (up to 4 columns)
+    num_imgs = len(images)
+    cols = min(4, num_imgs)
+    rows = (num_imgs + cols - 1) // cols
+
+    tile_w, tile_h = images[0].size
+    grid_img = Image.new("RGB", (cols * tile_w, rows * tile_h), (255, 255, 255))
+
+    for idx, img in enumerate(images):
+        r = idx // cols
+        c = idx % cols
+
+        if img.size != (tile_w, tile_h):
+            img = img.resize((tile_w, tile_h), Image.Resampling.LANCZOS)
+
+        grid_img.paste(img, (c * tile_w, r * tile_h))
+
+        # Calculate coordinates label (e.g. 1A, 1B, 2A...)
+        row_num = r + 1
+        col_letter = chr(65 + c)
+        label_text = f"{row_num}{col_letter}"
+
+        # Draw box and overlay
+        draw = ImageDraw.Draw(grid_img)
+        box_w = int(tile_w * 0.1) if tile_w > 400 else 50
+        box_h = int(tile_h * 0.08) if tile_h > 400 else 40
+        bx0 = c * tile_w
+        by0 = r * tile_h
+        bx1 = bx0 + box_w
+        by1 = by0 + box_h
+        
+        # Solid dark gray overlay
+        draw.rectangle([bx0, by0, bx1, by1], fill=(15, 15, 15))
+
+        # Load font dynamically to prevent crash
+        font = None
+        try:
+            font = ImageFont.truetype("arial.ttf", size=int(box_h * 0.55))
+        except Exception:
+            try:
+                font = ImageFont.truetype("DejaVuSans.ttf", size=int(box_h * 0.55))
+            except Exception:
+                font = ImageFont.load_default()
+
+        # Center the text label inside the box
+        draw.text((bx0 + int(box_w * 0.22), by0 + int(box_h * 0.18)), label_text, fill=(255, 255, 255), font=font)
+
+    out_buf = io.BytesIO()
+    grid_img.save(out_buf, format="PNG")
+    return out_buf.getvalue()
+
+
+def copy_style_settings_to_clipboard():
+    """Formats active style selections, ComfyUI overrides, and test prompts into structured Markdown for an LLM."""
+    lines = [
+        "### ABI-Pipeline Style Playground Report",
+        f"**Active Preset**: {state.style_selected_preset}",
+        f"**Base Workflow**: {state.style_selected_workflow}",
+        "",
+        "#### Style Templates",
+        f"**Style Prompt Prefix**:\n```\n{state.style_prompt_prefix}\n```",
+        f"**Style Negative Prompt**:\n```\n{state.style_negative_prompt}\n```",
+        "",
+        "#### Active Parameter Overrides:",
+    ]
+
+    if state.style_workflow_overrides:
+        for node_id, params in state.style_workflow_overrides.items():
+            lines.append(f"- **Node {node_id}**:")
+            for k, v in params.items():
+                lines.append(f"  - `{k}`: {v}")
+    else:
+        lines.append("*No overrides applied (Default workflow settings)*")
+
+    lines.append("")
+    lines.append("#### Generated Scenes Context Map:")
+    
+    for idx, item in enumerate(state.style_test_prompts):
+        is_dict = isinstance(item, dict)
+        chap = item.get("chapter", 1) if is_dict else 1
+        sec = item.get("scene", idx + 1) if is_dict else idx + 1
+        p_text = item.get("prompt", "") if is_dict else item
+        quote = item.get("quote", "") if is_dict else ""
+        seed = state.style_test_seeds[idx] if idx < len(state.style_test_seeds) else state.style_image_seed
+
+        row_num = (idx // 4) + 1
+        col_letter = chr(65 + (idx % 4))
+        label = f"{row_num}{col_letter}"
+
+        lines.append(f"- **[{label}] Ch {chap}, Scene {sec}** (Seed: {seed})")
+        if quote:
+            lines.append(f"  - *Source Quote*: \"{quote}\"")
+        lines.append(f"  - *Extracted Prompt*: {p_text}")
+
+    full_text = "\n".join(lines)
+    ui.clipboard.write(full_text)
+    ui.notify("Style configuration & prompt context copied to clipboard!", type="positive")
+
+
+def download_contact_sheet():
+    """Generates and triggers download of the stitched contact sheet PNG file."""
+    completed_images = [img for img in state.style_test_images if img is not None]
+    if not completed_images:
+        ui.notify("Generate test images first.", type="warning")
+        return
+    sheet_bytes = create_contact_sheet(completed_images)
+    if sheet_bytes:
+        ui.download(sheet_bytes, filename=f"style_grid_{state.style_selected_preset}.png")
+    else:
+        ui.notify("Failed to assemble download file.", type="negative")
+
+
+def open_contact_sheet_modal():
+    """Compiles completed renderings and opens the contact sheet modal overlay."""
+    global contact_sheet_base64, contact_sheet_dialog_ref
+    
+    completed_images = [img for img in state.style_test_images if img is not None]
+    if not completed_images:
+        ui.notify("No completed images in current visual feed. Run style test first!", type="warning")
+        return
+
+    sheet_bytes = create_contact_sheet(completed_images)
+    if not sheet_bytes:
+        ui.notify("Failed to stitch contact sheet images.", type="negative")
+        return
+
+    encoded = base64.b64encode(sheet_bytes).decode("utf-8")
+    contact_sheet_base64 = f"data:image/png;base64,{encoded}"
+
+    if contact_sheet_dialog_ref:
+        contact_sheet_dialog_ref.open()
+        render_contact_sheet_preview.refresh(contact_sheet_base64)
+
+@ui.refreshable
+def render_contact_sheet_preview(base64_data: str):
+    """Renders the compiled, high-resolution contact sheet preview inside the modal."""
+    if not base64_data:
+        ui.label("Stitching preview, please wait...").classes('text-xs text-slate-400')
+        return
+    ui.image(base64_data).classes('w-full max-h-[70vh] rounded-lg object-contain border shadow-sm')
+
 
 def list_available_workflows() -> list:
     """Discovers .json workflows inside local './workflows' directory."""
@@ -389,6 +557,8 @@ def render_style_playground_cards():
 
 
 def render_style_playground_tab(project, save_project_settings_cb=None):
+    global contact_sheet_dialog_ref
+    
     with ui.grid(columns='420px 1fr').classes('w-full gap-6 items-start'):
         # LEFT CONFIG PANEL
         with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
@@ -407,11 +577,11 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                 on_change=lambda e: handle_style_workflow_change(e.value)
             ).classes('w-full').bind_value(state, 'style_selected_workflow')
             
-            # Integrated Style Preset Library Modal button! No ugly dropdowns!
+            # Integrated Style Preset Library Modal button!
             with ui.row().classes('w-full items-center justify-between p-3 bg-slate-50 rounded border border-slate-200 mt-1'):
                 with ui.column().classes('gap-0 flex-1'):
                     ui.label('Active Preset').classes('text-[10px] font-bold text-slate-400 uppercase')
-                    ui.label(state.style_selected_preset).classes('text-xs font-bold text-slate-800')
+                    ui.label().classes('text-xs font-bold text-slate-800').bind_text_from(state, 'style_selected_preset')
                 ui.button(
                     'Browse Library', 
                     icon='photo_library', 
@@ -491,5 +661,45 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                         icon='bolt',
                         on_click=lambda: execute_style_playground_batch(project.name)
                     ).classes('bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-5 h-10')
+
+                # --- AI Collaboration Tools Panel ---
+                with ui.row().classes('w-full items-center justify-between bg-blue-50/50 p-3 rounded-lg border border-blue-100/50 mt-1'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('smart_toy', color='blue', size='sm')
+                        ui.label('AI Integration Toolkit').classes('text-xs font-black text-slate-700 uppercase tracking-wide')
+                    
+                    with ui.row().classes('gap-2'):
+                        ui.button(
+                            'Copy Prompt Pack',
+                            icon='content_copy',
+                            on_click=copy_style_settings_to_clipboard
+                        ).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold h-9')
+                        
+                        ui.button(
+                            'Generate Contact Sheet',
+                            icon='grid_view',
+                            on_click=open_contact_sheet_modal
+                        ).classes('bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold h-9')
             
             render_style_playground_cards()
+
+    # Declare Dialog Overlay inside workspace hierarchy
+    with ui.dialog() as contact_sheet_dialog:
+        with ui.card().classes('w-full max-w-4xl p-6 rounded-xl gap-4 bg-white'):
+            with ui.row().classes('w-full justify-between items-center pb-2 border-b'):
+                with ui.column().classes('gap-0'):
+                    ui.label('Generated AI Contact Sheet').classes('text-base font-bold text-slate-800')
+                    ui.label('Grid coordinate labels (1A, 1B...) are stamped on the image. Perfect for sending to LLMs.').classes('text-xs text-slate-500')
+                ui.button(
+                    'Download Contact Sheet',
+                    icon='download',
+                    on_click=download_contact_sheet
+                ).classes('bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold h-9')
+            
+            render_contact_sheet_preview(contact_sheet_base64)
+            
+            with ui.row().classes('w-full justify-between items-center pt-2 border-t text-[10px] text-slate-400'):
+                ui.label('Tip: Right-click the image to copy it directly, or click Download.')
+                ui.button('Close', on_click=contact_sheet_dialog.close).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs')
+
+    contact_sheet_dialog_ref = contact_sheet_dialog

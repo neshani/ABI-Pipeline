@@ -290,7 +290,7 @@ def render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcri
                 ui.label('Selected style controls prompt prefixes and generation workflows.').classes('text-[9px] text-slate-500')
             
             with ui.row().classes('items-center gap-2'):
-                ui.label(state.style_selected_preset).classes('text-xs font-bold text-blue-600 bg-white border px-3 py-1.5 rounded')
+                ui.label().classes('text-xs font-bold text-blue-600 bg-white border px-3 py-1.5 rounded').bind_text_from(state, 'style_selected_preset')
                 ui.button(
                     'Choose Style', 
                     icon='search', 
