@@ -170,7 +170,7 @@ def render_contact_sheet_preview(base64_data: str):
     if not base64_data:
         ui.label("Stitching preview, please wait...").classes('text-xs text-slate-400')
         return
-    ui.image(base64_data).classes('w-full max-h-[70vh] rounded-lg object-contain border shadow-sm')
+    ui.image(base64_data).props('fit=contain').classes('w-full max-h-[70vh] rounded-lg border shadow-sm bg-slate-50/20')
 
 
 def reroll_test_scenes(project_name: str, book_name: str):
@@ -676,7 +676,7 @@ def render_style_playground_cards(project_name: str = ""):
                         ui.spinner(size='md', color='blue')
                         ui.label("Rendering single card...").classes('text-[9px] text-slate-400 mt-1')
                 elif img_data:
-                    ui.image(img_data).classes('w-full h-48 rounded-lg object-cover border shadow-sm cursor-zoom-in hover:brightness-95 transition-all') \
+                    ui.image(img_data).props('fit=contain').classes('w-full h-48 bg-slate-50 rounded-lg border shadow-sm cursor-zoom-in hover:brightness-95 transition-all') \
                         .on('click', lambda _, img=img_data, title=full_title_header: open_large_image(img, title))
                 elif state.style_playground_loading:
                     with ui.column().classes('w-full h-48 items-center justify-center bg-slate-50 rounded-lg border border-dashed'):

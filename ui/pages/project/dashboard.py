@@ -430,10 +430,10 @@ def render_project_tabs(
     with ui.dialog() as global_preview_dialog:
         with ui.card().classes('w-full max-w-3xl p-4 items-center bg-white rounded-xl shadow-lg'):
             ui.label().classes('text-sm font-bold text-slate-800 mb-3 uppercase tracking-wider').bind_text_from(state, 'preview_image_title')
-            ui.image().classes('w-full rounded-lg max-h-[75vh] object-contain cursor-zoom-out').bind_source_from(state, 'preview_image_src').on('click', global_preview_dialog.close)
+            ui.image().props('fit=contain').classes('w-full rounded-lg max-h-[70vh] cursor-zoom-out bg-slate-50/30').bind_source_from(state, 'preview_image_src').on('click', global_preview_dialog.close)
             with ui.row().classes('w-full justify-end mt-3'):
                 ui.button('Close', on_click=global_preview_dialog.close).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs')
-                
+
     state.global_preview_dialog = global_preview_dialog
 
     # Reusable rollback confirmation dialog
@@ -482,32 +482,31 @@ def render_project_tabs(
 
     # Workspace Navigation Layout with Folder Shortcut
     with ui.row().classes('w-full justify-between items-center mb-1'):
-        with ui.row().classes('items-center gap-3'):
-            with ui.column().classes('gap-0'):
-                ui.label('Project Workspace Controls').classes('text-base font-bold text-slate-800')
-                ui.label('Configure orchestration guidelines and render dynamic style models.').classes('text-xs text-slate-500')
-            
-            def open_project_folder():
-                import platform
-                import subprocess
-                base_dir = Path(get_setting("output_dir", "./output")).resolve()
-                proj_dir = base_dir / project.name
-                proj_dir.mkdir(parents=True, exist_ok=True)
-                try:
-                    if platform.system() == "Windows":
-                        os.startfile(proj_dir)
-                    elif platform.system() == "Darwin":
-                        subprocess.Popen(["open", str(proj_dir)])
-                    else:
-                        subprocess.Popen(["xdg-open", str(proj_dir)])
-                except Exception as ex:
-                    ui.notify(f"Failed to open project folder: {str(ex)}", type="negative")
+        with ui.column().classes('gap-0'):
+            ui.label('Project Workspace Controls').classes('text-base font-bold text-slate-800')
+            ui.label('Configure orchestration guidelines and render dynamic style models.').classes('text-xs text-slate-500')
+        
+        def open_project_folder():
+            import platform
+            import subprocess
+            base_dir = Path(get_setting("output_dir", "./output")).resolve()
+            proj_dir = base_dir / project.name
+            proj_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                if platform.system() == "Windows":
+                    os.startfile(proj_dir)
+                elif platform.system() == "Darwin":
+                    subprocess.Popen(["open", str(proj_dir)])
+                else:
+                    subprocess.Popen(["xdg-open", str(proj_dir)])
+            except Exception as ex:
+                ui.notify(f"Failed to open project folder: {str(ex)}", type="negative")
 
-            ui.button(
-                'Open Folder', 
-                icon='folder_open', 
-                on_click=open_project_folder
-            ).props('flat dense').classes('text-xs text-slate-600')
+        ui.button(
+            'Open Folder', 
+            icon='folder_open', 
+            on_click=open_project_folder
+        ).props('flat dense').classes('text-xs text-slate-600')
     
     with ui.tabs().classes('w-full border-b') as project_tabs:
         tab_dash = ui.tab('Dashboard', icon='dashboard')

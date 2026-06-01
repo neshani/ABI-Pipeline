@@ -58,6 +58,9 @@ class StyleChooserModal:
     def __init__(self, on_apply: Callable[[str], None]):
         self.on_apply = on_apply
         self.dialog = None
+        self.preview_dialog = None
+        self.preview_title = None
+        self.preview_image_widget = None
         self.search_query = ""
         self.selected_style = "default"
         
@@ -224,6 +227,13 @@ class StyleChooserModal:
                         if is_active:
                             ui.icon("check", color="blue", size="xs")
 
+    def show_large_preview(self, category_title: str, image_base64: str):
+        """Populates and displays the nested secondary preview dialog with the selected image."""
+        if hasattr(self, 'preview_dialog') and self.preview_dialog:
+            self.preview_title.set_text(f"{self.selected_style} — {category_title}")
+            self.preview_image_widget.set_source(image_base64)
+            self.preview_dialog.open()
+
     def refresh_preview(self):
         """Refreshes the right-hand metadata details and image cards."""
         if self.preview_pane_container:
@@ -255,7 +265,8 @@ class StyleChooserModal:
                     with ui.card().classes("p-2 border rounded shadow-xs items-center gap-2 bg-white"):
                         ui.label("Portrait").classes("text-[10px] font-bold text-slate-400")
                         if self.portrait_img:
-                            ui.image(self.portrait_img).classes("w-full h-24 object-cover rounded border")
+                            ui.image(self.portrait_img).classes("w-full h-24 object-cover rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
+                                .on('click', lambda: self.show_large_preview("Portrait", self.portrait_img))
                         else:
                             with ui.column().classes("w-full h-24 items-center justify-center bg-slate-100 rounded border border-dashed text-slate-400"):
                                 ui.icon("face", size="sm")
@@ -265,7 +276,8 @@ class StyleChooserModal:
                     with ui.card().classes("p-2 border rounded shadow-xs items-center gap-2 bg-white"):
                         ui.label("Landscape").classes("text-[10px] font-bold text-slate-400")
                         if self.landscape_img:
-                            ui.image(self.landscape_img).classes("w-full h-24 object-cover rounded border")
+                            ui.image(self.landscape_img).classes("w-full h-24 object-cover rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
+                                .on('click', lambda: self.show_large_preview("Landscape", self.landscape_img))
                         else:
                             with ui.column().classes("w-full h-24 items-center justify-center bg-slate-100 rounded border border-dashed text-slate-400"):
                                 ui.icon("landscape", size="sm")
@@ -275,7 +287,8 @@ class StyleChooserModal:
                     with ui.card().classes("p-2 border rounded shadow-xs items-center gap-2 bg-white"):
                         ui.label("Architecture").classes("text-[10px] font-bold text-slate-400")
                         if self.architecture_img:
-                            ui.image(self.architecture_img).classes("w-full h-24 object-cover rounded border")
+                            ui.image(self.architecture_img).classes("w-full h-24 object-cover rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
+                                .on('click', lambda: self.show_large_preview("Architecture", self.architecture_img))
                         else:
                             with ui.column().classes("w-full h-24 items-center justify-center bg-slate-100 rounded border border-dashed text-slate-400"):
                                 ui.icon("account_balance", size="sm")
@@ -289,7 +302,7 @@ class StyleChooserModal:
 
     def apply_selection(self):
         """Fires the client callback applying this style selection, then closes the dialog."""
-        # A5: Write applied metadata selections directly back to the global state bindings
+        # Write applied metadata selections directly back to the global state bindings
         state.style_selected_preset = self.selected_style
         state.style_prompt_prefix = self.style_prefix
         state.style_negative_prompt = self.style_negative
@@ -305,6 +318,16 @@ class StyleChooserModal:
         self.load_preset_details(current_selection)
 
         with ui.context.client:
+            # Nested Large Image Preview Dialog
+            with ui.dialog() as self.preview_dialog:
+                with ui.card().classes("w-full max-w-3xl p-4 items-center bg-white rounded-xl shadow-lg gap-2"):
+                    self.preview_title = ui.label().classes("text-sm font-bold text-slate-800 uppercase tracking-wider mb-2")
+                    self.preview_image_widget = ui.image().props("fit=contain").classes("w-full rounded-lg max-h-[70vh] cursor-zoom-out bg-slate-50") \
+                        .on('click', lambda: self.preview_dialog.close())
+                    with ui.row().classes("w-full justify-end mt-2"):
+                        ui.button("Close", on_click=self.preview_dialog.close).classes("bg-slate-700 hover:bg-slate-800 text-white text-xs")
+
+            # Main Style Preset Selection Dialog
             with ui.dialog() as self.dialog:
                 with ui.card().classes("w-full max-w-4xl p-6 rounded-xl gap-4 bg-white"):
                     with ui.row().classes("w-full justify-between items-center pb-2 border-b"):
