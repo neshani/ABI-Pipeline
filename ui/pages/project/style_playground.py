@@ -2,11 +2,14 @@ import json
 import random
 import io
 import base64
+import asyncio
 from pathlib import Path
 from typing import Any, List, Dict, Optional
 from PIL import Image, ImageDraw, ImageFont
 from nicegui import ui
-from database.connection import get_setting
+from sqlmodel import Session, select
+from database.connection import engine, get_setting
+from database.models import Book
 from ui import state
 from ui.components.style_chooser_modal import StyleChooserModal
 
@@ -33,7 +36,6 @@ def create_contact_sheet(base64_list: list) -> Optional[bytes]:
     if not images:
         return None
 
-    # Determine optimal grid layout (up to 4 columns)
     num_imgs = len(images)
     cols = min(4, num_imgs)
     rows = (num_imgs + cols - 1) // cols
@@ -50,12 +52,10 @@ def create_contact_sheet(base64_list: list) -> Optional[bytes]:
 
         grid_img.paste(img, (c * tile_w, r * tile_h))
 
-        # Calculate coordinates label (e.g. 1A, 1B, 2A...)
         row_num = r + 1
         col_letter = chr(65 + c)
         label_text = f"{row_num}{col_letter}"
 
-        # Draw box and overlay
         draw = ImageDraw.Draw(grid_img)
         box_w = int(tile_w * 0.1) if tile_w > 400 else 50
         box_h = int(tile_h * 0.08) if tile_h > 400 else 40
@@ -64,10 +64,8 @@ def create_contact_sheet(base64_list: list) -> Optional[bytes]:
         bx1 = bx0 + box_w
         by1 = by0 + box_h
         
-        # Solid dark gray overlay
         draw.rectangle([bx0, by0, bx1, by1], fill=(15, 15, 15))
 
-        # Load font dynamically to prevent crash
         font = None
         try:
             font = ImageFont.truetype("arial.ttf", size=int(box_h * 0.55))
@@ -77,7 +75,6 @@ def create_contact_sheet(base64_list: list) -> Optional[bytes]:
             except Exception:
                 font = ImageFont.load_default()
 
-        # Center the text label inside the box
         draw.text((bx0 + int(box_w * 0.22), by0 + int(box_h * 0.18)), label_text, fill=(255, 255, 255), font=font)
 
     out_buf = io.BytesIO()
@@ -166,6 +163,7 @@ def open_contact_sheet_modal():
         contact_sheet_dialog_ref.open()
         render_contact_sheet_preview.refresh(contact_sheet_base64)
 
+
 @ui.refreshable
 def render_contact_sheet_preview(base64_data: str):
     """Renders the compiled, high-resolution contact sheet preview inside the modal."""
@@ -173,6 +171,94 @@ def render_contact_sheet_preview(base64_data: str):
         ui.label("Stitching preview, please wait...").classes('text-xs text-slate-400')
         return
     ui.image(base64_data).classes('w-full max-h-[70vh] rounded-lg object-contain border shadow-sm')
+
+
+def reroll_test_scenes(project_name: str, book_name: str):
+    """Pulls a completely new set of random test scenes from the active book volume."""
+    setattr(state, 'style_prompt_seed', random.randint(100000, 999999))
+    draw_style_test_sample(project_name, book_name)
+    ui.notify("Pulled new random test scenes!", type="info")
+
+
+def reroll_image_seeds():
+    """Keeps the exact same prompts but randomizes all of their generation seeds."""
+    if not state.style_test_prompts:
+        ui.notify("No test scenes loaded to reroll.", type="warning")
+        return
+    state.style_test_seeds = [random.randint(100000, 999999) for _ in range(len(state.style_test_prompts))]
+    state.style_test_images = [None] * len(state.style_test_prompts)
+    render_style_playground_cards.refresh()
+    ui.notify("Randomized generation seeds (prompts kept). Ready to re-test!", type="info")
+
+
+async def regenerate_single_card(project_name: str, idx: int):
+    """Randomizes the seed for a single scene card and immediately triggers independent rendering."""
+    if idx >= len(state.style_test_prompts):
+        return
+
+    # Randomize only this scene's seed
+    state.style_test_seeds[idx] = random.randint(100000, 999999)
+    state.style_test_images[idx] = "LOADING"
+    render_style_playground_cards.refresh()
+
+    comfy_url = get_setting("comfy_url", "127.0.0.1:8188")
+    if "http" in comfy_url:
+        comfy_url = comfy_url.replace("http://", "").replace("https://", "").strip("/")
+
+    wf_path = Path("./workflows") / state.style_selected_workflow
+    if not wf_path.exists():
+        wf_path = Path("./Comfy_Workflows") / state.style_selected_workflow
+
+    if not wf_path.exists():
+        state.style_test_images[idx] = None
+        render_style_playground_cards.refresh()
+        ui.notify(f"Workflow '{state.style_selected_workflow}' not found.", type="negative")
+        return
+
+    try:
+        with open(wf_path, "r") as f:
+            workflow_json = json.load(f)
+    except Exception as e:
+        state.style_test_images[idx] = None
+        render_style_playground_cards.refresh()
+        ui.notify(f"Failed to load workflow: {str(e)}", type="negative")
+        return
+
+    from services.comfy_client import ComfyClient
+    client = ComfyClient(comfy_url)
+
+    item = state.style_test_prompts[idx]
+    prompt_text = item["prompt"] if isinstance(item, dict) else item
+    seed = state.style_test_seeds[idx]
+
+    def run_single():
+        return client.generate_image_sync(
+            workflow_json=workflow_json,
+            prompt_text=prompt_text,
+            neg_prompt_text=state.style_negative_prompt,
+            seed=seed,
+            overrides=state.style_workflow_overrides,
+            prefix=state.style_prompt_prefix
+        )
+
+    try:
+        img_bytes, logs = await asyncio.to_thread(run_single)
+        if img_bytes:
+            encoded = base64.b64encode(img_bytes).decode("utf-8")
+            state.style_test_images[idx] = f"data:image/png;base64,{encoded}"
+        else:
+            state.style_test_images[idx] = None
+            ui.notify("Single render produced no output.", type="warning")
+
+        for line in logs.split("\n"):
+            if line.strip():
+                state.add_console_log(line)
+    except Exception as e:
+        state.style_test_images[idx] = None
+        state.add_console_log(f"[Style-Playground] Single card render failed: {str(e)}")
+        ui.notify(f"Render failed: {str(e)}", type="negative")
+    finally:
+        render_style_playground_cards.refresh()
 
 
 def list_available_workflows() -> list:
@@ -199,7 +285,6 @@ def load_style_presets() -> list:
 
 def load_style_preset_by_name(name: str):
     """Parses style json presets, seeding prompt/negative prompt UI textboxes."""
-    # Ensure default.json is generated on disk
     from ui.components.style_chooser_modal import ensure_default_style_exists
     ensure_default_style_exists()
     
@@ -423,7 +508,6 @@ async def execute_style_playground_batch(project_name: str):
     ui.notify("Visual test batch processing complete!", type="positive")
 
 
-# Global function to access the Style Chooser Modal across all files
 style_chooser_instance = None
 
 def open_style_chooser_modal_globally():
@@ -434,7 +518,6 @@ def open_style_chooser_modal_globally():
         state.style_selected_preset = selected_name
         load_style_preset_by_name(selected_name)
         ui.notify(f"Applied visual style: {selected_name}", type="positive")
-        # Trigger parent layout update to refresh text fields
         if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
             state.action_buttons_refresh()
             
@@ -510,7 +593,7 @@ def render_workflow_overrides_ui():
 
 
 @ui.refreshable
-def render_style_playground_cards():
+def render_style_playground_cards(project_name: str = ""):
     if not state.style_test_prompts:
         with ui.column().classes('w-full items-center justify-center p-12 text-slate-400 border border-dashed rounded-xl bg-slate-50'):
             ui.icon('brush', size='lg', color='slate-300')
@@ -536,10 +619,20 @@ def render_style_playground_cards():
                     with ui.column().classes('gap-0'):
                         ui.label(card_title).classes('text-xs font-black text-slate-700 uppercase')
                         ui.label(book_title).classes('text-[9px] text-slate-400 truncate max-w-[150px]')
-                    ui.badge(f"Seed: {seed}", color="slate").classes('text-[9px] font-bold')
+                    
+                    # Clickable Interactive Seed Badge
+                    ui.badge(f"Seed: {seed}", color="slate") \
+                        .classes('text-[10px] font-bold cursor-pointer hover:bg-slate-700 transition-all') \
+                        .on('click', lambda _, i=idx: regenerate_single_card(project_name, i)) \
+                        .tooltip('Click to randomize seed and regenerate just this scene!')
 
                 from ui.pages.project.dashboard import open_large_image
-                if img_data:
+                
+                if img_data == "LOADING":
+                    with ui.column().classes('w-full h-48 items-center justify-center bg-slate-50 rounded-lg border border-dashed'):
+                        ui.spinner(size='md', color='blue')
+                        ui.label("Rendering single card...").classes('text-[9px] text-slate-400 mt-1')
+                elif img_data:
                     ui.image(img_data).classes('w-full h-48 rounded-lg object-cover border shadow-sm cursor-zoom-in hover:brightness-95 transition-all') \
                         .on('click', lambda _, img=img_data, title=full_title_header: open_large_image(img, title))
                 elif state.style_playground_loading:
@@ -559,6 +652,19 @@ def render_style_playground_cards():
 def render_style_playground_tab(project, save_project_settings_cb=None):
     global contact_sheet_dialog_ref
     
+    # Query current volume listings inside database index
+    with Session(engine) as session:
+        books = session.exec(select(Book).where(Book.project_id == project.id)).all()
+    book_names = [b.name for b in books]
+    
+    # Sync default selection
+    if books and (not state.playground_book_selection or state.playground_book_selection not in book_names):
+        state.playground_book_selection = books[0].name
+        
+    # Auto-initialize visual test prompts so workspace is never left empty
+    if not state.style_test_prompts and state.playground_book_selection:
+        draw_style_test_sample(project.name, state.playground_book_selection)
+
     with ui.grid(columns='420px 1fr').classes('w-full gap-6 items-start'):
         # LEFT CONFIG PANEL
         with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
@@ -620,49 +726,65 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
         with ui.column().classes('w-full gap-4'):
             with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
                 with ui.row().classes('w-full items-center gap-2'):
-                    ui.icon('brush', size='sm', color='blue-500')
+                    ui.icon('tune', size='sm', color='blue-500')
                     ui.label('Style Visual Playground Settings').classes('text-sm font-bold text-slate-800')
                     
-                with ui.row().classes('items-end justify-between gap-4 w-full bg-slate-50 p-4 rounded-lg border'):
-                    ui.number(
-                        label="Num Images",
-                        value=state.style_chunk_count,
-                        min=1, max=8, step=1,
-                        on_change=lambda e: (setattr(state, 'style_chunk_count', int(e.value)) if e.value is not None else None, draw_style_test_sample(project.name, state.playground_book_selection))
-                    ).classes('w-20')
+                with ui.column().classes('w-full gap-4 bg-slate-50 p-4 rounded-lg border'):
+                    # Step 1: Volume Select & Number of scenes slider
+                    with ui.row().classes('w-full items-center justify-between gap-4'):
+                        ui.select(
+                            options=book_names,
+                            label="Book/Volume Source",
+                            on_change=lambda e: (setattr(state, 'playground_book_selection', e.value), draw_style_test_sample(project.name, e.value))
+                        ).classes('w-48 bg-white').bind_value(state, 'playground_book_selection')
+                        
+                        ui.slider(
+                            min=1, max=8, step=1,
+                            on_change=lambda e: (
+                                setattr(state, 'style_chunk_count', int(e.value)) if e.value is not None else None, 
+                                draw_style_test_sample(project.name, state.playground_book_selection)
+                            )
+                        ).classes('flex-1 mx-2').props('label-always').bind_value(state, 'style_chunk_count')
+                        ui.label('Test Count').classes('text-xs font-bold text-slate-400')
 
-                    with ui.row().classes('items-end gap-1'):
-                        prompt_seed_input = ui.number(
-                            label="Prompt Seed",
-                            value=state.style_prompt_seed,
-                            precision=0,
-                            on_change=lambda e: (setattr(state, 'style_prompt_seed', int(e.value)) if e.value is not None else None, draw_style_test_sample(project.name, state.playground_book_selection))
-                        ).classes('w-24')
+                    # Step 2: Reroll controllers
+                    with ui.row().classes('w-full gap-2 justify-end mt-1'):
+                        ui.button(
+                            'Reroll Scenes',
+                            icon='casino',
+                            on_click=lambda: reroll_test_scenes(project.name, state.playground_book_selection)
+                        ).classes('bg-slate-700 text-white text-xs font-semibold h-9') \
+                         .tooltip('Pulls a completely new set of random visual scenes from the selected volume')
                         
                         ui.button(
-                            icon="casino",
-                            on_click=lambda: (
-                                setattr(state, 'style_prompt_seed', random.randint(100000, 999999)),
-                                prompt_seed_input.set_value(state.style_prompt_seed)
+                            'Reroll Seeds',
+                            icon='refresh',
+                            on_click=reroll_image_seeds
+                        ).classes('bg-slate-700 text-white text-xs font-semibold h-9') \
+                         .tooltip('Keeps current text prompts but randomizes all of their image generation seeds')
+
+                    ui.separator()
+
+                    # Step 3: Seed locks & Main execution action
+                    with ui.row().classes('w-full items-center justify-between gap-4'):
+                        with ui.row().classes('items-center gap-4'):
+                            ui.switch("Random Seeds").bind_value(state, 'style_use_random_image_seed').classes('text-xs')
+                            
+                            ui.number(
+                                label="Manual Image Seed",
+                                precision=0
+                            ).bind_value(state, 'style_image_seed').classes('w-32 bg-white').props('outlined dense').bind_visibility_from(
+                                state, 'style_use_random_image_seed', value=False
                             )
-                        ).props('outline dense').classes('h-10 text-slate-500')
 
-                    ui.switch("Random Image Seeds").bind_value(state, 'style_use_random_image_seed').classes('text-xs mb-2')
-                    
-                    ui.number(
-                        label="Image Seed",
-                        precision=0
-                    ).bind_value(state, 'style_image_seed').classes('w-28').bind_visibility_from(
-                        state, 'style_use_random_image_seed', value=False
-                    )
+                        ui.button(
+                            'Test Style Preset',
+                            icon='bolt',
+                            on_click=lambda: execute_style_playground_batch(project.name)
+                        ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs px-5 h-10') \
+                         .tooltip('Submits all active prompts to ComfyUI for rendering')
 
-                    ui.button(
-                        'Test Style Preset',
-                        icon='bolt',
-                        on_click=lambda: execute_style_playground_batch(project.name)
-                    ).classes('bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs px-5 h-10')
-
-                # --- AI Collaboration Tools Panel ---
+                # --- AI Integration Toolkit Panel ---
                 with ui.row().classes('w-full items-center justify-between bg-blue-50/50 p-3 rounded-lg border border-blue-100/50 mt-1'):
                     with ui.row().classes('items-center gap-2'):
                         ui.icon('smart_toy', color='blue', size='sm')
@@ -681,7 +803,7 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                             on_click=open_contact_sheet_modal
                         ).classes('bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold h-9')
             
-            render_style_playground_cards()
+            render_style_playground_cards(project.name)
 
     # Declare Dialog Overlay inside workspace hierarchy
     with ui.dialog() as contact_sheet_dialog:
