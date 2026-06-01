@@ -216,6 +216,37 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
                 on_change=lambda e: handle_dashboard_template_change(e.value)
             ).classes('w-48 bg-white').props('outlined dense')
 
+        # --- Dynamic Scene Chunk Size Setting ---
+        with ui.row().classes('w-full items-center gap-3 bg-slate-50 p-3 rounded-lg border mt-1'):
+            ui.icon('wrap_text', size='sm', color='slate-500')
+            with ui.column().classes('gap-0 flex-1'):
+                ui.label('Scene Chunk Size (Words per Image)').classes('text-xs font-bold text-slate-700')
+                ui.label('Defines the text volume analyzed for each scene. Smaller = more images.').classes('text-[9px] text-slate-500')
+            
+            def handle_chunk_size_change(val: int):
+                if not val or val < 50:
+                    val = 50
+                state.playground_chunk_size = int(val)
+                from services.project_settings import save_project_settings_to_disk
+                if state.active_project_id:
+                    save_project_settings_to_disk(state.active_project_id)
+                
+                # Clear stats cache and call registered update handler safely
+                state._stats_cache.clear()
+                if hasattr(state, "stats_refresh_callback") and state.stats_refresh_callback:
+                    try:
+                        state.stats_refresh_callback()
+                    except Exception as ex:
+                        state.add_console_log(f"[Dashboard] Error refreshing stats callback: {str(ex)}")
+                
+                ui.notify(f"Scene chunk size updated to {val} words.", type="info")
+
+            ui.number(
+                value=state.playground_chunk_size,
+                min=50, max=2000, step=50,
+                on_change=lambda e: handle_chunk_size_change(e.value)
+            ).classes('w-48 bg-white').props('outlined dense suffix="words"')
+
         with ui.row().classes('w-full justify-between items-center mt-2 pt-2 border-t border-slate-100'):
             if state.project_status == "Generating Prompts":
                 with ui.row().classes('items-center gap-2'):

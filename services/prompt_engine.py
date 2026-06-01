@@ -231,8 +231,8 @@ def fetch_test_chunks(
         content = f.read()
 
     cleaned_text = content.replace("==CHAPTER==", " ").strip()
-    chunk_size = int(get_setting("batch_size", 30)) * 10
-    if chunk_size <= 0:
+    chunk_size = getattr(state, "playground_chunk_size", 350)
+    if not chunk_size or chunk_size <= 0:
         chunk_size = 350
 
     all_chunks = smart_chunk_text(cleaned_text, chunk_size)
@@ -358,9 +358,11 @@ async def start_project_prompt_gen(project_id: int):
         # Load LLM connection configurations
         llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
         model_name = get_setting("llm_model", "local-model")
-        chunk_size_words = int(get_setting("batch_size", 30)) * 10
-        if chunk_size_words <= 0:
-            chunk_size_words = 300
+        
+        # Load dynamic chunk size setting
+        chunk_size_words = getattr(state, "playground_chunk_size", 350)
+        if not chunk_size_words or chunk_size_words <= 0:
+            chunk_size_words = 350
 
         # Load Prompt Template
         template_name = state.playground_selected_template or "default"

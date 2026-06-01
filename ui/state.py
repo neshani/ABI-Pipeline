@@ -43,6 +43,7 @@ playground_template: str = ""
 playground_selected_template: str = "default"
 playground_book_selection: Optional[str] = None
 playground_chunk_count: int = 1
+playground_chunk_size: int = 350           # Defines how many words make up a scene chunk
 playground_start_index: int = 30           # Defaulting to 30 to skip intros
 playground_seed: int = 42                 # Seeded random default
 playground_selection_mode: str = "Seeded Random"
@@ -85,6 +86,10 @@ recent_images_refresh: Optional[Any] = None
 preview_image_src: str = ""
 preview_image_title: str = ""
 global_preview_dialog: Optional[Any] = None
+
+# --- Cache-Busted On-Disk Volume Statistics Engine ---
+_stats_cache: Dict[str, Any] = {}
+stats_refresh_callback: Optional[Any] = None
 
 # --- Real-Time Batch Process Telemetry ---
 batch_start_time: Optional[float] = None

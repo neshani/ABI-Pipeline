@@ -30,7 +30,8 @@ def save_project_settings_to_disk(project_id: int) -> None:
         "style_negative_prompt": state.style_negative_prompt,
         "style_use_random_image_seed": state.style_use_random_image_seed,
         "style_image_seed": state.style_image_seed,
-        "workflow_overrides": state.style_workflow_overrides
+        "workflow_overrides": state.style_workflow_overrides,
+        "playground_chunk_size": state.playground_chunk_size
     }
     
     try:
@@ -61,6 +62,7 @@ def load_project_settings_from_disk(project_id: int) -> None:
         state.style_image_seed = 42
         state.style_workflow_overrides = {}
         state.style_discovered_params = {}
+        state.playground_chunk_size = 350
         return
 
     try:
@@ -75,6 +77,7 @@ def load_project_settings_from_disk(project_id: int) -> None:
         state.style_use_random_image_seed = data.get("style_use_random_image_seed", True)
         state.style_image_seed = data.get("style_image_seed", 42)
         state.style_workflow_overrides = data.get("workflow_overrides", {})
+        state.playground_chunk_size = data.get("playground_chunk_size", 350)
         
         # Re-analyze active workflow parameters to repopulate active sliders
         if state.style_selected_workflow:

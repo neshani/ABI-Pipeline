@@ -32,7 +32,7 @@ from ui.pages import render_portal_view, render_project_tabs, render_book_tabs, 
 init_db()
 
 # --- Cache-Busted On-Disk Volume Statistics Engine ---
-_stats_cache = {}
+# Cache dictionary is now located safely inside state._stats_cache to prevent circular imports
 
 def get_book_stats(project_name: str, book_name: str) -> dict:
     """Computes fast on-disk statistics for a book volume without database queries."""
@@ -58,7 +58,12 @@ def get_book_stats(project_name: str, book_name: str) -> dict:
             txt = transcript_path.read_text(encoding="utf-8", errors="ignore")
             stats["char_count"] = len(txt)
             stats["word_count"] = len(txt.split())
-            stats["estimated_scenes"] = max(1, stats["char_count"] // 1500)
+            
+            # Apply dynamic custom chunk size setting
+            chunk_size = getattr(state, "playground_chunk_size", 350)
+            if not chunk_size or chunk_size <= 0:
+                chunk_size = 350
+            stats["estimated_scenes"] = max(1, stats["word_count"] // chunk_size)
         except Exception:
             pass
             
@@ -106,14 +111,14 @@ def get_book_stats_cached(project_name: str, book_name: str) -> dict:
             sig += f"{p.name}:{p.stat().st_mtime}|"
             
     cache_key = f"{project_name}:{book_name}"
-    if cache_key in _stats_cache:
-        cached_sig, cached_data = _stats_cache[cache_key]
+    if cache_key in state._stats_cache:
+        cached_sig, cached_data = state._stats_cache[cache_key]
         if cached_sig == sig:
             return cached_data
             
     # Parse fresh and cache
     stats = get_book_stats(project_name, book_name)
-    _stats_cache[cache_key] = (sig, stats)
+    state._stats_cache[cache_key] = (sig, stats)
     return stats
 
 def reset_stuck_transcriptions():
@@ -775,7 +780,7 @@ def check_for_active_transcriptions():
                     elif stats["total_prompts"] > 0:
                         state.books_subtitle[b.id] = f"{stats['total_prompts']} scene prompts ready"
                     elif stats["has_transcript"]:
-                        state.books_subtitle[b.id] = f"{stats['word_count']:,} words • Ready"
+                        state.books_subtitle[b.id] = f"{stats['word_count']:,} words • {stats['estimated_scenes']} est. images"
                     else:
                         state.books_subtitle[b.id] = "Awaiting prompts"
                         
@@ -787,6 +792,7 @@ def check_for_active_transcriptions():
                         state.books_subtitle[b.id] = f"All Approved! • {total_scenes} scenes"
                     else:
                         state.books_subtitle[b.id] = f"Rendered: {stats['generated_images']}/{total_scenes} ({stats['approved_prompts']} approved)"
+
 
             if books:
                 avg_progress = sum(b.progress for b in books) / len(books)
@@ -809,6 +815,9 @@ def check_for_active_transcriptions():
                 state.recent_prompts_refresh()
             except Exception:
                 pass
+
+# Register the statistics refresh callback on the safe state module
+state.stats_refresh_callback = check_for_active_transcriptions
 
 
 # --- Split-Panel Shell Renderer ---
