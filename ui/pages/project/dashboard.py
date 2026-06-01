@@ -205,7 +205,7 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
                 if loaded:
                     state.playground_template = loaded
                     # Auto-persist chosen template layout settings immediately
-                    from main import save_project_settings_to_disk
+                    from services.project_settings import save_project_settings_to_disk
                     if state.active_project_id:
                         save_project_settings_to_disk(state.active_project_id)
                     ui.notify(f"Active Prompt Template changed to: {val}", type="info")
