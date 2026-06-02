@@ -79,7 +79,7 @@ def load_associated_loras():
 
 
 async def async_load_comfy_and_lora_choices():
-    """Fetches model selection drop-down options from ComfyUI API object_info in a background task."""
+    """Fetches model and sampler selection options from ComfyUI API object_info in a background task."""
     global comfy_options_cache
     comfy_options_cache.clear()
     
@@ -98,17 +98,20 @@ async def async_load_comfy_and_lora_choices():
         if not class_type:
             continue
             
-        param_key = None
+        param_keys = []
         if node_type == "model_loader":
-            param_key = params.get("model_param_key", "ckpt_name")
+            param_keys = [params.get("model_param_key", "ckpt_name")]
         elif node_type == "lora_loader":
-            param_key = "lora_name"
+            param_keys = ["lora_name"]
         elif node_type == "clip_loader":
-            param_key = params.get("clip_param_key", "clip_name")
+            param_keys = [params.get("clip_param_key", "clip_name")]
         elif node_type == "vae_loader":
-            param_key = "vae_name"
+            param_keys = ["vae_name"]
+        elif node_type == "sampler":
+            # Automatically request lists of both samplers and schedulers from node class
+            param_keys = ["sampler_name", "scheduler"]
             
-        if param_key:
+        for param_key in param_keys:
             try:
                 async with httpx.AsyncClient() as client:
                     resp = await client.get(f"http://{comfy_url}/object_info/{class_type}", timeout=2.0)
@@ -788,16 +791,38 @@ def render_workflow_overrides_ui():
                             min=0.0, max=30.0, step=0.1,
                             on_change=lambda e, nid=node_id: update_override_state(nid, "cfg", e.value)
                         ).classes('w-full')
-                        ui.input(
-                            label="Sampler Name",
-                            value=current_sampler,
-                            on_change=lambda e, nid=node_id: update_override_state(nid, "sampler_name", e.value)
-                        ).classes('w-full')
-                        ui.input(
-                            label="Scheduler",
-                            value=current_scheduler,
-                            on_change=lambda e, nid=node_id: update_override_state(nid, "scheduler", e.value)
-                        ).classes('w-full')
+                        
+                        # Sampler Dropdown with API lookup
+                        comfy_sampler_key = f"{node_id}:sampler_name"
+                        if comfy_sampler_key in comfy_options_cache:
+                            ui.select(
+                                options=comfy_options_cache[comfy_sampler_key],
+                                value=current_sampler if current_sampler in comfy_options_cache[comfy_sampler_key] else None,
+                                label="Sampler Name",
+                                on_change=lambda e, nid=node_id: (update_override_state(nid, "sampler_name", e.value), render_workflow_overrides_ui.refresh())
+                            ).classes('w-full')
+                        else:
+                            ui.input(
+                                label="Sampler Name",
+                                value=current_sampler,
+                                on_change=lambda e, nid=node_id: update_override_state(nid, "sampler_name", e.value)
+                            ).classes('w-full')
+                            
+                        # Scheduler Dropdown with API lookup
+                        comfy_scheduler_key = f"{node_id}:scheduler"
+                        if comfy_scheduler_key in comfy_options_cache:
+                            ui.select(
+                                options=comfy_options_cache[comfy_scheduler_key],
+                                value=current_scheduler if current_scheduler in comfy_options_cache[comfy_scheduler_key] else None,
+                                label="Scheduler",
+                                on_change=lambda e, nid=node_id: (update_override_state(nid, "scheduler", e.value), render_workflow_overrides_ui.refresh())
+                            ).classes('w-full')
+                        else:
+                            ui.input(
+                                label="Scheduler",
+                                value=current_scheduler,
+                                on_change=lambda e, nid=node_id: update_override_state(nid, "scheduler", e.value)
+                            ).classes('w-full')
                         
                     elif node_type == "resolution":
                         current_width = state.style_workflow_overrides.get(node_id, {}).get("width", params["width"])
