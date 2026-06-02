@@ -1,6 +1,7 @@
 from .portal import render_portal_view
 from .project import render_project_tabs
 from .book_workspace import render_book_tabs
+from .lora_contact_sheet import render_lora_contact_sheet
 
 # Central global reference to the main layout for triggering dynamic workspace redraws
 main_layout_ref = None

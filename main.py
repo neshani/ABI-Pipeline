@@ -26,7 +26,7 @@ from ui.components.settings_modal import SettingsModal
 
 # Modularized states and pages imports
 from ui import state
-from ui.pages import render_portal_view, render_project_tabs, render_book_tabs, register_main_layout
+from ui.pages import render_portal_view, render_project_tabs, render_book_tabs, render_lora_contact_sheet, register_main_layout
 
 # --- Initialize SQLite Database & Recovery Engines ---
 init_db()
@@ -221,10 +221,17 @@ def select_book(book_id: int):
 def exit_to_portal():
     state.active_project_id = None
     state.active_book_id = None
+    state.active_tool = None
     state.active_log_widget = None
     header_controls.refresh()
     main_layout.refresh()
 
+def open_tool(tool_name: str):
+    state.active_project_id = None
+    state.active_book_id = None
+    state.active_tool = tool_name
+    header_controls.refresh()
+    main_layout.refresh()
 
 def refresh_dashboard():
     main_layout.refresh()
@@ -942,7 +949,9 @@ def render_split_panel_shell(project_id: int):
 # --- Dynamic Main Page Wrapper ---
 @ui.refreshable
 def main_layout():
-    if state.active_project_id is None:
+    if state.active_tool == "lora_contact_sheet":
+        render_lora_contact_sheet(exit_to_portal)
+    elif state.active_project_id is None:
         render_portal_view(select_project, refresh_dashboard)
     else:
         render_split_panel_shell(state.active_project_id)
@@ -1185,6 +1194,7 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
         with ui.button(icon='construction', color='slate-600') as tools_btn:
             tools_btn.classes('text-white text-sm capitalize rounded-lg')
             with ui.menu() as menu:
+                ui.menu_item('LoRA Contact Sheets', on_click=lambda: open_tool('lora_contact_sheet'))
                 ui.menu_item('Style Library', on_click=lambda: ui.notify('Style Library coming soon'))
                 ui.menu_item('Prompt Templates', on_click=lambda: ui.notify('Templates coming soon'))
         ui.button(icon='settings', on_click=lambda: settings_modal.open()).props('flat round color=white')

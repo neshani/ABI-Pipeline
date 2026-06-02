@@ -3,6 +3,13 @@ from typing import Optional, Dict, Any, List
 # Dynamic Workspace State
 active_project_id: Optional[int] = None
 active_book_id: Optional[int] = None
+active_tool: Optional[str] = None  # Tracks global tools like 'lora_contact_sheet'
+lora_tool_selected_workflow: str = "None"
+lora_library: List[Dict[str, Any]] = []  # Holds the parsed loras.csv
+lora_tool_active_lora_id: Optional[str] = None
+lora_tool_generating: bool = False
+lora_tool_cancel_flag: bool = False
+lora_tool_progress: Dict[str, Any] = {}  # Tracks {"lora_id": str, "current": int, "total": int}
 
 # Tab selections (bound to persist state during navigation)
 active_project_tab: str = 'Dashboard'
@@ -95,3 +102,4 @@ stats_refresh_callback: Optional[Any] = None
 batch_start_time: Optional[float] = None
 batch_elapsed_sec: float = 0.0
 batch_eta_label: str = "ETA: Estimating..."
+
