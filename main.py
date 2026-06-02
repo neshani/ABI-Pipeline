@@ -28,8 +28,6 @@ from ui.components.settings_modal import SettingsModal
 from ui import state
 from ui.pages import render_portal_view, render_project_tabs, render_book_tabs, render_lora_contact_sheet, register_main_layout
 
-# --- Initialize SQLite Database & Recovery Engines ---
-init_db()
 
 # --- Cache-Busted On-Disk Volume Statistics Engine ---
 # Cache dictionary is now located safely inside state._stats_cache to prevent circular imports
@@ -142,12 +140,16 @@ def reset_stuck_transcriptions():
             
         session.commit()
 
-# Ensure stuck tasks are cleared
-reset_stuck_transcriptions()
+# --- Initialize SQLite Database & Recovery Engines ---
+if __name__ == "__main__":
+    init_db()
+    
+    # Ensure stuck tasks are cleared
+    reset_stuck_transcriptions()
 
-# Run workspace recovery to restore wiped database entries
-with Session(engine) as session:
-    recover_from_temp_workspaces(session)
+    # Run workspace recovery to restore wiped database entries
+    with Session(engine) as session:
+        recover_from_temp_workspaces(session)
 
 # --- Programmatic App Restart Engine ---
 def restart_app():
@@ -1209,4 +1211,5 @@ with ui.column().classes('w-full max-w-7xl mx-auto p-6 gap-6'):
 ui.timer(2.0, check_for_active_transcriptions)
 
 # Launch our app
-ui.run(title="ABI-Pipeline")
+if __name__ in {"__main__", "__mp_main__"}:
+    ui.run(title="ABI-Pipeline")

@@ -1,3 +1,4 @@
+# ui/pages/lora_contact_sheet.py
 import os
 import csv
 import uuid
@@ -7,7 +8,7 @@ import asyncio
 from pathlib import Path
 from nicegui import ui
 from ui import state
-from typing import Callable, List, Dict, Any
+from typing import Callable, List, Dict, Any, Optional
 import json
 
 from services.comfy_client import ComfyClient
@@ -44,11 +45,35 @@ DEFAULT_PROMPTS = [
 image_preview_dialog = None
 preview_img = None
 preview_caption = None
+prev_btn = None
+next_btn = None
+
+preview_images_list = []
+preview_current_idx = -1
 
 edit_dialog = None
 edit_triggers = None
 edit_strength = None
 active_edit_lora = None
+
+delete_confirm_dialog = None
+active_delete_lora = None
+
+lora_contact_sheet_dialog = None
+lora_contact_sheet_base64 = ""
+
+prompts_editor_dialog = None
+prompts_textarea_ref = None
+
+def get_prompts_count() -> int:
+    """Helper to retrieve the number of active lines inside prompts.txt dynamically."""
+    if LORA_PROMPTS_PATH.exists():
+        try:
+            with open(LORA_PROMPTS_PATH, "r", encoding="utf-8") as f:
+                return len([line.strip() for line in f if line.strip()])
+        except Exception:
+            pass
+    return len(DEFAULT_PROMPTS)
 
 def init_lora_library():
     LORA_LIB_DIR.mkdir(parents=True, exist_ok=True)
@@ -59,12 +84,13 @@ def init_lora_library():
     if not LORA_CSV_PATH.exists():
         with open(LORA_CSV_PATH, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f, delimiter='|')
-            writer.writerow(["id", "workflow", "lora_path", "triggers", "strength", "avg_render_time", "status"])
+            writer.writerow(["id", "workflow", "lora_path", "triggers", "strength", "avg_render_time", "status", "favorite"])
         state.lora_library = []
         return
 
     rows = []
     has_stuck_generations = False
+    needs_migration = False
     with open(LORA_CSV_PATH, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter='|')
         for row in reader:
@@ -72,26 +98,35 @@ def init_lora_library():
             if row.get("status") == "Generating":
                 row["status"] = "Pending"
                 has_stuck_generations = True
+            
+            # Migration: Ensure the favorite field exists on every old row
+            if "favorite" not in row:
+                row["favorite"] = "False"
+                needs_migration = True
+                
             rows.append(row)
             
     state.lora_library = rows
     
-    # If we recovered any stuck LoRAs, rewrite the CSV to synchronize the disk immediately
-    if has_stuck_generations:
+    # If we recovered stuck LoRAs or migrated schema columns, rewrite the CSV now
+    if has_stuck_generations or needs_migration:
         save_lora_library_full()
+
 
 def save_lora_library_full():
     with open(LORA_CSV_PATH, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=["id", "workflow", "lora_path", "triggers", "strength", "avg_render_time", "status"], delimiter='|')
+        writer = csv.DictWriter(f, fieldnames=["id", "workflow", "lora_path", "triggers", "strength", "avg_render_time", "status", "favorite"], delimiter='|')
         writer.writeheader()
         for l in state.lora_library:
             writer.writerow(l)
+
 
 def save_lora_to_library(lora_data: List[Dict[str, Any]]):
     for l in lora_data:
         state.lora_library.append(l)
     save_lora_library_full()
     render_lora_sidebar.refresh()
+
 
 def parse_and_add_loras(raw_text: str, default_strength: float, dialog: Any):
     if not raw_text.strip():
@@ -126,7 +161,8 @@ def parse_and_add_loras(raw_text: str, default_strength: float, dialog: Any):
                 "triggers": triggers,
                 "strength": strength,
                 "avg_render_time": "0.0",
-                "status": "Pending"
+                "status": "Pending",
+                "favorite": "False"
             })
 
     if new_entries:
@@ -135,6 +171,7 @@ def parse_and_add_loras(raw_text: str, default_strength: float, dialog: Any):
         dialog.close()
     else:
         ui.notify("No new configurations added. (Duplicates ignored)", type="info")
+
 
 def get_lora_workflows() -> list[str]:
     client = ComfyClient("")
@@ -152,6 +189,7 @@ def get_lora_workflows() -> list[str]:
                 except Exception:
                     pass
     return sorted(list(set(valid_workflows)))
+
 
 # --- ASYNC EXECUTION ENGINE ---
 async def run_benchmark_task(lora_ids: List[str]):
@@ -282,21 +320,81 @@ async def run_benchmark_task(lora_ids: List[str]):
         render_lora_sidebar.refresh()
         render_lora_workspace.refresh()
 
+
 def cancel_generation():
     state.lora_tool_cancel_flag = True
     ui.notify("Stopping after current image finishes...", type="warning")
 
 
-def open_preview(img_path: str, idx: int):
+def update_preview_content():
+    global preview_images_list, preview_current_idx, preview_img, preview_caption
+    global prev_btn, next_btn
+    
+    if not preview_images_list or preview_current_idx < 0 or preview_current_idx >= len(preview_images_list):
+        return
+
+    img_path = str(preview_images_list[preview_current_idx])
+    preview_img.set_source(img_path)
+
     current_prompts = DEFAULT_PROMPTS
     if LORA_PROMPTS_PATH.exists():
         with open(LORA_PROMPTS_PATH, "r", encoding="utf-8") as f:
             current_prompts = [p.strip() for p in f.readlines() if p.strip()]
-            
-    preview_img.set_source(img_path)
-    caption_text = current_prompts[idx] if idx < len(current_prompts) else "Prompt unknown"
+
+    caption_text = f"[{preview_current_idx + 1}/{len(preview_images_list)}] " + (
+        current_prompts[preview_current_idx] if preview_current_idx < len(current_prompts) else "Prompt unknown"
+    )
     preview_caption.set_text(caption_text)
+
+    # Disable navigation buttons at boundaries to keep experience cohesive
+    if prev_btn:
+        if preview_current_idx > 0:
+            prev_btn.enable()
+            prev_btn.classes('opacity-100', remove='opacity-20')
+        else:
+            prev_btn.disable()
+            prev_btn.classes('opacity-20', remove='opacity-100')
+
+    if next_btn:
+        if preview_current_idx < len(preview_images_list) - 1:
+            next_btn.enable()
+            next_btn.classes('opacity-100', remove='opacity-20')
+        else:
+            next_btn.disable()
+            next_btn.classes('opacity-20', remove='opacity-100')
+
+
+def navigate_preview(direction: int):
+    global preview_images_list, preview_current_idx
+    if not preview_images_list:
+        return
+    new_idx = preview_current_idx + direction
+    if 0 <= new_idx < len(preview_images_list):
+        preview_current_idx = new_idx
+        update_preview_content()
+
+
+def handle_keyboard(e):
+    # Only intercept if the image preview modal is active
+    if not image_preview_dialog or not image_preview_dialog.value:
+        return
+
+    key = e.key.name.lower() if e.key and e.key.name else ""
+    if key in ["arrowleft", "s"]:
+        navigate_preview(-1)
+    elif key in ["arrowright", "f"]:
+        navigate_preview(1)
+    elif key == "escape":
+        image_preview_dialog.close()
+
+
+def open_preview(img_path: str, idx: int, images_list: list):
+    global preview_images_list, preview_current_idx
+    preview_images_list = images_list
+    preview_current_idx = idx
+    update_preview_content()
     image_preview_dialog.open()
+
 
 def open_edit(lora: Dict[str, Any]):
     global active_edit_lora
@@ -305,6 +403,219 @@ def open_edit(lora: Dict[str, Any]):
     edit_strength.set_value(float(lora["strength"]))
     edit_dialog.open()
 
+
+def open_delete(lora: Dict[str, Any]):
+    global active_delete_lora
+    active_delete_lora = lora
+    delete_confirm_dialog.open()
+
+
+def confirm_delete_lora():
+    global active_delete_lora
+    if not active_delete_lora:
+        return
+
+    # Delete folder hierarchy containing generated png outputs
+    out_dir = LORA_LIB_DIR / active_delete_lora["id"]
+    if out_dir.exists():
+        try:
+            shutil.rmtree(out_dir)
+        except Exception as e:
+            state.add_console_log(f"[LoRA-Library] Error cleaning directory: {str(e)}")
+
+    # Remove active selection element from registry and flush
+    state.lora_library = [l for l in state.lora_library if l["id"] != active_delete_lora["id"]]
+    save_lora_library_full()
+
+    if state.lora_tool_active_lora_id == active_delete_lora["id"]:
+        state.lora_tool_active_lora_id = None
+
+    active_delete_lora = None
+    delete_confirm_dialog.close()
+    
+    ui.notify("LoRA and associated benchmark files successfully deleted.", type="positive")
+    render_lora_sidebar.refresh()
+    render_lora_workspace.refresh()
+
+def create_lora_contact_sheet(lora_id: str) -> Optional[bytes]:
+    """Stitches completed disk benchmark images into a numbered, header-labeled PNG grid."""
+    from PIL import Image, ImageDraw, ImageFont
+    import io
+
+    lora = next((l for l in state.lora_library if l["id"] == lora_id), None)
+    if not lora:
+        return None
+        
+    out_dir = LORA_LIB_DIR / lora_id
+    if not out_dir.exists():
+        return None
+        
+    images = sorted([f for f in out_dir.glob("*.png")])
+    if not images:
+        return None
+        
+    opened_images = []
+    for img_path in images:
+        try:
+            opened_images.append(Image.open(img_path))
+        except Exception:
+            pass
+            
+    if not opened_images:
+        return None
+        
+    num_imgs = len(opened_images)
+    cols = 5  # Standard grid columns for benchmarking
+    rows = (num_imgs + cols - 1) // cols
+    
+    tile_w, tile_h = opened_images[0].size
+    
+    # Calculate responsive header height
+    header_h = int(tile_h * 0.15) if tile_h > 400 else 60
+    grid_w = cols * tile_w
+    grid_h = rows * tile_h + header_h
+    
+    # Dark gray theme background canvas
+    grid_img = Image.new("RGB", (grid_w, grid_h), (20, 20, 20))
+    draw = ImageDraw.Draw(grid_img)
+    
+    # Set text fonts
+    font_title = None
+    font_label = None
+    try:
+        font_title = ImageFont.truetype("arial.ttf", size=int(header_h * 0.4))
+        font_label = ImageFont.truetype("arial.ttf", size=int(tile_h * 0.08))
+    except Exception:
+        try:
+            font_title = ImageFont.truetype("DejaVuSans.ttf", size=int(header_h * 0.4))
+            font_label = ImageFont.truetype("DejaVuSans.ttf", size=int(tile_h * 0.08))
+        except Exception:
+            font_title = ImageFont.load_default()
+            font_label = ImageFont.load_default()
+            
+    short_name = Path(lora["lora_path"]).name
+    header_text = f"LoRA: {short_name}  |  Strength: {float(lora['strength']):.2f}  |  Workflow: {lora['workflow']}"
+    
+    # Center header text on canvas
+    try:
+        text_w = draw.textlength(header_text, font=font_title)
+    except AttributeError:
+        text_w = font_title.getsize(header_text)[0] if hasattr(font_title, 'getsize') else len(header_text) * 8
+        
+    x_pos = max(20, (grid_w - text_w) // 2)
+    y_pos = int((header_h - (header_h * 0.4)) // 2)
+    draw.text((x_pos, y_pos), header_text, fill=(255, 255, 255), font=font_title)
+    
+    # Paste and stamp sequential numbers onto individual tiles
+    for idx, img in enumerate(opened_images):
+        r = idx // cols
+        c = idx % cols
+        
+        if img.size != (tile_w, tile_h):
+            img = img.resize((tile_w, tile_h), Image.Resampling.LANCZOS)
+            
+        x_offset = c * tile_w
+        y_offset = r * tile_h + header_h
+        grid_img.paste(img, (x_offset, y_offset))
+        
+        label_text = str(idx + 1)
+        box_w = int(tile_w * 0.12) if tile_w > 400 else 40
+        box_h = int(tile_h * 0.10) if tile_h > 400 else 32
+        
+        bx0 = x_offset
+        by0 = y_offset
+        bx1 = bx0 + box_w
+        by1 = by0 + box_h
+        
+        # Stamp background rectangle
+        draw.rectangle([bx0, by0, bx1, by1], fill=(15, 15, 15))
+        
+        # Center coordinates
+        try:
+            lbl_w = draw.textlength(label_text, font=font_label)
+        except AttributeError:
+            lbl_w = font_label.getsize(label_text)[0] if hasattr(font_label, 'getsize') else len(label_text) * 8
+            
+        lx = bx0 + (box_w - lbl_w) // 2
+        ly = by0 + (box_h - int(tile_h * 0.08)) // 2 if tile_h > 400 else by0 + 2
+        draw.text((lx, ly), label_text, fill=(255, 255, 255), font=font_label)
+        
+    out_buf = io.BytesIO()
+    grid_img.save(out_buf, format="PNG")
+    return out_buf.getvalue()
+
+
+def download_lora_contact_sheet(lora_id: str):
+    """Triggers direct browser download of the compiled benchmark image grid."""
+    lora = next((l for l in state.lora_library if l["id"] == lora_id), None)
+    if not lora:
+        return
+    sheet_bytes = create_lora_contact_sheet(lora_id)
+    if sheet_bytes:
+        short_name = Path(lora["lora_path"]).stem
+        ui.download(sheet_bytes, filename=f"lora_grid_{short_name}_{lora['strength']}.png")
+    else:
+        ui.notify("Failed to assemble download file.", type="negative")
+
+def open_prompts_editor_modal():
+    """Reads the current prompts file from disk, populates the textarea, and opens the editor modal."""
+    global prompts_editor_dialog, prompts_textarea_ref
+    if not prompts_editor_dialog or not prompts_textarea_ref:
+        return
+    
+    initial_prompts_txt = ""
+    if LORA_PROMPTS_PATH.exists():
+        try:
+            initial_prompts_txt = LORA_PROMPTS_PATH.read_text(encoding="utf-8")
+        except Exception:
+            initial_prompts_txt = "\n".join(DEFAULT_PROMPTS)
+    else:
+        initial_prompts_txt = "\n".join(DEFAULT_PROMPTS)
+    
+    prompts_textarea_ref.set_value(initial_prompts_txt)
+    prompts_editor_dialog.open()
+
+
+def open_lora_contact_sheet_modal(lora_id: str):
+    """Encodes stitched image, loads dialog base, and opens the preview overlay."""
+    global lora_contact_sheet_base64, lora_contact_sheet_dialog
+    sheet_bytes = create_lora_contact_sheet(lora_id)
+    if not sheet_bytes:
+        ui.notify("Failed to generate contact sheet preview.", type="negative")
+        return
+        
+    import base64
+    encoded = base64.b64encode(sheet_bytes).decode("utf-8")
+    lora_contact_sheet_base64 = f"data:image/png;base64,{encoded}"
+    
+    if lora_contact_sheet_dialog:
+        lora_contact_sheet_dialog.open()
+        render_lora_contact_sheet_preview.refresh(lora_contact_sheet_base64)
+
+
+def copy_numbered_prompts_to_clipboard():
+    """Formats only active evaluation prompts as sequential lines and saves to keyboard cache."""
+    current_prompts = DEFAULT_PROMPTS
+    if LORA_PROMPTS_PATH.exists():
+        with open(LORA_PROMPTS_PATH, "r", encoding="utf-8") as f:
+            current_prompts = [p.strip() for p in f.readlines() if p.strip()]
+            
+    lines = []
+    for idx, prompt_text in enumerate(current_prompts):
+        lines.append(f"{idx + 1}. {prompt_text}")
+        
+    full_text = "\n".join(lines)
+    ui.clipboard.write(full_text)
+    ui.notify("Numbered evaluation prompts copied to clipboard!", type="positive")
+
+
+@ui.refreshable
+def render_lora_contact_sheet_preview(base64_data: str):
+    """Renders the stitched high-res contact sheet within the modal dialog viewport."""
+    if not base64_data:
+        ui.label("Stitching preview, please wait...").classes('text-xs text-slate-400')
+        return
+    ui.image(base64_data).props('fit=contain').classes('w-full max-h-[70vh] rounded-lg border shadow-sm bg-slate-50/20')
 
 @ui.refreshable
 def render_lora_sidebar():
@@ -345,10 +656,21 @@ def render_lora_sidebar():
 
     if state.lora_tool_selected_workflow != "None" and not state.lora_tool_generating:
         ui.button('Add LoRAs', icon='add', on_click=add_lora_dialog.open).classes('w-full bg-blue-600 hover:bg-blue-700 text-white font-bold mb-2')
-    
+        
+        # Collapsible prompts flat-file configuration drawer
+        ui.button(
+            'Edit Prompts', 
+            icon='edit_note', 
+            on_click=open_prompts_editor_modal
+        ).classes('w-full bg-slate-700 hover:bg-slate-800 text-white font-bold mb-2') \
+         .tooltip('Open full-size benchmark prompts editor modal.')
+        
     ui.separator().classes('mb-4 mt-2')
     
     active_loras = [l for l in state.lora_library if l.get("workflow") == state.lora_tool_selected_workflow]
+
+    # Bubble favorites up to the top, and sort alphabetically underneath
+    active_loras = sorted(active_loras, key=lambda l: (l.get("favorite") != "True", Path(l["lora_path"]).name.lower()))
 
     with ui.column().classes('w-full gap-2'):
         if state.lora_tool_selected_workflow == "None":
@@ -383,7 +705,11 @@ def render_lora_sidebar():
                     render_lora_workspace.refresh()
 
                 with ui.card().classes(f'w-full p-3 border cursor-pointer transition-all gap-1 {card_bg}').on('click', select_lora):
-                    ui.label(short_path).classes('text-xs font-bold text-slate-800 truncate w-full')
+                    with ui.row().classes('w-full items-center justify-between gap-1'):
+                        ui.label(short_path).classes('text-xs font-bold text-slate-800 truncate flex-1')
+                        if lora.get("favorite") == "True":
+                            ui.icon('star', color='amber-500', size='14px')
+                            
                     with ui.row().classes('w-full justify-between items-center mt-1'):
                         ui.badge(f'str: {float(lora["strength"]):.2f}', color='blue-100').classes('text-blue-800 text-[10px] px-1 py-0 rounded')
                         ui.badge(lora["status"], color=status_color).classes(f'text-{status_text} text-[10px] px-1 py-0 rounded font-bold')
@@ -409,18 +735,39 @@ def render_lora_workspace():
 
     with ui.column().classes('w-full gap-4'):
         with ui.card().classes('w-full bg-white border rounded-xl p-4 shadow-sm gap-2'):
-            with ui.row().classes('w-full justify-between items-start'):
-                with ui.column().classes('gap-0'):
-                    ui.label(short_path).classes('text-xl font-bold text-slate-800')
-                    with ui.row().classes('items-center gap-2 text-sm text-slate-500'):
-                        ui.icon('bolt', size='sm')
-                        ui.label(f'Triggers: {clean_triggers}')
+            # Beautiful flex layout utilizing flex-nowrap to prevent the right action cluster wrapping below
+            with ui.row().classes('w-full justify-between items-start gap-4 flex-nowrap'):
+                with ui.column().classes('gap-0 flex-1 min-w-0'):
+                    ui.label(short_path).classes('text-xl font-bold text-slate-800 truncate w-full')
+                    with ui.row().classes('items-center gap-2 text-sm text-slate-500 flex-wrap'):
+                        ui.icon('bolt', size='sm').classes('flex-shrink-0')
+                        ui.label(f'Triggers: {clean_triggers}').classes('truncate max-w-md')
                         ui.label('•')
-                        ui.label(f'Strength: {float(active_lora["strength"]):.2f}')
+                        ui.label(f'Strength: {float(active_lora["strength"]):.2f}').classes('flex-shrink-0')
                 
-                with ui.row().classes('items-center gap-4'):
+                with ui.row().classes('items-center gap-2 flex-shrink-0'):
                     if not state.lora_tool_generating:
+                        # Star toggle button
+                        is_fav = active_lora.get("favorite") == "True"
+                        star_icon = "star" if is_fav else "star_border"
+                        star_color = "text-amber-500" if is_fav else "text-slate-400"
+                        
+                        def toggle_favorite():
+                            active_lora["favorite"] = "False" if active_lora.get("favorite") == "True" else "True"
+                            save_lora_library_full()
+                            render_lora_sidebar.refresh()
+                            render_lora_workspace.refresh()
+                            
+                        ui.button(
+                            icon=star_icon,
+                            on_click=toggle_favorite
+                        ).props('flat dense').classes(f'{star_color} hover:text-amber-500 text-xs font-bold').tooltip('Toggle Favorite')
+
+                        # Edit config settings button
                         ui.button('Edit Settings', icon='edit', on_click=lambda: open_edit(active_lora)).props('flat dense').classes('text-slate-400 hover:text-blue-500 text-xs font-bold')
+                        
+                        # Permanent deletion trigger
+                        ui.button('Delete', icon='delete', on_click=lambda: open_delete(active_lora)).props('flat dense').classes('text-slate-400 hover:text-rose-500 text-xs font-bold')
                         
                     if active_lora["status"] == "Completed":
                         with ui.column().classes('items-end gap-0 bg-slate-50 p-2 rounded border'):
@@ -428,30 +775,31 @@ def render_lora_workspace():
                             ui.label(f'{float(active_lora["avg_render_time"]):.1f}s / image').classes('text-lg font-black text-blue-600')
 
         if active_lora["status"] == "Pending":
+            p_count = get_prompts_count()
             with ui.column().classes('w-full h-64 bg-slate-50 border border-dashed rounded-xl p-8 items-center justify-center gap-4'):
                 ui.icon('speed', size='64px').classes('text-blue-200')
                 ui.label('Ready to Benchmark').classes('text-lg font-bold text-slate-700')
-                ui.label('This will generate 20 images using your default prompts to evaluate the style and render speed.').classes('text-sm text-slate-500 text-center max-w-md')
+                ui.label(f'This will generate {p_count} images using your default prompts to evaluate the style and render speed.').classes('text-sm text-slate-500 text-center max-w-md')
                 if not state.lora_tool_generating:
-                    ui.button('Start 20-Image Benchmark', icon='play_arrow', on_click=lambda: asyncio.create_task(run_benchmark_task([active_lora["id"]]))).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold px-6 py-2 mt-2 shadow-sm')
+                    ui.button(f'Start {p_count}-Image Benchmark', icon='play_arrow', on_click=lambda: asyncio.create_task(run_benchmark_task([active_lora["id"]]))).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold px-6 py-2 mt-2 shadow-sm')
 
         elif active_lora["status"] == "Generating":
+            p_count = get_prompts_count()
             with ui.column().classes('w-full h-64 bg-blue-50 border border-blue-200 border-dashed rounded-xl p-8 items-center justify-center gap-4'):
                 ui.spinner(size='xl', color='blue-500')
                 
-                # REACTIVE PROGRESS BINDINGS: Zero flashing, zero modal closing!
                 progress_label = ui.label().classes('text-lg font-bold text-blue-800')
                 progress_label.bind_text_from(
                     state, 
                     'lora_tool_progress', 
-                    backward=lambda p: f"Rendering Image {p.get('current', 0)} of {p.get('total', 20)}"
+                    backward=lambda p, pc=p_count: f"Rendering Image {p.get('current', 0)} of {p.get('total', pc)}"
                 )
                 
                 progress_bar = ui.linear_progress(show_value=False).classes('w-64 h-2 rounded-full')
                 progress_bar.bind_value_from(
                     state, 
                     'lora_tool_progress', 
-                    backward=lambda p: p.get("current", 0) / max(1, p.get("total", 20))
+                    backward=lambda p, pc=p_count: p.get("current", 0) / max(1, p.get("total", pc))
                 )
                 
                 ui.button('Cancel Generation', icon='stop', on_click=cancel_generation).props('flat').classes('text-rose-500 mt-2')
@@ -459,29 +807,72 @@ def render_lora_workspace():
         elif active_lora["status"] == "Completed":
             out_dir = LORA_LIB_DIR / active_lora["id"]
             
+            if not state.lora_tool_generating:
+                # Premium Toolkit row housing evaluations, grids, and restarts
+                with ui.row().classes('w-full justify-between items-center bg-slate-50 p-3 rounded-lg border mb-2'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('assistant', color='blue', size='sm')
+                        ui.label('AI Benchmark Evaluation').classes('text-xs font-bold text-slate-700 uppercase tracking-wide')
+                    
+                    with ui.row().classes('items-center gap-2'):
+                        ui.button(
+                            'Copy Prompts',
+                            icon='content_copy',
+                            on_click=copy_numbered_prompts_to_clipboard
+                        ).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold h-9') \
+                         .tooltip('Copy only numbered prompts list to send to LLM context.')
+                        
+                        ui.button(
+                            'Generate Contact Sheet',
+                            icon='grid_view',
+                            on_click=lambda lid=active_lora["id"]: open_lora_contact_sheet_modal(lid)
+                        ).classes('bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold h-9') \
+                         .tooltip('Generates a numbered grid image of all 20 frames.')
+                        
+                        ui.button(
+                            'Regenerate All',
+                            icon='refresh',
+                            on_click=lambda lid=active_lora["id"]: asyncio.create_task(run_benchmark_task([lid]))
+                        ).props('flat').classes('text-slate-500 hover:text-blue-600 text-xs font-bold h-9')
+            
             with ui.grid(columns=5).classes('w-full gap-4'):
                 if out_dir.exists():
                     images = sorted([f for f in out_dir.glob("*.png")])
                     for idx, img in enumerate(images):
                         with ui.card().classes('p-0 overflow-hidden border shadow-sm hover:shadow-md transition-shadow'):
-                            ui.image(str(img)).classes('w-full h-48 object-cover cursor-pointer').on('click', lambda p=img, i=idx: open_preview(str(p), i))
-                            
-            if not state.lora_tool_generating:
-                with ui.row().classes('w-full justify-end mt-4'):
-                    ui.button('Regenerate All', icon='refresh', on_click=lambda: asyncio.create_task(run_benchmark_task([active_lora["id"]]))).props('flat').classes('text-slate-400 hover:text-blue-600 text-xs font-bold')
+                            # Capture and pass the current array sequence to the navigation cycle in open_preview
+                            ui.image(str(img)).classes('w-full h-48 object-cover cursor-pointer').on('click', lambda p=img, i=idx, img_list=images: open_preview(str(p), i, img_list))
 
 
 def render_lora_contact_sheet(exit_tool_cb: Callable):
     init_lora_library()
 
     global image_preview_dialog, preview_img, preview_caption
+    global prev_btn, next_btn
     global edit_dialog, edit_triggers, edit_strength, active_edit_lora
+    global delete_confirm_dialog, active_delete_lora
+    global lora_contact_sheet_dialog, lora_contact_sheet_base64
+    global prompts_editor_dialog, prompts_textarea_ref
+
+    # Global keyboard event handlers registered cleanly onto this window view scope
+    ui.keyboard(on_key=handle_keyboard)
 
     # Declared outside of refreshable containers so they never flash or close on refresh
-    with ui.dialog() as image_preview_dialog, ui.card().classes('p-0 bg-transparent shadow-none w-full max-w-5xl items-center justify-center'):
-        # Fix aspect ratio: scale-down keeps original aspect ratio with no crop
-        preview_img = ui.image().props('no-spinner fit=scale-down').classes('w-full max-h-[80vh] rounded-lg shadow-lg bg-black/50')
-        preview_caption = ui.label().classes('w-full text-center text-white bg-slate-900/80 p-3 rounded-b-lg text-sm mt-[-4px] shadow-lg')
+    with ui.dialog() as image_preview_dialog:
+        # Side-by-side row container allowing large floating arrows next to the media card
+        with ui.row().classes('items-center justify-center w-full max-w-6xl bg-transparent gap-4 no-wrap'):
+            prev_btn = ui.button(icon='chevron_left', on_click=lambda: navigate_preview(-1)) \
+                .props('round flat size=xl color=white') \
+                .classes('bg-black/40 hover:bg-black/60 shadow flex-shrink-0 opacity-100 transition-all')
+            
+            with ui.column().classes('p-0 bg-transparent shadow-none items-center justify-center flex-1 max-w-4xl'):
+                # Scale-down maintains original aspect ratio cleanly
+                preview_img = ui.image().props('no-spinner fit=scale-down').classes('w-full max-h-[75vh] rounded-lg shadow-lg bg-black/50')
+                preview_caption = ui.label().classes('w-full text-center text-white bg-slate-900/80 p-3 rounded-b-lg text-sm mt-[-4px] shadow-lg')
+                
+            next_btn = ui.button(icon='chevron_right', on_click=lambda: navigate_preview(1)) \
+                .props('round flat size=xl color=white') \
+                .classes('bg-black/40 hover:bg-black/60 shadow flex-shrink-0 opacity-100 transition-all')
 
     with ui.dialog() as edit_dialog, ui.card().classes('p-6 rounded-xl w-96'):
         ui.label('Edit LoRA Settings').classes('text-lg font-bold text-slate-800')
@@ -508,6 +899,74 @@ def render_lora_contact_sheet(exit_tool_cb: Callable):
         with ui.row().classes('w-full justify-end gap-3 mt-6'):
             ui.button('Cancel', on_click=edit_dialog.close).props('flat color=slate')
             ui.button('Save & Reset', on_click=save_edits).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold')
+
+    with ui.dialog() as delete_confirm_dialog, ui.card().classes('p-6 rounded-xl w-96'):
+        ui.label('Delete LoRA?').classes('text-lg font-bold text-slate-800')
+        ui.label('This will permanently delete this LoRA configuration and all generated contact sheet benchmark images. This action cannot be undone.').classes('text-xs text-slate-500 mb-6')
+        with ui.row().classes('w-full justify-end gap-3'):
+            ui.button('Cancel', on_click=delete_confirm_dialog.close).props('flat color=slate')
+            ui.button('Delete Permanently', on_click=confirm_delete_lora).classes('bg-rose-600 hover:bg-rose-700 text-white font-bold')
+
+    # Header-focused Prompts Editor Modal with optimized vertical heights
+    with ui.dialog() as prompts_editor_dialog:
+        with ui.card().classes('w-full max-w-5xl p-6 rounded-xl gap-4 bg-white max-h-[85vh] flex flex-col'):
+            # Combined Header Row: Title & Counter on Left, Save/Cancel Controls on Right
+            with ui.row().classes('w-full justify-between items-center pb-2 border-b flex-shrink-0 flex-nowrap'):
+                with ui.column().classes('gap-0'):
+                    ui.label('Configure Benchmark Prompts').classes('text-xl font-bold text-slate-800')
+                    # Dynamic counter sits cleanly right beneath the title
+                    count_label = ui.label().classes('text-xs font-bold text-blue-600')
+                
+                with ui.row().classes('items-center gap-3 flex-shrink-0'):
+                    ui.button('Cancel', on_click=prompts_editor_dialog.close).props('flat color=slate')
+                    
+                    def save_custom_prompts():
+                        try:
+                            with open(LORA_PROMPTS_PATH, "w", encoding="utf-8") as f:
+                                f.write(prompts_textarea_ref.value)
+                            ui.notify("Benchmark prompts updated successfully!", type="positive")
+                            prompts_editor_dialog.close()
+                            render_lora_sidebar.refresh()
+                            render_lora_workspace.refresh()
+                        except Exception as err:
+                            ui.notify(f"Failed to save prompts: {str(err)}", type="negative")
+                            
+                    ui.button('Save Prompts', icon='save', on_click=save_custom_prompts).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold px-4')
+
+            # Secondary instruction row sitting directly under the header line
+            ui.label('Modify the default list of prompts used for benchmarking your LoRAs. Enter one prompt per line. Length adapts dynamically.').classes('text-xs text-slate-500 flex-shrink-0 mt-[-4px]')
+            
+            # Optimized height prevents the outer card container from overflowing its viewport limits
+            prompts_textarea_ref = ui.textarea(
+                label="Active Prompts List (Line-by-Line)"
+            ).classes('w-full h-[380px] bg-white text-xs') \
+             .props('outlined input-style="height: 310px"')
+            
+            # Count listener hook that triggers automatically when values are loaded or changed
+            def update_count_label():
+                lines = [line.strip() for line in prompts_textarea_ref.value.split('\n') if line.strip()]
+                count_label.set_text(f"Total: {len(lines)} active benchmark prompts")
+            
+            prompts_textarea_ref.on('update:value', update_count_label)
+
+    # Stamped Stitched Contact Sheet Dialog Overlay
+    with ui.dialog() as lora_contact_sheet_dialog:
+        with ui.card().classes('w-full max-w-4xl p-6 rounded-xl gap-4 bg-white'):
+            with ui.row().classes('w-full justify-between items-center pb-2 border-b'):
+                with ui.column().classes('gap-0'):
+                    ui.label('Generated LoRA Contact Sheet').classes('text-base font-bold text-slate-800')
+                    ui.label('Numbered grid coordinates are stamped on the image. Perfect for sending directly to LLMs.').classes('text-xs text-slate-500')
+                ui.button(
+                    'Download Contact Sheet',
+                    icon='download',
+                    on_click=lambda: download_lora_contact_sheet(state.lora_tool_active_lora_id)
+                ).classes('bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold h-9')
+            
+            render_lora_contact_sheet_preview(lora_contact_sheet_base64)
+            
+            with ui.row().classes('w-full justify-between items-center pt-2 border-t text-[10px] text-slate-400'):
+                ui.label('Tip: Right-click the image to copy it directly, or click Download.')
+                ui.button('Close', on_click=lora_contact_sheet_dialog.close).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs')
 
     with ui.row().classes('w-full justify-between items-center mb-4'):
         with ui.column().classes('gap-0'):
