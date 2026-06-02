@@ -3,8 +3,9 @@ import random
 import io
 import base64
 import asyncio
+import httpx
 from pathlib import Path
-from typing import Any, List, Dict, Optional
+from typing import Any, List, Dict, Optional, Callable
 from PIL import Image, ImageDraw, ImageFont
 from nicegui import ui
 from sqlmodel import Session, select
@@ -16,6 +17,223 @@ from ui.components.style_chooser_modal import StyleChooserModal
 # Module-level dialog and state holders
 contact_sheet_dialog_ref = None
 contact_sheet_base64 = ""
+
+# Cache holders for ComfyUI API selections and local Benchmarked LoRAs
+comfy_options_cache: Dict[str, List[str]] = {}
+associated_loras_list: List[Dict[str, Any]] = []
+
+lora_chooser_dialog_ref = None
+chooser_active_node_id = None
+chooser_selected_lora_id = None
+
+
+def get_node_class_type(node_id: str) -> Optional[str]:
+    """Resolves the raw class_type of a node inside the active ComfyUI workflow JSON."""
+    val = state.style_selected_workflow
+    if not val:
+        return None
+    wf_path = Path("./workflows") / val
+    if not wf_path.exists():
+        wf_path = Path("./Comfy_Workflows") / val
+    if wf_path.exists():
+        try:
+            with open(wf_path, "r") as f:
+                wf_json = json.load(f)
+            node_data = wf_json.get(node_id, {})
+            return node_data.get("class_type")
+        except Exception:
+            pass
+    return None
+
+
+def load_associated_loras():
+    """Filters, sorts, and loads LoRAs associated with the current workflow from output/_lora_library/loras.csv."""
+    global associated_loras_list
+    associated_loras_list.clear()
+    
+    lora_csv = Path("./output/_lora_library/loras.csv")
+    if not lora_csv.exists():
+        return
+        
+    try:
+        import csv
+        with open(lora_csv, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="|")
+            rows = list(reader)
+            
+            # Filter for current selected workflow
+            filtered = [
+                row for row in rows 
+                if row.get("workflow") == state.style_selected_workflow
+            ]
+            
+            # Sort: favorites at the top (favorite == "True"), then alphabetically by filename
+            def sort_key(item):
+                is_fav = item.get("favorite") == "True"
+                filename = Path(item.get("lora_path", "")).name.lower()
+                return (not is_fav, filename)
+                
+            associated_loras_list = sorted(filtered, key=sort_key)
+    except Exception as e:
+        print(f"[Style-Playground] Error reading loras.csv: {str(e)}")
+
+
+async def async_load_comfy_and_lora_choices():
+    """Fetches model selection drop-down options from ComfyUI API object_info in a background task."""
+    global comfy_options_cache
+    comfy_options_cache.clear()
+    
+    # Refresh LoRA options from local loras.csv
+    load_associated_loras()
+    
+    comfy_url = get_setting("comfy_url", "127.0.0.1:8188")
+    if "http" in comfy_url:
+        comfy_url = comfy_url.replace("http://", "").replace("https://", "").strip("/")
+        
+    for node_id, data in list(state.style_discovered_params.items()):
+        node_type = data["type"]
+        params = data["params"]
+        
+        class_type = get_node_class_type(node_id)
+        if not class_type:
+            continue
+            
+        param_key = None
+        if node_type == "model_loader":
+            param_key = params.get("model_param_key", "ckpt_name")
+        elif node_type == "lora_loader":
+            param_key = "lora_name"
+        elif node_type == "clip_loader":
+            param_key = params.get("clip_param_key", "clip_name")
+        elif node_type == "vae_loader":
+            param_key = "vae_name"
+            
+        if param_key:
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(f"http://{comfy_url}/object_info/{class_type}", timeout=2.0)
+                    if resp.status_code == 200:
+                        res_json = resp.json()
+                        choices = res_json.get(class_type, {}).get("input", {}).get("required", {}).get(param_key, [[]])[0]
+                        if isinstance(choices, list) and choices:
+                            comfy_options_cache[f"{node_id}:{param_key}"] = sorted(choices)
+            except Exception:
+                pass
+                
+    render_workflow_overrides_ui.refresh()
+
+
+def open_lora_chooser_modal(node_id: str):
+    """Pre-selects the active LoRA and opens the Visual LoRA Chooser overlay."""
+    global chooser_active_node_id, chooser_selected_lora_id
+    chooser_active_node_id = node_id
+    
+    current_override_lora = state.style_workflow_overrides.get(node_id, {}).get("lora_name")
+    chooser_selected_lora_id = None
+    if current_override_lora:
+        for item in associated_loras_list:
+            if item["lora_path"] == current_override_lora:
+                chooser_selected_lora_id = item["id"]
+                break
+                
+    if lora_chooser_dialog_ref:
+        lora_chooser_dialog_ref.open()
+        render_lora_chooser_content.refresh()
+
+
+@ui.refreshable
+def render_lora_chooser_content():
+    """Visual selection matrix showcasing trigger words and 2x2 grids of completed sample images."""
+    global chooser_selected_lora_id, chooser_active_node_id
+    
+    if not associated_loras_list:
+        with ui.column().classes('w-full items-center justify-center p-12 text-slate-400'):
+            ui.icon('grid_off', size='lg')
+            ui.label("No benchmarked LoRAs found for this workflow.").classes('text-xs text-center mt-2')
+            ui.label("Run benchmarks in the LoRA Contact Sheets tool to see them here.").classes('text-[10px] text-slate-400 text-center')
+        return
+
+    if not chooser_selected_lora_id and associated_loras_list:
+        chooser_selected_lora_id = associated_loras_list[0]["id"]
+
+    selected_lora = next((l for l in associated_loras_list if l["id"] == chooser_selected_lora_id), None)
+
+    with ui.grid(columns='240px 1fr').classes('w-full h-[500px] gap-4'):
+        # LEFT SIDEBAR: Benchmarked LoRA list
+        with ui.column().classes('border-r pr-2 gap-1 overflow-y-auto h-full'):
+            for lora in associated_loras_list:
+                is_selected = lora["id"] == chooser_selected_lora_id
+                bg_color = "bg-blue-50 border-blue-200 text-blue-700 font-bold" if is_selected else "hover:bg-slate-50 border-transparent text-slate-700"
+                
+                def select_lora_item(lid=lora["id"]):
+                    global chooser_selected_lora_id
+                    chooser_selected_lora_id = lid
+                    render_lora_chooser_content.refresh()
+                    
+                with ui.row().classes(f'w-full p-2 rounded-lg border cursor-pointer transition-colors items-center justify-between {bg_color}') \
+                        .on('click', select_lora_item):
+                    with ui.row().classes('items-center gap-1 truncate flex-1'):
+                        if lora.get("favorite") == "True":
+                            ui.icon('star', color='amber-500', size='14px').classes('flex-shrink-0')
+                        ui.label(Path(lora["lora_path"]).name).classes('text-xs truncate')
+                    ui.label(f"str: {float(lora['strength']):.1f}").classes('text-[9px] text-slate-400 flex-shrink-0')
+
+        # RIGHT PREVIEW PANEL: Sample Grid & Selection Metadata
+        with ui.column().classes('h-full flex flex-col gap-3 justify-between'):
+            if selected_lora:
+                with ui.column().classes('w-full gap-2 flex-1 min-h-0'):
+                    ui.label(Path(selected_lora["lora_path"]).name).classes('text-base font-bold text-slate-800')
+                    
+                    triggers = selected_lora.get("triggers", "").strip()
+                    if triggers and triggers != ".":
+                        with ui.row().classes('w-full p-2 bg-blue-50 rounded border border-blue-100 text-xs items-center gap-1'):
+                            ui.icon('bolt', color='blue', size='xs')
+                            ui.label("Triggers:").classes('font-bold text-blue-800')
+                            ui.label(triggers).classes('font-mono font-semibold text-blue-700')
+                    else:
+                        ui.label("(No trigger words configured for this LoRA)").classes('text-xs text-slate-400 italic')
+                        
+                    # Retrieve first 4 samples for styling demonstration
+                    lora_dir = Path("./output/_lora_library") / selected_lora["id"]
+                    sample_images = []
+                    if lora_dir.exists():
+                        sample_images = sorted(list(lora_dir.glob("*.png")))[:4]
+                        
+                    if sample_images:
+                        with ui.grid(columns=2).classes('w-full gap-3 mt-1 overflow-y-auto flex-1 p-1'):
+                            for img_path in sample_images:
+                                ui.image(str(img_path)).classes('w-full h-32 object-cover rounded border shadow-sm')
+                    else:
+                        with ui.column().classes('w-full flex-1 items-center justify-center border border-dashed rounded bg-slate-50 text-slate-400'):
+                            ui.icon('photo_library', size='lg')
+                            ui.label("No benchmark images rendered yet for this LoRA.").classes('text-xs text-center')
+
+                # Dialog action panel
+                with ui.row().classes('w-full justify-end gap-3 border-t pt-2 flex-shrink-0'):
+                    ui.button('Cancel', on_click=lora_chooser_dialog_ref.close).props('flat color=slate')
+                    
+                    def apply_selection():
+                        if selected_lora and chooser_active_node_id:
+                            update_override_state(chooser_active_node_id, "lora_name", selected_lora["lora_path"])
+                            update_override_state(chooser_active_node_id, "strength_model", float(selected_lora["strength"]))
+                            
+                            triggers_to_add = selected_lora.get("triggers", "").strip()
+                            if triggers_to_add and triggers_to_add != ".":
+                                if triggers_to_add not in state.style_prompt_prefix:
+                                    cleaned_prefix = state.style_prompt_prefix.strip()
+                                    if cleaned_prefix and not cleaned_prefix.endswith(","):
+                                        cleaned_prefix += ","
+                                    state.style_prompt_prefix = f"{cleaned_prefix} {triggers_to_add}, ".strip().replace("  ", " ")
+                                    ui.notify(f"Selected LoRA and appended trigger words: '{triggers_to_add}'", type="positive")
+                                else:
+                                    ui.notify("Selected LoRA successfully!", type="positive")
+                            else:
+                                ui.notify("Selected LoRA successfully!", type="positive")
+                                
+                            lora_chooser_dialog_ref.close()
+                            render_workflow_overrides_ui.refresh()
+                            
+                    ui.button('Accept & Apply', on_click=apply_selection).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs h-9')
 
 
 def create_contact_sheet(base64_list: list) -> Optional[bytes]:
@@ -354,11 +572,20 @@ def handle_style_workflow_change(val: str, clear_overrides: bool = True):
             with open(wf_path, "r") as f:
                 wf_json = json.load(f)
             from services.comfy_client import ComfyClient
-            client = ComfyClient("127.0.0.1:8188")
+            
+            comfy_url = get_setting("comfy_url", "127.0.0.1:8188")
+            if "http" in comfy_url:
+                comfy_url = comfy_url.replace("http://", "").replace("https://", "").strip("/")
+            client = ComfyClient(comfy_url)
+            
             state.style_discovered_params = client.analyze_workflow(wf_json)
             if clear_overrides:
                 state.style_workflow_overrides.clear()
             ui.notify(f"Analyzed workflow '{val}'. Discovered {len(state.style_discovered_params)} overrides.", type="info")
+            
+            # Fire-and-forget back-end loading of drop-down options from ComfyUI API and CSV
+            asyncio.create_task(async_load_comfy_and_lora_choices())
+            
         except Exception as e:
             ui.notify(f"Failed to analyze workflow: {str(e)}", type="warning")
             state.style_discovered_params.clear()
@@ -593,11 +820,67 @@ def render_workflow_overrides_ui():
                         current_lora_name = state.style_workflow_overrides.get(node_id, {}).get("lora_name", params["lora_name"])
                         current_strength_model = state.style_workflow_overrides.get(node_id, {}).get("strength_model", params["strength_model"])
                         
-                        ui.input(
-                            label="LoRA Filename",
-                            value=current_lora_name,
-                            on_change=lambda e, nid=node_id: update_override_state(nid, "lora_name", e.value)
-                        ).classes('w-full')
+                        # Render ComfyUI dropdown alongside the visual palette chooser button
+                        comfy_lora_key = f"{node_id}:lora_name"
+                        if comfy_lora_key in comfy_options_cache:
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.select(
+                                    options=comfy_options_cache[comfy_lora_key],
+                                    value=current_lora_name if current_lora_name in comfy_options_cache[comfy_lora_key] else None,
+                                    label="Select LoRA",
+                                    on_change=lambda e: (update_override_state(node_id, "lora_name", e.value), render_workflow_overrides_ui.refresh())
+                                ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon="palette",
+                                    on_click=lambda nid=node_id: open_lora_chooser_modal(nid)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Open Visual LoRA Chooser")
+                        else:
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.input(
+                                    label="LoRA Filename",
+                                    value=current_lora_name,
+                                    on_change=lambda e: update_override_state(node_id, "lora_name", e.value)
+                                ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon="palette",
+                                    on_click=lambda nid=node_id: open_lora_chooser_modal(nid)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Open Visual LoRA Chooser")
+                        
+                        # Render triggers section if any benchmarked lora is selected
+                        active_bench = None
+                        for item in associated_loras_list:
+                            if item["lora_path"] == current_lora_name:
+                                active_bench = item
+                                break
+                                
+                        if active_bench and active_bench.get("triggers"):
+                            triggers_text = active_bench["triggers"]
+                            with ui.row().classes('w-full items-center justify-between p-2 bg-blue-50/50 rounded border border-blue-100 text-xs mt-1'):
+                                with ui.column().classes('gap-0 flex-1 min-w-0'):
+                                    ui.label("Trigger Words:").classes('text-[9px] font-bold text-blue-400 uppercase')
+                                    ui.label(triggers_text).classes('font-mono font-semibold text-blue-700 truncate w-full')
+                                
+                                with ui.row().classes('gap-1 flex-shrink-0'):
+                                    ui.button(
+                                        icon="content_copy",
+                                        on_click=lambda: (ui.clipboard.write(triggers_text), ui.notify("Trigger words copied to clipboard!", type="positive"))
+                                    ).props('flat dense').classes('text-blue-600').tooltip("Copy triggers to clipboard")
+                                    
+                                    def add_to_prefix_val():
+                                        if triggers_text not in state.style_prompt_prefix:
+                                            cleaned_prefix = state.style_prompt_prefix.strip()
+                                            if cleaned_prefix and not cleaned_prefix.endswith(","):
+                                                cleaned_prefix += ","
+                                            state.style_prompt_prefix = f"{cleaned_prefix} {triggers_text}, ".strip().replace("  ", " ")
+                                            ui.notify("Added triggers to Style Prompt Prefix!", type="positive")
+                                            
+                                    ui.button(
+                                        icon="playlist_add",
+                                        on_click=add_to_prefix_val
+                                    ).props('flat dense').classes('text-blue-600').tooltip("Append triggers to Style Prompt Prefix")
+                                    
                         ui.number(
                             label="Strength",
                             value=current_strength_model,
@@ -609,30 +892,59 @@ def render_workflow_overrides_ui():
                         param_key = params.get("model_param_key", "ckpt_name")
                         current_model_name = state.style_workflow_overrides.get(node_id, {}).get(param_key, params.get(param_key, ""))
                         
-                        ui.input(
-                            label=f"Model Filename ({param_key})",
-                            value=current_model_name,
-                            on_change=lambda e, nid=node_id, pk=param_key: update_override_state(nid, pk, e.value)
-                        ).classes('w-full')
+                        comfy_key = f"{node_id}:{param_key}"
+                        if comfy_key in comfy_options_cache:
+                            # Dropdown only if ComfyUI online and data loaded successfully
+                            ui.select(
+                                options=comfy_options_cache[comfy_key],
+                                value=current_model_name if current_model_name in comfy_options_cache[comfy_key] else None,
+                                label=f"Select Model ({param_key})",
+                                on_change=lambda e, pk=param_key: (update_override_state(node_id, pk, e.value), render_workflow_overrides_ui.refresh())
+                            ).classes('w-full')
+                        else:
+                            # Self-healing text input fallback if ComfyUI is offline
+                            ui.input(
+                                label=f"Model Filename ({param_key})",
+                                value=current_model_name,
+                                on_change=lambda e, pk=param_key: update_override_state(node_id, pk, e.value)
+                            ).classes('w-full')
 
                     elif node_type == "clip_loader":
                         param_key = params.get("clip_param_key", "clip_name")
                         current_clip_name = state.style_workflow_overrides.get(node_id, {}).get(param_key, params.get(param_key, ""))
                         
-                        ui.input(
-                            label=f"CLIP Filename ({param_key})",
-                            value=current_clip_name,
-                            on_change=lambda e, nid=node_id, pk=param_key: update_override_state(nid, pk, e.value)
-                        ).classes('w-full')
+                        comfy_key = f"{node_id}:{param_key}"
+                        if comfy_key in comfy_options_cache:
+                            ui.select(
+                                options=comfy_options_cache[comfy_key],
+                                value=current_clip_name if current_clip_name in comfy_options_cache[comfy_key] else None,
+                                label=f"Select CLIP Model ({param_key})",
+                                on_change=lambda e, pk=param_key: (update_override_state(node_id, pk, e.value), render_workflow_overrides_ui.refresh())
+                            ).classes('w-full')
+                        else:
+                            ui.input(
+                                label=f"CLIP Filename ({param_key})",
+                                value=current_clip_name,
+                                on_change=lambda e, pk=param_key: update_override_state(node_id, pk, e.value)
+                            ).classes('w-full')
 
                     elif node_type == "vae_loader":
                         current_vae_name = state.style_workflow_overrides.get(node_id, {}).get("vae_name", params.get("vae_name", ""))
                         
-                        ui.input(
-                            label="VAE Filename",
-                            value=current_vae_name,
-                            on_change=lambda e, nid=node_id: update_override_state(nid, "vae_name", e.value)
-                        ).classes('w-full')
+                        comfy_key = f"{node_id}:vae_name"
+                        if comfy_key in comfy_options_cache:
+                            ui.select(
+                                options=comfy_options_cache[comfy_key],
+                                value=current_vae_name if current_vae_name in comfy_options_cache[comfy_key] else None,
+                                label="Select VAE Model",
+                                on_change=lambda e: (update_override_state(node_id, "vae_name", e.value), render_workflow_overrides_ui.refresh())
+                            ).classes('w-full')
+                        else:
+                            ui.input(
+                                label="VAE Filename",
+                                value=current_vae_name,
+                                on_change=lambda e: update_override_state(node_id, "vae_name", e.value)
+                            ).classes('w-full')
 
 
 @ui.refreshable
@@ -693,7 +1005,7 @@ def render_style_playground_cards(project_name: str = ""):
 
 
 def render_style_playground_tab(project, save_project_settings_cb=None):
-    global contact_sheet_dialog_ref
+    global contact_sheet_dialog_ref, lora_chooser_dialog_ref
     
     # Query current volume listings inside database index
     with Session(engine) as session:
@@ -707,6 +1019,11 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
     # Auto-initialize visual test prompts so workspace is never left empty
     if not state.style_test_prompts and state.playground_book_selection:
         draw_style_test_sample(project.name, state.playground_book_selection)
+
+    # Make sure loras list is hydrated and Comfy choices start loading asynchronously
+    load_associated_loras()
+    if state.style_selected_workflow:
+        asyncio.create_task(async_load_comfy_and_lora_choices())
 
     with ui.grid(columns='420px 1fr').classes('w-full gap-6 items-start'):
         # LEFT CONFIG PANEL
@@ -868,4 +1185,16 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                 ui.label('Tip: Right-click the image to copy it directly, or click Download.')
                 ui.button('Close', on_click=contact_sheet_dialog.close).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs')
 
+    # Declare Lora Chooser Dialog Overlay inside workspace hierarchy
+    with ui.dialog() as lora_chooser_dialog:
+        with ui.card().classes('w-full max-w-4xl p-5 rounded-xl gap-4 bg-white'):
+            with ui.row().classes('w-full justify-between items-center pb-1 border-b'):
+                with ui.column().classes('gap-0'):
+                    ui.label('Visual LoRA Chooser').classes('text-base font-bold text-slate-800')
+                    ui.label('Select benchmarked LoRAs to preview styling and automatically configure strength and trigger words.').classes('text-xs text-slate-500')
+                ui.button(icon='close', on_click=lora_chooser_dialog.close).props('flat round size=sm').classes('text-slate-400')
+                
+            render_lora_chooser_content()
+
     contact_sheet_dialog_ref = contact_sheet_dialog
+    lora_chooser_dialog_ref = lora_chooser_dialog
