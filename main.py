@@ -174,6 +174,7 @@ async def async_restart():
 DEFAULT_SETTINGS = {
     "comfy_url": "http://127.0.0.1:8188",
     "comfy_path": "F:/AI/ComfyUI/ComfyUI",
+    "comfy_args": "--windows-standalone-build",
     "llm_url": "http://127.0.0.1:11434",
     "llm_api_key": "",
     "llm_model": "unsloth/gemma-4-e4b-it",
@@ -1046,33 +1047,38 @@ def launch_comfyui():
     embedded_py_win = comfy_dir / "python_embeded" / "python.exe"
     embedded_py_unix = comfy_dir / "python_embeded" / "bin" / "python"
     
+    # Retrieve startup launch arguments safely using shlex to parse string elements
+    import shlex
+    comfy_args_str = get_setting("comfy_args", "--windows-standalone-build") or ""
+    comfy_args_list = shlex.split(comfy_args_str)
+    
     try:
         if os.name == 'nt':  # Windows
             if bat_file.exists():
-                subprocess.Popen([str(bat_file)], cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
+                subprocess.Popen([str(bat_file)] + comfy_args_list, cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
                 ui.notify("Launching ComfyUI via run_nvidia_gpu.bat...", type="info")
             elif embedded_py_win.exists() and inner_python_file.exists():
                 # Direct fallback running main.py using the embedded python executable rather than system python
-                subprocess.Popen([str(embedded_py_win), "-s", "ComfyUI\\main.py", "--windows-standalone-build"], cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
+                subprocess.Popen([str(embedded_py_win), "-s", "ComfyUI\\main.py"] + comfy_args_list, cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
                 ui.notify("Launching ComfyUI via embedded python...", type="info")
             elif python_file.exists():
                 venv_python = comfy_dir / "venv" / "Scripts" / "python.exe"
                 py_exec = str(venv_python) if venv_python.exists() else sys.executable
-                subprocess.Popen([py_exec, "main.py"], cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
+                subprocess.Popen([py_exec, "main.py"] + comfy_args_list, cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
                 ui.notify(f"Launching ComfyUI via Python interpreter ({py_exec})...", type="info")
             else:
                 ui.notify("Could not locate run_nvidia_gpu.bat, embedded python, or main.py.", type="warning")
         else:  # Linux / macOS
             if sh_file.exists():
-                subprocess.Popen(["bash", str(sh_file)], cwd=str(comfy_dir))
+                subprocess.Popen(["bash", str(sh_file)] + comfy_args_list, cwd=str(comfy_dir))
                 ui.notify("Launching ComfyUI via shell script...", type="info")
             elif embedded_py_unix.exists() and inner_python_file.exists():
-                subprocess.Popen([str(embedded_py_unix), "-s", "ComfyUI/main.py"], cwd=str(comfy_dir))
+                subprocess.Popen([str(embedded_py_unix), "-s", "ComfyUI/main.py"] + comfy_args_list, cwd=str(comfy_dir))
                 ui.notify("Launching ComfyUI via embedded python...", type="info")
             elif python_file.exists():
                 venv_python = comfy_dir / "venv" / "bin" / "python"
                 py_exec = str(venv_python) if venv_python.exists() else sys.executable
-                subprocess.Popen([py_exec, "main.py"], cwd=str(comfy_dir))
+                subprocess.Popen([py_exec, "main.py"] + comfy_args_list, cwd=str(comfy_dir))
                 ui.notify("Launching ComfyUI via Python interpreter...", type="info")
             else:
                 ui.notify("Could not locate shell script, embedded python, or main.py.", type="warning")

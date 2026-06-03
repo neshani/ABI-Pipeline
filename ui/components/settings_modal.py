@@ -196,6 +196,7 @@ class SettingsModal:
                 with ui.column().classes('w-full p-4 gap-3'):
                     ui.input('ComfyUI Base URL').bind_value(self.settings, 'comfy_url').classes('w-full')
                     ui.input('Local Comfy Directory Path').bind_value(self.settings, 'comfy_path').classes('w-full')
+                    ui.input('ComfyUI Launch Arguments', placeholder="e.g., --windows-standalone-build").bind_value(self.settings, 'comfy_args').classes('w-full')
                     ui.input('LLM API Endpoint URL', placeholder="e.g., http://localhost:11434").bind_value(self.settings, 'llm_url').classes('w-full')
                     ui.input('LLM API Key (Optional)', password=True, password_toggle_button=True).bind_value(self.settings, 'llm_api_key').classes('w-full')
                     
