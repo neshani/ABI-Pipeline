@@ -72,6 +72,38 @@ def handle_delete_template(template_dropdown, prompt_editor_widget):
     state.playground_template = loaded_default
     prompt_editor_widget.set_value(loaded_default)
 
+def copy_diagnostic_primer_to_clipboard():
+    """Formats a diagnostic framework primer for external larger AIs and copies it to clipboard."""
+    primer_text = (
+        "I am using a local AI book illustration tool called ABI-Pipeline. It extracts verbatim "
+        "quotes from audiobook text transcripts and generates style-free image prompts for ComfyUI.\n\n"
+        "I need your help debugging and fine-tuning my active prompt template. Below are the structural "
+        "limitations and rules we MUST respect:\n\n"
+        "### PIPELINE CONSTRAINTS & RULES:\n"
+        "1. REGEX-PARSED OUTPUT: The small local LLM must output exactly in this format:\n"
+        "   QUOTE: [verbatim quote from the passage]\n"
+        "   PROMPT: [single-sentence descriptive prompt]\n"
+        "   Any conversational chatter, introductory words, or departures from this format will break our regex parser.\n\n"
+        "2. NO EXAMPLE CONTAMINATION: Do not include literal example QUOTES or PROMPTS in the system instructions. "
+        "The local 4B model has extremely weak generalization; if we show it any concrete examples in quotes, it "
+        "will overfit and try to recycle parts of those examples (or their specific subjects/structures) in every subsequent output.\n\n"
+        "3. STYLE-FREE PROMPTS: The generated prompt must ONLY describe neutral, observable visual details (subject, setting, actions). "
+        "Do NOT include camera terminology, medium styles (e.g., 'watercolor', 'illustration'), or lighting jargon. "
+        "Artistic style is controlled downstream in ComfyUI via a separate prompt prefix/suffix system.\n\n"
+        "4. STATELESS RUNS: The prompt generator runs on individual chunks of text in isolation. There is no chat history, "
+        "memory, or context from previous chapters.\n\n"
+        "--------------------------------------------------------------------------------\n\n"
+        "### CURRENT RUN DATA:\n"
+        "[PASTE YOUR COPIED RUN RESULTS HERE]\n\n"
+        "--------------------------------------------------------------------------------\n\n"
+        "### MY SPECIFIC ADJUSTMENT REQUEST:\n"
+        "[Insert your request here, e.g. 'Since we are running Harry Potter, we can tell the LLM it is a Harry Potter scene "
+        "and allow it to use character names like Harry, Ron, and Hermione directly instead of describing them neutrally. "
+        "Please provide an updated system prompt reflecting this change!']"
+    )
+    _copy_via_javascript(primer_text)
+    ui.notify("Diagnostic AI Primer copied! Paste this first, then your results.", type="positive", icon="psychology")
+
 
 def copy_results_to_clipboard():
     """Formats prompt configurations and outputs as markdown, copying to host clipboard safely."""
@@ -177,8 +209,9 @@ def render_playground_results_container():
                 ui.label("Evaluation Iteration Ready").classes('text-xs font-bold text-slate-700')
                 ui.label("Format optimized for sharing with diagnostic AIs").classes('text-[10px] text-slate-500')
             with ui.row().classes('gap-2'):
-                ui.button("Copy Full", icon="content_copy", on_click=copy_results_to_clipboard).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold px-4')
-                ui.button("Copy Condensed (Saves Tokens)", icon="compress", on_click=copy_condensed_results_to_clipboard).classes('bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold px-4')
+                ui.button("Copy AI Primer", icon="psychology", on_click=copy_diagnostic_primer_to_clipboard).classes('bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold px-3')
+                ui.button("Copy Full", icon="content_copy", on_click=copy_results_to_clipboard).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold px-3')
+                ui.button("Copy Condensed", icon="compress", on_click=copy_condensed_results_to_clipboard).classes('bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold px-3')
 
         for idx, res in enumerate(state.playground_results):
             is_refusal = res.get("status") == "refusal"

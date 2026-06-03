@@ -92,6 +92,17 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
             session.add(book)
         except Exception as e:
             print(f"Error parsing word count for book '{book.name}': {e}")
+    else:
+        # Reset word counts and statuses when transcript does not exist
+        book.word_count = 0
+        chapters = session.exec(
+            select(Chapter).where(Chapter.book_id == book_id).order_by(Chapter.chapter_num)
+        ).all()
+        for ch in chapters:
+            ch.word_count = 0
+            ch.status = "Pending"
+            session.add(ch)
+        session.add(book)
 
     # 2. Update Image Counters from prompts.csv and generated images on disk
     global_completed = 0
@@ -187,6 +198,18 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
 
         except Exception as e:
             print(f"Error counting images in prompts.csv for '{book.name}': {e}")
+    else:
+        # If prompts don't exist, reset image metrics on books and chapters
+        book.total_images = 0
+        book.completed_images = 0
+        book.progress = 0.0
+        session.add(book)
+        
+        chapters = session.exec(select(Chapter).where(Chapter.book_id == book_id)).all()
+        for ch in chapters:
+            ch.total_images = 0
+            ch.completed_images = 0
+            session.add(ch)
 
     # 3. Dynamic stage status recovery based on file existence and completion values
     if has_transcript:

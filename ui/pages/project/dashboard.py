@@ -28,8 +28,8 @@ def get_active_stage_idx(status: str) -> int:
     return mapping.get(status, 0)
 
 
-def backup_and_cleanup_files(project_id: int, target_status: str):
-    """Safely renames directories and csv/txt files to prevent loss and reset pipeline states on disk."""
+def execute_project_rollback_io(project_id: int, choice: str) -> None:
+    """Safely renames and archives files on disk depending on the user's rollback selection."""
     import datetime
     from sqlmodel import Session
     from database.connection import engine
@@ -46,7 +46,7 @@ def backup_and_cleanup_files(project_id: int, target_status: str):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_base = Path(get_setting("output_dir", "./output")).resolve()
     
-    state.add_console_log(f"[Rollback-Engine] Initiating file archiver for project: {project_name}")
+    state.add_console_log(f"[Rollback-Engine] Initiating file archiver for project: {project_name} (Choice: {choice})")
     
     for book in books:
         book_dir = output_base / project_name / book.name
@@ -54,9 +54,15 @@ def backup_and_cleanup_files(project_id: int, target_status: str):
             state.add_console_log(f"[Rollback-Engine] Directory not found for book: {book.name}")
             continue
             
-        state.add_console_log(f"[Rollback-Engine] Archiving files in book directory: {book.name}")
+        state.add_console_log(f"[Rollback-Engine] Processing on-disk assets for book: {book.name}")
             
-        if target_status == "Imported":
+        # Choices cascade logically to maintain functional data constraints:
+        # - "transcripts": Archives transcript.txt, prompts.csv, and images/
+        # - "prompts": Archives prompts.csv and images/
+        # - "images": Archives images/
+        
+        # 1. Archive transcripts
+        if choice == "transcripts":
             transcript_path = book_dir / "transcript.txt"
             if transcript_path.exists():
                 new_transcript = book_dir / f"transcript_backup_{timestamp}.txt"
@@ -66,6 +72,8 @@ def backup_and_cleanup_files(project_id: int, target_status: str):
                 except Exception as e:
                     state.add_console_log(f"[Rollback-Engine] Error archiving transcript.txt: {str(e)}")
                     
+        # 2. Archive prompts (Choice of either "transcripts" or "prompts" wipes prompt-level states)
+        if choice in ("transcripts", "prompts"):
             prompts_path = book_dir / "prompts.csv"
             if prompts_path.exists():
                 new_prompts = book_dir / f"prompts_backup_{timestamp}.csv"
@@ -75,71 +83,31 @@ def backup_and_cleanup_files(project_id: int, target_status: str):
                 except Exception as e:
                     state.add_console_log(f"[Rollback-Engine] Error archiving prompts.csv: {str(e)}")
                     
-            images_dir = book_dir / "images"
-            if images_dir.exists() and images_dir.is_dir():
-                new_images = book_dir / f"images_backup_{timestamp}"
-                try:
-                    images_dir.rename(new_images)
-                    state.add_console_log(f"[Rollback-Engine] Archived images folder to: {new_images.name}")
-                except Exception as e:
-                    state.add_console_log(f"[Rollback-Engine] Error archiving images folder: {str(e)}")
-                    
-        elif target_status == "Transcribed":
-            prompts_path = book_dir / "prompts.csv"
-            if prompts_path.exists():
-                new_prompts = book_dir / f"prompts_backup_{timestamp}.csv"
-                try:
-                    prompts_path.rename(new_prompts)
-                    state.add_console_log(f"[Rollback-Engine] Archived prompts to: {new_prompts.name}")
-                except Exception as e:
-                    state.add_console_log(f"[Rollback-Engine] Error archiving prompts.csv: {str(e)}")
-                    
-            images_dir = book_dir / "images"
-            if images_dir.exists() and images_dir.is_dir():
-                new_images = book_dir / f"images_backup_{timestamp}"
-                try:
-                    images_dir.rename(new_images)
-                    state.add_console_log(f"[Rollback-Engine] Archived images folder to: {new_images.name}")
-                except Exception as e:
-                    state.add_console_log(f"[Rollback-Engine] Error archiving images folder: {str(e)}")
-                    
-        elif target_status == "Prompts Created":
-            images_dir = book_dir / "images"
-            if images_dir.exists() and images_dir.is_dir():
-                new_images = book_dir / f"images_backup_{timestamp}"
-                try:
-                    images_dir.rename(new_images)
-                    state.add_console_log(f"[Rollback-Engine] Archived images folder to: {new_images.name}")
-                except Exception as e:
-                    state.add_console_log(f"[Rollback-Engine] Error archiving images folder: {str(e)}")
+        # 3. Archive rendered images (All options archive generated visual records)
+        images_dir = book_dir / "images"
+        if images_dir.exists() and images_dir.is_dir():
+            new_images = book_dir / f"images_backup_{timestamp}"
+            try:
+                images_dir.rename(new_images)
+                state.add_console_log(f"[Rollback-Engine] Archived images folder to: {new_images.name}")
+            except Exception as e:
+                state.add_console_log(f"[Rollback-Engine] Error archiving images folder: {str(e)}")
                     
     state.add_console_log("[Rollback-Engine] State rollback file archival step complete.")
 
 
-def rollback_project_status(project_id: int, target_status: str, refresh_callback) -> None:
-    """Safely shifts project and book statuses backwards to allow pipeline step re-runs."""
+def rescan_project_database_state(project_id: int) -> None:
+    """Invokes sync operations across all project books to dynamically align database indexes with flat files."""
+    from services.sync_engine import sync_book_from_disk
     with Session(engine) as session:
-        project = session.get(Project, project_id)
-        if not project:
-            return
-        project.status = target_status
-        session.add(project)
-        
         books = session.exec(select(Book).where(Book.project_id == project_id)).all()
         for b in books:
-            b.status = target_status
-            if target_status in ("Imported", "Transcribed", "Prompts Created"):
-                b.progress = 0.0
-            session.add(b)
+            sync_book_from_disk(b.id, session)
             
+        project = session.get(Project, project_id)
+        if project:
+            state.project_status = project.status
         session.commit()
-        
-    state.project_status = target_status
-    ui.notify(f"Project rolled back to: {target_status}", type="warning")
-    refresh_callback()
-    
-    if hasattr(state, 'active_header_refresh') and state.active_header_refresh:
-        state.active_header_refresh()
 
 
 def render_transcription_step_view(project, books, start_transcribe_cb, stop_transcribe_cb):
@@ -174,20 +142,13 @@ def render_transcription_step_view(project, books, start_transcribe_cb, stop_tra
                 ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs px-5')
 
 
-def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb, trigger_rollback_cb):
+def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb):
     available_templates = list_stored_templates()
     
     with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-3'):
-        with ui.row().classes('w-full justify-between items-center'):
-            with ui.row().classes('items-center gap-2'):
-                ui.icon('psychology', size='sm', color='purple-500')
-                ui.label('Phase 2: LLM Prompt Generation & Extraction').classes('text-sm font-bold text-slate-800')
-            
-            ui.button(
-                'Rollback to Transcription',
-                icon='history',
-                on_click=lambda: trigger_rollback_cb("Imported")
-            ).classes('text-[10px] text-slate-500 hover:text-red-600').props('flat dense')
+        with ui.row().classes('items-center gap-2'):
+            ui.icon('psychology', size='sm', color='purple-500')
+            ui.label('Phase 2: LLM Prompt Generation & Extraction').classes('text-sm font-bold text-slate-800')
             
         ui.label('Transcription passages are processed through a local LLM to extract key quotes and generate visual rendering prompts.').classes('text-xs text-slate-500')
         
@@ -267,18 +228,11 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
                 ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-5')
 
 
-def render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb, trigger_rollback_cb):
+def render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb):
     with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-3'):
-        with ui.row().classes('w-full justify-between items-center'):
-            with ui.row().classes('items-center gap-2'):
-                ui.icon('image', size='sm', color='amber-500')
-                ui.label('Phase 3: ComfyUI Image Generation').classes('text-sm font-bold text-slate-800')
-            
-            ui.button(
-                'Rollback to Prompt Gen',
-                icon='history',
-                on_click=lambda: trigger_rollback_cb("Transcribed")
-            ).classes('text-[10px] text-slate-500 hover:text-red-600').props('flat dense')
+        with ui.row().classes('items-center gap-2'):
+            ui.icon('image', size='sm', color='amber-500')
+            ui.label('Phase 3: ComfyUI Image Generation').classes('text-sm font-bold text-slate-800')
             
         ui.label('Render image batches via ComfyUI. Visual style settings and base workflows can be adjusted inside the Style & Workflows tab.').classes('text-xs text-slate-500')
         
@@ -317,18 +271,11 @@ def render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcri
                 ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-5')
 
 
-def render_completed_step_view(project, books, trigger_rollback_cb):
+def render_completed_step_view(project, books):
     with ui.card().classes('w-full border p-5 shadow-sm bg-emerald-50/10 gap-3'):
-        with ui.row().classes('w-full justify-between items-center'):
-            with ui.row().classes('items-center gap-2'):
-                ui.icon('task_alt', size='sm', color='emerald-500')
-                ui.label('Automatic Execution Phases Completed!').classes('text-sm font-bold text-slate-800')
-            
-            ui.button(
-                'Rollback to Image Gen',
-                icon='history',
-                on_click=lambda: trigger_rollback_cb("Prompts Created")
-            ).classes('text-[10px] text-slate-500 hover:text-red-600').props('flat dense')
+        with ui.row().classes('items-center gap-2'):
+            ui.icon('task_alt', size='sm', color='emerald-500')
+            ui.label('Automatic Execution Phases Completed!').classes('text-sm font-bold text-slate-800')
             
         ui.label('All automatic generation steps have completed. You can now proofread chapters, tune image prompts, and bake description metadata.').classes('text-xs text-slate-500')
         
@@ -337,7 +284,6 @@ def render_completed_step_view(project, books, trigger_rollback_cb):
             with ui.column().classes('gap-0 flex-1'):
                 ui.label('Next Step: Workspace Proofreader').classes('text-xs font-bold text-slate-700')
                 ui.label('Select a specific book in the left sidebar to open the Proofreader & Interactive Editor Grid.').classes('text-[10px] text-slate-500')
-
 
 def open_large_image(img_base64: str, title: str):
     """Opens a modal popup dialog displaying the full-size rendered image using stable global references."""
@@ -436,51 +382,34 @@ def render_project_tabs(
 
     state.global_preview_dialog = global_preview_dialog
 
-    # Reusable rollback confirmation dialog
+    # Reusable Rollback Configuration Radio Modal
     with ui.dialog() as rollback_dialog, ui.card().classes('w-full max-w-md p-6 rounded-xl gap-4'):
         ui.label('Confirm State Rollback').classes('text-lg font-bold text-slate-800')
-        warning_msg = ui.label().classes('text-xs text-slate-600 leading-relaxed')
-        backup_details = ui.markdown().classes('text-[10px] text-slate-500 bg-slate-50 p-2.5 rounded border border-slate-200 font-mono leading-normal w-full')
+        ui.label('Select how far back you want to roll this project. Your existing files will be safely archived on disk.').classes('text-xs text-slate-500 leading-normal')
         
-        rollback_target = {"status": "Imported"}
+        rollback_choice = ui.radio({
+            'images': 'Archive Images and regenerate images (Archives images only)',
+            'prompts': 'Archive prompts and regenerate prompts (Includes archiving images)',
+            'transcripts': 'Archive transcripts and re-transcribe audio (Includes archiving prompts and images)'
+        }, value='images').classes('text-xs w-full gap-2 p-2 border rounded bg-slate-50/50')
         
         async def confirm_action():
-            target = rollback_target["status"]
-            ui.notify("Archiving and renaming on-disk folders...", type="info")
-            await asyncio.to_thread(backup_and_cleanup_files, project.id, target)
-            rollback_project_status(project.id, target, render_dynamic_step_dashboard.refresh)
+            choice = rollback_choice.value
+            ui.notify("Executing rollback and archiving files...", type="info")
+            await asyncio.to_thread(execute_project_rollback_io, project.id, choice)
+            await asyncio.to_thread(rescan_project_database_state, project.id)
+            
+            render_dynamic_step_dashboard.refresh()
+            if hasattr(state, 'active_header_refresh') and state.active_header_refresh:
+                state.active_header_refresh()
             rollback_dialog.close()
+            ui.notify("Project rolled back successfully!", type="positive")
             
         with ui.row().classes('w-full justify-end gap-3 mt-2'):
             ui.button('Cancel', on_click=rollback_dialog.close).props('flat color=slate').classes('text-xs font-semibold')
             ui.button('Confirm & Rollback', on_click=confirm_action, color='red').classes('text-xs font-bold text-white')
 
-    def trigger_rollback_prompt(target_status: str):
-        rollback_target["status"] = target_status
-        if target_status == "Imported":
-            warning_msg.set_text("You are rolling back to the Transcription phase. This will archive active transcripts, prompt files, and rendered images so transcription can be executed fresh.")
-            backup_details.set_content(
-                "**Action items:**\n"
-                "- Rename `transcript.txt` ➔ `transcript_backup_*.txt`\n"
-                "- Rename `prompts.csv` ➔ `prompts_backup_*.csv`\n"
-                "- Rename `images/` ➔ `images_backup_*`"
-            )
-        elif target_status == "Transcribed":
-            warning_msg.set_text("You are rolling back to the Prompt Generation phase. This will keep transcripts intact, but archive your active prompt list and rendered images so scene prompts can be generated fresh.")
-            backup_details.set_content(
-                "**Action items:**\n"
-                "- Rename `prompts.csv` ➔ `prompts_backup_*.csv`\n"
-                "- Rename `images/` ➔ `images_backup_*`"
-            )
-        elif target_status == "Prompts Created":
-            warning_msg.set_text("You are rolling back to the Image Generation phase. This will keep transcripts and prompt files intact, but archive your rendered images folder so you can clean render the entire visual list.")
-            backup_details.set_content(
-                "**Action items:**\n"
-                "- Rename `images/` ➔ `images_backup_*`"
-            )
-        rollback_dialog.open()
-
-    # Workspace Navigation Layout with Folder Shortcut
+    # Workspace Navigation Layout with Folder & Rollback Shortcuts
     with ui.row().classes('w-full justify-between items-center mb-1'):
         with ui.column().classes('gap-0'):
             ui.label('Project Workspace Controls').classes('text-base font-bold text-slate-800')
@@ -502,11 +431,17 @@ def render_project_tabs(
             except Exception as ex:
                 ui.notify(f"Failed to open project folder: {str(ex)}", type="negative")
 
-        ui.button(
-            'Open Folder', 
-            icon='folder_open', 
-            on_click=open_project_folder
-        ).props('flat dense').classes('text-xs text-slate-600')
+        with ui.row().classes('items-center gap-2'):
+            ui.button(
+                'Open Folder', 
+                icon='folder_open', 
+                on_click=open_project_folder
+            ).props('flat dense').classes('text-xs text-slate-600')
+            ui.button(
+                'Rollback Project',
+                icon='history',
+                on_click=rollback_dialog.open
+            ).props('flat dense').classes('text-xs text-red-600 hover:text-red-800')
     
     with ui.tabs().classes('w-full border-b') as project_tabs:
         tab_dash = ui.tab('Dashboard', icon='dashboard')
@@ -518,18 +453,20 @@ def render_project_tabs(
     with ui.tab_panels(project_tabs, value=state.active_project_tab).classes('w-full bg-transparent p-0'):
         with ui.tab_panel(tab_dash):
             with ui.column().classes('w-full gap-4'):
+                global render_dynamic_step_dashboard
                 @ui.refreshable
-                def render_dynamic_step_dashboard():
+                def render_dynamic_step_dashboard_local():
                     status = state.project_status
                     if status in ("Imported", "Transcribing"):
                         render_transcription_step_view(project, books, start_transcribe_cb, stop_transcribe_cb)
                     elif status in ("Transcribed", "Generating Prompts"):
-                        render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb, trigger_rollback_prompt)
+                        render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb)
                     elif status in ("Prompts Created", "Rendering Images"):
-                        render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb, trigger_rollback_prompt)
+                        render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb)
                     else:
-                        render_completed_step_view(project, books, trigger_rollback_prompt)
+                        render_completed_step_view(project, books)
                         
+                render_dynamic_step_dashboard = render_dynamic_step_dashboard_local
                 render_dynamic_step_dashboard()
 
             @ui.refreshable

@@ -26,6 +26,9 @@ lora_chooser_dialog_ref = None
 chooser_active_node_id = None
 chooser_selected_lora_id = None
 
+# Track expansion state of auto-discovered parameter workflow nodes
+expansion_states: Dict[str, bool] = {}
+
 
 def get_node_class_type(node_id: str) -> Optional[str]:
     """Resolves the raw class_type of a node inside the active ComfyUI workflow JSON."""
@@ -771,7 +774,12 @@ def render_workflow_overrides_ui():
             node_type = data["type"]
             params = data["params"]
             
-            with ui.expansion(f"{node_title} (ID: {node_id})").classes('w-full border rounded bg-white text-xs'):
+            # Ensure we track the expanded state across UI refreshes
+            if node_id not in expansion_states:
+                expansion_states[node_id] = False
+                
+            with ui.expansion(f"{node_title} (ID: {node_id})").classes('w-full border rounded bg-white text-xs') as exp:
+                exp.bind_value(expansion_states, node_id)
                 with ui.column().classes('w-full p-3 gap-3'):
                     if node_type == "sampler":
                         current_steps = state.style_workflow_overrides.get(node_id, {}).get("steps", params["steps"])
@@ -853,7 +861,7 @@ def render_workflow_overrides_ui():
                                     options=comfy_options_cache[comfy_lora_key],
                                     value=current_lora_name if current_lora_name in comfy_options_cache[comfy_lora_key] else None,
                                     label="Select LoRA",
-                                    on_change=lambda e: (update_override_state(node_id, "lora_name", e.value), render_workflow_overrides_ui.refresh())
+                                    on_change=lambda e, nid=node_id: (update_override_state(nid, "lora_name", e.value), render_workflow_overrides_ui.refresh())
                                 ).classes('flex-1')
                                 
                                 ui.button(
@@ -865,7 +873,7 @@ def render_workflow_overrides_ui():
                                 ui.input(
                                     label="LoRA Filename",
                                     value=current_lora_name,
-                                    on_change=lambda e: update_override_state(node_id, "lora_name", e.value)
+                                    on_change=lambda e, nid=node_id: update_override_state(nid, "lora_name", e.value)
                                 ).classes('flex-1')
                                 
                                 ui.button(
@@ -890,20 +898,20 @@ def render_workflow_overrides_ui():
                                 with ui.row().classes('gap-1 flex-shrink-0'):
                                     ui.button(
                                         icon="content_copy",
-                                        on_click=lambda: (ui.clipboard.write(triggers_text), ui.notify("Trigger words copied to clipboard!", type="positive"))
+                                        on_click=lambda t=triggers_text: (ui.clipboard.write(t), ui.notify("Trigger words copied to clipboard!", type="positive"))
                                     ).props('flat dense').classes('text-blue-600').tooltip("Copy triggers to clipboard")
                                     
-                                    def add_to_prefix_val():
-                                        if triggers_text not in state.style_prompt_prefix:
+                                    def add_to_prefix_val(t=triggers_text):
+                                        if t not in state.style_prompt_prefix:
                                             cleaned_prefix = state.style_prompt_prefix.strip()
                                             if cleaned_prefix and not cleaned_prefix.endswith(","):
                                                 cleaned_prefix += ","
-                                            state.style_prompt_prefix = f"{cleaned_prefix} {triggers_text}, ".strip().replace("  ", " ")
+                                            state.style_prompt_prefix = f"{cleaned_prefix} {t}, ".strip().replace("  ", " ")
                                             ui.notify("Added triggers to Style Prompt Prefix!", type="positive")
                                             
                                     ui.button(
                                         icon="playlist_add",
-                                        on_click=add_to_prefix_val
+                                        on_click=lambda: add_to_prefix_val()
                                     ).props('flat dense').classes('text-blue-600').tooltip("Append triggers to Style Prompt Prefix")
                                     
                         ui.number(
@@ -924,14 +932,14 @@ def render_workflow_overrides_ui():
                                 options=comfy_options_cache[comfy_key],
                                 value=current_model_name if current_model_name in comfy_options_cache[comfy_key] else None,
                                 label=f"Select Model ({param_key})",
-                                on_change=lambda e, pk=param_key: (update_override_state(node_id, pk, e.value), render_workflow_overrides_ui.refresh())
+                                on_change=lambda e, nid=node_id, pk=param_key: (update_override_state(nid, pk, e.value), render_workflow_overrides_ui.refresh())
                             ).classes('w-full')
                         else:
                             # Self-healing text input fallback if ComfyUI is offline
                             ui.input(
                                 label=f"Model Filename ({param_key})",
                                 value=current_model_name,
-                                on_change=lambda e, pk=param_key: update_override_state(node_id, pk, e.value)
+                                on_change=lambda e, nid=node_id, pk=param_key: update_override_state(nid, pk, e.value)
                             ).classes('w-full')
 
                     elif node_type == "clip_loader":
@@ -944,13 +952,13 @@ def render_workflow_overrides_ui():
                                 options=comfy_options_cache[comfy_key],
                                 value=current_clip_name if current_clip_name in comfy_options_cache[comfy_key] else None,
                                 label=f"Select CLIP Model ({param_key})",
-                                on_change=lambda e, pk=param_key: (update_override_state(node_id, pk, e.value), render_workflow_overrides_ui.refresh())
+                                on_change=lambda e, nid=node_id, pk=param_key: (update_override_state(nid, pk, e.value), render_workflow_overrides_ui.refresh())
                             ).classes('w-full')
                         else:
                             ui.input(
                                 label=f"CLIP Filename ({param_key})",
                                 value=current_clip_name,
-                                on_change=lambda e, pk=param_key: update_override_state(node_id, pk, e.value)
+                                on_change=lambda e, nid=node_id, pk=param_key: update_override_state(nid, pk, e.value)
                             ).classes('w-full')
 
                     elif node_type == "vae_loader":
@@ -962,13 +970,13 @@ def render_workflow_overrides_ui():
                                 options=comfy_options_cache[comfy_key],
                                 value=current_vae_name if current_vae_name in comfy_options_cache[comfy_key] else None,
                                 label="Select VAE Model",
-                                on_change=lambda e: (update_override_state(node_id, "vae_name", e.value), render_workflow_overrides_ui.refresh())
+                                on_change=lambda e, nid=node_id: (update_override_state(nid, "vae_name", e.value), render_workflow_overrides_ui.refresh())
                             ).classes('w-full')
                         else:
                             ui.input(
                                 label="VAE Filename",
                                 value=current_vae_name,
-                                on_change=lambda e: update_override_state(node_id, "vae_name", e.value)
+                                on_change=lambda e, nid=node_id: update_override_state(nid, "vae_name", e.value)
                             ).classes('w-full')
 
 
