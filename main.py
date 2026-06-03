@@ -863,7 +863,7 @@ def render_split_panel_shell(project_id: int):
 
     with ui.grid(columns='260px 1fr').classes('w-full gap-6 items-start'):
         # LEFT NAVIGATION SIDEBAR
-        with ui.column().classes('bg-white border rounded-xl p-4 gap-4 shadow-sm h-[calc(100vh-140px)] sticky top-24'):
+        with ui.column().classes('bg-white border rounded-xl p-4 gap-4 shadow-sm h-[calc(100vh-140px)] sticky top-24 w-full overflow-x-hidden'):
             ui.button(
                 'Back to Projects', 
                 icon='arrow_back', 
@@ -873,7 +873,7 @@ def render_split_panel_shell(project_id: int):
             # --- Project Global Header Card ---
             project_card_bg = 'bg-blue-50/70 border-blue-100/50 text-blue-700 font-bold' if state.active_book_id is None else 'bg-slate-50/50 hover:bg-slate-100'
 
-            with ui.card().classes(f'w-full border p-3 rounded-lg shadow-xs gap-2 cursor-pointer transition-all {project_card_bg}') \
+            with ui.card().classes(f'w-full border p-3 rounded-lg shadow-xs gap-2 cursor-pointer transition-all overflow-hidden {project_card_bg}') \
                     .on('click', lambda: select_project(project.id)):
                 with ui.row().classes('items-center gap-2 w-full justify-between'):
                     ui.icon('folder' if project.is_batch else 'menu_book', size='sm', color='slate-700')
@@ -881,7 +881,8 @@ def render_split_panel_shell(project_id: int):
                     ui.badge().classes('px-2 py-0.5 text-[10px] font-bold rounded-full bg-blue-100 text-blue-800') \
                         .bind_text_from(state, 'project_status', backward=lambda val: display_mapping.get(val, val))
                     
-                ui.label(project.name).classes('text-sm font-bold text-slate-800 leading-tight truncate')
+                # Applying break-words and whitespace-normal to prevent overflows
+                ui.label(project.name).classes('text-sm font-bold text-slate-800 leading-tight break-words whitespace-normal')
                 
                 with ui.column().classes('w-full gap-0.5 mt-1'):
                     ui.label('').classes('text-[9px] font-bold text-slate-500 uppercase tracking-wide') \
@@ -915,21 +916,23 @@ def render_split_panel_shell(project_id: int):
                         state.books_subtitle[book.id] = f"Rendered: {stats['generated_images']}/{total_scenes}"
 
                     book_bg = 'bg-blue-50/70 border border-blue-100/50 text-blue-700 font-bold' if state.active_book_id == book.id else 'hover:bg-slate-50 text-slate-700'
-                    with ui.row().classes(f'w-full p-2 rounded-lg cursor-pointer items-center justify-between transition-colors {book_bg}') \
+                    
+                    # Use items-start to allow the row card to expand vertically for multi-line content
+                    with ui.row().classes(f'w-full p-2 rounded-lg cursor-pointer items-start justify-between transition-colors {book_bg}') \
                             .on('click', lambda b_id=book.id: select_book(b_id)):
-                        with ui.row().classes('items-center gap-3 truncate flex-1'):
-                            # Upgrade cover sizes to beautiful standard 2:3 aspect ratio (w-10 h-14)
+                        with ui.row().classes('items-start gap-3 flex-1 min-w-0'):
+                            # Upgrade cover sizes to standard 2:3 aspect ratio (w-10 h-14)
                             if book.cover_path:
                                 ui.image(book.cover_path).classes('w-10 h-14 rounded object-cover shadow-sm border flex-shrink-0')
                             else:
                                 with ui.column().classes('w-10 h-14 bg-slate-50 border border-dashed rounded items-center justify-center flex-shrink-0 text-slate-400'):
                                     ui.icon('library_books', size='16px')
                             
-                            # Multi-line column container: allows subtitles to wrap gracefully without truncating
+                            # Multi-line column container: allows subtitles and wrapped titles to flow downwards naturally
                             with ui.column().classes('gap-0.5 flex-1 min-w-0'):
-                                ui.label(book.name).classes('text-xs font-semibold truncate leading-tight')
-                                # BIND TEXT REACTIVELY (Supports multi-line wraps cleanly!)
-                                ui.label('').classes('text-[9px] font-medium text-slate-500 leading-normal break-words') \
+                                ui.label(book.name).classes('text-xs font-semibold leading-tight break-words whitespace-normal')
+                                # BIND TEXT REACTIVELY (Supports multi-line wraps cleanly)
+                                ui.label('').classes('text-[9px] font-medium text-slate-500 leading-normal break-words whitespace-normal') \
                                     .bind_text_from(state.books_subtitle, book.id)
                                 
 
@@ -1054,13 +1057,15 @@ def launch_comfyui():
     
     try:
         if os.name == 'nt':  # Windows
-            if bat_file.exists():
-                subprocess.Popen([str(bat_file)] + comfy_args_list, cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
-                ui.notify("Launching ComfyUI via run_nvidia_gpu.bat...", type="info")
-            elif embedded_py_win.exists() and inner_python_file.exists():
-                # Direct fallback running main.py using the embedded python executable rather than system python
+            # Prioritize direct embedded Python execution to ensure all custom parameters
+            # (like --port, --highvram) are forwarded properly. Standalone ComfyUI .bat files
+            # do not forward command-line parameters natively because they lack a `%*` suffix.
+            if embedded_py_win.exists() and inner_python_file.exists():
                 subprocess.Popen([str(embedded_py_win), "-s", "ComfyUI\\main.py"] + comfy_args_list, cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
                 ui.notify("Launching ComfyUI via embedded python...", type="info")
+            elif bat_file.exists():
+                subprocess.Popen([str(bat_file)] + comfy_args_list, cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
+                ui.notify("Launching ComfyUI via run_nvidia_gpu.bat...", type="info")
             elif python_file.exists():
                 venv_python = comfy_dir / "venv" / "Scripts" / "python.exe"
                 py_exec = str(venv_python) if venv_python.exists() else sys.executable
@@ -1069,12 +1074,13 @@ def launch_comfyui():
             else:
                 ui.notify("Could not locate run_nvidia_gpu.bat, embedded python, or main.py.", type="warning")
         else:  # Linux / macOS
-            if sh_file.exists():
-                subprocess.Popen(["bash", str(sh_file)] + comfy_args_list, cwd=str(comfy_dir))
-                ui.notify("Launching ComfyUI via shell script...", type="info")
-            elif embedded_py_unix.exists() and inner_python_file.exists():
+            # Prioritize direct embedded or local Python execution to bypass static .sh constraints
+            if embedded_py_unix.exists() and inner_python_file.exists():
                 subprocess.Popen([str(embedded_py_unix), "-s", "ComfyUI/main.py"] + comfy_args_list, cwd=str(comfy_dir))
                 ui.notify("Launching ComfyUI via embedded python...", type="info")
+            elif sh_file.exists():
+                subprocess.Popen(["bash", str(sh_file)] + comfy_args_list, cwd=str(comfy_dir))
+                ui.notify("Launching ComfyUI via shell script...", type="info")
             elif python_file.exists():
                 venv_python = comfy_dir / "venv" / "bin" / "python"
                 py_exec = str(venv_python) if venv_python.exists() else sys.executable
