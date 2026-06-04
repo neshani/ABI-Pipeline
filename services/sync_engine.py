@@ -3,9 +3,113 @@ import os
 import json
 import csv
 from pathlib import Path
-from sqlmodel import Session, select
+from sqlmodel import Session, select, delete
 from database.connection import engine, get_setting
-from database.models import Project, Book, Chapter
+from database.models import Project, Book, Chapter, ScenePrompt
+
+def sync_project_status(project_id: int, session: Session) -> None:
+    """
+    Dynamically calculates and updates the parent Project status
+    based on the status of all of its child Books.
+    """
+    project = session.get(Project, project_id)
+    if not project:
+        return
+
+    books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+    if not books:
+        return
+
+    book_statuses = [b.status for b in books]
+
+    # Priority status hierarchy to determine the bottleneck state
+    if "Rendering Images" in book_statuses:
+        project.status = "Rendering Images"
+    elif "Transcribing" in book_statuses:
+        project.status = "Transcribing"
+    elif "Generating Prompts" in book_statuses:
+        project.status = "Generating Prompts"
+    elif "Prompts Created" in book_statuses:
+        project.status = "Prompts Created"
+    elif "Transcribed" in book_statuses:
+        project.status = "Transcribed"
+    elif "Images Created" in book_statuses:
+        project.status = "Images Created"
+    else:
+        project.status = "Imported"
+
+    session.add(project)
+    session.flush()
+
+
+def sync_prompts_csv_to_db_cache(book_id: int, session: Session) -> None:
+    """
+    Parses prompts.csv and loads rows into SQLite ScenePrompt cache
+    only if prompts.csv modification time has changed.
+    """
+    book = session.get(Book, book_id)
+    if not book:
+        return
+
+    project = session.get(Project, book.project_id) if book.project_id else None
+    project_name = project.name if project else "Default_Project"
+
+    base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
+    book_output_dir = base_output_dir / project_name / book.name
+    prompts_file = book_output_dir / "prompts.csv"
+
+    if not prompts_file.exists():
+        session.exec(delete(ScenePrompt).where(ScenePrompt.book_id == book_id))
+        book.prompts_mtime = None
+        session.add(book)
+        session.flush()
+        return
+
+    mtime = prompts_file.stat().st_mtime
+    if book.prompts_mtime == mtime:
+        return  # Cache is already fully up to date!
+
+    try:
+        with open(prompts_file, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="|")
+            if not reader.fieldnames:
+                return
+            
+            # Normalize column headers to lowercase
+            reader.fieldnames = [name.strip().lower() if name else "" for name in reader.fieldnames]
+            
+            # Clear existing scene cache for this book
+            session.exec(delete(ScenePrompt).where(ScenePrompt.book_id == book_id))
+            session.flush()
+
+            for row in reader:
+                cleaned_row = {k.strip().lower(): v.strip() if v else "" for k, v in row.items() if k}
+                try:
+                    ch = int(float(cleaned_row.get("chapter", "1")))
+                    sc = int(float(cleaned_row.get("scene", "1")))
+                except (ValueError, TypeError):
+                    ch, sc = 1, 1
+
+                is_approved = cleaned_row.get("approved", "false").strip().lower() == "true"
+                timestamp = cleaned_row.get("timestamp", "00:00:00")
+
+                scene_prompt = ScenePrompt(
+                    book_id=book_id,
+                    chapter_num=ch,
+                    scene_num=sc,
+                    prompt=cleaned_row.get("prompt", ""),
+                    quote=cleaned_row.get("quote", ""),
+                    approved=is_approved,
+                    timestamp=timestamp
+                )
+                session.add(scene_prompt)
+
+            book.prompts_mtime = mtime
+            session.add(book)
+            session.flush()
+    except Exception as e:
+        print(f"[Sync-Engine] Error caching prompts.csv to SQLite: {e}")
+
 
 def sync_project_status(project_id: int, session: Session) -> None:
     """
@@ -53,11 +157,14 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
     if not book:
         return
 
+    # First, guarantee the SQLite database ScenePrompt cache table is fully synchronized with disk CSV state
+    sync_prompts_csv_to_db_cache(book_id, session)
+
     project = session.get(Project, book.project_id) if book.project_id else None
     project_name = project.name if project else "Default_Project"
 
     # Base output directories
-    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
     book_output_dir = base_output_dir / project_name / book.name
     transcript_file = book_output_dir / "transcript.txt"
     prompts_file = book_output_dir / "prompts.csv"
@@ -234,8 +341,7 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
 def recover_from_temp_workspaces(session: Session) -> None:
     """
     Scans both workspace_temp/ and output/ folders for transcription tracking metadata.
-    Reconstructs the complete database index (entire projects and books) on database wipe,
-    restoring finished projects, partial active transcribing state, and synced counts.
+    Reconstructs the complete database index on database wipe.
     """
     detected_projects = {}  # project_path -> project_name
     meta_items = []
@@ -257,7 +363,7 @@ def recover_from_temp_workspaces(session: Session) -> None:
                         print(f"Error reading temp state file {state_file}: {e}")
 
     # 2. Gather any fully completed output configurations
-    output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
     if output_dir.exists() and output_dir.is_dir():
         for meta_file in output_dir.glob("*/*/metadata.json"):
             try:
@@ -274,7 +380,7 @@ def recover_from_temp_workspaces(session: Session) -> None:
 
     print(f"[Sync-Engine] Found {len(meta_items)} project tracking records to synchronize.")
 
-    # 3. Reconstruct parent Projects using lightning scanner
+    # 3. Reconstruct parent Projects
     for item in meta_items:
         project_name = item.get("project_name")
         project_path = item.get("project_path")
@@ -293,7 +399,8 @@ def recover_from_temp_workspaces(session: Session) -> None:
                 from services.scanner import scan_directory, ingest_project
                 scan_res = scan_directory(proj_path)
                 if scan_res["type"] != "none":
-                    ingest_project(scan_res, proj_name)
+                    # Pass the active transaction session directly down to parent scanner ingest
+                    ingest_project(scan_res, proj_name, session)
             except Exception as e:
                 print(f"[Sync-Engine] Could not re-ingest parent project '{proj_name}': {e}")
 
@@ -317,7 +424,7 @@ def recover_from_temp_workspaces(session: Session) -> None:
             continue
 
         if source_type == "output":
-            # Book has a completed transcript on disk, let sync perform audit to resolve correct step
+            # Book has a completed transcript on disk, perform audit to resolve correct step
             sync_book_from_disk(book.id, session)
 
         elif source_type == "temp":

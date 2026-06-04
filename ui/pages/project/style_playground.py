@@ -216,7 +216,7 @@ def render_lora_chooser_content():
 
                 # Dialog action panel
                 with ui.row().classes('w-full justify-end gap-3 border-t pt-2 flex-shrink-0'):
-                    ui.button('Cancel', on_click=lora_chooser_dialog_ref.close).props('flat color=slate')
+                    ui.button('Cancel', on_click=lambda: lora_chooser_dialog_ref.close() if lora_chooser_dialog_ref else None).props('flat color=slate')
                     
                     def apply_selection():
                         if selected_lora and chooser_active_node_id:

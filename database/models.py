@@ -23,6 +23,7 @@ class Book(SQLModel, table=True):
     word_count: Optional[int] = Field(default=None)
     total_images: Optional[int] = Field(default=None)
     completed_images: Optional[int] = Field(default=None)
+    prompts_mtime: Optional[float] = Field(default=None)  # Dynamic cache syncing timestamp
 
 class Chapter(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -37,3 +38,13 @@ class Chapter(SQLModel, table=True):
     word_count: Optional[int] = Field(default=None)
     total_images: Optional[int] = Field(default=None)
     completed_images: Optional[int] = Field(default=None)
+
+class ScenePrompt(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    book_id: int = Field(foreign_key="book.id", index=True)
+    chapter_num: int = Field(index=True)
+    scene_num: int = Field(index=True)
+    prompt: str
+    quote: str
+    approved: bool = Field(default=False)
+    timestamp: Optional[str] = Field(default="00:00:00")

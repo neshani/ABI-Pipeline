@@ -213,12 +213,14 @@ def create_chapter_plan_for_book(book_id: int, audio_type: str, files: List[str]
             session.add(chapter)
 
 
-def ingest_project(scan_result: Dict[str, Any], custom_project_name: str) -> int:
+def ingest_project(scan_result: Dict[str, Any], custom_project_name: str, session: Optional[Session] = None) -> int:
     """
     Takes the scan metadata preview and inserts the Project, Books, and Chapter
     entities into the database within a single transaction.
     """
-    with Session(engine) as session:
+    # Use parent active session if provided, otherwise open a standalone session
+    active_session = session if session is not None else Session(engine)
+    try:
         # 1. Create and add Project record
         project = Project(
             name=custom_project_name,
@@ -226,8 +228,8 @@ def ingest_project(scan_result: Dict[str, Any], custom_project_name: str) -> int
             is_batch=(scan_result["type"] == "batch"),
             status="Imported"
         )
-        session.add(project)
-        session.flush()  # Populates project.id before committing
+        active_session.add(project)
+        active_session.flush()  # Populates project.id before committing
 
         # 2. Create Books and associated Chapter lists
         for book_data in scan_result["books"]:
@@ -239,20 +241,30 @@ def ingest_project(scan_result: Dict[str, Any], custom_project_name: str) -> int
                 status="Imported",
                 progress=0.0
             )
-            session.add(book)
-            session.flush()  # Populates book.id
+            active_session.add(book)
+            active_session.flush()  # Populates book.id
 
             # 3. Create the chapters
             create_chapter_plan_for_book(
                 book_id=book.id,
                 audio_type=book_data["audio_type"],
                 files=book_data["files"],
-                session=session
+                session=active_session
             )
 
             # 4. Instant scan for any pre-existing output files on disk
             from services.sync_engine import sync_book_from_disk
-            sync_book_from_disk(book.id, session)
+            sync_book_from_disk(book.id, active_session)
 
-        session.commit()
+        # Only commit here if we opened a standalone session locally
+        if session is None:
+            active_session.commit()
+            
         return project.id
+    except Exception as e:
+        if session is None:
+            active_session.rollback()
+        raise e
+    finally:
+        if session is None:
+            active_session.close()

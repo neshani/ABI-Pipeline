@@ -12,7 +12,7 @@ from PIL.PngImagePlugin import PngInfo
 import io
 from typing import Optional, List, Dict, Any
 
-from nicegui import ui
+from nicegui import ui, app
 from sqlmodel import Session, select
 from database.connection import init_db, get_setting, set_setting, engine
 from database.models import Project, Book, Chapter
@@ -140,16 +140,27 @@ def reset_stuck_transcriptions():
             
         session.commit()
 
-# --- Initialize SQLite Database & Recovery Engines ---
-if __name__ == "__main__":
-    init_db()
-    
+
+
+# --- Initialize SQLite Database Schema ---
+# Running this globally right after imports ensures that the setting tables exist 
+# before DEFAULT_SETTINGS and any global database reads are evaluated.
+init_db()
+
+
+# --- Initialize SQLite Database & Recovery Engines (One-time Startup Event) ---
+
+def run_startup_recovery():
+    """Clears stuck tasks and recovers workspaces exactly once on startup."""
     # Ensure stuck tasks are cleared
     reset_stuck_transcriptions()
 
     # Run workspace recovery to restore wiped database entries
     with Session(engine) as session:
         recover_from_temp_workspaces(session)
+
+# Registers the callback so it only executes once in the active child worker process
+app.on_startup(run_startup_recovery)
 
 # --- Programmatic App Restart Engine ---
 def restart_app():
@@ -218,6 +229,10 @@ def select_book(book_id: int):
     state.active_book_id = book_id
     state.active_book_tab = 'Dashboard'
     state.active_log_widget = None  # Clear log references on panel change
+    
+    # Instantly scroll the browser window back to the top of the page
+    ui.run_javascript('window.scrollTo(0, 0)')
+    
     main_layout.refresh()
 
 
@@ -596,6 +611,11 @@ async def async_run_project_image_gen_logic(project_id: int):
                         save_image_with_metadata(img_bytes, target_path, quote_text)
                     await asyncio.to_thread(save_and_bake)
                     state.add_console_log(f"[Image-Gen] Saved and baked metadata into: {target_filename}")
+                    
+                    # Store dynamic coordinate timestamp to selectively cache-bust only this card
+                    if not hasattr(state, 'custom_image_timestamps'):
+                        state.custom_image_timestamps = {}
+                    state.custom_image_timestamps[(chapter, scene)] = int(time.time() * 1000)
                     
                     # Convert to base64 data string and inject directly to real-time feed
                     import base64

@@ -2,6 +2,7 @@ import json
 import os
 from sqlmodel import SQLModel, create_engine, Session, select
 from .models import Setting
+from typing import Optional
 
 DATABASE_FILE = "abi_pipeline.db"
 DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
@@ -13,15 +14,25 @@ def init_db():
     """Initializes the SQLite database and creates the tables if they don't exist."""
     SQLModel.metadata.create_all(engine)
 
-def get_setting(key: str, default=None):
+def get_setting(key: str, default=None, session: Optional[Session] = None):
     """Retrieves a setting by key. Automatically parses JSON strings into Python dicts/lists."""
-    with Session(engine) as session:
+    # Reuse open active session if provided to avoid connection locks
+    if session is not None:
         statement = select(Setting).where(Setting.key == key)
         setting = session.exec(statement).first()
         if not setting:
             return default
-        
-        # Try to parse as JSON, otherwise return the raw string
+        try:
+            return json.loads(setting.value)
+        except (json.JSONDecodeError, TypeError):
+            return setting.value
+
+    # Standalone connection block fallback
+    with Session(engine) as standalone_session:
+        statement = select(Setting).where(Setting.key == key)
+        setting = standalone_session.exec(statement).first()
+        if not setting:
+            return default
         try:
             return json.loads(setting.value)
         except (json.JSONDecodeError, TypeError):
