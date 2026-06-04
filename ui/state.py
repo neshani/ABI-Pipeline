@@ -70,6 +70,7 @@ cancel_image_gen_flag: bool = False
 style_selected_preset: str = "default"
 style_selected_workflow: str = ""
 style_prompt_prefix: str = "ArsMJStyle, 1890s Victorian illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. "
+style_prompt_suffix: str = ""
 style_negative_prompt: str = "blurry, bad quality, text, watermark, photorealistic, photography"
 style_test_prompts: List[Dict[str, Any]] = []
 style_test_images: List[Optional[str]] = []  # List of Base64-encoded strings or None

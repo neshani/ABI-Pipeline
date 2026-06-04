@@ -572,7 +572,8 @@ async def async_run_project_image_gen_logic(project_id: int):
                     neg_prompt_text=state.style_negative_prompt,
                     seed=seed,
                     overrides=state.style_workflow_overrides,
-                    prefix=state.style_prompt_prefix
+                    prefix=state.style_prompt_prefix,
+                    suffix=getattr(state, "style_prompt_suffix", "")
                 )
 
             img_bytes, logs = await asyncio.to_thread(render_block)

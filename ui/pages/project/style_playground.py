@@ -306,31 +306,74 @@ def create_contact_sheet(base64_list: list) -> Optional[bytes]:
     return out_buf.getvalue()
 
 
-def copy_style_settings_to_clipboard():
-    """Formats active style selections, ComfyUI overrides, and test prompts into structured Markdown for an LLM."""
+def _get_resolved_workflow_settings() -> List[str]:
+    """Helper to compile currently adjustable settings, merging workflow defaults and overrides."""
+    lines = []
+    if not state.style_discovered_params:
+        return ["*No adjustable parameters detected or loaded for this workflow.*"]
+    
+    for node_id, data in state.style_discovered_params.items():
+        node_title = data["title"]
+        node_type = data["type"]
+        params = data["params"]
+        overrides = state.style_workflow_overrides.get(node_id, {})
+        
+        lines.append(f"- **{node_title} (ID: {node_id})**:")
+        if node_type == "sampler":
+            steps = overrides.get("steps", params.get("steps"))
+            cfg = overrides.get("cfg", params.get("cfg"))
+            sampler = overrides.get("sampler_name", params.get("sampler_name", "euler"))
+            scheduler = overrides.get("scheduler", params.get("scheduler", "normal"))
+            lines.append(f"  - `steps`: {steps}")
+            lines.append(f"  - `cfg`: {cfg}")
+            lines.append(f"  - `sampler_name`: {sampler}")
+            lines.append(f"  - `scheduler`: {scheduler}")
+        elif node_type == "resolution":
+            w = overrides.get("width", params.get("width"))
+            h = overrides.get("height", params.get("height"))
+            lines.append(f"  - `width`: {w}")
+            lines.append(f"  - `height`: {h}")
+        elif node_type == "lora_loader":
+            lora_name = overrides.get("lora_name", params.get("lora_name"))
+            strength = overrides.get("strength_model", params.get("strength_model"))
+            lines.append(f"  - `lora_name`: {lora_name}")
+            lines.append(f"  - `strength_model`: {strength}")
+        elif node_type == "model_loader":
+            pk = params.get("model_param_key", "ckpt_name")
+            model = overrides.get(pk, params.get(pk, ""))
+            lines.append(f"  - `{pk}`: {model}")
+        elif node_type == "clip_loader":
+            pk = params.get("clip_param_key", "clip_name")
+            clip = overrides.get(pk, params.get(pk, ""))
+            lines.append(f"  - `{pk}`: {clip}")
+        elif node_type == "vae_loader":
+            vae = overrides.get("vae_name", params.get("vae_name", ""))
+            lines.append(f"  - `vae_name`: {vae}")
+            
+    return lines
+
+
+def copy_style_settings_to_clipboard(project_name: str = "Active Project"):
+    """Formats active style selections, ComfyUI parameters, and test prompts into structured Markdown."""
+    resolved_settings = "\n".join(_get_resolved_workflow_settings())
+    
     lines = [
         "### ABI-Pipeline Style Playground Report",
+        f"**Project**: {project_name}",
         f"**Active Preset**: {state.style_selected_preset}",
         f"**Base Workflow**: {state.style_selected_workflow}",
         "",
         "#### Style Templates",
         f"**Style Prompt Prefix**:\n```\n{state.style_prompt_prefix}\n```",
+        f"**Style Prompt Suffix**:\n```\n{state.style_prompt_suffix}\n```",
         f"**Style Negative Prompt**:\n```\n{state.style_negative_prompt}\n```",
         "",
-        "#### Active Parameter Overrides:",
+        "#### Adjustable Workflow Settings:",
+        resolved_settings,
+        "",
+        "#### Generated Scenes Context Map:",
     ]
 
-    if state.style_workflow_overrides:
-        for node_id, params in state.style_workflow_overrides.items():
-            lines.append(f"- **Node {node_id}**:")
-            for k, v in params.items():
-                lines.append(f"  - `{k}`: {v}")
-    else:
-        lines.append("*No overrides applied (Default workflow settings)*")
-
-    lines.append("")
-    lines.append("#### Generated Scenes Context Map:")
-    
     for idx, item in enumerate(state.style_test_prompts):
         is_dict = isinstance(item, dict)
         chap = item.get("chapter", 1) if is_dict else 1
@@ -351,6 +394,57 @@ def copy_style_settings_to_clipboard():
     full_text = "\n".join(lines)
     ui.clipboard.write(full_text)
     ui.notify("Style configuration & prompt context copied to clipboard!", type="positive")
+
+
+def copy_style_primer_to_clipboard(project_name: str):
+    """Formats a diagnostic visual style framework primer and copies it to clipboard."""
+    resolved_settings = "\n".join(_get_resolved_workflow_settings())
+    
+    scenes_lines = []
+    for idx, item in enumerate(state.style_test_prompts):
+        is_dict = isinstance(item, dict)
+        chap = item.get("chapter", 1) if is_dict else 1
+        sec = item.get("scene", idx + 1) if is_dict else idx + 1
+        p_text = item.get("prompt", "") if is_dict else item
+        quote = item.get("quote", "") if is_dict else ""
+        seed = state.style_test_seeds[idx] if idx < len(state.style_test_seeds) else state.style_image_seed
+
+        row_num = (idx // 4) + 1
+        col_letter = chr(65 + (idx % 4))
+        label = f"{row_num}{col_letter}"
+
+        scenes_lines.append(f"- **[{label}] Ch {chap}, Scene {sec}** (Seed: {seed})")
+        if quote:
+            scenes_lines.append(f"  - *Source Quote*: \"{quote}\"")
+        scenes_lines.append(f"  - *Visual Prompt*: {p_text}")
+    
+    scenes_str = "\n".join(scenes_lines) if scenes_lines else "*No test scenes generated yet.*"
+
+    primer_text = (
+        f"I am using a local AI book illustration pipeline called ABI-Pipeline for my project: '{project_name}'. "
+        "I need your expert help tuning and debugging my active visual style preset, ComfyUI settings, and descriptive prompts.\n\n"
+        "Below is the current visual orchestration configuration and the resulting visual prompts extracted from our transcript:\n\n"
+        "### ARTISTIC STYLE TEMPLATES:\n"
+        f"- **Style Prompt Prefix (Appended at front)**:\n  ```text\n  {state.style_prompt_prefix}\n  ```\n"
+        f"- **Style Prompt Suffix (Appended at end)**:\n  ```text\n  {state.style_prompt_suffix}\n  ```\n"
+        f"- **Style Negative Prompt (Avoid list)**:\n  ```text\n  {state.style_negative_prompt}\n  ```\n\n"
+        "--------------------------------------------------------------------------------\n\n"
+        "### ADJUSTABLE WORKFLOW SETTINGS:\n"
+        f"**Base Workflow**: {state.style_selected_workflow}\n"
+        f"{resolved_settings}\n\n"
+        "--------------------------------------------------------------------------------\n\n"
+        "### CURRENT RUN DATA (PROMPTS & METADATA):\n"
+        f"**Volume Selected**: {state.playground_book_selection}\n"
+        f"{scenes_str}\n\n"
+        "--------------------------------------------------------------------------------\n\n"
+        "### MY SPECIFIC ADJUSTMENT REQUEST:\n"
+        "[Insert your request here, e.g. 'My rendered images look way too realistic, and the lighting is harsh. "
+        "Looking at my Style Prefix/Suffix and active adjustable parameters (like CFG and sampler choice above), what changes "
+        "do you recommend to achieve a softer, hand-drawn look? Please suggest updated style templates or parameter values!']"
+    )
+    
+    ui.clipboard.write(primer_text)
+    ui.notify("Style AI Primer copied! Paste this first, then upload or paste your results.", type="positive", icon="psychology")
 
 
 def download_contact_sheet():
@@ -462,7 +556,8 @@ async def regenerate_single_card(project_name: str, idx: int):
             neg_prompt_text=state.style_negative_prompt,
             seed=seed,
             overrides=state.style_workflow_overrides,
-            prefix=state.style_prompt_prefix
+            prefix=state.style_prompt_prefix,
+            suffix=state.style_prompt_suffix
         )
 
     try:
@@ -524,6 +619,7 @@ def load_style_preset_by_name(name: str):
                 handle_style_workflow_change(associated_wf, clear_overrides=False)
                 
             state.style_prompt_prefix = data.get("prompt_prefix", "")
+            state.style_prompt_suffix = data.get("prompt_suffix", "")
             state.style_negative_prompt = data.get("negative_prompt", "")
             state.style_workflow_overrides = data.get("overrides", {})
         except Exception:
@@ -533,7 +629,7 @@ def load_style_preset_by_name(name: str):
 
 
 def save_style_preset_by_name(name: str):
-    """Saves style prefix & negative prompt variables into an on-disk style preset JSON file."""
+    """Saves style prefix, suffix & negative prompt variables into an on-disk style preset JSON file."""
     name_clean = name.strip().replace(" ", "_")
     if not name_clean:
         ui.notify("Please enter a valid Style name.", type="negative")
@@ -545,6 +641,7 @@ def save_style_preset_by_name(name: str):
         "name": name,
         "workflow": state.style_selected_workflow,
         "prompt_prefix": state.style_prompt_prefix,
+        "prompt_suffix": state.style_prompt_suffix,
         "negative_prompt": state.style_negative_prompt,
         "overrides": state.style_workflow_overrides
     }
@@ -719,7 +816,8 @@ async def execute_style_playground_batch(project_name: str):
                 neg_prompt_text=state.style_negative_prompt,
                 seed=seed,
                 overrides=state.style_workflow_overrides,
-                prefix=state.style_prompt_prefix
+                prefix=state.style_prompt_prefix,
+                suffix=state.style_prompt_suffix
             )
             
         try:
@@ -1108,6 +1206,10 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
             ui.textarea(
                 label="Style Prompt Prefix"
             ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_prompt_prefix')
+
+            ui.textarea(
+                label="Style Prompt Suffix"
+            ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_prompt_suffix')
             
             ui.textarea(
                 label="Style Negative Prompt"
@@ -1186,9 +1288,16 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                     
                     with ui.row().classes('gap-2'):
                         ui.button(
+                            'Copy Style Primer',
+                            icon='psychology',
+                            on_click=lambda: copy_style_primer_to_clipboard(project.name)
+                        ).classes('bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold h-9') \
+                         .tooltip('Formats diagnostic visual parameters and prompt runs specifically for debugging chats with external LLMs')
+
+                        ui.button(
                             'Copy Prompt Pack',
                             icon='content_copy',
-                            on_click=copy_style_settings_to_clipboard
+                            on_click=lambda: copy_style_settings_to_clipboard(project.name)
                         ).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold h-9')
                         
                         ui.button(

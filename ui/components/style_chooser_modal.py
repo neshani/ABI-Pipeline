@@ -44,6 +44,7 @@ def ensure_default_style_exists():
             "name": "default",
             "workflow": default_wf,
             "prompt_prefix": "ArsMJStyle, 1890s Victorian illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. ",
+            "prompt_suffix": "",
             "negative_prompt": "blurry, bad quality, text, watermark, photorealistic, photography",
             "overrides": {}
         }
@@ -66,6 +67,7 @@ class StyleChooserModal:
         
         # Loaded metadata details
         self.style_prefix = ""
+        self.style_suffix = ""
         self.style_negative = ""
         self.style_workflow = ""
         
@@ -100,14 +102,17 @@ class StyleChooserModal:
                 with open(file_path, "r") as f:
                     data = json.load(f)
                 self.style_prefix = data.get("prompt_prefix", "")
+                self.style_suffix = data.get("prompt_suffix", "")
                 self.style_negative = data.get("negative_prompt", "")
                 self.style_workflow = data.get("workflow", "")
             except Exception:
                 self.style_prefix = ""
+                self.style_suffix = ""
                 self.style_negative = ""
                 self.style_workflow = ""
         else:
             self.style_prefix = ""
+            self.style_suffix = ""
             self.style_negative = ""
             self.style_workflow = ""
                     
@@ -170,7 +175,8 @@ class StyleChooserModal:
                         neg_prompt_text=self.style_negative,
                         seed=seed,
                         overrides=overrides,
-                        prefix=self.style_prefix
+                        prefix=self.style_prefix,
+                        suffix=self.style_suffix
                     )
 
                 try:
@@ -259,6 +265,11 @@ class StyleChooserModal:
                     ui.label("PROMPT PREFIX:").classes("font-bold text-slate-400")
                     ui.label(self.style_prefix or "None").classes("text-slate-600 leading-normal truncate")
 
+                # Suffix Text Block Preview
+                with ui.column().classes("gap-1 bg-slate-50 p-2 rounded border w-full text-[10px]"):
+                    ui.label("PROMPT SUFFIX:").classes("font-bold text-slate-400")
+                    ui.label(self.style_suffix or "None").classes("text-slate-600 leading-normal truncate")
+
                 # Visual Benchmarks Row
                 with ui.grid(columns=3).classes("w-full gap-3 mt-1"):
                     # Portrait Card
@@ -305,6 +316,7 @@ class StyleChooserModal:
         # Write applied metadata selections directly back to the global state bindings
         state.style_selected_preset = self.selected_style
         state.style_prompt_prefix = self.style_prefix
+        state.style_prompt_suffix = self.style_suffix
         state.style_negative_prompt = self.style_negative
         state.style_selected_workflow = self.style_workflow
         
