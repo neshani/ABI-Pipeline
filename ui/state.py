@@ -25,6 +25,11 @@ current_scan_result: Optional[Dict[str, Any]] = None
 scan_error: str = ""
 custom_project_name_value: str = ""
 
+# Multi-format import variables
+selected_txt_files: List[str] = []
+selected_epub_files: List[str] = []
+import_project_name: str = ""
+
 # --- Stable UI Binding Stores (Dictionaried mapped by ID) ---
 project_status: str = "Imported"
 project_progress: float = 0.0

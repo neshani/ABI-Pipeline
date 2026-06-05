@@ -292,22 +292,217 @@ def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, re
                                     ).props('flat dense').classes('text-xs text-blue-600 font-bold capitalize')
 
     with ui.dialog() as new_project_dialog, ui.card().classes('w-full max-w-2xl p-6 rounded-xl'):
-        ui.label('Create New Project').classes('text-xl font-bold text-slate-800 mb-2')
-        ui.label('Enter a local audiobook directory path. We will analyze the structure and discover the covers automatically.').classes('text-sm text-slate-500 mb-4')
+        ui.label('Import New Project').classes('text-xl font-bold text-slate-800 mb-2')
         
-        with ui.column().classes('w-full gap-4'):
-            path_input = ui.input(
-                'Local Directory Path', 
-                placeholder='e.g., F:/Audiobooks/Jack_Aubrey_Series',
-                on_change=lambda e: run_live_scan(e, new_project_dialog, refresh_parent)
-            ).classes('w-full')
+        # Elegant header navigation tabs
+        with ui.tabs().classes('w-full border-b mb-4') as tabs:
+            audiobook_tab = ui.tab('Audiobook Folder', icon='folder')
+            txt_tab = ui.tab('Text Transcripts', icon='description')
+            epub_tab = ui.tab('EPUB Novels', icon='book')
             
-            scan_preview_container(new_project_dialog, refresh_parent)
+        with ui.tab_panels(tabs, value=audiobook_tab).classes('w-full bg-transparent p-0') as panels:
+            
+            # TAB 1: Standard Audiobook Directories Importer
+            with ui.tab_panel(audiobook_tab).classes('p-0 gap-4 column w-full'):
+                ui.label('Select or enter a local audiobook directory path. We will analyze the structure and discover the covers automatically.').classes('text-xs text-slate-500 mb-2')
+                
+                with ui.row().classes('w-full items-end gap-2'):
+                    path_input = ui.input(
+                        'Local Directory Path', 
+                        placeholder='e.g., F:/Audiobooks/Jack_Aubrey_Series',
+                        on_change=lambda e: run_live_scan(e, new_project_dialog, refresh_parent)
+                    ).classes('flex-1')
+                    
+                    async def browse_folder():
+                        from services.picker import run_directory_picker
+                        selected_path = await asyncio.to_thread(run_directory_picker, "Select Audiobook Directory")
+                        if selected_path:
+                            path_input.set_value(selected_path)
+                    
+                    ui.button(
+                        icon='folder_open', 
+                        on_click=browse_folder
+                    ).props('flat dense').classes('h-10 text-blue-600').tooltip('Browse Local Folders')
+                
+                scan_preview_container(new_project_dialog, refresh_parent)
+                
+            # TAB 2: Text Transcript Files Importer (.txt)
+            with ui.tab_panel(txt_tab).classes('p-0 gap-4 column w-full'):
+                ui.label('Select one or more plain text files containing transcriptions. We will split chapters dynamically on ==CHAPTER== tags.').classes('text-xs text-slate-500 mb-2')
+                
+                ui.input(
+                    'Project Title', 
+                    placeholder='e.g., Sherlock Holmes Collection',
+                    value=state.import_project_name,
+                    on_change=lambda e: setattr(state, 'import_project_name', e.value)
+                ).classes('w-full')
+                
+                async def browse_txt_files():
+                    from services.picker import run_file_picker
+                    selected = await asyncio.to_thread(
+                        run_file_picker, 
+                        "Select Transcript TXT Files", 
+                        [("Text Files", "*.txt")]
+                    )
+                    if selected:
+                        state.selected_txt_files.extend(selected)
+                        # Filter unique paths to avoid duplicates
+                        state.selected_txt_files = list(set(state.selected_txt_files))
+                        txt_files_list.refresh()
+                
+                ui.button(
+                    'Browse TXT Files...', 
+                    icon='add', 
+                    on_click=browse_txt_files
+                ).classes('w-full bg-blue-50 text-blue-600 border border-dashed border-blue-200 shadow-none hover:bg-blue-100')
+                
+                # Reactive listing of selected file paths
+                @ui.refreshable
+                def txt_files_list():
+                    if not state.selected_txt_files:
+                        with ui.column().classes('w-full items-center justify-center p-4 text-slate-400 border border-dashed rounded-lg bg-slate-50'):
+                            ui.label('No text files selected yet.').classes('text-xs')
+                        return
+                    
+                    with ui.column().classes('w-full gap-2 max-h-40 overflow-y-auto p-2 bg-slate-50 border rounded-lg'):
+                        for path in state.selected_txt_files:
+                            from pathlib import Path
+                            filename = Path(path).name
+                            with ui.row().classes('w-full justify-between items-center bg-white p-2 rounded border shadow-xs'):
+                                with ui.row().classes('items-center gap-2'):
+                                    ui.icon('description', size='xs', color='slate-400')
+                                    ui.label(filename).classes('text-xs font-medium text-slate-700 truncate max-w-sm')
+                                ui.button(
+                                    icon='delete', 
+                                    on_click=lambda p=path: (state.selected_txt_files.remove(p), txt_files_list.refresh())
+                                ).props('flat dense round').classes('text-rose-500 h-6 w-6')
+                
+                txt_files_list()
+                
+                # Async Click Handler keeps client context active
+                async def do_txt_import():
+                    await trigger_text_import(new_project_dialog, refresh_parent)
+                
+                with ui.row().classes('w-full justify-end gap-3 mt-4'):
+                    ui.button('Cancel', on_click=new_project_dialog.close).props('flat color=slate')
+                    ui.button(
+                        'Import Transcripts', 
+                        on_click=do_txt_import
+                    ).classes('bg-blue-600 hover:bg-blue-700 text-white font-semibold')
+                    
+            # TAB 3: EPUB Books Importer (.epub)
+            with ui.tab_panel(epub_tab).classes('p-0 gap-4 column w-full'):
+                ui.label('Select one or more EPUB novel files. We will automatically extract texts and structural chapters.').classes('text-xs text-slate-500 mb-2')
+                
+                ui.input(
+                    'Project Title', 
+                    placeholder='e.g., Harry Potter Collection',
+                    value=state.import_project_name,
+                    on_change=lambda e: setattr(state, 'import_project_name', e.value)
+                ).classes('w-full')
+                
+                async def browse_epub_files():
+                    from services.picker import run_file_picker
+                    selected = await asyncio.to_thread(
+                        run_file_picker, 
+                        "Select EPUB Book Files", 
+                        [("EPUB Books", "*.epub")]
+                    )
+                    if selected:
+                        state.selected_epub_files.extend(selected)
+                        state.selected_epub_files = list(set(state.selected_epub_files))
+                        epub_files_list.refresh()
+                
+                ui.button(
+                    'Browse EPUB Files...', 
+                    icon='add', 
+                    on_click=browse_epub_files
+                ).classes('w-full bg-blue-50 text-blue-600 border border-dashed border-blue-200 shadow-none hover:bg-blue-100')
+                
+                # Reactive listing of selected file paths
+                @ui.refreshable
+                def epub_files_list():
+                    if not state.selected_epub_files:
+                        with ui.column().classes('w-full items-center justify-center p-4 text-slate-400 border border-dashed rounded-lg bg-slate-50'):
+                            ui.label('No EPUB files selected yet.').classes('text-xs')
+                        return
+                    
+                    with ui.column().classes('w-full gap-2 max-h-40 overflow-y-auto p-2 bg-slate-50 border rounded-lg'):
+                        for path in state.selected_epub_files:
+                            from pathlib import Path
+                            filename = Path(path).name
+                            with ui.row().classes('w-full justify-between items-center bg-white p-2 rounded border shadow-xs'):
+                                with ui.row().classes('items-center gap-2'):
+                                    ui.icon('book', size='xs', color='slate-400')
+                                    ui.label(filename).classes('text-xs font-medium text-slate-700 truncate max-w-sm')
+                                ui.button(
+                                    icon='delete', 
+                                    on_click=lambda p=path: (state.selected_epub_files.remove(p), epub_files_list.refresh())
+                                ).props('flat dense round').classes('text-rose-500 h-6 w-6')
+                
+                epub_files_list()
+                
+                # Async Click Handler keeps client context active
+                async def do_epub_import():
+                    await trigger_epub_import(new_project_dialog, refresh_parent)
+                
+                with ui.row().classes('w-full justify-end gap-3 mt-4'):
+                    ui.button('Cancel', on_click=new_project_dialog.close).props('flat color=slate')
+                    ui.button(
+                        'Import EPUBs', 
+                        on_click=do_epub_import
+                    ).classes('bg-blue-600 hover:bg-blue-700 text-white font-semibold')
+
+
+async def trigger_text_import(dialog, refresh_parent):
+    """Imports plain text transcript files asynchronously inside the active client session."""
+    if not state.import_project_name.strip():
+        ui.notify("Please enter a Project Title first.", type="warning")
+        return
+    if not state.selected_txt_files:
+        ui.notify("Please select at least one TXT file to import.", type="warning")
+        return
+        
+    from services.import_engine import import_text_transcripts
+    ui.notify("Processing and importing text transcripts...", type="info")
+    project_id = await asyncio.to_thread(
+        import_text_transcripts, 
+        state.import_project_name.strip(), 
+        state.selected_txt_files
+    )
+    ui.notify(f"Successfully imported project ID: {project_id}!", type="positive")
+    dialog.close()
+    refresh_parent()
+
+
+async def trigger_epub_import(dialog, refresh_parent):
+    """Extracts, parses, and imports EPUB chapters asynchronously inside the active client session."""
+    if not state.import_project_name.strip():
+        ui.notify("Please enter a Project Title first.", type="warning")
+        return
+    if not state.selected_epub_files:
+        ui.notify("Please select at least one EPUB file to import.", type="warning")
+        return
+        
+    from services.import_engine import import_epub_novels
+    ui.notify("Parsing EPUB spine and extracting text chapters...", type="info")
+    project_id = await asyncio.to_thread(
+        import_epub_novels, 
+        state.import_project_name.strip(), 
+        state.selected_epub_files
+    )
+    ui.notify(f"Successfully imported project ID: {project_id}!", type="positive")
+    dialog.close()
+    refresh_parent()
 
 
 def open_new_project_dialog(dialog, path_input):
+    """Resets scanner and format caches before presenting the active import modal."""
     state.current_scan_result = None
     state.scan_error = ""
     state.custom_project_name_value = ""
+    state.selected_txt_files = []
+    state.selected_epub_files = []
+    state.import_project_name = ""
     path_input.set_value("")
     dialog.open()
