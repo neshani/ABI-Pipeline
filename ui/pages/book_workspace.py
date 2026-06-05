@@ -952,8 +952,43 @@ def render_book_tabs(book_id: int):
     # Non-blocking scroll checking timer
     ui.timer(0.3, check_scroll)
 
-    # --- Real-Time Background Image Pop-in Timer ---
+ # --- Real-Time Background Image Pop-in Timer (Offloaded!) ---
     last_file_count = [len(images_cache)]
     
+    async def check_for_image_updates():
+        if state.active_book_id is None:
+            return
+            
+        img_dir = Path(f"./output/{project_name}/{book_name}/images")
+        parent_dir = Path(f"./output/{project_name}/{book_name}")
+        
+        # Offload file-system counting checks to a background thread
+        def count_files():
+            count = 0
+            if img_dir.exists():
+                try:
+                    count += len(os.listdir(img_dir))
+                except Exception:
+                    pass
+            if parent_dir.exists():
+                try:
+                    count += len(os.listdir(parent_dir))
+                except Exception:
+                    pass
+            return count
+            
+        count = await asyncio.to_thread(count_files)
+        
+        if count != last_file_count[0]:
+            last_file_count[0] = count
+            
+            nonlocal images_cache
+            # Offload heavy folder parsing cache building to a background thread
+            images_cache = await asyncio.to_thread(get_book_images_cache, project_name, book_name)
+            
+            update_grid_views_in_place()
+            if theater_dialog.value:
+                update_active_scene_ui()
+
     # Check for newly generated images every 3 seconds
     ui.timer(3.0, check_for_image_updates)

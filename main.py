@@ -16,12 +16,13 @@ from nicegui import ui, app
 from sqlmodel import Session, select
 from database.connection import init_db, get_setting, set_setting, engine
 from database.models import Project, Book, Chapter
-from services.sync_engine import recover_from_temp_workspaces
+from services.sync_engine import recover_from_temp_workspaces, get_book_stats, get_book_stats_cached
 from services.transcription import (
     start_project_transcription, 
     cancel_project_transcription, 
     active_projects
 )
+
 from ui.components.settings_modal import SettingsModal
 
 # Modularized states and pages imports
@@ -32,92 +33,6 @@ from ui.pages import render_portal_view, render_project_tabs, render_book_tabs, 
 # --- Cache-Busted On-Disk Volume Statistics Engine ---
 # Cache dictionary is now located safely inside state._stats_cache to prevent circular imports
 
-def get_book_stats(project_name: str, book_name: str) -> dict:
-    """Computes fast on-disk statistics for a book volume without database queries."""
-    stats = {
-        "has_transcript": False,
-        "char_count": 0,
-        "word_count": 0,
-        "total_prompts": 0,
-        "approved_prompts": 0,
-        "generated_images": 0,
-        "estimated_scenes": 0
-    }
-    
-    book_dir = Path(f"./output/{project_name}/{book_name}")
-    transcript_path = book_dir / "transcript.txt"
-    prompts_path = book_dir / "prompts.csv"
-    images_dir = book_dir / "images"
-    
-    # 1. Transcript Stats
-    if transcript_path.exists():
-        stats["has_transcript"] = True
-        try:
-            txt = transcript_path.read_text(encoding="utf-8", errors="ignore")
-            stats["char_count"] = len(txt)
-            stats["word_count"] = len(txt.split())
-            
-            # Apply dynamic custom chunk size setting
-            chunk_size = getattr(state, "playground_chunk_size", 350)
-            if not chunk_size or chunk_size <= 0:
-                chunk_size = 350
-            stats["estimated_scenes"] = max(1, stats["word_count"] // chunk_size)
-        except Exception:
-            pass
-            
-    # 2. Prompts CSV Stats
-    if prompts_path.exists():
-        try:
-            with open(prompts_path, mode='r', encoding='utf-8') as f:
-                reader = csv.DictReader(f, delimiter='|')
-                rows = list(reader)
-                stats["total_prompts"] = len(rows)
-                approved_count = 0
-                for r in rows:
-                    app_val = r.get("approved") or r.get("Approved") or "False"
-                    if app_val.strip().lower() == "true":
-                        approved_count += 1
-                stats["approved_prompts"] = approved_count
-        except Exception:
-            pass
-            
-    # 3. Generated Images
-    for d in [images_dir, book_dir]:
-        if d.exists() and d.is_dir():
-            try:
-                png_count = len([f for f in os.listdir(d) if f.lower().endswith('.png')])
-                if png_count > 0:
-                    stats["generated_images"] = png_count
-                    break
-            except Exception:
-                pass
-                
-    return stats
-
-
-def get_book_stats_cached(project_name: str, book_name: str) -> dict:
-    """Checks timestamps on disk before parsing, preventing I/O overhead on polling ticks."""
-    book_dir = Path(f"./output/{project_name}/{book_name}")
-    transcript_path = book_dir / "transcript.txt"
-    prompts_path = book_dir / "prompts.csv"
-    images_dir = book_dir / "images"
-    
-    # Build signature based on file modified times
-    sig = ""
-    for p in [transcript_path, prompts_path, images_dir]:
-        if p.exists():
-            sig += f"{p.name}:{p.stat().st_mtime}|"
-            
-    cache_key = f"{project_name}:{book_name}"
-    if cache_key in state._stats_cache:
-        cached_sig, cached_data = state._stats_cache[cache_key]
-        if cached_sig == sig:
-            return cached_data
-            
-    # Parse fresh and cache
-    stats = get_book_stats(project_name, book_name)
-    state._stats_cache[cache_key] = (sig, stats)
-    return stats
 
 def reset_stuck_transcriptions():
     """Finds and resets any projects, books, or chapters that were stuck in a 'Transcribing' or 'Generating Prompts' state on startup."""
@@ -233,6 +148,18 @@ def select_book(book_id: int):
     # Instantly scroll the browser window back to the top of the page
     ui.run_javascript('window.scrollTo(0, 0)')
     
+    main_layout.refresh()
+
+
+def select_book_from_portal(project_id: int, book_id: int):
+    """Sets the active project, loads its settings from disk, and opens the target book workspace."""
+    state.active_project_id = project_id
+    load_project_settings_from_disk(project_id)
+    state.active_book_id = book_id
+    state.active_book_tab = 'Dashboard'
+    state.active_log_widget = None
+    ui.run_javascript('window.scrollTo(0, 0)')
+    header_controls.refresh()
     main_layout.refresh()
 
 
@@ -762,75 +689,98 @@ state.stop_image_generation_cb = stop_transcribing
 
 
 # --- Dynamic WebSocket State-Updater (No full page refreshes!) ---
-def check_for_active_transcriptions():
+async def check_for_active_transcriptions():
     if state.active_project_id is not None:
-        with Session(engine) as session:
-            project = session.get(Project, state.active_project_id)
-            if not project:
-                return
+        # Offload database queries and heavy file statistics checking to a background thread
+        def perform_background_sync():
+            with Session(engine) as session:
+                project = session.get(Project, state.active_project_id)
+                if not project:
+                    return None
+                    
+                books = session.exec(select(Book).where(Book.project_id == state.active_project_id)).all()
                 
-            status_changed = (project.status != state.project_status)
-            state.project_status = project.status
+                # Pre-fetch and assemble stats off-thread
+                updates = {
+                    "project_status": project.status,
+                    "books": []
+                }
+                
+                for b in books:
+                    stats = get_book_stats_cached(project.name, b.name)
+                    updates["books"].append({
+                        "id": b.id,
+                        "progress": b.progress,
+                        "status": b.status,
+                        "stats": stats
+                    })
+                return updates
+
+        res = await asyncio.to_thread(perform_background_sync)
+        if not res:
+            return
             
-            if status_changed and hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
-                try:
-                    state.action_buttons_refresh()
-                except Exception:
-                    pass
-            
+        status_changed = (res["project_status"] != state.project_status)
+        state.project_status = res["project_status"]
+        
+        if status_changed and hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
             try:
-                header_controls.refresh()
+                state.action_buttons_refresh()
             except Exception:
                 pass
+        
+        try:
+            header_controls.refresh()
+        except Exception:
+            pass
 
-            # Update timing statistics
-            import time
-            if state.image_gen_active and state.batch_start_time:
-                state.batch_elapsed_sec = time.time() - state.batch_start_time
+        # Update timing statistics
+        import time
+        if state.image_gen_active and state.batch_start_time:
+            state.batch_elapsed_sec = time.time() - state.batch_start_time
 
-            books = session.exec(select(Book).where(Book.project_id == state.active_project_id)).all()
-            for b in books:
-                state.books_progress[b.id] = b.progress
-                state.books_status[b.id] = b.status
-                
-                # Fetch step-aware statistics on disk
-                stats = get_book_stats_cached(project.name, b.name)
-                
-                # Dynamic subtitle based on project step status
-                if project.status in ("Imported", "Transcribing"):
-                    if b.status == "Transcribing":
-                        state.books_subtitle[b.id] = f"Transcribing... {int(b.progress * 100)}%"
-                    elif stats["has_transcript"]:
-                        state.books_subtitle[b.id] = f"{stats['word_count']:,} words • {stats['estimated_scenes']} est. scenes"
-                    else:
-                        state.books_subtitle[b.id] = "Awaiting transcription"
-                        
-                elif project.status in ("Transcribed", "Generating Prompts"):
-                    if b.status == "Generating Prompts":
-                        state.books_subtitle[b.id] = f"Generating prompts... {int(b.progress * 100)}%"
-                    elif stats["total_prompts"] > 0:
-                        state.books_subtitle[b.id] = f"{stats['total_prompts']} scene prompts ready"
-                    elif stats["has_transcript"]:
-                        state.books_subtitle[b.id] = f"{stats['word_count']:,} words • {stats['estimated_scenes']} est. images"
-                    else:
-                        state.books_subtitle[b.id] = "Awaiting prompts"
-                        
-                else:  # Image Generation, Finished, or Proofreading states
-                    total_scenes = stats["total_prompts"] or stats["estimated_scenes"] or 1
-                    if b.status == "Rendering Images":
-                        state.books_subtitle[b.id] = f"Rendering: {stats['generated_images']} / {total_scenes} ({int(b.progress * 100)}%)"
-                    elif stats["approved_prompts"] == total_scenes and total_scenes > 0:
-                        state.books_subtitle[b.id] = f"All Approved! • {total_scenes} scenes"
-                    else:
-                        state.books_subtitle[b.id] = f"Rendered: {stats['generated_images']}/{total_scenes} ({stats['approved_prompts']} approved)"
+        # Update UI state binders on the main thread safely
+        for b_data in res["books"]:
+            b_id = b_data["id"]
+            state.books_progress[b_id] = b_data["progress"]
+            state.books_status[b_id] = b_data["status"]
+            stats = b_data["stats"]
+            
+            # Dynamic subtitle based on project step status
+            if state.project_status in ("Imported", "Transcribing"):
+                if b_data["status"] == "Transcribing":
+                    state.books_subtitle[b_id] = f"Transcribing... {int(b_data['progress'] * 100)}%"
+                elif stats["has_transcript"]:
+                    state.books_subtitle[b_id] = f"{stats['word_count']:,} words • {stats['estimated_scenes']} est. scenes"
+                else:
+                    state.books_subtitle[b_id] = "Awaiting transcription"
+                    
+            elif state.project_status in ("Transcribed", "Generating Prompts"):
+                if b_data["status"] == "Generating Prompts":
+                    state.books_subtitle[b_id] = f"Generating prompts... {int(b_data['progress'] * 100)}%"
+                elif stats["total_prompts"] > 0:
+                    state.books_subtitle[b_id] = f"{stats['total_prompts']} scene prompts ready"
+                elif stats["has_transcript"]:
+                    state.books_subtitle[b_id] = f"{stats['word_count']:,} words • {stats['estimated_scenes']} est. images"
+                else:
+                    state.books_subtitle[b_id] = "Awaiting prompts"
+                    
+            else:  # Image Generation, Finished, or Proofreading states
+                total_scenes = stats["total_prompts"] or stats["estimated_scenes"] or 1
+                if b_data["status"] == "Rendering Images":
+                    state.books_subtitle[b_id] = f"Rendering: {stats['generated_images']} / {total_scenes} ({int(b_data['progress'] * 100)}%)"
+                elif stats["approved_prompts"] == total_scenes and total_scenes > 0:
+                    state.books_subtitle[b_id] = f"All Approved! • {total_scenes} scenes"
+                else:
+                    state.books_subtitle[b_id] = f"Rendered: {stats['generated_images']}/{total_scenes} ({stats['approved_prompts']} approved)"
 
-
-            if books:
-                avg_progress = sum(b.progress for b in books) / len(books)
-            else:
-                avg_progress = 0.0
-            state.project_progress = avg_progress
-            state.project_progress_label = f"Batch Progress ({int(avg_progress * 100)}%)"
+        books_count = len(res["books"])
+        if books_count > 0:
+            avg_progress = sum(b["progress"] for b in res["books"]) / books_count
+        else:
+            avg_progress = 0.0
+        state.project_progress = avg_progress
+        state.project_progress_label = f"Batch Progress ({int(avg_progress * 100)}%)"
 
         if state.active_log_widget:
             try:
@@ -979,7 +929,7 @@ def main_layout():
     if state.active_tool == "lora_contact_sheet":
         render_lora_contact_sheet(exit_to_portal)
     elif state.active_project_id is None:
-        render_portal_view(select_project, refresh_dashboard)
+        render_portal_view(select_project, select_book_from_portal, refresh_dashboard)
     else:
         render_split_panel_shell(state.active_project_id)
 

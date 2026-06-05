@@ -120,15 +120,52 @@ def save_scanned_project(new_project_dialog, refresh_parent: Callable):
         ui.notify(f"Failed to save project: {str(ex)}", type="negative")
 
 
-def render_portal_view(select_project_cb: Callable, refresh_parent: Callable):
+def toggle_project_expansion(project_id: int, refresh_parent: Callable):
+    """Toggles the expansion visibility state for a project card."""
+    if project_id in state.expanded_projects:
+        state.expanded_projects.remove(project_id)
+    else:
+        state.expanded_projects.add(project_id)
+    refresh_parent()
+
+
+def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, refresh_parent: Callable):
+    from services.sync_engine import get_book_stats_cached
+
     projects_data = []
     with Session(engine) as session:
         projects = session.exec(select(Project)).all()
         for p in projects:
             books = session.exec(select(Book).where(Book.project_id == p.id)).all()
+            
+            # Aggregate stats across all child volumes/books on-the-fly
+            total_words = 0
+            total_scenes = 0
+            total_completed = 0
+            books_data = []
+            
+            for b in books:
+                stats = get_book_stats_cached(p.name, b.name)
+                total_words += stats["word_count"]
+                
+                # Deduce total scenes either from existing prompts or fallback estimates
+                b_scenes = stats["total_prompts"] if stats["total_prompts"] > 0 else stats["estimated_scenes"]
+                total_scenes += b_scenes
+                total_completed += stats["generated_images"]
+                
+                books_data.append({
+                    "id": b.id,
+                    "name": b.name,
+                    "status": b.status,
+                    "progress": b.progress,
+                    "cover_path": b.cover_path,
+                    "stats": stats
+                })
+
             avg_progress = (
                 sum(b.progress for b in books) / len(books) if books else 0.0
             )
+            
             projects_data.append({
                 "id": p.id,
                 "name": p.name,
@@ -136,12 +173,19 @@ def render_portal_view(select_project_cb: Callable, refresh_parent: Callable):
                 "is_batch": p.is_batch,
                 "progress": avg_progress,
                 "books_count": len(books),
-                "books": books
+                "books": books,
+                "books_data": books_data,
+                "total_words": total_words,
+                "total_scenes": total_scenes,
+                "total_completed": total_completed
             })
 
+    # Deep-filtering logic: matching project titles OR nested book titles
     filtered = []
     for p in projects_data:
-        name_match = state.search_query.lower() in p["name"].lower()
+        project_name_match = state.search_query.lower() in p["name"].lower()
+        book_name_match = any(state.search_query.lower() in b["name"].lower() for b in p["books_data"])
+        name_match = project_name_match or book_name_match
         
         type_match = True
         if state.selected_project_type == "Single" and p["is_batch"]:
@@ -150,6 +194,9 @@ def render_portal_view(select_project_cb: Callable, refresh_parent: Callable):
             type_match = False
             
         if name_match and type_match:
+            # Polished UX: Auto-expand projects if the search query matches its nested book but not its name
+            if state.search_query.strip() and book_name_match and not project_name_match:
+                state.expanded_projects.add(p["id"])
             filtered.append(p)
 
     with ui.row().classes('w-full justify-between items-center mb-2'):
@@ -167,25 +214,82 @@ def render_portal_view(select_project_cb: Callable, refresh_parent: Callable):
             ui.label('No projects found. Use "+ New Project" to import audiobooks.').classes('text-lg text-center')
     else:
         for project in filtered:
-            with ui.card().classes('w-full border rounded-xl shadow-sm hover:shadow-md transition-all p-5 mb-4 bg-white cursor-pointer') \
-                    .on('click', lambda p_id=project["id"]: select_project_cb(p_id)):
+            is_expanded = project["id"] in state.expanded_projects
+            
+            with ui.card().classes('w-full border rounded-xl shadow-sm p-5 mb-4 bg-white transition-all'):
+                # 1. Main Dashboard Card Header
                 with ui.row().classes('w-full items-center justify-between'):
-                    with ui.row().classes('items-center gap-3'):
+                    # Clicking the title/icon area takes you directly to the project's workspace
+                    with ui.row().classes('items-center gap-3 cursor-pointer') \
+                            .on('click', lambda p_id=project["id"]: select_project_cb(p_id)):
                         if project["is_batch"]:
                             ui.icon('folder', size='md', color='amber-500')
                             with ui.column().classes('gap-0'):
-                                ui.label(project["name"]).classes('text-base font-semibold text-slate-800')
-                                ui.label(f'Batch Workspace • {project["books_count"]} books').classes('text-xs text-slate-400')
+                                ui.label(project["name"]).classes('text-base font-semibold text-slate-800 leading-tight')
+                                ui.label(f'Batch Workspace • {project["books_count"]} volumes').classes('text-xs text-slate-400')
                         else:
                             ui.icon('menu_book', size='md', color='blue-500')
                             with ui.column().classes('gap-0'):
-                                ui.label(project["name"]).classes('text-base font-semibold text-slate-800')
+                                ui.label(project["name"]).classes('text-base font-semibold text-slate-800 leading-tight')
                                 ui.label('Single Novel Workspace').classes('text-xs text-slate-400')
                     
+                    # Performance stats, status badges, and expandable control actions
                     with ui.row().classes('items-center gap-4'):
                         get_status_badge(project["status"])
+                        
+                        # Aggregated numeric statistics
+                        with ui.column().classes('items-end gap-0'):
+                            ui.label(f'{project["total_words"]:,} words').classes('text-[11px] font-semibold text-slate-500')
+                            ui.label(f'{project["total_completed"]}/{project["total_scenes"]} rendered').classes('text-[10px] text-slate-400 font-medium')
+                        
                         ui.linear_progress(value=project["progress"], show_value=False).classes('w-24 h-2 rounded-full')
-                        ui.icon('chevron_right', size='sm', color='slate-400')
+                        
+                        # Workspace shortcut trigger
+                        ui.button(
+                            'Open Workspace', 
+                            icon='launch',
+                            on_click=lambda p_id=project["id"]: select_project_cb(p_id)
+                        ).props('flat dense').classes('text-blue-600 text-xs font-bold capitalize')
+
+                        # Collapsible Detail Toggle Chevron
+                        chevron_icon = 'expand_less' if is_expanded else 'expand_more'
+                        ui.button(
+                            icon=chevron_icon,
+                            on_click=lambda p_id=project["id"]: toggle_project_expansion(p_id, refresh_parent)
+                        ).props('flat round dense').classes('text-slate-500')
+
+                # 2. Collapsible Child Book Listings details
+                if is_expanded:
+                    ui.separator().classes('my-3')
+                    with ui.column().classes('w-full gap-3 pl-8'):
+                        ui.label('Volumes included').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wider')
+                        
+                        for b in project["books_data"]:
+                            with ui.row().classes('w-full items-center justify-between bg-slate-50 border border-slate-100 rounded-lg p-3 hover:bg-slate-100/50 transition-colors'):
+                                # Book thumbnail, title, and file counters
+                                with ui.row().classes('items-center gap-3 flex-1 min-w-0'):
+                                    if b["cover_path"]:
+                                        ui.image(b["cover_path"]).classes('w-10 h-14 rounded object-cover shadow-sm border border-slate-200 flex-shrink-0')
+                                    else:
+                                        with ui.column().classes('w-10 h-14 bg-slate-100 border border-dashed border-slate-300 rounded items-center justify-center flex-shrink-0 text-slate-400'):
+                                            ui.icon('library_books', size='16px')
+                                            
+                                    with ui.column().classes('gap-0.5 flex-1 min-w-0'):
+                                        ui.label(b["name"]).classes('text-sm font-semibold text-slate-800 truncate')
+                                        if b["stats"]["has_transcript"]:
+                                            total_b_scenes = b["stats"]["total_prompts"] or b["stats"]["estimated_scenes"]
+                                            ui.label(f'{b["stats"]["word_count"]:,} words • {b["stats"]["generated_images"]}/{total_b_scenes} rendered').classes('text-xs text-slate-500 font-medium')
+                                        else:
+                                            ui.label('Awaiting transcription or text import').classes('text-xs text-slate-400 italic')
+
+                                # Direct Book Selection Navigation Trigger
+                                with ui.row().classes('items-center gap-3'):
+                                    ui.badge(b["status"]).classes('px-2.5 py-0.5 text-[10px] rounded bg-slate-200 text-slate-700 font-medium')
+                                    ui.button(
+                                        'Jump to Book',
+                                        icon='chevron_right',
+                                        on_click=lambda p_id=project["id"], b_id=b["id"]: select_book_cb(p_id, b_id)
+                                    ).props('flat dense').classes('text-xs text-blue-600 font-bold capitalize')
 
     with ui.dialog() as new_project_dialog, ui.card().classes('w-full max-w-2xl p-6 rounded-xl'):
         ui.label('Create New Project').classes('text-xl font-bold text-slate-800 mb-2')

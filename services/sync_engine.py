@@ -459,3 +459,93 @@ def recover_from_temp_workspaces(session: Session) -> None:
                 sync_project_status(book.project_id, session)
 
     print("[Sync-Engine] Database state recovery sequence complete.")
+
+
+def get_book_stats(project_name: str, book_name: str) -> dict:
+    """Computes fast on-disk statistics for a book volume without database queries."""
+    from ui import state
+    stats = {
+        "has_transcript": False,
+        "char_count": 0,
+        "word_count": 0,
+        "total_prompts": 0,
+        "approved_prompts": 0,
+        "generated_images": 0,
+        "estimated_scenes": 0
+    }
+    
+    book_dir = Path(f"./output/{project_name}/{book_name}")
+    transcript_path = book_dir / "transcript.txt"
+    prompts_path = book_dir / "prompts.csv"
+    images_dir = book_dir / "images"
+    
+    # 1. Transcript Stats
+    if transcript_path.exists():
+        stats["has_transcript"] = True
+        try:
+            txt = transcript_path.read_text(encoding="utf-8", errors="ignore")
+            stats["char_count"] = len(txt)
+            stats["word_count"] = len(txt.split())
+            
+            # Apply dynamic custom chunk size setting
+            chunk_size = getattr(state, "playground_chunk_size", 350)
+            if not chunk_size or chunk_size <= 0:
+                chunk_size = 350
+            stats["estimated_scenes"] = max(1, stats["word_count"] // chunk_size)
+        except Exception:
+            pass
+            
+    # 2. Prompts CSV Stats
+    if prompts_path.exists():
+        try:
+            with open(prompts_path, mode='r', encoding='utf-8') as f:
+                reader = csv.DictReader(f, delimiter='|')
+                rows = list(reader)
+                stats["total_prompts"] = len(rows)
+                approved_count = 0
+                for r in rows:
+                    app_val = r.get("approved") or r.get("Approved") or "False"
+                    if app_val.strip().lower() == "true":
+                        approved_count += 1
+                stats["approved_prompts"] = approved_count
+        except Exception:
+            pass
+            
+    # 3. Generated Images
+    for d in [images_dir, book_dir]:
+        if d.exists() and d.is_dir():
+            try:
+                png_count = len([f for f in os.listdir(d) if f.lower().endswith('.png')])
+                if png_count > 0:
+                    stats["generated_images"] = png_count
+                    break
+            except Exception:
+                pass
+                
+    return stats
+
+
+def get_book_stats_cached(project_name: str, book_name: str) -> dict:
+    """Checks timestamps on disk before parsing, preventing I/O overhead on polling ticks."""
+    from ui import state
+    book_dir = Path(f"./output/{project_name}/{book_name}")
+    transcript_path = book_dir / "transcript.txt"
+    prompts_path = book_dir / "prompts.csv"
+    images_dir = book_dir / "images"
+    
+    # Build signature based on file modified times
+    sig = ""
+    for p in [transcript_path, prompts_path, images_dir]:
+        if p.exists():
+            sig += f"{p.name}:{p.stat().st_mtime}|"
+            
+    cache_key = f"{project_name}:{book_name}"
+    if cache_key in state._stats_cache:
+        cached_sig, cached_data = state._stats_cache[cache_key]
+        if cached_sig == sig:
+            return cached_data
+            
+    # Parse fresh and cache
+    stats = get_book_stats(project_name, book_name)
+    state._stats_cache[cache_key] = (sig, stats)
+    return stats

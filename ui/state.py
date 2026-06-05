@@ -18,6 +18,7 @@ active_book_tab: str = 'Dashboard'
 # Directory filters
 search_query: str = ""
 selected_project_type: str = "All"
+expanded_projects: set[int] = set()
 
 # Scan context
 current_scan_result: Optional[Dict[str, Any]] = None
