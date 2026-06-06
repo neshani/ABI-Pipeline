@@ -145,6 +145,14 @@ def render_transcription_step_view(project, books, start_transcribe_cb, stop_tra
 def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb):
     available_templates = list_stored_templates()
     
+    # Check for unapproved transcripts across all books in the project
+    unapproved_books = []
+    for b in books:
+        t_path = Path(f"./output/{project.name}/{b.name}/transcript.txt")
+        app_path = Path(f"./output/{project.name}/{b.name}/.transcript_approved")
+        if t_path.exists() and not app_path.exists():
+            unapproved_books.append(b.name)
+            
     with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-3'):
         with ui.row().classes('items-center gap-2'):
             ui.icon('psychology', size='sm', color='purple-500')
@@ -152,6 +160,14 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
             
         ui.label('Transcription passages are processed through a local LLM to extract key quotes and generate visual rendering prompts.').classes('text-xs text-slate-500')
         
+        # Unapproved Warning Banner
+        if unapproved_books:
+            with ui.row().classes('w-full items-center gap-3 bg-amber-50 p-3 rounded-lg border border-amber-200 mt-1'):
+                ui.icon('warning', color='amber', size='sm')
+                with ui.column().classes('gap-0 flex-1'):
+                    ui.label('Review Required').classes('text-xs font-bold text-amber-800')
+                    ui.label(f'The following volume(s) have unapproved transcripts: {", ".join(unapproved_books)}. Please approve them inside the book workspace before generating prompts.').classes('text-[10px] text-amber-700 leading-normal')
+
         with ui.row().classes('w-full items-center gap-3 bg-slate-50 p-3 rounded-lg border mt-1'):
             ui.icon('description', size='sm', color='slate-500')
             with ui.column().classes('gap-0 flex-1'):
@@ -221,10 +237,25 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
                 ).classes('px-4 font-semibold text-xs')
             else:
                 ui.label('Guidelines configured. Ready to run local prompt generation.').classes('text-xs font-semibold text-slate-400')
+                
+                # Intercept logic to display confirmation dialog if unapproved transcripts exist
+                def confirm_and_generate_prompts():
+                    if unapproved_books:
+                        with ui.dialog() as confirm_dialog, ui.card().classes('w-full max-w-sm p-5 rounded-xl gap-4'):
+                            ui.label('Unapproved Transcripts Detected').classes('text-base font-bold text-slate-800')
+                            ui.label(f'Some volumes have not been approved yet: {", ".join(unapproved_books)}. Generating prompts now might analyze boilerplate or TOC headers.').classes('text-xs text-slate-500 leading-relaxed')
+                            with ui.row().classes('w-full justify-end gap-2 mt-2'):
+                                ui.button('Cancel', on_click=confirm_dialog.close).props('flat').classes('text-xs text-slate-600')
+                                ui.button('Proceed Anyway', on_click=lambda: (confirm_dialog.close(), start_prompt_gen_cb(project.id) if start_prompt_gen_cb else None)).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-4')
+                        confirm_dialog.open()
+                    else:
+                        if start_prompt_gen_cb:
+                            start_prompt_gen_cb(project.id)
+
                 ui.button(
                     'Generate Prompts', 
                     icon='bolt', 
-                    on_click=lambda: start_prompt_gen_cb(project.id) if start_prompt_gen_cb else None
+                    on_click=confirm_and_generate_prompts
                 ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-5')
 
 

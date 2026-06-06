@@ -632,71 +632,163 @@ def render_book_tabs(book_id: int):
 
     # --- 2. LAYOUT RENDERING COMPONENT DECLARATIONS ---
 
-    # Awaiting Generation Panel
+    # Awaiting Generation Panel / Transcript Editor Portal
     if not prompts:
         transcript_path = Path(f"./output/{project_name}/{book_name}/transcript.txt")
         has_transcript = transcript_path.exists()
-        char_count = 0
-        word_count = 0
+        
         if has_transcript:
+            approved_marker_path = Path(f"./output/{project_name}/{book_name}/.transcript_approved")
+            is_approved = approved_marker_path.exists()
+            
             try:
                 text_content = transcript_path.read_text(encoding="utf-8")
-                char_count = len(text_content)
-                word_count = len(text_content.split())
-            except Exception:
-                pass
-
-        with ui.card().classes('w-full border p-6 shadow-sm bg-white gap-4'):
-            with ui.row().classes('items-center gap-2 border-b pb-3 w-full'):
-                ui.icon('pending_actions', size='md', color='amber-500')
-                with ui.column().classes('gap-0'):
-                    ui.label('Awaiting Generation Pipeline').classes('text-base font-bold text-slate-800')
-                    ui.label('Complete the initial setup phases to start image proofing.').classes('text-xs text-slate-500')
+            except Exception as e:
+                text_content = f"Error reading transcript: {str(e)}"
+                
+            char_count = len(text_content)
+            word_count = len(text_content.split())
             
-            with ui.grid(columns='1fr 1fr').classes('w-full gap-4'):
-                with ui.column().classes('gap-3 bg-slate-50 p-4 rounded-xl border border-dashed'):
-                    ui.label('Volume Statistics').classes('text-xs font-bold text-slate-700 uppercase tracking-wide')
+            with ui.card().classes('w-full border p-6 shadow-sm bg-white gap-4'):
+                with ui.row().classes('items-center justify-between border-b pb-3 w-full'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('description', size='md', color='blue-500')
+                        with ui.column().classes('gap-0'):
+                            ui.label('Step 1.5: Transcript Review & Formatting').classes('text-base font-bold text-slate-800')
+                            ui.label('Review text, prune publishing boilerplate, and mark as approved to unlock prompt generation.').classes('text-xs text-slate-500')
                     
-                    with ui.row().classes('items-center justify-between w-full text-xs'):
-                        ui.label('Transcript File:').classes('text-slate-500')
-                        if has_transcript:
-                            ui.badge('Found', color='emerald').classes('px-2 py-0.5 text-[10px]')
-                        else:
-                            ui.badge('Missing', color='red').classes('px-2 py-0.5 text-[10px]')
-                            
-                    with ui.row().classes('items-center justify-between w-full text-xs'):
-                        ui.label('Character Count:').classes('text-slate-500')
+                    if is_approved:
+                        ui.badge('Approved & Ready', color='emerald').classes('px-3 py-1 text-xs font-semibold rounded-full')
+                    else:
+                        ui.badge('Awaiting Review', color='amber').classes('px-3 py-1 text-xs font-semibold rounded-full')
+                
+                # Volume Stats Bar
+                with ui.row().classes('w-full justify-start gap-6 bg-slate-50 p-3 rounded-lg border border-dashed text-xs'):
+                    with ui.column().classes('gap-0'):
+                        ui.label('Character Count').classes('text-slate-400 font-medium')
                         ui.label(f"{char_count:,} characters").classes('font-bold text-slate-700')
-                        
-                    with ui.row().classes('items-center justify-between w-full text-xs'):
-                        ui.label('Word Count:').classes('text-slate-500')
+                    with ui.column().classes('gap-0'):
+                        ui.label('Word Count').classes('text-slate-400 font-medium')
                         ui.label(f"{word_count:,} words").classes('font-bold text-slate-700')
+                    with ui.column().classes('gap-0'):
+                        ui.label('Estimated Scenes').classes('text-slate-400 font-medium')
+                        ui.label(f"~ {max(1, word_count // 350)} scenes").classes('font-bold text-slate-700')
+                
+                # Text Editor Component (Manual Save prevents typing latency)
+                editor = ui.textarea(
+                    label="Editable transcript.txt", 
+                    value=text_content
+                ).classes('w-full text-xs') \
+                 .props('outlined input-style="height: 500px; font-family: monospace; overflow-y: auto;"') \
+                 .style('height: 520px;')
+                
+                def save_transcript():
+                    try:
+                        transcript_path.write_text(editor.value, encoding="utf-8")
+                        ui.notify("Transcript file saved successfully!", type="positive")
+                        from ui import pages
+                        if pages.main_layout_ref:
+                            pages.main_layout_ref.refresh()
+                    except Exception as e:
+                        ui.notify(f"Failed to save: {str(e)}", type="negative")
+                        
+                def open_in_system_editor():
+                    import platform
+                    import subprocess
+                    abs_path = transcript_path.resolve()
+                    try:
+                        if platform.system() == "Windows":
+                            os.startfile(abs_path)
+                        elif platform.system() == "Darwin":
+                            subprocess.Popen(["open", str(abs_path)])
+                        else:
+                            subprocess.Popen(["xdg-open", str(abs_path)])
+                        ui.notify("Opening in native text editor...", type="info")
+                    except Exception as e:
+                        ui.notify(f"Could not open editor: {str(e)}", type="negative")
+                        
+                def reload_from_disk():
+                    from ui import pages
+                    if pages.main_layout_ref:
+                        pages.main_layout_ref.refresh()
 
-                    with ui.row().classes('items-center justify-between w-full text-xs'):
-                        ui.label('Estimated Scenes:').classes('text-slate-500')
-                        est_scenes = max(1, char_count // 1500) if char_count > 0 else 0
-                        ui.label(f"~ {est_scenes} scenes").classes('font-bold text-slate-700')
-
-                with ui.column().classes('gap-3 bg-slate-50 p-4 rounded-xl border border-dashed'):
-                    ui.label('Orchestration Guide').classes('text-xs font-bold text-slate-700 uppercase tracking-wide')
+                def toggle_approval():
+                    if approved_marker_path.exists():
+                        approved_marker_path.unlink()
+                        ui.notify("Transcript approval revoked.", type="warning")
+                    else:
+                        approved_marker_path.touch()
+                        ui.notify("Transcript approved! Ready for Phase 2 prompt generation.", type="positive")
                     
-                    with ui.row().classes('items-center gap-2 text-xs'):
-                        ui.icon('check_circle' if has_transcript else 'radio_button_unchecked', color='emerald' if has_transcript else 'slate', size='16px')
-                        ui.label('Step 1: Transcription').classes('font-bold ' + ('text-slate-400 line-through' if has_transcript else 'text-slate-700'))
+                    from ui import pages
+                    if pages.main_layout_ref:
+                        pages.main_layout_ref.refresh()
                         
-                    with ui.row().classes('items-center gap-2 text-xs'):
-                        is_step_2_active = has_transcript and not prompts
-                        icon_color = 'purple' if is_step_2_active else 'slate'
-                        ui.icon('radio_button_checked' if is_step_2_active else 'radio_button_unchecked', color=icon_color, size='16px')
-                        ui.label('Step 2: Generate Prompts').classes('font-bold ' + ('text-purple-700 animate-pulse' if is_step_2_active else 'text-slate-700'))
+                    # Trigger main project dashboard stats check
+                    if state.stats_refresh_callback:
+                        asyncio.create_task(state.stats_refresh_callback())
+                
+                with ui.row().classes('w-full justify-between items-center border-t pt-3 mt-1'):
+                    with ui.row().classes('gap-2'):
+                        ui.button('Save Changes', icon='save', on_click=save_transcript).classes('bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4')
+                        ui.button('Reload from Disk', icon='refresh', on_click=reload_from_disk).classes('bg-slate-500 hover:bg-slate-600 text-white text-xs font-semibold px-4')
+                        ui.button('Open in External Editor', icon='open_in_new', on_click=open_in_system_editor).props('flat').classes('text-xs text-slate-600')
                         
-                    with ui.row().classes('items-center gap-2 text-xs'):
-                        ui.icon('radio_button_unchecked', color='slate', size='16px')
-                        ui.label('Step 3: Render Images').classes('font-bold text-slate-500')
+                    if is_approved:
+                        ui.button('Revoke Approval', icon='cancel', on_click=toggle_approval, color='red').classes('text-xs font-bold text-white px-5')
+                    else:
+                        ui.button('Approve Transcript', icon='check_circle', on_click=toggle_approval, color='emerald').classes('text-xs font-bold text-white px-5')
+            return
+
+        else:
+            # Original Awaiting Generation Panel (No transcript available yet)
+            char_count = 0
+            word_count = 0
+            with ui.card().classes('w-full border p-6 shadow-sm bg-white gap-4'):
+                with ui.row().classes('items-center gap-2 border-b pb-3 w-full'):
+                    ui.icon('pending_actions', size='md', color='amber-500')
+                    with ui.column().classes('gap-0'):
+                        ui.label('Awaiting Generation Pipeline').classes('text-base font-bold text-slate-800')
+                        ui.label('Complete the initial setup phases to start image proofing.').classes('text-xs text-slate-500')
+                
+                with ui.grid(columns='1fr 1fr').classes('w-full gap-4'):
+                    with ui.column().classes('gap-3 bg-slate-50 p-4 rounded-xl border border-dashed'):
+                        ui.label('Volume Statistics').classes('text-xs font-bold text-slate-700 uppercase tracking-wide')
                         
-            with ui.row().classes('w-full justify-end mt-2 border-t pt-3'):
-                ui.label("Switch to the 'Dashboard' tab on the project workspace to run these steps.").classes('text-[11px] text-slate-500 italic')
-        return
+                        with ui.row().classes('items-center justify-between w-full text-xs'):
+                            ui.label('Transcript File:').classes('text-slate-500')
+                            ui.badge('Missing', color='red').classes('px-2 py-0.5 text-[10px]')
+                                
+                        with ui.row().classes('items-center justify-between w-full text-xs'):
+                            ui.label('Character Count:').classes('text-slate-500')
+                            ui.label("0 characters").classes('font-bold text-slate-700')
+                            
+                        with ui.row().classes('items-center justify-between w-full text-xs'):
+                            ui.label('Word Count:').classes('text-slate-500')
+                            ui.label("0 words").classes('font-bold text-slate-700')
+
+                        with ui.row().classes('items-center justify-between w-full text-xs'):
+                            ui.label('Estimated Scenes:').classes('text-slate-500')
+                            ui.label("~ 0 scenes").classes('font-bold text-slate-700')
+
+                    with ui.column().classes('gap-3 bg-slate-50 p-4 rounded-xl border border-dashed'):
+                        ui.label('Orchestration Guide').classes('text-xs font-bold text-slate-700 uppercase tracking-wide')
+                        
+                        with ui.row().classes('items-center gap-2 text-xs'):
+                            ui.icon('radio_button_unchecked', color='slate', size='16px')
+                            ui.label('Step 1: Transcription').classes('font-bold text-slate-700')
+                            
+                        with ui.row().classes('items-center gap-2 text-xs'):
+                            ui.icon('radio_button_unchecked', color='slate', size='16px')
+                            ui.label('Step 2: Generate Prompts').classes('font-bold text-slate-700')
+                            
+                        with ui.row().classes('items-center gap-2 text-xs'):
+                            ui.icon('radio_button_unchecked', color='slate', size='16px')
+                            ui.label('Step 3: Render Images').classes('font-bold text-slate-500')
+                            
+                with ui.row().classes('w-full justify-end mt-2 border-t pt-3'):
+                    ui.label("Switch to the 'Dashboard' tab on the project workspace to run these steps.").classes('text-[11px] text-slate-500 italic')
+            return
 
     # Hidden filter reference
     filter_mode = ui.select(

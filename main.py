@@ -13,6 +13,14 @@ import io
 from typing import Optional, List, Dict, Any
 
 from nicegui import ui, app
+
+# --- Configure WebSockets for Large Payloads ---
+# This overrides the default 1MB Socket.IO limit to prevent connection drops on large transcript.txt files.
+from nicegui import core
+core.sio.max_http_buffer_size = 50 * 1024 * 1024  # Raise limit to 50 MB
+if hasattr(core.sio, 'eio'):
+    core.sio.eio.max_http_buffer_size = 50 * 1024 * 1024
+    
 from sqlmodel import Session, select
 from database.connection import init_db, get_setting, set_setting, engine
 from database.models import Project, Book, Chapter
