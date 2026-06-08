@@ -639,105 +639,110 @@ def render_book_tabs(book_id: int):
         
         if has_transcript:
             approved_marker_path = Path(f"./output/{project_name}/{book_name}/.transcript_approved")
-            is_approved = approved_marker_path.exists()
             
-            try:
-                text_content = transcript_path.read_text(encoding="utf-8")
-            except Exception as e:
-                text_content = f"Error reading transcript: {str(e)}"
-                
-            char_count = len(text_content)
-            word_count = len(text_content.split())
-            
-            with ui.card().classes('w-full border p-6 shadow-sm bg-white gap-4'):
-                with ui.row().classes('items-center justify-between border-b pb-3 w-full'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon('description', size='md', color='blue-500')
-                        with ui.column().classes('gap-0'):
-                            ui.label('Step 1.5: Transcript Review & Formatting').classes('text-base font-bold text-slate-800')
-                            ui.label('Review text, prune publishing boilerplate, and mark as approved to unlock prompt generation.').classes('text-xs text-slate-500')
+            @ui.refreshable
+            def render_transcript_editor():
+                is_approved = approved_marker_path.exists()
+                try:
+                    text_content = transcript_path.read_text(encoding="utf-8")
+                except Exception as e:
+                    text_content = f"Error reading transcript: {str(e)}"
                     
-                    if is_approved:
-                        ui.badge('Approved & Ready', color='emerald').classes('px-3 py-1 text-xs font-semibold rounded-full')
-                    else:
-                        ui.badge('Awaiting Review', color='amber').classes('px-3 py-1 text-xs font-semibold rounded-full')
+                char_count = len(text_content)
+                word_count = len(text_content.split())
                 
-                # Volume Stats Bar
-                with ui.row().classes('w-full justify-start gap-6 bg-slate-50 p-3 rounded-lg border border-dashed text-xs'):
-                    with ui.column().classes('gap-0'):
-                        ui.label('Character Count').classes('text-slate-400 font-medium')
-                        ui.label(f"{char_count:,} characters").classes('font-bold text-slate-700')
-                    with ui.column().classes('gap-0'):
-                        ui.label('Word Count').classes('text-slate-400 font-medium')
-                        ui.label(f"{word_count:,} words").classes('font-bold text-slate-700')
-                    with ui.column().classes('gap-0'):
-                        ui.label('Estimated Scenes').classes('text-slate-400 font-medium')
-                        ui.label(f"~ {max(1, word_count // 350)} scenes").classes('font-bold text-slate-700')
-                
-                # Text Editor Component (Manual Save prevents typing latency)
-                editor = ui.textarea(
-                    label="Editable transcript.txt", 
-                    value=text_content
-                ).classes('w-full text-xs') \
-                 .props('outlined input-style="height: 500px; font-family: monospace; overflow-y: auto;"') \
-                 .style('height: 520px;')
-                
-                def save_transcript():
-                    try:
-                        transcript_path.write_text(editor.value, encoding="utf-8")
-                        ui.notify("Transcript file saved successfully!", type="positive")
-                        from ui import pages
-                        if pages.main_layout_ref:
-                            pages.main_layout_ref.refresh()
-                    except Exception as e:
-                        ui.notify(f"Failed to save: {str(e)}", type="negative")
+                with ui.card().classes('w-full border p-6 shadow-sm bg-white gap-4'):
+                    with ui.row().classes('items-center justify-between border-b pb-3 w-full'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('description', size='md', color='blue-500')
+                            with ui.column().classes('gap-0'):
+                                ui.label('Step 1.5: Transcript Review & Formatting').classes('text-base font-bold text-slate-800')
+                                ui.label('Review text, prune publishing boilerplate, and mark as approved to unlock prompt generation.').classes('text-xs text-slate-500')
                         
-                def open_in_system_editor():
-                    import platform
-                    import subprocess
-                    abs_path = transcript_path.resolve()
-                    try:
-                        if platform.system() == "Windows":
-                            os.startfile(abs_path)
-                        elif platform.system() == "Darwin":
-                            subprocess.Popen(["open", str(abs_path)])
+                        if is_approved:
+                            ui.badge('Approved & Ready', color='emerald').classes('px-3 py-1 text-xs font-semibold rounded-full')
                         else:
-                            subprocess.Popen(["xdg-open", str(abs_path)])
-                        ui.notify("Opening in native text editor...", type="info")
-                    except Exception as e:
-                        ui.notify(f"Could not open editor: {str(e)}", type="negative")
-                        
-                def reload_from_disk():
-                    from ui import pages
-                    if pages.main_layout_ref:
-                        pages.main_layout_ref.refresh()
-
-                def toggle_approval():
-                    if approved_marker_path.exists():
-                        approved_marker_path.unlink()
-                        ui.notify("Transcript approval revoked.", type="warning")
-                    else:
-                        approved_marker_path.touch()
-                        ui.notify("Transcript approved! Ready for Phase 2 prompt generation.", type="positive")
+                            ui.badge('Awaiting Review', color='amber').classes('px-3 py-1 text-xs font-semibold rounded-full')
                     
-                    from ui import pages
-                    if pages.main_layout_ref:
-                        pages.main_layout_ref.refresh()
+                    # Volume Stats Bar
+                    with ui.row().classes('w-full justify-start gap-6 bg-slate-50 p-3 rounded-lg border border-dashed text-xs'):
+                        with ui.column().classes('gap-0'):
+                            ui.label('Character Count').classes('text-slate-400 font-medium')
+                            ui.label(f"{char_count:,} characters").classes('font-bold text-slate-700')
+                        with ui.column().classes('gap-0'):
+                            ui.label('Word Count').classes('text-slate-400 font-medium')
+                            ui.label(f"{word_count:,} words").classes('font-bold text-slate-700')
+                        with ui.column().classes('gap-0'):
+                            ui.label('Estimated Scenes').classes('text-slate-400 font-medium')
+                            ui.label(f"~ {max(1, word_count // 350)} scenes").classes('font-bold text-slate-700')
+                    
+                    def save_transcript():
+                        try:
+                            transcript_path.write_text(editor.value, encoding="utf-8")
+                            ui.notify("Transcript file saved successfully!", type="positive")
+                            render_transcript_editor.refresh()
+                        except Exception as e:
+                            ui.notify(f"Failed to save: {str(e)}", type="negative")
+                            
+                    def open_in_system_editor():
+                        import platform
+                        import subprocess
+                        abs_path = transcript_path.resolve()
+                        try:
+                            if platform.system() == "Windows":
+                                os.startfile(abs_path)
+                            elif platform.system() == "Darwin":
+                                subprocess.Popen(["open", str(abs_path)])
+                            else:
+                                subprocess.Popen(["xdg-open", str(abs_path)])
+                            ui.notify("Opening in native text editor...", type="info")
+                        except Exception as e:
+                            ui.notify(f"Could not open editor: {str(e)}", type="negative")
+                            
+                    def reload_from_disk():
+                        render_transcript_editor.refresh()
+
+                    def toggle_approval():
+                        try:
+                            # Auto-save changes on approval toggle so users do not lose typed edits
+                            transcript_path.write_text(editor.value, encoding="utf-8")
+                        except Exception as e:
+                            state.add_console_log(f"[Workspace] Failed to auto-save transcript on approval: {str(e)}")
+
+                        if approved_marker_path.exists():
+                            approved_marker_path.unlink()
+                            ui.notify("Transcript approval revoked.", type="warning")
+                        else:
+                            approved_marker_path.touch()
+                            ui.notify("Transcript approved! Ready for Phase 2 prompt generation.", type="positive")
                         
-                    # Trigger main project dashboard stats check
-                    if state.stats_refresh_callback:
-                        asyncio.create_task(state.stats_refresh_callback())
-                
-                with ui.row().classes('w-full justify-between items-center border-t pt-3 mt-1'):
-                    with ui.row().classes('gap-2'):
-                        ui.button('Save Changes', icon='save', on_click=save_transcript).classes('bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4')
-                        ui.button('Reload from Disk', icon='refresh', on_click=reload_from_disk).classes('bg-slate-500 hover:bg-slate-600 text-white text-xs font-semibold px-4')
-                        ui.button('Open in External Editor', icon='open_in_new', on_click=open_in_system_editor).props('flat').classes('text-xs text-slate-600')
+                        render_transcript_editor.refresh()
                         
-                    if is_approved:
-                        ui.button('Revoke Approval', icon='cancel', on_click=toggle_approval, color='red').classes('text-xs font-bold text-white px-5')
-                    else:
-                        ui.button('Approve Transcript', icon='check_circle', on_click=toggle_approval, color='emerald').classes('text-xs font-bold text-white px-5')
+                        # Trigger main project dashboard stats check
+                        if state.stats_refresh_callback:
+                            asyncio.create_task(state.stats_refresh_callback())
+                    
+                    # Action Buttons (Positioned above the text area)
+                    with ui.row().classes('w-full justify-between items-center border-b pb-3 mb-1'):
+                        with ui.row().classes('gap-2'):
+                            ui.button('Save Changes', icon='save', on_click=save_transcript).classes('bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4')
+                            ui.button('Reload from Disk', icon='refresh', on_click=reload_from_disk).classes('bg-slate-500 hover:bg-slate-600 text-white text-xs font-semibold px-4')
+                            ui.button('Open in External Editor', icon='open_in_new', on_click=open_in_system_editor).props('flat').classes('text-xs text-slate-600')
+                            
+                        if is_approved:
+                            ui.button('Revoke Approval', icon='cancel', on_click=toggle_approval).classes('bg-red-600 hover:bg-red-700 text-white text-xs font-bold px-5')
+                        else:
+                            ui.button('Approve Transcript', icon='check_circle', on_click=toggle_approval).classes('bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-5')
+
+                    # Text Editor Component
+                    editor = ui.textarea(
+                        label="Editable transcript.txt", 
+                        value=text_content
+                    ).classes('w-full text-xs') \
+                     .props('outlined input-style="height: 500px; font-family: monospace; overflow-y: auto;"') \
+                     .style('height: 520px;')
+
+            render_transcript_editor()
             return
 
         else:

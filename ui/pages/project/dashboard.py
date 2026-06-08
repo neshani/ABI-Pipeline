@@ -96,6 +96,51 @@ def execute_project_rollback_io(project_id: int, choice: str) -> None:
     state.add_console_log("[Rollback-Engine] State rollback file archival step complete.")
 
 
+def execute_project_delete_io(project_id: int) -> bool:
+    """Deletes a project, its child books and chapters from DB, and completely wipes its output directory."""
+    import shutil
+    from sqlmodel import Session
+    from database.connection import engine, get_setting
+    from database.models import Project, Book, Chapter
+    
+    try:
+        with Session(engine) as session:
+            project = session.get(Project, project_id)
+            if not project:
+                state.add_console_log(f"[Delete-Engine] Error: Project ID {project_id} not found.")
+                return False
+                
+            project_name = project.name
+            state.add_console_log(f"[Delete-Engine] Initiating full wipe for project: {project_name}")
+            
+            # Fetch all books in the project
+            books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+            for book in books:
+                # Delete chapters of each book
+                chapters = session.exec(select(Chapter).where(Chapter.book_id == book.id)).all()
+                for chapter in chapters:
+                    session.delete(chapter)
+                session.delete(book)
+                
+            session.delete(project)
+            session.commit()
+            
+        # Wipe the output directory on disk
+        output_base = Path(get_setting("output_dir", "./output")).resolve()
+        project_dir = output_base / project_name
+        if project_dir.exists() and project_dir.is_dir():
+            shutil.rmtree(project_dir)
+            state.add_console_log(f"[Delete-Engine] Successfully deleted directory: {project_dir}")
+        else:
+            state.add_console_log(f"[Delete-Engine] Directory not found or already deleted: {project_dir}")
+            
+        state.add_console_log(f"[Delete-Engine] Project {project_name} deleted from database and disk.")
+        return True
+    except Exception as e:
+        state.add_console_log(f"[Delete-Engine] Error during project deletion: {str(e)}")
+        return False
+
+
 def rescan_project_database_state(project_id: int) -> None:
     """Invokes sync operations across all project books to dynamically align database indexes with flat files."""
     from services.sync_engine import sync_book_from_disk
@@ -166,11 +211,40 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
         
         # Unapproved Warning Banner
         if unapproved_books:
-            with ui.row().classes('w-full items-center gap-3 bg-amber-50 p-3 rounded-lg border border-amber-200 mt-1'):
-                ui.icon('warning', color='amber', size='sm')
-                with ui.column().classes('gap-0 flex-1'):
-                    ui.label('Review Required').classes('text-xs font-bold text-amber-800')
-                    ui.label(f'The following volume(s) have unapproved transcripts: {", ".join(unapproved_books)}. Please approve them inside the book workspace before generating prompts.').classes('text-[10px] text-amber-700 leading-normal')
+            with ui.row().classes('w-full items-center justify-between gap-3 bg-amber-50 p-3 rounded-lg border border-amber-200 mt-1'):
+                with ui.row().classes('items-center gap-3 flex-1 min-w-0'):
+                    ui.icon('warning', color='amber', size='sm')
+                    with ui.column().classes('gap-0 flex-1 min-w-0'):
+                        ui.label('Review Required').classes('text-xs font-bold text-amber-800')
+                        ui.label(f'The following volume(s) have unapproved transcripts: {", ".join(unapproved_books)}. Please approve them inside the book workspace before generating prompts.').classes('text-[10px] text-amber-700 leading-normal')
+                
+                def handle_approve_all():
+                    output_base = Path(get_setting("output_dir", "./output")).resolve()
+                    approved_count = 0
+                    for b in books:
+                        t_path = output_base / project.name / b.name / "transcript.txt"
+                        app_path = output_base / project.name / b.name / ".transcript_approved"
+                        if t_path.exists() and not app_path.exists():
+                            try:
+                                app_path.touch()
+                                approved_count += 1
+                            except Exception as ex:
+                                state.add_console_log(f"[Dashboard] Error approving transcript for {b.name}: {str(ex)}")
+                    
+                    if approved_count > 0:
+                        ui.notify(f"Approved {approved_count} volume transcripts!", type="positive")
+                        rescan_project_database_state(project.id)
+                        render_dynamic_step_dashboard.refresh()
+                        if hasattr(state, 'active_header_refresh') and state.active_header_refresh:
+                            state.active_header_refresh()
+                    else:
+                        ui.notify("No transcripts were eligible for approval.", type="info")
+
+                ui.button(
+                    'Approve All', 
+                    icon='done_all', 
+                    on_click=handle_approve_all
+                ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-3 py-1.5 rounded')
 
         with ui.row().classes('w-full items-center gap-3 bg-slate-50 p-3 rounded-lg border mt-1'):
             ui.icon('description', size='sm', color='slate-500')
@@ -444,7 +518,37 @@ def render_project_tabs(
             ui.button('Cancel', on_click=rollback_dialog.close).props('flat color=slate').classes('text-xs font-semibold')
             ui.button('Confirm & Rollback', on_click=confirm_action, color='red').classes('text-xs font-bold text-white')
 
-    # Workspace Navigation Layout with Folder & Rollback Shortcuts
+    # Reusable Delete Confirmation Modal
+    with ui.dialog() as delete_dialog, ui.card().classes('w-full max-w-md p-6 rounded-xl gap-4'):
+        ui.label('Delete Project?').classes('text-lg font-bold text-rose-800')
+        ui.label('Warning: This action is permanent!').classes('text-xs font-bold text-slate-700')
+        ui.label('This will completely delete the project from the database, along with all of its volumes, transcripts, prompts, and generated images on disk.').classes('text-xs text-slate-500 leading-normal')
+        
+        async def confirm_delete():
+            ui.notify("Deleting project and wiping files...", type="info")
+            success = await asyncio.to_thread(execute_project_delete_io, project.id)
+            if success:
+                ui.notify("Project deleted successfully!", type="positive")
+                # Clean exit state to portal
+                state.active_project_id = None
+                state.active_book_id = None
+                state.active_tool = None
+                state.active_log_widget = None
+                
+                from ui.pages import main_layout_ref
+                if main_layout_ref:
+                    main_layout_ref.refresh()
+                if hasattr(state, 'active_header_refresh') and state.active_header_refresh:
+                    state.active_header_refresh()
+            else:
+                ui.notify("Error deleting project. Check the process logs.", type="negative")
+            delete_dialog.close()
+            
+        with ui.row().classes('w-full justify-end gap-3 mt-2'):
+            ui.button('Cancel', on_click=delete_dialog.close).props('flat color=slate').classes('text-xs font-semibold')
+            ui.button('Confirm & Delete', on_click=confirm_delete, color='red').classes('text-xs font-bold text-white')
+
+    # Workspace Navigation Layout with Folder, Rollback, and Delete Shortcuts
     with ui.row().classes('w-full justify-between items-center mb-1'):
         with ui.column().classes('gap-0'):
             ui.label('Project Workspace Controls').classes('text-base font-bold text-slate-800')
@@ -477,6 +581,11 @@ def render_project_tabs(
                 icon='history',
                 on_click=rollback_dialog.open
             ).props('flat dense').classes('text-xs text-red-600 hover:text-red-800')
+            ui.button(
+                'Delete Project',
+                icon='delete_forever',
+                on_click=delete_dialog.open
+            ).props('flat dense').classes('text-xs text-rose-600 hover:text-rose-800')
     
     with ui.tabs().classes('w-full border-b') as project_tabs:
         tab_dash = ui.tab('Dashboard', icon='dashboard')
