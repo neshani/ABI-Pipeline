@@ -57,3 +57,28 @@ def set_setting(key: str, value) -> None:
             
         session.add(setting)
         session.commit()
+
+def touch_project(project_id: int, session: Optional[Session] = None) -> None:
+    """Updates the project's modified_at timestamp to the current time both in DB and on disk."""
+    import time
+    from .models import Project
+
+    def _touch(sess: Session):
+        project = sess.get(Project, project_id)
+        if project:
+            project.modified_at = time.time()
+            sess.add(project)
+            sess.commit()
+
+    if session:
+        _touch(session)
+    else:
+        with Session(engine) as standalone_session:
+            _touch(standalone_session)
+
+    # Persist the updated modified_at directly into the on-disk config JSON
+    try:
+        from services.project_settings import save_project_settings_to_disk
+        save_project_settings_to_disk(project_id)
+    except Exception:
+        pass

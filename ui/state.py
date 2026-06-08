@@ -15,9 +15,9 @@ lora_tool_progress: Dict[str, Any] = {}  # Tracks {"lora_id": str, "current": in
 active_project_tab: str = 'Dashboard'
 active_book_tab: str = 'Dashboard'
 
-# Directory filters
+# Directory filters / sorting
 search_query: str = ""
-selected_project_type: str = "All"
+selected_sort: str = "Most Recent"
 expanded_projects: set[int] = set()
 
 # Scan context

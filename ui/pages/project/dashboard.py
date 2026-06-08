@@ -99,6 +99,7 @@ def execute_project_rollback_io(project_id: int, choice: str) -> None:
 def rescan_project_database_state(project_id: int) -> None:
     """Invokes sync operations across all project books to dynamically align database indexes with flat files."""
     from services.sync_engine import sync_book_from_disk
+    from database.connection import touch_project
     with Session(engine) as session:
         books = session.exec(select(Book).where(Book.project_id == project_id)).all()
         for b in books:
@@ -108,6 +109,9 @@ def rescan_project_database_state(project_id: int) -> None:
         if project:
             state.project_status = project.status
         session.commit()
+        
+    # Touch the project to synchronize modified_at both in database and disk
+    touch_project(project_id)
 
 
 def render_transcription_step_view(project, books, start_transcribe_cb, stop_transcribe_cb):

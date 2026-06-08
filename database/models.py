@@ -1,3 +1,4 @@
+import time
 from typing import Optional
 from sqlmodel import SQLModel, Field
 
@@ -11,6 +12,7 @@ class Project(SQLModel, table=True):
     path: str
     status: str = Field(default="Imported")
     is_batch: bool = Field(default=False)
+    modified_at: float = Field(default_factory=time.time)
 
 class Book(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)

@@ -205,6 +205,10 @@ def start_transcribing(project_id: int):
     start_project_transcription(project_id)
     ui.notify("Background audiobook transcription started!", type="positive")
     
+    # Touch project modification timestamp
+    from database.connection import touch_project
+    touch_project(project_id)
+    
     # Fast trigger to update action buttons and stepper layout
     state.project_status = "Transcribing"
     if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
@@ -263,6 +267,7 @@ def start_prompt_generation(project_id: int):
         project = session.get(Project, project_id)
         if project:
             project.status = "Generating Prompts"
+            project.modified_at = time.time()  # Touch modification timestamp directly inside the session
             session.add(project)
             
             books = session.exec(select(Book).where(Book.project_id == project_id)).all()
@@ -675,6 +680,7 @@ def start_image_generation(project_id: int):
         project = session.get(Project, project_id)
         if project:
             project.status = "Rendering Images"
+            project.modified_at = time.time()  # Touch modification timestamp directly inside the session
             session.add(project)
             
             books = session.exec(select(Book).where(Book.project_id == project_id)).all()
@@ -988,10 +994,10 @@ def header_controls():
             ).props('dark borderless dense').classes('w-48 px-2')
             
             ui.select(
-                options=['All', 'Single', 'Batch'],
-                value=state.selected_project_type,
-                on_change=lambda e: (setattr(state, 'selected_project_type', e.value), refresh_dashboard())
-            ).props('dark borderless dense').classes('w-24 text-sm')
+                options=['Most Recent', 'Alphabetical'],
+                value=state.selected_sort,
+                on_change=lambda e: (setattr(state, 'selected_sort', e.value), refresh_dashboard())
+            ).props('dark borderless dense').classes('w-32 text-sm')
     else:
         render_topbar_stepper(state.project_status)
 

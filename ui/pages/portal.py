@@ -28,7 +28,7 @@ def get_status_badge(status: str):
         "Finished": "bg-emerald-100 text-emerald-800 border-emerald-200"
     }
     style = styles.get(display_status, "bg-slate-100 text-slate-800")
-    return ui.badge(display_status).classes(f'px-3 py-1 text-xs rounded-full font-medium {style}')
+    return ui.badge(display_status).classes(f'px-2.5 py-0.5 text-[10px] rounded-full font-semibold {style}')
 
 
 @ui.refreshable
@@ -171,6 +171,7 @@ def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, re
                 "name": p.name,
                 "status": p.status,
                 "is_batch": p.is_batch,
+                "modified_at": p.modified_at,  # Include modified_at timestamp
                 "progress": avg_progress,
                 "books_count": len(books),
                 "books": books,
@@ -187,17 +188,18 @@ def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, re
         book_name_match = any(state.search_query.lower() in b["name"].lower() for b in p["books_data"])
         name_match = project_name_match or book_name_match
         
-        type_match = True
-        if state.selected_project_type == "Single" and p["is_batch"]:
-            type_match = False
-        elif state.selected_project_type == "Batch" and not p["is_batch"]:
-            type_match = False
-            
-        if name_match and type_match:
+        if name_match:
             # Polished UX: Auto-expand projects if the search query matches its nested book but not its name
             if state.search_query.strip() and book_name_match and not project_name_match:
                 state.expanded_projects.add(p["id"])
             filtered.append(p)
+
+    # Apply global sorting options
+    if state.selected_sort == "Alphabetical":
+        filtered.sort(key=lambda x: x["name"].lower())
+    else:  # "Most Recent"
+        # Sort by modified_at timestamp descending, falling back to id order
+        filtered.sort(key=lambda x: (x.get("modified_at") or 0.0, x["id"]), reverse=True)
 
     with ui.row().classes('w-full justify-between items-center mb-2'):
         with ui.column().classes('gap-0'):
@@ -216,37 +218,39 @@ def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, re
         for project in filtered:
             is_expanded = project["id"] in state.expanded_projects
             
-            with ui.card().classes('w-full border rounded-xl shadow-sm p-5 mb-4 bg-white transition-all'):
+            # Tighter outer layout: p-5 reduced to p-3, mb-4 to mb-2
+            with ui.card().classes('w-full border rounded-lg shadow-sm p-3 mb-2 bg-white transition-all hover:border-slate-300'):
                 # 1. Main Dashboard Card Header
                 with ui.row().classes('w-full items-center justify-between'):
                     # Clicking the title/icon area takes you directly to the project's workspace
-                    with ui.row().classes('items-center gap-3 cursor-pointer') \
+                    with ui.row().classes('items-center gap-2 cursor-pointer') \
                             .on('click', lambda p_id=project["id"]: select_project_cb(p_id)):
                         if project["is_batch"]:
-                            ui.icon('folder', size='md', color='amber-500')
+                            ui.icon('folder', size='sm', color='amber-500')
                             with ui.column().classes('gap-0'):
-                                ui.label(project["name"]).classes('text-base font-semibold text-slate-800 leading-tight')
-                                ui.label(f'Batch Workspace • {project["books_count"]} volumes').classes('text-xs text-slate-400')
+                                ui.label(project["name"]).classes('text-sm font-semibold text-slate-800 leading-tight')
+                                ui.label(f'Batch Workspace • {project["books_count"]} volumes').classes('text-[10px] text-slate-400')
                         else:
-                            ui.icon('menu_book', size='md', color='blue-500')
+                            ui.icon('menu_book', size='sm', color='blue-500')
                             with ui.column().classes('gap-0'):
-                                ui.label(project["name"]).classes('text-base font-semibold text-slate-800 leading-tight')
-                                ui.label('Single Novel Workspace').classes('text-xs text-slate-400')
+                                ui.label(project["name"]).classes('text-sm font-semibold text-slate-800 leading-tight')
+                                ui.label('Single Novel Workspace').classes('text-[10px] text-slate-400')
                     
-                    # Performance stats, status badges, and expandable control actions
-                    with ui.row().classes('items-center gap-4'):
+                    # Performance stats, status badges, and expandable control actions (snug spacing)
+                    with ui.row().classes('items-center gap-3'):
                         get_status_badge(project["status"])
                         
-                        # Aggregated numeric statistics
+                        # Aggregated numeric statistics (smaller text footprint)
                         with ui.column().classes('items-end gap-0'):
-                            ui.label(f'{project["total_words"]:,} words').classes('text-[11px] font-semibold text-slate-500')
-                            ui.label(f'{project["total_completed"]}/{project["total_scenes"]} rendered').classes('text-[10px] text-slate-400 font-medium')
+                            ui.label(f'{project["total_words"]:,} words').classes('text-[10px] font-semibold text-slate-500')
+                            ui.label(f'{project["total_completed"]}/{project["total_scenes"]} rendered').classes('text-[9px] text-slate-400 font-medium')
                         
-                        ui.linear_progress(value=project["progress"], show_value=False).classes('w-24 h-2 rounded-full')
+                        # Sized down linear progress
+                        ui.linear_progress(value=project["progress"], show_value=False).classes('w-20 h-1.5 rounded-full')
                         
-                        # Workspace shortcut trigger
+                        # Compact Workspace shortcut trigger
                         ui.button(
-                            'Open Workspace', 
+                            'Open', 
                             icon='launch',
                             on_click=lambda p_id=project["id"]: select_project_cb(p_id)
                         ).props('flat dense').classes('text-blue-600 text-xs font-bold capitalize')
@@ -258,35 +262,35 @@ def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, re
                             on_click=lambda p_id=project["id"]: toggle_project_expansion(p_id, refresh_parent)
                         ).props('flat round dense').classes('text-slate-500')
 
-                # 2. Collapsible Child Book Listings details
+                # 2. Collapsible Child Book Listings details (tightened lists, smaller margins, and micro thumbnails)
                 if is_expanded:
-                    ui.separator().classes('my-3')
-                    with ui.column().classes('w-full gap-3 pl-8'):
-                        ui.label('Volumes included').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wider')
+                    ui.separator().classes('my-2')
+                    with ui.column().classes('w-full gap-1.5 pl-6'):
+                        ui.label('Volumes included').classes('text-[9px] font-bold text-slate-400 uppercase tracking-wider')
                         
                         for b in project["books_data"]:
-                            with ui.row().classes('w-full items-center justify-between bg-slate-50 border border-slate-100 rounded-lg p-3 hover:bg-slate-100/50 transition-colors'):
-                                # Book thumbnail, title, and file counters
-                                with ui.row().classes('items-center gap-3 flex-1 min-w-0'):
+                            with ui.row().classes('w-full items-center justify-between bg-slate-50 border border-slate-100 rounded-lg py-1.5 px-2.5 hover:bg-slate-100/50 transition-colors'):
+                                # Book thumbnail, title, and file counters (thumbnails down to w-8 h-11)
+                                with ui.row().classes('items-center gap-2 flex-1 min-w-0'):
                                     if b["cover_path"]:
-                                        ui.image(b["cover_path"]).classes('w-10 h-14 rounded object-cover shadow-sm border border-slate-200 flex-shrink-0')
+                                        ui.image(b["cover_path"]).classes('w-8 h-11 rounded object-cover shadow-sm border border-slate-200 flex-shrink-0')
                                     else:
-                                        with ui.column().classes('w-10 h-14 bg-slate-100 border border-dashed border-slate-300 rounded items-center justify-center flex-shrink-0 text-slate-400'):
-                                            ui.icon('library_books', size='16px')
+                                        with ui.column().classes('w-8 h-11 bg-slate-100 border border-dashed border-slate-300 rounded items-center justify-center flex-shrink-0 text-slate-400'):
+                                            ui.icon('library_books', size='14px')
                                             
-                                    with ui.column().classes('gap-0.5 flex-1 min-w-0'):
-                                        ui.label(b["name"]).classes('text-sm font-semibold text-slate-800 truncate')
+                                    with ui.column().classes('gap-0 flex-1 min-w-0'):
+                                        ui.label(b["name"]).classes('text-xs font-semibold text-slate-800 truncate')
                                         if b["stats"]["has_transcript"]:
                                             total_b_scenes = b["stats"]["total_prompts"] or b["stats"]["estimated_scenes"]
-                                            ui.label(f'{b["stats"]["word_count"]:,} words • {b["stats"]["generated_images"]}/{total_b_scenes} rendered').classes('text-xs text-slate-500 font-medium')
+                                            ui.label(f'{b["stats"]["word_count"]:,} words • {b["stats"]["generated_images"]}/{total_b_scenes} rendered').classes('text-[10px] text-slate-500 font-medium')
                                         else:
-                                            ui.label('Awaiting transcription or text import').classes('text-xs text-slate-400 italic')
+                                            ui.label('Awaiting transcription or text import').classes('text-[10px] text-slate-400 italic')
 
                                 # Direct Book Selection Navigation Trigger
-                                with ui.row().classes('items-center gap-3'):
-                                    ui.badge(b["status"]).classes('px-2.5 py-0.5 text-[10px] rounded bg-slate-200 text-slate-700 font-medium')
+                                with ui.row().classes('items-center gap-2'):
+                                    ui.badge(b["status"]).classes('px-1.5 py-0.5 text-[9px] rounded bg-slate-200 text-slate-700 font-medium')
                                     ui.button(
-                                        'Jump to Book',
+                                        'Jump',
                                         icon='chevron_right',
                                         on_click=lambda p_id=project["id"], b_id=b["id"]: select_book_cb(p_id, b_id)
                                     ).props('flat dense').classes('text-xs text-blue-600 font-bold capitalize')
