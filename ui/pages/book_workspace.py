@@ -804,12 +804,37 @@ def render_book_tabs(book_id: int):
     # --- Top Interface Toolbar ---
     with ui.row().classes('w-full justify-between items-center bg-white p-3 border rounded-xl shadow-xs mb-4'):
         with ui.row().classes('items-center gap-4'):
-            # Filtering selector
-            ui.select(
-                options=["All", "Unapproved Only", "Missing Only"],
-                label="Filter Scenes",
-                on_change=lambda e: (setattr(filter_mode, 'value', e.value), render_content.refresh())
-            ).classes('w-44 bg-white').props('outlined dense').bind_value_to(filter_mode, 'value')
+            # Icon-based Filter Selector Segment
+            with ui.row().classes('items-center gap-1 bg-slate-100 p-1 rounded-lg border'):
+                btn_all = ui.button(icon='grid_view').props('flat dense').classes('px-3 py-1.5 rounded-md')
+                btn_unapproved = ui.button(icon='rate_review').props('flat dense').classes('px-3 py-1.5 rounded-md')
+                btn_missing = ui.button(icon='image_not_supported').props('flat dense').classes('px-3 py-1.5 rounded-md')
+                
+                with btn_all:
+                    ui.tooltip('Show All Scenes')
+                with btn_unapproved:
+                    ui.tooltip('Show Unapproved Scenes Only')
+                with btn_missing:
+                    ui.tooltip('Show Missing Scenes Only')
+                    
+                def update_button_styles(mode: str):
+                    for m, btn in [('All', btn_all), ('Unapproved Only', btn_unapproved), ('Missing Only', btn_missing)]:
+                        if mode == m:
+                            btn.classes(replace='px-3 py-1.5 rounded-md bg-white text-blue-600 shadow-sm font-bold')
+                        else:
+                            btn.classes(replace='px-3 py-1.5 rounded-md text-slate-500 hover:text-slate-700 hover:bg-slate-200/50')
+                            
+                def set_filter(mode: str):
+                    filter_mode.value = mode
+                    update_button_styles(mode)
+                    render_content.refresh()
+                    
+                btn_all.on('click', lambda: set_filter('All'))
+                btn_unapproved.on('click', lambda: set_filter('Unapproved Only'))
+                btn_missing.on('click', lambda: set_filter('Missing Only'))
+                
+                # Apply styles without evaluating render_content.refresh() too early
+                update_button_styles(filter_mode.value)
             
             # Direct batch reboot action
             ui.button(
@@ -1083,7 +1108,12 @@ def render_book_tabs(book_id: int):
             # Offload heavy folder parsing cache building to a background thread
             images_cache = await asyncio.to_thread(get_book_images_cache, project_name, book_name)
             
-            update_grid_views_in_place()
+            # Use smooth swap on "All" view; refresh grid container for filter changes
+            if filter_mode.value == "All":
+                update_grid_views_in_place()
+            else:
+                render_content.refresh()
+                
             if theater_dialog.value:
                 update_active_scene_ui()
 

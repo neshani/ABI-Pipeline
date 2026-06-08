@@ -148,15 +148,36 @@ def select_project(project_id: int):
     main_layout.refresh()
 
 
-def select_book(book_id: int):
+async def async_select_book(book_id: int, client):
+    # Capture the current scroll position of the sidebar books list container
+    try:
+        scroll_pos = await client.run_javascript("document.getElementById('sidebar-books-list')?.scrollTop || 0")
+    except Exception:
+        scroll_pos = 0
+    
     state.active_book_id = book_id
     state.active_book_tab = 'Dashboard'
     state.active_log_widget = None  # Clear log references on panel change
     
     # Instantly scroll the browser window back to the top of the page
-    ui.run_javascript('window.scrollTo(0, 0)')
+    try:
+        await client.run_javascript('window.scrollTo(0, 0)')
+    except Exception:
+        pass
     
     main_layout.refresh()
+    
+    # Restore the scroll position after DOM updates render
+    await asyncio.sleep(0.15)
+    try:
+        await client.run_javascript(f"var el = document.getElementById('sidebar-books-list'); if (el) el.scrollTop = {scroll_pos};")
+    except Exception:
+        pass
+
+def select_book(book_id: int):
+    # Capture client context synchronously in the active event handler thread
+    client = ui.context.client
+    asyncio.create_task(async_select_book(book_id, client))
 
 
 def select_book_from_portal(project_id: int, book_id: int):
@@ -887,7 +908,7 @@ def render_split_panel_shell(project_id: int):
             ui.separator()
             ui.label('Books & Volumes').classes('text-[10px] font-bold text-slate-400 tracking-wider uppercase px-1')
             
-            with ui.column().classes('w-full gap-2 overflow-y-auto flex-1'):
+            with ui.column().classes('w-full gap-2 overflow-y-auto flex-1').props('id="sidebar-books-list"'):
                 for book in books:
                     # Seed bindings
                     if book.id not in state.books_progress:
