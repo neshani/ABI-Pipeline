@@ -218,18 +218,34 @@ class SettingsModal:
 
             # 2. STT Selection & Installation Status (Collapsed at the bottom)
             with ui.expansion('Transcription Setup (One-Time)', icon='construction').classes('w-full border rounded-lg bg-slate-50/50'):
-                with ui.column().classes('w-full p-4 gap-3 bg-white'):
-                    # Engine Dropdown Selector
-                    ui.select(
-                        options=['Parakeet ONNX', 'Whisper'], 
-                        label='STT Engine'
-                    ).bind_value(self.settings, 'stt_engine').on_value_change(self.update_installation_statuses).classes('w-full')
+                with ui.column().classes('w-full p-4 gap-4 bg-white'):
                     
-                    # Hardware Target Dropdown Selector
-                    ui.select(
-                        options=['GPU/CUDA', 'CPU'], 
-                        label='STT Device / Hardware'
-                    ).bind_value(self.settings, 'stt_device').on_value_change(self.update_installation_statuses).classes('w-full')
+                    # Engine Radio Selector
+                    with ui.column().classes('w-full gap-1'):
+                        ui.label('STT Engine').classes('text-xs font-bold text-slate-500')
+                        self.engine_radio = ui.radio(
+                            options={
+                                'Parakeet ONNX': 'Parakeet ONNX (Recommended - ~160x Speed)',
+                                'Whisper': 'Faster-Whisper (Backup - ~38x Speed)'
+                            }
+                        ).bind_value(self.settings, 'stt_engine').on_value_change(self.update_installation_statuses).classes('w-full text-sm')
+                        
+                        # Subtext with the newly uncovered file sizes and speed benchmarks
+                        with ui.column().classes('bg-slate-50 p-3 rounded-lg border border-slate-100 mt-1 gap-1.5 text-[11px] text-slate-600 leading-normal'):
+                            ui.label('• Parakeet ONNX: Ultra-fast parallel sequential batching. Transcribes a 20-hour audiobook in ~5 to 8 minutes on GPU. Footprint: ~300 MB packages + ~2.5 GB model weights.').classes('font-medium')
+                            ui.label('• Faster-Whisper: Highly detailed phrase-level timing maps, but processes audio sequentially. Transcribes a 20-hour audiobook in ~35 minutes on GPU. Footprint: ~3.5 GB PyTorch packages + ~484 MB model weights.').classes('font-medium')
+
+                    ui.separator()
+
+                    # Hardware Target Radio Selector
+                    with ui.column().classes('w-full gap-1'):
+                        ui.label('STT Device / Hardware Target').classes('text-xs font-bold text-slate-500')
+                        self.device_radio = ui.radio(
+                            options={
+                                'GPU/CUDA': 'GPU / CUDA (Recommended for Nvidia GPU setups)',
+                                'CPU': 'CPU (Not Recommended - Slow)'
+                            }
+                        ).bind_value(self.settings, 'stt_device').on_value_change(self.update_installation_statuses).classes('w-full text-sm')
                     
                     # Real-Time Status Indicators
                     with ui.column().classes('gap-1 mt-1'):
@@ -244,6 +260,7 @@ class SettingsModal:
                     ui.label('Installation Console Output').classes('text-xs font-bold text-slate-500 mt-2')
                     self.terminal_log = ui.log().classes('h-36 w-full bg-slate-950 p-2 text-emerald-400 font-mono text-[10px] rounded-lg')
 
+                    
             # Actions Bottom Bar
             with ui.row().classes('w-full justify-end gap-3 mt-2'):
                 ui.button('Cancel', on_click=self.dialog.close).props('flat color=slate')
