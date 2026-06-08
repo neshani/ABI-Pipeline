@@ -208,7 +208,7 @@ def render_lora_chooser_content():
                     if sample_images:
                         with ui.grid(columns=2).classes('w-full gap-3 mt-1 overflow-y-auto flex-1 p-1'):
                             for img_path in sample_images:
-                                ui.image(str(img_path)).classes('w-full h-32 object-cover rounded border shadow-sm')
+                                ui.image(str(img_path)).props('fit=contain').classes('w-full rounded border shadow-sm')
                     else:
                         with ui.column().classes('w-full flex-1 items-center justify-center border border-dashed rounded bg-slate-50 text-slate-400'):
                             ui.icon('photo_library', size='lg')
@@ -241,6 +241,7 @@ def render_lora_chooser_content():
                             
                     ui.button('Accept & Apply', on_click=apply_selection).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs h-9')
 
+                    
 
 def create_contact_sheet(base64_list: list) -> Optional[bytes]:
     """Stitches completed base64 image strings into a single PNG grid stamped with 1A, 1B coordinate labels."""

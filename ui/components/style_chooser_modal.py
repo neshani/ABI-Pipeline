@@ -261,14 +261,14 @@ class StyleChooserModal:
                         ).classes("bg-blue-600 text-white text-xs font-semibold px-3 py-1.5 rounded h-8 shadow-xs")
 
                 # Prefix Text Block Preview
-                with ui.column().classes("gap-1 bg-slate-50 p-2 rounded border w-full text-[10px]"):
+                with ui.column().classes("gap-1 bg-slate-50 p-2 rounded border w-full text-[10px] min-w-0"):
                     ui.label("PROMPT PREFIX:").classes("font-bold text-slate-400")
-                    ui.label(self.style_prefix or "None").classes("text-slate-600 leading-normal truncate")
+                    ui.label(self.style_prefix or "None").classes("text-slate-600 leading-normal break-words whitespace-normal")
 
                 # Suffix Text Block Preview
-                with ui.column().classes("gap-1 bg-slate-50 p-2 rounded border w-full text-[10px]"):
+                with ui.column().classes("gap-1 bg-slate-50 p-2 rounded border w-full text-[10px] min-w-0"):
                     ui.label("PROMPT SUFFIX:").classes("font-bold text-slate-400")
-                    ui.label(self.style_suffix or "None").classes("text-slate-600 leading-normal truncate")
+                    ui.label(self.style_suffix or "None").classes("text-slate-600 leading-normal break-words whitespace-normal")
 
                 # Visual Benchmarks Row
                 with ui.grid(columns=3).classes("w-full gap-3 mt-1"):
@@ -276,7 +276,7 @@ class StyleChooserModal:
                     with ui.card().classes("p-2 border rounded shadow-xs items-center gap-2 bg-white"):
                         ui.label("Portrait").classes("text-[10px] font-bold text-slate-400")
                         if self.portrait_img:
-                            ui.image(self.portrait_img).classes("w-full h-24 object-cover rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
+                            ui.image(self.portrait_img).props("fit=contain").classes("w-full rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
                                 .on('click', lambda: self.show_large_preview("Portrait", self.portrait_img))
                         else:
                             with ui.column().classes("w-full h-24 items-center justify-center bg-slate-100 rounded border border-dashed text-slate-400"):
@@ -287,7 +287,7 @@ class StyleChooserModal:
                     with ui.card().classes("p-2 border rounded shadow-xs items-center gap-2 bg-white"):
                         ui.label("Landscape").classes("text-[10px] font-bold text-slate-400")
                         if self.landscape_img:
-                            ui.image(self.landscape_img).classes("w-full h-24 object-cover rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
+                            ui.image(self.landscape_img).props("fit=contain").classes("w-full rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
                                 .on('click', lambda: self.show_large_preview("Landscape", self.landscape_img))
                         else:
                             with ui.column().classes("w-full h-24 items-center justify-center bg-slate-100 rounded border border-dashed text-slate-400"):
@@ -298,7 +298,7 @@ class StyleChooserModal:
                     with ui.card().classes("p-2 border rounded shadow-xs items-center gap-2 bg-white"):
                         ui.label("Architecture").classes("text-[10px] font-bold text-slate-400")
                         if self.architecture_img:
-                            ui.image(self.architecture_img).classes("w-full h-24 object-cover rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
+                            ui.image(self.architecture_img).props("fit=contain").classes("w-full rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
                                 .on('click', lambda: self.show_large_preview("Architecture", self.architecture_img))
                         else:
                             with ui.column().classes("w-full h-24 items-center justify-center bg-slate-100 rounded border border-dashed text-slate-400"):
@@ -350,8 +350,8 @@ class StyleChooserModal:
                         ).props("outlined dense").classes("w-48")
 
                     with ui.grid(columns="240px 1fr").classes("w-full gap-4 items-start"):
-                        self.sidebar_container = ui.column().classes("w-full border rounded-lg p-2 max-h-[50vh] overflow-y-auto bg-slate-50")
-                        self.preview_pane_container = ui.column().classes("w-full border rounded-lg p-4 gap-3 bg-slate-50")
+                        self.sidebar_container = ui.column().classes("w-full border rounded-lg p-2 max-h-[50vh] overflow-y-auto bg-slate-50 min-w-0")
+                        self.preview_pane_container = ui.column().classes("w-full border rounded-lg p-4 gap-3 bg-slate-50 min-w-0")
 
                     self.refresh_sidebar()
                     self.refresh_preview()
