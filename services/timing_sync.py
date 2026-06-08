@@ -34,7 +34,7 @@ def get_normalized_and_map(text: str) -> Tuple[str, List[int]]:
 def find_quote_offset(transcript_text: str, quote: str) -> int:
     """
     Attempts exact search, falling back to mapping-preserved normalized character offsets, 
-    and finally prefix-based sliding mapping for maximum fuzzy matching resilience.
+    and finally prefix/suffix-based sliding mapping for maximum fuzzy matching resilience.
     """
     if not transcript_text or not quote:
         return 0
@@ -56,13 +56,23 @@ def find_quote_offset(transcript_text: str, quote: str) -> int:
     if norm_idx != -1:
         return text_map[norm_idx]
 
-    # 3. Sliding fallback prefixes for LLM paraphrasing/punctuation anomalies
+    # 3. Sliding fallback prefixes (for trailing paraphrase/truncation anomalies)
     for prefix_len in [40, 30, 20]:
         if len(norm_quote) >= prefix_len:
             prefix = norm_quote[:prefix_len]
             norm_idx = norm_text.find(prefix)
             if norm_idx != -1:
                 return text_map[norm_idx]
+
+    # 4. Sliding fallback suffixes (for leading paraphrase anomalies like "I clamped" vs "I was clamping")
+    for suffix_len in [40, 30, 20]:
+        if len(norm_quote) >= suffix_len:
+            suffix = norm_quote[-suffix_len:]
+            norm_idx = norm_text.find(suffix)
+            if norm_idx != -1:
+                # Estimate the start of the quote by offsetting backward from the matched suffix
+                estimated_norm_idx = max(0, norm_idx - (len(norm_quote) - suffix_len))
+                return text_map[estimated_norm_idx]
 
     return 0
 
@@ -171,6 +181,18 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
     if "timestamp" not in fieldnames:
         fieldnames.append("timestamp")
 
+    # Load transcript_timing.json sub-chapter chunk alignment if available
+    import json
+    timing_json_path = book_dir / "transcript_timing.json"
+    timing_data = {}
+    if timing_json_path.exists():
+        try:
+            with open(timing_json_path, "r", encoding="utf-8") as f:
+                timing_data = json.load(f).get("chapters", {})
+            log("[Timing-Sync] Loaded sub-chapter timing alignments from transcript_timing.json!")
+        except Exception as e:
+            log(f"[Timing-Sync] Warning: Failed to load transcript_timing.json: {e}")
+
     # Match rows to quotes
     for row in rows:
         quote = row.get("quote", "").strip()
@@ -198,8 +220,39 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
         if total_len == 0:
             total_len = 1
 
-        ratio = offset / total_len
-        estimated_seconds = ch_start + (ratio * ch_dur)
+        # Locate exact sub-chapter chunk mapping
+        ch_timing = timing_data.get(str(chapter_num))
+        matched_chunk = None
+        if ch_timing:
+            for chunk in ch_timing:
+                if chunk["char_start"] <= offset <= chunk["char_end"]:
+                    matched_chunk = chunk
+                    break
+            # Fallback to closest chunk on error
+            if not matched_chunk and ch_timing:
+                matched_chunk = min(
+                    ch_timing,
+                    key=lambda c: min(abs(offset - c["char_start"]), abs(offset - c["char_end"]))
+                )
+
+        if matched_chunk:
+            chunk_char_start = matched_chunk["char_start"]
+            chunk_char_end = matched_chunk["char_end"]
+            chunk_char_len = max(1, chunk_char_end - chunk_char_start)
+            
+            chunk_ratio = (offset - chunk_char_start) / chunk_char_len
+            chunk_ratio = max(0.0, min(1.0, chunk_ratio))
+            
+            chunk_start_time = matched_chunk["start"]
+            chunk_end_time = matched_chunk["end"]
+            chunk_dur = chunk_end_time - chunk_start_time
+            
+            estimated_seconds_in_chapter = chunk_start_time + (chunk_ratio * chunk_dur)
+            estimated_seconds = ch_start + estimated_seconds_in_chapter
+        else:
+            # Fallback to linear chapter interpolation
+            ratio = offset / total_len
+            estimated_seconds = ch_start + (ratio * ch_dur)
 
         row["timestamp"] = format_seconds(estimated_seconds)
 

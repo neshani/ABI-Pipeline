@@ -13,6 +13,7 @@ from sqlmodel import Session, select
 from database.connection import engine, get_setting
 from database.models import Project, Book, Chapter
 
+
 # Thread-safe global trackers for active/cancelled jobs
 active_projects = set()
 cancelled_projects = set()
@@ -40,16 +41,17 @@ def module_print(*args, **kwargs):
 print = module_print
 
 
-def chunk_audio_with_ffmpeg(audio_path: Path, output_dir: Path) -> List[Path]:
+def chunk_audio_with_ffmpeg(audio_path: Path, output_dir: Path) -> tuple[List[Path], List[tuple[float, float]]]:
     """
     Splits a 16kHz mono WAV file into ~60-second chunks using FFmpeg silence detection.
-    Extremely fast, low-overhead, and completely self-contained.
+    Extremely fast, low-overhead, and completely self-contained. Returns chunk paths and (start, end) timings.
     """
     SILENCE_THRESHOLD_DB = "-30dB"
     SILENCE_DURATION_S = "0.5"
     TARGET_CHUNK_S = 60
 
     chunk_paths = []
+    chunk_timings = []
     try:
         command = [
             'ffmpeg', '-i', str(audio_path),
@@ -80,18 +82,19 @@ def chunk_audio_with_ffmpeg(audio_path: Path, output_dir: Path) -> List[Path]:
             if end - start < 0.5:
                 continue
 
-            chunk_file = output_dir / f"chunk_{i+1}.wav"
+            chunk_file = output_dir / f"chunk_{len(chunk_paths) + 1}.wav"
             (
                 ffmpeg.input(str(audio_path), ss=start, to=end)
                 .output(str(chunk_file), acodec='pcm_s16le', ac=1, ar='16000', loglevel="panic")
                 .run(overwrite_output=True)
             )
             chunk_paths.append(chunk_file)
+            chunk_timings.append((start, end))
 
-        return chunk_paths
+        return chunk_paths, chunk_timings
     except Exception as e:
         print(f"ERROR: FFmpeg chunking failed for {audio_path.name}: {e}")
-        return []
+        return [], []
 
 
 def get_onnx_model():
@@ -106,6 +109,8 @@ def get_onnx_model():
     device_setting = get_setting("stt_device", "GPU/CUDA")
     
     sess_options = ort.SessionOptions()
+    sess_options.intra_op_num_threads = 8  # Use multiple CPU cores for audio feature extraction
+    sess_options.inter_op_num_threads = 8
     sess_options.enable_mem_pattern = False
     sess_options.enable_cpu_mem_arena = False
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -144,6 +149,8 @@ def get_onnx_model():
         gpu_options = {
             "device_id": "0",
             "arena_extend_strategy": "kNextPowerOfTwo",
+            "cudnn_conv_algo_search": "EXHAUSTIVE",   # <--- MASSIVE SPEEDUP
+            "cudnn_conv_use_max_workspace": "1",      # Allows RTX 3090 to use its massive VRAM for math
             "do_copy_in_default_stream": "1",
         }
         providers = [("CUDAExecutionProvider", gpu_options), "CPUExecutionProvider"]
@@ -428,6 +435,7 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
     """Preprocesses a chapter's audio track, slices it, and performs speech-to-text in parallel batches."""
     import traceback
     import time
+    import json
     
     preprocessed_wav = working_dir / f"temp_chapter_{chapter.chapter_num}_preprocessed.wav"
     try:
@@ -459,19 +467,39 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
             vad_parameters=dict(min_silence_duration_ms=500)
         )
         
-        text = " ".join([segment.text for segment in segments])
+        segments_list = list(segments)
+        timing_map = []
+        current_char_offset = 0
+        cleaned_texts = []
         
+        for segment in segments_list:
+            text_str = segment.text.strip()
+            cleaned_texts.append(text_str)
+            text_len = len(text_str)
+            
+            timing_map.append({
+                "start": segment.start,
+                "end": segment.end,
+                "char_start": current_char_offset,
+                "char_end": current_char_offset + text_len
+            })
+            current_char_offset += text_len + 1  # accounts for space separator in join()
+            
+        chapter_json = working_dir / f"chapter_{chapter.chapter_num}.json"
+        with open(chapter_json, "w", encoding="utf-8") as jf:
+            json.dump(timing_map, jf, indent=4)
+            
         total_time = time.time() - start_time
         print(f"[ABI-Pipeline] Chapter {chapter.chapter_num} complete! Total time: {total_time:.2f}s")
         
         if preprocessed_wav.exists():
             preprocessed_wav.unlink()
             
-        return text.strip()
+        return " ".join(cleaned_texts).strip()
 
     temp_chunk_dir = working_dir / f"chapter_{chapter.chapter_num}_chunks"
     print(f"[ABI-Pipeline] Chunking with ffmpeg silence detection...")
-    chunk_paths = chunk_audio_with_ffmpeg(preprocessed_wav, temp_chunk_dir)
+    chunk_paths, chunk_timings = chunk_audio_with_ffmpeg(preprocessed_wav, temp_chunk_dir)
 
     if not chunk_paths:
         if preprocessed_wav.exists(): preprocessed_wav.unlink()
@@ -518,6 +546,27 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
         print(f"  -> Batch {i+1}/{num_batches} processed {len(batch_chunks)} chunks in {batch_time:.2f}s ({chunks_per_sec:.2f} chunk/s)")
         gc.collect()
 
+    timing_map = []
+    current_char_offset = 0
+    cleaned_texts = []
+    for idx, text in enumerate(all_texts):
+        text_str = text.strip() if text else ""
+        cleaned_texts.append(text_str)
+        text_len = len(text_str)
+        
+        start_t, end_t = chunk_timings[idx]
+        timing_map.append({
+            "start": start_t,
+            "end": end_t,
+            "char_start": current_char_offset,
+            "char_end": current_char_offset + text_len
+        })
+        current_char_offset += text_len + 1  # accounts for space separator in join()
+
+    chapter_json = working_dir / f"chapter_{chapter.chapter_num}.json"
+    with open(chapter_json, "w", encoding="utf-8") as jf:
+        json.dump(timing_map, jf, indent=4)
+
     total_time = time.time() - start_time_total
     avg_speed = len(chunk_paths) / total_time if total_time > 0 else 0
     print(f"[ABI-Pipeline] Chapter {chapter.chapter_num} complete! Total time: {total_time:.2f}s ({avg_speed:.2f} chunk/s avg)\n")
@@ -527,11 +576,12 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
         try: shutil.rmtree(temp_chunk_dir)
         except Exception: pass
 
-    return " ".join([t for t in all_texts if t]).strip()
+    return " ".join(cleaned_texts).strip()
 
 
 def combine_chapters(working_dir: Path, book_output_dir: Path) -> None:
     """Appends all temporary chapter text files into the final transcript.txt inside the structured book directory."""
+    import json
     final_text_path = book_output_dir / "transcript.txt"
     chapter_files = sorted(
         list(working_dir.glob("chapter_*.txt")),
@@ -547,3 +597,21 @@ def combine_chapters(working_dir: Path, book_output_dir: Path) -> None:
             with open(ch_file, "r", encoding="utf-8") as f:
                 final_file.write(f.read())
             final_file.write("\n\n")
+
+    # Combine chapter timing metadata JSON files
+    timing_files = sorted(
+        list(working_dir.glob("chapter_*.json")),
+        key=lambda x: int(x.stem.split('_')[1])
+    )
+    master_timing = {"chapters": {}}
+    for t_file in timing_files:
+        try:
+            ch_num = t_file.stem.split('_')[1]
+            with open(t_file, "r", encoding="utf-8") as f:
+                master_timing["chapters"][ch_num] = json.load(f)
+        except Exception as e:
+            print(f"[Timing-Sync] Error merging chapter timing metadata: {e}")
+
+    if master_timing["chapters"]:
+        with open(book_output_dir / "transcript_timing.json", "w", encoding="utf-8") as f:
+            json.dump(master_timing, f, indent=4)
