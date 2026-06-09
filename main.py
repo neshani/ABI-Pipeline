@@ -479,6 +479,29 @@ async def async_run_project_image_gen_logic(project_id: int):
         out_dir = parent_dir / "images"
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        # Pre-index existing files on disk exactly once to prevent thousands of O(N^2) directory globs
+        existing_coords = set()
+        def index_existing_images(directory: Path):
+            if not directory.exists():
+                return
+            try:
+                for filename in os.listdir(directory):
+                    if filename.lower().endswith('.png'):
+                        stem, _ = os.path.splitext(filename)
+                        parts = stem.split('_')
+                        if len(parts) >= 2:
+                            try:
+                                ch = int(parts[0])
+                                sc = int(parts[1])
+                                existing_coords.add((ch, sc))
+                            except ValueError:
+                                pass
+            except Exception as e:
+                state.add_console_log(f"[Image-Gen] Error pre-indexing folder {directory.name}: {e}")
+
+        index_existing_images(parent_dir)
+        index_existing_images(out_dir)
+
         completed_prompts = 0
         
         for idx, row in enumerate(valid_rows):
@@ -499,12 +522,8 @@ async def async_run_project_image_gen_logic(project_id: int):
             except ValueError:
                 scene = idx + 1
 
-            # Check both folders to keep backward compatibility and maintain resumability
-            existing_files = list(out_dir.glob(f"{chapter:02d}_{scene:02d}_*.png")) or list(parent_dir.glob(f"{chapter:02d}_{scene:02d}_*.png"))
-            if not existing_files:
-                existing_files = list(out_dir.glob(f"{chapter:02d}_{scene:02d}.png")) or list(parent_dir.glob(f"{chapter:02d}_{scene:02d}.png"))
-
-            if existing_files:
+            # High performance coordinate set lookup
+            if (chapter, scene) in existing_coords:
                 state.add_console_log(f"[Image-Gen] Resume Skip: Ch {chapter}, Scene {scene} already rendered.")
                 completed_prompts += 1
                 global_completed_prompts += 1

@@ -86,7 +86,7 @@ def format_seconds(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def sync_book_timing(book_id: int, project_name: str, book_name: str, console_log_cb=None) -> bool:
+def sync_book_timing(book_id: int, project_name: str, book_name: str, console_log_cb=None, auto_approve: bool = False) -> bool:
     """
     Scans the book's chapters and original audio sources stored in the database,
     calculates exact timestamps for all extracted quotes, and writes them back to prompts.csv.
@@ -178,8 +178,10 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
         log("[Timing-Sync] No prompt entries in prompts.csv to process.")
         return True
 
-    if "timestamp" not in fieldnames:
-        fieldnames.append("timestamp")
+    # Define exact, structured column layout required by the desktop client
+    desired_order = ["chapter", "scene", "prompt", "quote", "approved", "timestamp"]
+    other_fields = [f for f in fieldnames if f not in desired_order]
+    final_fieldnames = desired_order + other_fields
 
     # Load transcript_timing.json sub-chapter chunk alignment if available
     import json
@@ -195,14 +197,28 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
 
     # Match rows to quotes
     for row in rows:
-        quote = row.get("quote", "").strip()
+        # Defensive check to initialize any missing keys
+        for key in desired_order:
+            if key not in row:
+                row[key] = ""
+
+        # Determine approval status based on context
+        existing_approval = (row.get("approved") or "").strip().lower()
+        if auto_approve:
+            row["approved"] = "true"
+        else:
+            # Maintain whatever was already there. Default to "false" if missing/empty.
+            row["approved"] = existing_approval if existing_approval in ["true", "false"] else "false"
+
+        raw_quote = row.get("quote")
+        quote = raw_quote.strip() if raw_quote else ""
         if not quote or quote.upper() == "NONE" or quote.upper() == "REFUSAL":
             row["timestamp"] = "00:00:00"
             continue
 
         try:
-            chapter_num = int(float(row.get("chapter", 1)))
-        except ValueError:
+            chapter_num = int(float(row.get("chapter", 1) or 1))
+        except (ValueError, TypeError):
             chapter_num = 1
 
         # Retrieve mapped text for this chapter
@@ -258,7 +274,7 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
 
     # Save timing results back to prompts.csv
     with open(prompts_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="|")
+        writer = csv.DictWriter(f, fieldnames=final_fieldnames, delimiter="|")
         writer.writeheader()
         writer.writerows(rows)
 
