@@ -34,6 +34,7 @@ import_project_name: str = ""
 project_status: str = "Imported"
 project_progress: float = 0.0
 project_progress_label: str = "Batch Progress (0%)"
+was_manually_cancelled: bool = False  # Track user-triggered process stops
 books_progress: Dict[int, float] = {}  # {book_id: float}
 books_status: Dict[int, str] = {}      # {book_id: status}
 books_subtitle: Dict[int, str] = {}    # {book_id: "status â€¢ percentage%"}
@@ -109,4 +110,3 @@ stats_refresh_callback: Optional[Any] = None
 batch_start_time: Optional[float] = None
 batch_elapsed_sec: float = 0.0
 batch_eta_label: str = "ETA: Estimating..."
-

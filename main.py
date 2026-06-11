@@ -66,9 +66,27 @@ def reset_stuck_transcriptions():
 
 
 # --- Initialize SQLite Database Schema ---
-# Running this globally right after imports ensures that the setting tables exist 
-# before DEFAULT_SETTINGS and any global database reads are evaluated.
 init_db()
+
+# --- Mount Static Directory & Auto-Create on Startup ---
+static_dir = Path("./static")
+static_dir.mkdir(exist_ok=True)
+app.add_static_files('/static', 'static')
+
+# --- Inject Client-Side Focus Reset Actions ---
+ui.add_head_html('''
+<script>
+window.addEventListener('focus', () => {
+    const fav = document.querySelector("link[rel~='icon']");
+    if (fav && fav.href.includes('favicon_alert.png')) {
+        fav.href = '/static/favicon.png';
+    }
+    if (document.title.startsWith('(✓)') || document.title.includes('Process Finished')) {
+        document.title = "ABI-Pipeline";
+    }
+});
+</script>
+''')
 
 
 # --- Initialize SQLite Database & Recovery Engines (One-time Startup Event) ---
@@ -115,7 +133,9 @@ DEFAULT_SETTINGS = {
     "stt_engine": "Parakeet ONNX",
     "stt_device": "GPU/CUDA",
     "batch_size": 30,
-    "output_dir": "./output"
+    "output_dir": "./output",
+    "enable_desktop_notifications": False,
+    "notification_threshold": 30
 }
 
 app_settings = {}
@@ -223,6 +243,9 @@ def start_transcribing(project_id: int):
         )
         return
 
+    # Clear cancellation tracking status
+    state.was_manually_cancelled = False
+
     start_project_transcription(project_id)
     ui.notify("Background audiobook transcription started!", type="positive")
     
@@ -259,6 +282,9 @@ def interrupt_comfy_execution():
 
 def stop_transcribing(project_id: int):
     """Interrupts active pipeline subprocesses and state tasks gracefully."""
+    # Set the cancellation tracking status
+    state.was_manually_cancelled = True
+
     if state.project_status == "Transcribing":
         cancel_project_transcription(project_id)
         ui.notify("Stopping transcription process...", type="warning")
@@ -282,7 +308,11 @@ def stop_transcribing(project_id: int):
 def start_prompt_generation(project_id: int):
     """Launches the asynchronous, interruptible, and resumable prompt generation process."""
     from services.prompt_engine import start_project_prompt_gen
+    import time
     
+    # Clear cancellation tracking status
+    state.was_manually_cancelled = False
+
     # Reset all books to start prompt generation at 0% progress
     with Session(engine) as session:
         project = session.get(Project, project_id)
@@ -714,6 +744,10 @@ def start_image_generation(project_id: int):
 
     state.image_gen_active = True
     state.cancel_image_gen_flag = False
+    
+    # Clear cancellation tracking status
+    state.was_manually_cancelled = False
+
     state.project_status = "Rendering Images"
     
     with Session(engine) as session:
@@ -775,7 +809,14 @@ async def check_for_active_transcriptions():
             return
             
         status_changed = (res["project_status"] != state.project_status)
-        state.project_status = res["project_status"]
+        
+        # State transition tracking for task completions
+        if not hasattr(state, 'last_known_status'):
+            state.last_known_status = None
+            
+        old_status = state.last_known_status
+        new_status = res["project_status"]
+        state.project_status = new_status
         
         if status_changed and hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
             try:
@@ -850,6 +891,69 @@ async def check_for_active_transcriptions():
                 state.recent_prompts_refresh()
             except Exception:
                 pass
+
+        # --- Dynamic Browser Tab Progress and Notification Orchestrator ---
+        active_statuses = {"Transcribing", "Generating Prompts", "Rendering Images"}
+        was_cancelled = getattr(state, "was_manually_cancelled", False)
+        
+        # 1. Update Title During Active Process Runs
+        if new_status in active_statuses:
+            progress_pct = int(state.project_progress * 100)
+            status_text = {
+                "Transcribing": "Transcribing",
+                "Generating Prompts": "Prompting",
+                "Rendering Images": "Rendering"
+            }.get(new_status, new_status)
+            
+            ui.run_javascript(f'document.title = "[{progress_pct}%] {status_text}... | ABI-Pipeline";')
+            
+        # 2. State Transition Completion Event Detector (Process Just Ended)
+        elif old_status in active_statuses and new_status not in active_statuses:
+            if was_cancelled:
+                # Reset cancellation state and silently reset UI elements without notification triggers
+                state.was_manually_cancelled = False
+                ui.run_javascript('''
+                    document.title = "ABI-Pipeline";
+                    const fav = document.querySelector("link[rel~='icon']");
+                    if (fav) fav.href = "/static/favicon.png";
+                ''')
+            else:
+                ui.run_javascript('''
+                    document.title = "(✓) Process Finished | ABI-Pipeline";
+                    const fav = document.querySelector("link[rel~='icon']");
+                    if (fav) fav.href = "/static/favicon_alert.png";
+                ''')
+                
+                enable_notif = get_setting("enable_desktop_notifications") in ("True", True)
+                notif_threshold = int(get_setting("notification_threshold", 30))
+                
+                # Sum up total items across books to verify alert threshold rules
+                total_items = 0
+                for b_data in res["books"]:
+                    stats = b_data["stats"]
+                    total_items += stats.get("total_prompts", 0) or stats.get("estimated_scenes", 0) or 0
+                    
+                if enable_notif and total_items >= notif_threshold:
+                    ui.run_javascript(f'''
+                        if ("Notification" in window && Notification.permission === "granted") {{
+                            new Notification("ABI-Pipeline", {{
+                                body: "The background process has finished successfully ({total_items} items processed).",
+                                icon: "/static/favicon_alert.png"
+                            }});
+                        }}
+                    ''')
+                
+        # 3. Fallback Title Check (Enforce clean Title if not actively processing/alerting)
+        elif new_status not in active_statuses:
+            ui.run_javascript('''
+                const fav = document.querySelector("link[rel~='icon']");
+                if (fav && !fav.href.includes('favicon_alert.png') && document.title !== "ABI-Pipeline") {
+                    document.title = "ABI-Pipeline";
+                }
+            ''')
+
+        # Update transition tracking anchor
+        state.last_known_status = new_status
 
 # Register the statistics refresh callback on the safe state module
 state.stats_refresh_callback = check_for_active_transcriptions
@@ -1249,4 +1353,4 @@ ui.timer(2.0, check_for_active_transcriptions)
 
 # Launch our app
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(title="ABI-Pipeline")
+    ui.run(title="ABI-Pipeline", favicon="static/favicon.png")

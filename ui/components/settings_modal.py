@@ -216,7 +216,36 @@ class SettingsModal:
                             on_click=self.refresh_llm_models
                         ).props('flat dense').classes('h-10 text-blue-600').tooltip('Scan Connection for Models')
 
-            # 2. STT Selection & Installation Status (Collapsed at the bottom)
+            # 2. UI & Notifications Accordion
+            with ui.expansion('Notifications & Alerts', icon='notifications').classes('w-full border rounded-lg bg-slate-50/50'):
+                with ui.column().classes('w-full p-4 gap-3 bg-white'):
+                    
+                    def on_notification_toggle(e):
+                        if e.value:
+                            ui.run_javascript('''
+                                if (!("Notification" in window)) {
+                                    alert("This browser does not support desktop notifications.");
+                                } else if (Notification.permission !== "granted") {
+                                    Notification.requestPermission().then(permission => {
+                                        if (permission !== "granted") {
+                                            alert("Notification permission was denied. Enable permission in browser settings to receive alerts.");
+                                        }
+                                    });
+                                }
+                            ''')
+                            
+                    ui.checkbox(
+                        'Enable Desktop Notifications',
+                        value=self.settings.get('enable_desktop_notifications', False)
+                    ).bind_value(self.settings, 'enable_desktop_notifications').on_value_change(on_notification_toggle)
+                    
+                    ui.number(
+                        'Alert Item Count Threshold',
+                        value=int(self.settings.get('notification_threshold', 30)),
+                        placeholder='e.g., 30'
+                    ).bind_value(self.settings, 'notification_threshold').classes('w-full').tooltip('Only notifies if the batch contains at least this many processed items')
+
+            # 3. STT Selection & Installation Status (Collapsed at the bottom)
             with ui.expansion('Transcription Setup (One-Time)', icon='construction').classes('w-full border rounded-lg bg-slate-50/50'):
                 with ui.column().classes('w-full p-4 gap-4 bg-white'):
                     
