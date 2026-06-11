@@ -286,12 +286,40 @@ def transcribe_project_worker(project_id: int) -> None:
     active_projects.discard(project_id)
 
 
-def transcribe_book(book_id: int, model, project_id: int) -> None:
+def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bool = False) -> None:
     """Processes all chapters of an individual audiobook sequential track-by-track."""
     import json
+    import shutil
+    
+    working_dir = Path("./workspace_temp") / f"book_{book_id}"
+    
+    if force_retranscribe:
+        print(f"[ABI-Pipeline] Force flag active. Clearing transcription cache directory: {working_dir}")
+        if working_dir.exists():
+            try:
+                shutil.rmtree(working_dir)
+            except Exception as e:
+                print(f"[ABI-Pipeline] Warning: Could not remove directory {working_dir}: {e}")
+        
+        # Reset all chapter statuses to Pending in database
+        with Session(engine) as session:
+            chapters_to_reset = session.exec(
+                select(Chapter).where(Chapter.book_id == book_id)
+            ).all()
+            for ch in chapters_to_reset:
+                ch.status = "Pending"
+                session.add(ch)
+            session.commit()
+            print(f"[ABI-Pipeline] Reset {len(chapters_to_reset)} chapter statuses to 'Pending'.")
+
     with Session(engine) as session:
         book = session.get(Book, book_id)
-        if not book or book.status == "Transcribed":
+        if not book:
+            print(f"[ABI-Pipeline] Error: Book ID {book_id} not found.")
+            return
+            
+        if book.status == "Transcribed" and not force_retranscribe:
+            print(f"[ABI-Pipeline] Skipping book '{book.name}' as status is already 'Transcribed'.")
             return
 
         book_name = book.name
@@ -310,11 +338,12 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
         ).all()
         total_chapters = len(chapters)
 
+    print(f"[ABI-Pipeline] Starting transcription for '{book_name}' with {total_chapters} chapter(s)...")
+
     base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
     book_output_dir = base_output_dir / project_name / book_name
     book_output_dir.mkdir(parents=True, exist_ok=True)
 
-    working_dir = Path("./workspace_temp") / f"book_{book_id}"
     working_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -332,12 +361,19 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
 
     for chapter in chapters:
         if project_id in cancelled_projects:
+            print("[ABI-Pipeline] Transcription cancelled by user.")
             break
 
-        if chapter.status == "Completed":
-            chapter_txt = working_dir / f"chapter_{chapter.chapter_num}.txt"
+        chapter_txt = working_dir / f"chapter_{chapter.chapter_num}.txt"
+        
+        if chapter.status == "Completed" and not force_retranscribe:
             if chapter_txt.exists():
+                print(f"[ABI-Pipeline] Chapter {chapter.chapter_num} ('{chapter.title}') already complete. Skipping transcription.")
                 continue
+            else:
+                print(f"[ABI-Pipeline] Chapter {chapter.chapter_num} status is 'Completed' but text file is missing. Will re-transcribe.")
+
+        print(f"[ABI-Pipeline] Processing Chapter {chapter.chapter_num}: '{chapter.title}' (Status: {chapter.status})")
 
         with Session(engine) as session:
             db_chapter = session.get(Chapter, chapter.id)
@@ -349,7 +385,6 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
         transcript_text = transcribe_chapter(chapter, model, working_dir)
 
         if transcript_text:
-            chapter_txt = working_dir / f"chapter_{chapter.chapter_num}.txt"
             with open(chapter_txt, "w", encoding="utf-8") as f:
                 f.write(transcript_text)
 
@@ -360,6 +395,7 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
                     session.add(db_chapter)
                     session.commit()
         else:
+            print(f"[ABI-Pipeline] Error: Transcription returned empty text for Chapter {chapter.chapter_num}")
             with Session(engine) as session:
                 db_chapter = session.get(Chapter, chapter.id)
                 if db_chapter:
@@ -385,6 +421,7 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
         gc.collect()
 
     if project_id not in cancelled_projects:
+        print(f"[ABI-Pipeline] Combining chapter texts and merging timing metadata for '{book_name}'...")
         combine_chapters(working_dir, book_output_dir)
 
         try:
@@ -412,6 +449,7 @@ def transcribe_book(book_id: int, model, project_id: int) -> None:
                 shutil.rmtree(working_dir)
             except Exception:
                 pass
+        print(f"[ABI-Pipeline] Book '{book_name}' transcription finished successfully.")
     else:
         with Session(engine) as session:
             db_book = session.get(Book, book_id)

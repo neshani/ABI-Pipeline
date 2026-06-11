@@ -124,7 +124,7 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
         log(f"[Timing-Sync] Error: No chapters found in database for book: {book_name}")
         return False
 
-    log(f"[Timing-Sync] Synchronizing timing for book '{book_name}' using {len(chapters_db)} chapters...")
+    log(f"[Timing-Sync] Synchronizing timing for book '{book_name}' using {len(chapters_db)} database chapters...")
 
     # Load chapter splits from master transcript
     with open(transcript_path, "r", encoding="utf-8") as f:
@@ -195,6 +195,11 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
         except Exception as e:
             log(f"[Timing-Sync] Warning: Failed to load transcript_timing.json: {e}")
 
+    # Determine if we are matching a single-file book structure against a multi-chapter transcript
+    is_single_db_chapter = (len(chapters_db) == 1)
+    if is_single_db_chapter:
+        log("[Timing-Sync] Continuous single-audio-file mapping enabled.")
+
     # Match rows to quotes
     for row in rows:
         # Defensive check to initialize any missing keys
@@ -207,7 +212,6 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
         if auto_approve:
             row["approved"] = "true"
         else:
-            # Maintain whatever was already there. Default to "false" if missing/empty.
             row["approved"] = existing_approval if existing_approval in ["true", "false"] else "false"
 
         raw_quote = row.get("quote")
@@ -221,15 +225,23 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
         except (ValueError, TypeError):
             chapter_num = 1
 
-        # Retrieve mapped text for this chapter
-        chapter_idx = max(0, chapter_num - 1)
-        if chapter_idx < len(transcript_splits):
-            target_text = transcript_splits[chapter_idx]
+        # Retrieve text & base timing config
+        if is_single_db_chapter:
+            target_text = full_transcript
+            single_ch_num = chapters_db[0].chapter_num
+            ch_start, ch_dur = timing_map.get(single_ch_num, (0.0, 0.0))
         else:
-            target_text = transcript_splits[-1] if transcript_splits else ""
-
-        # Retrieve timing config for this chapter
-        ch_start, ch_dur = timing_map.get(chapter_num, (0.0, 0.0))
+            chapter_idx = max(0, chapter_num - 1)
+            if chapter_idx < len(transcript_splits):
+                target_text = transcript_splits[chapter_idx]
+            else:
+                target_text = transcript_splits[-1] if transcript_splits else ""
+            
+            if chapter_num in timing_map:
+                ch_start, ch_dur = timing_map[chapter_num]
+            else:
+                ch_start, ch_dur = (0.0, 0.0)
+                log(f"[Timing-Sync] Warning: Chapter {chapter_num} from CSV not found in database chapters map.")
 
         offset = find_quote_offset(target_text, quote)
         total_len = len(target_text) if target_text else 1
@@ -237,7 +249,13 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
             total_len = 1
 
         # Locate exact sub-chapter chunk mapping
-        ch_timing = timing_data.get(str(chapter_num))
+        ch_timing = None
+        if is_single_db_chapter:
+            single_ch_num = chapters_db[0].chapter_num
+            ch_timing = timing_data.get(str(single_ch_num))
+        else:
+            ch_timing = timing_data.get(str(chapter_num))
+
         matched_chunk = None
         if ch_timing:
             for chunk in ch_timing:

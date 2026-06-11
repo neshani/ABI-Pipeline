@@ -243,8 +243,9 @@ def render_lora_chooser_content():
 
                     
 
-def create_contact_sheet(base64_list: list) -> Optional[bytes]:
-    """Stitches completed base64 image strings into a single PNG grid stamped with 1A, 1B coordinate labels."""
+def create_contact_sheet(base64_list: list, overlay_text: str = "") -> Optional[bytes]:
+    """Stitches completed base64 image strings into a single PNG grid stamped with sequential digits (1, 2, 3...)
+    and an optional custom bottom-center evaluation text banner."""
     images = []
     for img_str in base64_list:
         if not img_str:
@@ -277,12 +278,11 @@ def create_contact_sheet(base64_list: list) -> Optional[bytes]:
 
         grid_img.paste(img, (c * tile_w, r * tile_h))
 
-        row_num = r + 1
-        col_letter = chr(65 + c)
-        label_text = f"{row_num}{col_letter}"
+        # Render simple sequential numbers (1, 2, 3...) instead of row/col coordinates
+        label_text = str(idx + 1)
 
         draw = ImageDraw.Draw(grid_img)
-        box_w = int(tile_w * 0.1) if tile_w > 400 else 50
+        box_w = int(tile_w * 0.08) if tile_w > 400 else 40
         box_h = int(tile_h * 0.08) if tile_h > 400 else 40
         bx0 = c * tile_w
         by0 = r * tile_h
@@ -300,7 +300,48 @@ def create_contact_sheet(base64_list: list) -> Optional[bytes]:
             except Exception:
                 font = ImageFont.load_default()
 
-        draw.text((bx0 + int(box_w * 0.22), by0 + int(box_h * 0.18)), label_text, fill=(255, 255, 255), font=font)
+        # Adjust text layout horizontally for sequential digits
+        draw.text((bx0 + int(box_w * 0.35), by0 + int(box_h * 0.18)), label_text, fill=(255, 255, 255), font=font)
+
+    # Apply global custom evaluation text overlay bottom-center
+    clean_overlay = overlay_text.strip()
+    if clean_overlay:
+        draw = ImageDraw.Draw(grid_img)
+        overlay_font_size = max(16, int(grid_img.height * 0.035))
+        
+        overlay_font = None
+        try:
+            overlay_font = ImageFont.truetype("arial.ttf", size=overlay_font_size)
+        except Exception:
+            try:
+                overlay_font = ImageFont.truetype("DejaVuSans.ttf", size=overlay_font_size)
+            except Exception:
+                overlay_font = ImageFont.load_default()
+
+        # Measure text boundaries safely
+        try:
+            left, top, right, bottom = draw.textbbox((0, 0), clean_overlay, font=overlay_font)
+            text_w = right - left
+            text_h = bottom - top
+        except AttributeError:
+            # Fallback for older PIL installations
+            text_w = len(clean_overlay) * (overlay_font_size * 0.6)
+            text_h = overlay_font_size
+
+        padding_x = 24
+        padding_y = 12
+        rect_w = text_w + padding_x * 2
+        rect_h = text_h + padding_y * 2
+
+        # Center horizontally, stick to the lower edge
+        rx0 = (grid_img.width - rect_w) // 2
+        ry0 = grid_img.height - rect_h - 24
+        rx1 = rx0 + rect_w
+        ry1 = ry0 + rect_h
+
+        # Dark background banner and white text overlay
+        draw.rectangle([rx0, ry0, rx1, ry1], fill=(15, 15, 15))
+        draw.text((rx0 + padding_x, ry0 + padding_y), clean_overlay, fill=(255, 255, 255), font=overlay_font)
 
     out_buf = io.BytesIO()
     grid_img.save(out_buf, format="PNG")
@@ -454,7 +495,7 @@ def download_contact_sheet():
     if not completed_images:
         ui.notify("Generate test images first.", type="warning")
         return
-    sheet_bytes = create_contact_sheet(completed_images)
+    sheet_bytes = create_contact_sheet(completed_images, state.style_contact_sheet_overlay)
     if sheet_bytes:
         ui.download(sheet_bytes, filename=f"style_grid_{state.style_selected_preset}.png")
     else:
@@ -470,7 +511,7 @@ def open_contact_sheet_modal():
         ui.notify("No completed images in current visual feed. Run style test first!", type="warning")
         return
 
-    sheet_bytes = create_contact_sheet(completed_images)
+    sheet_bytes = create_contact_sheet(completed_images, state.style_contact_sheet_overlay)
     if not sheet_bytes:
         ui.notify("Failed to stitch contact sheet images.", type="negative")
         return
@@ -1282,30 +1323,41 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                          .tooltip('Submits all active prompts to ComfyUI for rendering')
 
                 # --- AI Integration Toolkit Panel ---
-                with ui.row().classes('w-full items-center justify-between bg-blue-50/50 p-3 rounded-lg border border-blue-100/50 mt-1'):
-                    with ui.row().classes('items-center gap-2'):
+                with ui.column().classes('w-full bg-blue-50/50 p-3 rounded-lg border border-blue-100/50 mt-1 gap-2.5'):
+                    # Row 1: Header Line on its own row
+                    with ui.row().classes('items-center gap-1.5 w-full'):
                         ui.icon('smart_toy', color='blue', size='sm')
-                        ui.label('AI Integration Toolkit').classes('text-xs font-black text-slate-700 uppercase tracking-wide')
+                        ui.label('AI Toolkit').classes('text-xs font-black text-slate-700 uppercase tracking-wide')
                     
-                    with ui.row().classes('gap-2'):
-                        ui.button(
-                            'Copy Style Primer',
-                            icon='psychology',
-                            on_click=lambda: copy_style_primer_to_clipboard(project.name)
-                        ).classes('bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold h-9') \
-                         .tooltip('Formats diagnostic visual parameters and prompt runs specifically for debugging chats with external LLMs')
+                    # Row 2: Controls grouped and wrapping logically
+                    with ui.row().classes('w-full items-center justify-between gap-3 flex-wrap'):
+                        # Left grouping: Copy utility buttons
+                        with ui.row().classes('items-center gap-2'):
+                            ui.button(
+                                'Copy Primer',
+                                icon='psychology',
+                                on_click=lambda: copy_style_primer_to_clipboard(project.name)
+                            ).classes('bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold h-9') \
+                             .tooltip('Formats diagnostic visual parameters and prompt runs specifically for debugging chats with external LLMs')
 
-                        ui.button(
-                            'Copy Prompt Pack',
-                            icon='content_copy',
-                            on_click=lambda: copy_style_settings_to_clipboard(project.name)
-                        ).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold h-9')
+                            ui.button(
+                                'Copy Prompt Pack',
+                                icon='content_copy',
+                                on_click=lambda: copy_style_settings_to_clipboard(project.name)
+                            ).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold h-9')
                         
-                        ui.button(
-                            'Generate Contact Sheet',
-                            icon='grid_view',
-                            on_click=open_contact_sheet_modal
-                        ).classes('bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold h-9')
+                        # Right grouping: Contact Sheet config (guaranteed on a single line)
+                        with ui.row().classes('items-center gap-2 flex-nowrap'):
+                            ui.input(
+                                placeholder='Overlay text...'
+                            ).classes('w-44 text-xs bg-white').props('outlined dense').bind_value(state, 'style_contact_sheet_overlay') \
+                             .tooltip('Text written onto bottom-center of generated contact sheets')
+
+                            ui.button(
+                                'Contact Sheet',
+                                icon='grid_view',
+                                on_click=open_contact_sheet_modal
+                            ).classes('bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold h-9 flex-shrink-0')
             
             render_style_playground_cards(project.name)
 
@@ -1315,7 +1367,7 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
             with ui.row().classes('w-full justify-between items-center pb-2 border-b'):
                 with ui.column().classes('gap-0'):
                     ui.label('Generated AI Contact Sheet').classes('text-base font-bold text-slate-800')
-                    ui.label('Grid coordinate labels (1A, 1B...) are stamped on the image. Perfect for sending to LLMs.').classes('text-xs text-slate-500')
+                    ui.label('Grid coordinate labels (1, 2...) are stamped on the image. Perfect for sending to LLMs.').classes('text-xs text-slate-500')
                 ui.button(
                     'Download Contact Sheet',
                     icon='download',

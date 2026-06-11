@@ -73,7 +73,36 @@ def handle_delete_template(template_dropdown, prompt_editor_widget):
     prompt_editor_widget.set_value(loaded_default)
 
 def copy_diagnostic_primer_to_clipboard():
-    """Formats a diagnostic framework primer for external larger AIs and copies it to clipboard."""
+    """Formats a diagnostic framework primer with active run results for external larger AIs and copies it to clipboard."""
+    if not state.playground_results:
+        ui.notify("Please run a prompt test first to populate current run data.", type="warning")
+        return
+
+    # Dynamically compile the current run results
+    run_data_lines = []
+    run_data_lines.append("### Active Prompt Template:")
+    run_data_lines.append(f"```text\n{state.playground_template}\n```\n")
+    
+    run_data_lines.append("### Pipeline Run Parameters:")
+    run_data_lines.append(f"- **Volume:** {state.playground_book_selection}")
+    run_data_lines.append(f"- **Mode:** {state.playground_selection_mode}")
+    if state.playground_selection_mode == "Static Segment":
+        run_data_lines.append(f"- **Start Index:** {state.playground_start_index}")
+    else:
+        run_data_lines.append(f"- **Seed:** {state.playground_seed}")
+    run_data_lines.append(f"- **Chunk Count Tested:** {state.playground_chunk_count}\n")
+
+    run_data_lines.append("### Segment Evaluation Output:")
+    for idx, res in enumerate(state.playground_results):
+        status_label = "Refusal Skipped" if res.get("status") == "refusal" else "Extraction Match"
+        run_data_lines.append(f"#### Segment Chunk {idx + 1} ({status_label})")
+        run_data_lines.append(f"**Source Text Passage:**\n> \"{res['chunk']}\"\n")
+        run_data_lines.append(f"**Extracted Verbatim Quote:**\n> \"{res['quote']}\"\n")
+        run_data_lines.append(f"**Generated Visual Prompt:**\n> {res['prompt']}\n")
+        run_data_lines.append("-" * 30 + "\n")
+
+    formatted_run_data = "\n".join(run_data_lines)
+
     primer_text = (
         "I am using a local AI book illustration tool called ABI-Pipeline. It extracts verbatim "
         "quotes from audiobook text transcripts and generates style-free image prompts for ComfyUI.\n\n"
@@ -94,7 +123,7 @@ def copy_diagnostic_primer_to_clipboard():
         "memory, or context from previous chapters.\n\n"
         "--------------------------------------------------------------------------------\n\n"
         "### CURRENT RUN DATA:\n"
-        "[PASTE YOUR COPIED RUN RESULTS HERE]\n\n"
+        f"{formatted_run_data}\n"
         "--------------------------------------------------------------------------------\n\n"
         "### MY SPECIFIC ADJUSTMENT REQUEST:\n"
         "[Insert your request here, e.g. 'Since we are running Harry Potter, we can tell the LLM it is a Harry Potter scene "
@@ -102,7 +131,7 @@ def copy_diagnostic_primer_to_clipboard():
         "Please provide an updated system prompt reflecting this change!']"
     )
     _copy_via_javascript(primer_text)
-    ui.notify("Diagnostic AI Primer copied! Paste this first, then your results.", type="positive", icon="psychology")
+    ui.notify("Diagnostic AI Primer with run data copied!", type="positive", icon="psychology")
 
 
 def copy_results_to_clipboard():
@@ -323,7 +352,7 @@ def render_prompt_playground_tab(project, books):
                 label="Prompt Instructions (contains <text>)",
                 value=state.playground_template,
                 on_change=lambda e: setattr(state, 'playground_template', e.value)
-            ).classes('w-full h-64 font-mono text-xs leading-relaxed').props('outlined')
+            ).classes('w-full font-mono text-xs leading-relaxed').props('outlined input-style="height: 280px"')
 
             with ui.row().classes('w-full gap-3 justify-between items-end'):
                 ui.number(

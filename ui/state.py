@@ -86,6 +86,7 @@ style_lock_samples: bool = False
 style_playground_loading: bool = False
 style_discovered_params: Dict[str, Any] = {}  # Dynamic structures found by introspection
 style_workflow_overrides: Dict[str, Any] = {}  # {node_id: {field_name: value}}
+style_contact_sheet_overlay: str = ""  # Custom text banner drawn bottom-center of the sheet
 
 # Seeds and controls for Prompt Playground matching
 style_prompt_seed: int = 42
