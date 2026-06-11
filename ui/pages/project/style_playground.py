@@ -706,6 +706,11 @@ def handle_style_workflow_change(val: str, clear_overrides: bool = True):
     """Reads a ComfyUI JSON, introspects active sampler/latents, and rebuilds dynamic UI sliders."""
     if not val:
         return
+        
+    # Guard: If workflow is already active and analyzed, skip to avoid clearing/overwriting overrides
+    if state.style_selected_workflow == val and state.style_discovered_params:
+        return
+
     state.style_selected_workflow = val
     
     wf_path = Path("./workflows") / val

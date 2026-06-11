@@ -27,6 +27,7 @@ def save_project_settings_to_disk(project_id: int) -> None:
         "active_style_preset": state.style_selected_preset,
         "active_workflow": state.style_selected_workflow,
         "style_prompt_prefix": state.style_prompt_prefix,
+        "style_prompt_suffix": state.style_prompt_suffix,
         "style_negative_prompt": state.style_negative_prompt,
         "style_use_random_image_seed": state.style_use_random_image_seed,
         "style_image_seed": state.style_image_seed,
@@ -57,6 +58,7 @@ def load_project_settings_from_disk(project_id: int) -> None:
         state.style_selected_preset = "default"
         state.style_selected_workflow = ""
         state.style_prompt_prefix = "ArsMJStyle, 1890s Victorian illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. "
+        state.style_prompt_suffix = ""
         state.style_negative_prompt = "blurry, bad quality, text, watermark, photorealistic, photography"
         state.style_use_random_image_seed = True
         state.style_image_seed = 42
@@ -70,13 +72,40 @@ def load_project_settings_from_disk(project_id: int) -> None:
             data = json.load(f)
 
         state.playground_selected_template = data.get("active_template", "default")
-        state.style_selected_preset = data.get("active_style_preset", "default")
-        state.style_selected_workflow = data.get("active_workflow", "")
-        state.style_prompt_prefix = data.get("style_prompt_prefix", "")
-        state.style_negative_prompt = data.get("style_negative_prompt", "")
+        
+        # 1. Load the base Style Preset first to ensure all preset defaults are fully populated
+        preset_name = data.get("active_style_preset", "default")
+        state.style_selected_preset = preset_name
+        
+        if preset_name != "default":
+            from ui.pages.project.style_playground import load_style_preset_by_name
+            load_style_preset_by_name(preset_name)
+        else:
+            # Fallback default values if no preset is selected
+            state.style_selected_workflow = ""
+            state.style_prompt_prefix = "ArsMJStyle, 1890s Victorian illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. "
+            state.style_prompt_suffix = ""
+            state.style_negative_prompt = "blurry, bad quality, text, watermark, photorealistic, photography"
+            state.style_workflow_overrides = {}
+
+        # 2. Apply/Overlay any customized project-level settings on top of the preset (only if they exist and are non-empty in project_settings.json)
+        if data.get("active_workflow"):
+            state.style_selected_workflow = data.get("active_workflow")
+        if data.get("style_prompt_prefix"):
+            state.style_prompt_prefix = data.get("style_prompt_prefix")
+        if data.get("style_prompt_suffix"):
+            state.style_prompt_suffix = data.get("style_prompt_suffix")
+        if data.get("style_negative_prompt"):
+            state.style_negative_prompt = data.get("style_negative_prompt")
+            
         state.style_use_random_image_seed = data.get("style_use_random_image_seed", True)
         state.style_image_seed = data.get("style_image_seed", 42)
-        state.style_workflow_overrides = data.get("workflow_overrides", {})
+        
+        # Merge workflow overrides rather than fully overwriting them, preserving preset overrides if project has none
+        project_overrides = data.get("workflow_overrides", {})
+        if project_overrides:
+            state.style_workflow_overrides.update(project_overrides)
+            
         state.playground_chunk_size = data.get("playground_chunk_size", 350)
         
         # Re-analyze active workflow parameters to repopulate active sliders
