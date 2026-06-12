@@ -15,17 +15,16 @@ def get_status_badge(status: str):
         "Generating Prompts": "Prompt Gen",
         "Prompts Created": "Image Gen",
         "Rendering Images": "Image Gen",
-        "Images Created": "Finished",
-        "Proofreading": "Finished",
-        "Finished": "Finished"
+        "Images Created": "Image Gen",
+        "Proofreading": "Image Gen",
+        "Finished": "Image Gen"
     }
     display_status = display_mapping.get(status, status)
     
     styles = {
         "Transcription": "bg-slate-200 text-slate-700",
         "Prompt Gen": "bg-blue-100 text-blue-800 border-blue-200",
-        "Image Gen": "bg-purple-100 text-purple-800 border-purple-200",
-        "Finished": "bg-emerald-100 text-emerald-800 border-emerald-200"
+        "Image Gen": "bg-purple-100 text-purple-800 border-purple-200"
     }
     style = styles.get(display_status, "bg-slate-100 text-slate-800")
     return ui.badge(display_status).classes(f'px-2.5 py-0.5 text-[10px] rounded-full font-semibold {style}')

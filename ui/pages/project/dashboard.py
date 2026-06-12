@@ -11,7 +11,7 @@ from database.connection import get_setting, engine
 from ui.pages.project.style_playground import render_style_playground_tab, open_style_chooser_modal_globally
 from ui.pages.project.prompt_playground import render_prompt_playground_tab, list_stored_templates, load_template_by_name
 
-STAGES = ["Imported", "Transcription", "Prompt Gen", "Image Gen", "Finished"]
+STAGES = ["Imported", "Transcription", "Prompt Gen", "Image Gen"]
 
 def get_active_stage_idx(status: str) -> int:
     mapping = {
@@ -21,9 +21,9 @@ def get_active_stage_idx(status: str) -> int:
         "Generating Prompts": 2,
         "Prompts Created": 3,
         "Rendering Images": 3,
-        "Images Created": 4,
-        "Proofreading": 4,
-        "Finished": 4
+        "Images Created": 3,
+        "Proofreading": 3,
+        "Finished": 3
     }
     return mapping.get(status, 0)
 
@@ -605,10 +605,10 @@ def render_project_tabs(
                         render_transcription_step_view(project, books, start_transcribe_cb, stop_transcribe_cb)
                     elif status in ("Transcribed", "Generating Prompts"):
                         render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb)
-                    elif status in ("Prompts Created", "Rendering Images"):
-                        render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb)
                     else:
-                        render_completed_step_view(project, books)
+                        # Keeps dashboard at the ComfyUI Image Generation stage for "Prompts Created", 
+                        # "Rendering Images", "Images Created", "Proofreading", and "Finished" states
+                        render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb)
                         
                 render_dynamic_step_dashboard = render_dynamic_step_dashboard_local
                 render_dynamic_step_dashboard()

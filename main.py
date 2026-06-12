@@ -987,9 +987,9 @@ def render_split_panel_shell(project_id: int):
         "Generating Prompts": "Prompt Gen",
         "Prompts Created": "Image Gen",
         "Rendering Images": "Image Gen",
-        "Images Created": "Finished",
-        "Proofreading": "Finished",
-        "Finished": "Finished"
+        "Images Created": "Image Gen",
+        "Proofreading": "Image Gen",
+        "Finished": "Image Gen"
     }
 
     with ui.grid(columns='260px 1fr').classes('w-full gap-6 items-start'):
