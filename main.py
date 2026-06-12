@@ -130,6 +130,8 @@ DEFAULT_SETTINGS = {
     "llm_url": "http://127.0.0.1:11434",
     "llm_api_key": "",
     "llm_model": "unsloth/gemma-4-e4b-it",
+    "llm_launch_path": "",
+    "llm_launch_args": "",
     "stt_engine": "Parakeet ONNX",
     "stt_device": "GPU/CUDA",
     "batch_size": 30,
@@ -1221,6 +1223,97 @@ def launch_comfyui():
         ui.notify(f"Failed to launch ComfyUI process: {str(e)}", type="negative")
 
 
+def launch_llm_host():
+    """Launches the configured local LLM host in a non-blocking background subprocess."""
+    llm_path_str = get_setting("llm_launch_path", "")
+    if not llm_path_str:
+        ui.notify("LLM launch path is not configured in settings.", type="warning")
+        return
+        
+    llm_dir_or_file = Path(llm_path_str).resolve()
+    if not llm_dir_or_file.exists():
+        ui.notify(f"LLM executable/directory not found: {llm_dir_or_file}", type="negative")
+        return
+
+    import shlex
+    llm_args_str = get_setting("llm_launch_args", "") or ""
+    llm_args_list = shlex.split(llm_args_str)
+    
+    if llm_dir_or_file.is_dir():
+        ui.notify("LLM Launch Path points to a directory. Please specify the executable file path.", type="warning")
+        return
+        
+    working_dir = llm_dir_or_file.parent
+    
+    try:
+        if os.name == 'nt':  # Windows
+            subprocess.Popen([str(llm_dir_or_file)] + llm_args_list, cwd=str(working_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
+        else:  # Linux / macOS
+            subprocess.Popen([str(llm_dir_or_file)] + llm_args_list, cwd=str(working_dir))
+        ui.notify("Launching LLM Host process...", type="info")
+        state.add_console_log(f"[LLM-Launcher] Process launched: {llm_dir_or_file.name} {llm_args_str}")
+    except Exception as e:
+        ui.notify(f"Failed to launch LLM process: {str(e)}", type="negative")
+        state.add_console_log(f"[LLM-Launcher] Error launching LLM process: {str(e)}")
+
+
+def find_comfy_output_dir() -> Optional[Path]:
+    """Finds the ComfyUI output directory based on current settings."""
+    comfy_path_str = get_setting("comfy_path", "")
+    if not comfy_path_str:
+        return None
+        
+    base_dir = Path(comfy_path_str).resolve()
+    
+    # Check possible output locations
+    paths_to_check = [
+        base_dir / "output",
+        base_dir / "ComfyUI" / "output"
+    ]
+    
+    for path in paths_to_check:
+        if path.exists() and path.is_dir():
+            return path
+            
+    return None
+
+
+def clear_comfy_outputs():
+    """Cleans up ABI-specific files inside the ComfyUI output directory safely."""
+    output_dir = find_comfy_output_dir()
+    if not output_dir:
+        ui.notify("Could not resolve ComfyUI output folder. Verify ComfyUI Path in Settings.", type="negative")
+        return
+        
+    try:
+        count = 0
+        for f in output_dir.glob("abi_*.png"):
+            if f.is_file():
+                f.unlink()
+                count += 1
+                
+        if count > 0:
+            ui.notify(f"Successfully cleaned up {count} ABI-generated file(s) from ComfyUI output folder.", type="positive")
+            state.add_console_log(f"[Housekeeping] Deleted {count} 'abi_*' images from {output_dir}")
+        else:
+            ui.notify("No ABI-generated files found to clear.", type="info")
+    except Exception as e:
+        ui.notify(f"Error during cleanup: {str(e)}", type="negative")
+
+
+# --- Declarative confirmation dialog for clearing ComfyUI output files ---
+with ui.dialog() as clear_comfy_dialog, ui.card().classes('w-full max-w-md p-6 rounded-xl'):
+    ui.label('Clear ComfyUI Outputs').classes('text-xl font-bold text-slate-800 mb-2')
+    ui.label('This will delete all temporary or cache files starting with "abi_" in your ComfyUI output folder. Unrelated files will not be touched.').classes('text-sm text-slate-500 mb-4')
+    
+    with ui.row().classes('w-full justify-end gap-3'):
+        ui.button('Cancel', on_click=clear_comfy_dialog.close).props('flat color=slate')
+        ui.button(
+            'Confirm Clear', 
+            on_click=lambda: (clear_comfy_outputs(), clear_comfy_dialog.close())
+        ).classes('bg-rose-600 text-white font-semibold')
+
+
 def free_all_memory():
     """Unloads model weights and clears memory caches from ComfyUI and any active LLM providers using a shotgun strategy."""
     ui.notify("Dispatching VRAM/RAM clearance commands...", type="info")
@@ -1336,6 +1429,14 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
             on_click=launch_comfyui
         ).props('flat dense').classes('text-xs text-blue-400 hover:text-blue-300 font-bold px-2 py-1 bg-slate-700/50 rounded border border-slate-600/30')
         
+        # Launch LLM Button (Visible only if path is populated)
+        ui.button(
+            'Launch LLM',
+            icon='psychology',
+            on_click=launch_llm_host
+        ).props('flat dense').classes('text-xs text-emerald-400 hover:text-emerald-300 font-bold px-2 py-1 bg-slate-700/50 rounded border border-slate-600/30') \
+            .bind_visibility_from(app_settings, 'llm_launch_path', backward=lambda val: bool(val and val.strip()))
+        
         # Free VRAM Button (Universal Shortcut)
         ui.button(
             'Free VRAM', 
@@ -1347,8 +1448,7 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
             tools_btn.classes('text-white text-sm capitalize rounded-lg')
             with ui.menu() as menu:
                 ui.menu_item('LoRA Contact Sheets', on_click=lambda: open_tool('lora_contact_sheet'))
-                ui.menu_item('Style Library', on_click=lambda: ui.notify('Style Library coming soon'))
-                ui.menu_item('Prompt Templates', on_click=lambda: ui.notify('Templates coming soon'))
+                ui.menu_item('Clear Comfy Outputs (abi_*)', on_click=clear_comfy_dialog.open)
         ui.button(icon='settings', on_click=lambda: settings_modal.open()).props('flat round color=white')
 
 

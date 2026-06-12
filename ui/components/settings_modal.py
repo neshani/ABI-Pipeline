@@ -200,6 +200,10 @@ class SettingsModal:
                     ui.input('LLM API Endpoint URL', placeholder="e.g., http://localhost:11434").bind_value(self.settings, 'llm_url').classes('w-full')
                     ui.input('LLM API Key (Optional)', password=True, password_toggle_button=True).bind_value(self.settings, 'llm_api_key').classes('w-full')
                     
+                    # Local LLM Launcher Configuration
+                    ui.input('Local LLM Host Executable Path', placeholder="e.g., E:/llama-cpp/llama-server.exe").bind_value(self.settings, 'llm_launch_path').classes('w-full')
+                    ui.input('Local LLM Launch Arguments', placeholder="e.g., --models-preset models.ini --port 1357").bind_value(self.settings, 'llm_launch_args').classes('w-full')
+                    
                     # Row with Model Dropdown & Dynamic Refresh Option
                     with ui.row().classes('w-full items-end gap-2'):
                         saved_model = self.settings.get('llm_model', '')
@@ -261,8 +265,8 @@ class SettingsModal:
                         
                         # Subtext with the newly uncovered file sizes and speed benchmarks
                         with ui.column().classes('bg-slate-50 p-3 rounded-lg border border-slate-100 mt-1 gap-1.5 text-[11px] text-slate-600 leading-normal'):
-                            ui.label('• Parakeet ONNX: Ultra-fast parallel sequential batching. Transcribes a 20-hour audiobook in ~5 to 8 minutes on GPU. Footprint: ~300 MB packages + ~2.5 GB model weights.').classes('font-medium')
-                            ui.label('• Faster-Whisper: Highly detailed phrase-level timing maps, but processes audio sequentially. Transcribes a 20-hour audiobook in ~35 minutes on GPU. Footprint: ~3.5 GB PyTorch packages + ~484 MB model weights.').classes('font-medium')
+                            ui.label('â€¢ Parakeet ONNX: Ultra-fast parallel sequential batching. Transcribes a 20-hour audiobook in ~5 to 8 minutes on GPU. Footprint: ~300 MB packages + ~2.5 GB model weights.').classes('font-medium')
+                            ui.label('â€¢ Faster-Whisper: Highly detailed phrase-level timing maps, but processes audio sequentially. Transcribes a 20-hour audiobook in ~35 minutes on GPU. Footprint: ~3.5 GB PyTorch packages + ~484 MB model weights.').classes('font-medium')
 
                     ui.separator()
 
