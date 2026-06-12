@@ -1222,7 +1222,7 @@ def launch_comfyui():
 
 
 def free_all_memory():
-    """Unloads model weights and clears memory caches from both ComfyUI and LM Studio/Ollama."""
+    """Unloads model weights and clears memory caches from ComfyUI and any active LLM providers using a shotgun strategy."""
     ui.notify("Dispatching VRAM/RAM clearance commands...", type="info")
     
     # 1. Clear ComfyUI Cache and Unload Models
@@ -1244,7 +1244,7 @@ def free_all_memory():
     except Exception as e:
         state.add_console_log(f"[Memory-Engine] ComfyUI clearance skipped or host offline: {str(e)}")
 
-    # 2. Clear LM Studio / Ollama Model Weights
+    # 2. Shotgun dynamic LLM clearance against the resolved host endpoint
     llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
     model_name = get_setting("llm_model", "local-model")
     
@@ -1256,57 +1256,66 @@ def free_all_memory():
     except Exception:
         base_host_url = llm_url
 
-    if "11434" in llm_url:  # Ollama Server
+    state.add_console_log(f"[Memory-Engine] Dispatching shotgun VRAM clear requests to: {base_host_url}")
+
+    # --- SHOTGUN TARGET A: LM Studio Models & Instances ---
+    try:
+        models_resp = requests.get(f"{base_host_url}/api/v1/models", timeout=3.0)
+        if models_resp.status_code == 200:
+            models_data = models_resp.json()
+            models_list = models_data.get("models", []) or models_data.get("data", [])
+            for model in models_list:
+                m_id = model.get("id")
+                if m_id:
+                    requests.post(f"{base_host_url}/api/v1/models/unload", json={"instance_id": m_id}, timeout=3.0)
+                    state.add_console_log(f"[Memory-Engine] Sent LM Studio ID unload: {m_id}")
+                for instance in model.get("loaded_instances", []):
+                    inst_id = instance.get("id")
+                    if inst_id:
+                        requests.post(f"{base_host_url}/api/v1/models/unload", json={"instance_id": inst_id}, timeout=3.0)
+                        state.add_console_log(f"[Memory-Engine] Sent LM Studio instance unload: {inst_id}")
+    except Exception:
+        pass
+
+    # Generic manual LM Studio fallback using our configured setting name
+    try:
+        requests.post(f"{base_host_url}/api/v1/models/unload", json={"instance_id": model_name}, timeout=3.0)
+    except Exception:
+        pass
+
+    # --- SHOTGUN TARGET B: llama-server Router Mode ---
+    # Query both standard paths /models and /v1/models to capture different server configurations
+    for model_endpoint in [f"{base_host_url}/models", f"{base_host_url}/v1/models"]:
         try:
-            resp = requests.post(
-                f"{base_host_url}/api/generate", 
-                json={"model": model_name, "keep_alive": 0, "prompt": ""}, 
-                timeout=4.0
-            )
-            if resp.status_code == 200:
-                state.add_console_log(f"[Memory-Engine] Successfully requested Ollama to unload model '{model_name}'.")
-        except Exception as e:
-            state.add_console_log(f"[Memory-Engine] Ollama clearance skipped or host offline: {str(e)}")
-    else:  # LM Studio Server
-        try:
-            # Query models to fetch active model instance IDs
-            models_resp = requests.get(f"{base_host_url}/api/v1/models", timeout=4.0)
-            if models_resp.status_code == 200:
-                models_data = models_resp.json()
-                models_list = models_data.get("models", [])
-                if not models_list and "data" in models_data:
-                    models_list = models_data.get("data", [])
-                
-                unloaded_count = 0
-                for model in models_list:
-                    # In LM Studio v1 REST API, loaded instances reside inside 'loaded_instances' list of each model
-                    loaded_instances = model.get("loaded_instances", [])
-                    for instance in loaded_instances:
-                        instance_id = instance.get("id")
-                        if instance_id:
-                            unload_resp = requests.post(
-                                f"{base_host_url}/api/v1/models/unload",
-                                json={"instance_id": instance_id},
-                                timeout=4.0
-                            )
-                            if unload_resp.status_code == 200:
-                                state.add_console_log(f"[Memory-Engine] Successfully unloaded LM Studio model instance: {instance_id}")
-                                unloaded_count += 1
-                            else:
-                                state.add_console_log(f"[Memory-Engine] Unload command failed for instance {instance_id} with status: {unload_resp.status_code}")
-                                
-                if unloaded_count == 0:
-                    state.add_console_log("[Memory-Engine] No active model instances discovered in LM Studio's loaded cache.")
-            else:
-                # Direct fallback unload trigger using configured setting name as a generic ID
-                requests.post(
-                    f"{base_host_url}/api/v1/models/unload", 
-                    json={"instance_id": model_name}, 
-                    timeout=4.0
-                )
-                state.add_console_log(f"[Memory-Engine] Dispatched generic LM Studio unload request for model: {model_name}")
-        except Exception as e:
-            state.add_console_log(f"[Memory-Engine] LM Studio clearance skipped or host offline: {str(e)}")
+            llama_resp = requests.get(model_endpoint, timeout=3.0)
+            if llama_resp.status_code == 200:
+                llama_data = llama_resp.json()
+                models_list = llama_data if isinstance(llama_data, list) else llama_data.get("data", [])
+                if isinstance(models_list, list):
+                    for m in models_list:
+                        m_name = m.get("name") or m.get("id") or m.get("model")
+                        if m_name:
+                            requests.post(f"{base_host_url}/models/unload", json={"model": m_name}, timeout=3.0)
+                            state.add_console_log(f"[Memory-Engine] Sent llama-server model unload: {m_name}")
+        except Exception:
+            pass
+
+    # Generic manual llama-server fallback using our configured setting path
+    try:
+        requests.post(f"{base_host_url}/models/unload", json={"model": model_name}, timeout=3.0)
+    except Exception:
+        pass
+
+    # --- SHOTGUN TARGET C: Ollama ---
+    try:
+        requests.post(
+            f"{base_host_url}/api/generate", 
+            json={"model": model_name, "keep_alive": 0, "prompt": ""}, 
+            timeout=3.0
+        )
+        state.add_console_log(f"[Memory-Engine] Sent Ollama clearance for: {model_name}")
+    except Exception:
+        pass
 
     ui.notify("VRAM and RAM clearance commands successfully sent!", type="positive")
 
@@ -1353,4 +1362,4 @@ ui.timer(2.0, check_for_active_transcriptions)
 
 # Launch our app
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(title="ABI-Pipeline", favicon="static/favicon.png")
+    ui.run(title="ABI-Pipeline", favicon="static/favicon.png", port=8910)

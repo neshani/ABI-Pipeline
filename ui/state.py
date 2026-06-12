@@ -75,6 +75,7 @@ cancel_image_gen_flag: bool = False
 
 # --- Style Playground & Workflow Analyzer Bindings ---
 style_selected_preset: str = "default"
+style_preset_save_name: str = ""
 style_selected_workflow: str = ""
 style_prompt_prefix: str = "ArsMJStyle, 1890s Victorian illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. "
 style_prompt_suffix: str = ""

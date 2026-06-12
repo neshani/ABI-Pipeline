@@ -29,6 +29,9 @@ chooser_selected_lora_id = None
 # Track expansion state of auto-discovered parameter workflow nodes
 expansion_states: Dict[str, bool] = {}
 
+# Keep track of the active workflow that was last successfully analyzed
+_last_analyzed_workflow: Optional[str] = None
+
 
 def get_node_class_type(node_id: str) -> Optional[str]:
     """Resolves the raw class_type of a node inside the active ComfyUI workflow JSON."""
@@ -649,6 +652,9 @@ def load_style_preset_by_name(name: str):
     from ui.components.style_chooser_modal import ensure_default_style_exists
     ensure_default_style_exists()
     
+    # Pre-populate the save preset input box with the active style's name
+    state.style_preset_save_name = name
+    
     styles_dir = Path("./styles")
     file_path = styles_dir / f"{name}.json"
     if file_path.exists():
@@ -690,6 +696,7 @@ def save_style_preset_by_name(name: str):
     try:
         with open(styles_dir / f"{name_clean}.json", "w") as f:
             json.dump(data, f, indent=2)
+        state.style_selected_preset = name_clean
         ui.notify(f"Style preset '{name_clean}' saved successfully!", type="positive")
     except Exception as e:
         ui.notify(f"Failed to save preset: {str(e)}", type="negative")
@@ -704,11 +711,13 @@ def update_override_state(node_id: str, key: str, value: Any):
 
 def handle_style_workflow_change(val: str, clear_overrides: bool = True):
     """Reads a ComfyUI JSON, introspects active sampler/latents, and rebuilds dynamic UI sliders."""
+    global _last_analyzed_workflow
     if not val:
         return
         
-    # Guard: If workflow is already active and analyzed, skip to avoid clearing/overwriting overrides
-    if state.style_selected_workflow == val and state.style_discovered_params:
+    # Guard: If this workflow is already analyzed and matches the requested workflow,
+    # skip to avoid clearing overrides or performing redundant file reads/analysis.
+    if _last_analyzed_workflow == val and state.style_discovered_params:
         return
 
     state.style_selected_workflow = val
@@ -731,6 +740,9 @@ def handle_style_workflow_change(val: str, clear_overrides: bool = True):
             state.style_discovered_params = client.analyze_workflow(wf_json)
             if clear_overrides:
                 state.style_workflow_overrides.clear()
+            
+            # Commit the successfully analyzed workflow name
+            _last_analyzed_workflow = val
             ui.notify(f"Analyzed workflow '{val}'. Discovered {len(state.style_discovered_params)} overrides.", type="info")
             
             # Fire-and-forget back-end loading of drop-down options from ComfyUI API and CSV
@@ -739,6 +751,7 @@ def handle_style_workflow_change(val: str, clear_overrides: bool = True):
         except Exception as e:
             ui.notify(f"Failed to analyze workflow: {str(e)}", type="warning")
             state.style_discovered_params.clear()
+            _last_analyzed_workflow = None
             
     render_workflow_overrides_ui.refresh()
 
@@ -1208,7 +1221,33 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
         with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
             ui.label('Style Preset & Workflow Config').classes('text-sm font-bold text-slate-800')
             
-            # Workflow selection
+            # 1. Style Preset Library Loader (The Parent Concept)
+            with ui.row().classes('w-full items-center justify-between p-3 bg-slate-50 rounded border border-slate-200 mt-1'):
+                with ui.column().classes('gap-0 flex-1'):
+                    ui.label('Active Preset').classes('text-[10px] font-bold text-slate-400 uppercase')
+                    ui.label().classes('text-xs font-bold text-slate-800').bind_text_from(state, 'style_selected_preset')
+                ui.button(
+                    'Browse Library', 
+                    icon='photo_library', 
+                    on_click=lambda: open_style_chooser_modal_globally()
+                ).classes('bg-blue-600 text-white text-xs h-9 font-semibold')
+            
+            # 2. Preset Save Field (Grouped with Preset Management)
+            with ui.row().classes('w-full items-end gap-2'):
+                custom_style_name = ui.input(placeholder="Preset Name", label="Save Current Preset") \
+                    .classes('flex-1') \
+                    .bind_value(state, 'style_preset_save_name') \
+                    .tooltip("Saves current prompts and overrides as a global, reusable preset in your styles library")
+                ui.button(
+                    icon="save",
+                    on_click=lambda: (
+                        save_style_preset_by_name(custom_style_name.value)
+                    )
+                ).props('outline').classes('h-10 text-blue-600').tooltip("Save or overwrite this preset in the global styles library")
+
+            ui.separator()
+
+            # 3. Workflow Selector (Child Engine of the Selected Style)
             available_workflows = list_available_workflows()
             if not state.style_selected_workflow or state.style_selected_workflow not in available_workflows:
                 if available_workflows:
@@ -1221,33 +1260,6 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                 on_change=lambda e: handle_style_workflow_change(e.value)
             ).classes('w-full').bind_value(state, 'style_selected_workflow')
             
-            # Integrated Style Preset Library Modal button!
-            with ui.row().classes('w-full items-center justify-between p-3 bg-slate-50 rounded border border-slate-200 mt-1'):
-                with ui.column().classes('gap-0 flex-1'):
-                    ui.label('Active Preset').classes('text-[10px] font-bold text-slate-400 uppercase')
-                    ui.label().classes('text-xs font-bold text-slate-800').bind_text_from(state, 'style_selected_preset')
-                ui.button(
-                    'Browse Library', 
-                    icon='photo_library', 
-                    on_click=lambda: open_style_chooser_modal_globally()
-                ).classes('bg-blue-600 text-white text-xs h-9 font-semibold')
-            
-            # Quick save row
-            with ui.row().classes('w-full items-end gap-2'):
-                custom_style_name = ui.input(placeholder="Preset Name", label="Save Current Preset").classes('flex-1')
-                ui.button(
-                    icon="save",
-                    on_click=lambda: (
-                        save_style_preset_by_name(custom_style_name.value)
-                    )
-                ).props('outline').classes('h-10 text-blue-600')
-
-            ui.button(
-                'Save Project Settings',
-                icon='settings_backup_restore',
-                on_click=lambda: save_project_settings_cb(project.id) if save_project_settings_cb else None
-            ).classes('w-full bg-slate-100 text-slate-700 hover:bg-slate-200 text-xs font-semibold py-1.5 h-10 border')
-
             ui.separator()
             
             ui.textarea(
@@ -1268,9 +1280,17 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
         # RIGHT: Visual Style Playground Grid
         with ui.column().classes('w-full gap-4'):
             with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
-                with ui.row().classes('w-full items-center gap-2'):
-                    ui.icon('tune', size='sm', color='blue-500')
-                    ui.label('Style Visual Playground Settings').classes('text-sm font-bold text-slate-800')
+                with ui.row().classes('w-full items-center justify-between'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('tune', size='sm', color='blue-500')
+                        ui.label('Style Visual Playground Settings').classes('text-sm font-bold text-slate-800')
+                    
+                    # Relocated project settings save button with disk icon and tooltip helper
+                    ui.button(
+                        icon='save',
+                        on_click=lambda: save_project_settings_cb(project.id) if save_project_settings_cb else None
+                    ).props('flat round size=md').classes('text-blue-600') \
+                     .tooltip("Saves active preset selection and manual seed choices specifically for this project")
                     
                 with ui.column().classes('w-full gap-4 bg-slate-50 p-4 rounded-lg border'):
                     # Step 1: Volume Select & Number of scenes slider
