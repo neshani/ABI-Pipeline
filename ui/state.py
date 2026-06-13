@@ -48,6 +48,7 @@ active_log_widget: Optional[Any] = None
 logs_pushed_index: int = 0
 
 def add_console_log(message: str):
+    print(message, flush=True)  # Mirror directly to standard Python system console
     console_logs.append(message)
     if len(console_logs) > 500:
         console_logs.pop(0)
@@ -112,3 +113,6 @@ stats_refresh_callback: Optional[Any] = None
 batch_start_time: Optional[float] = None
 batch_elapsed_sec: float = 0.0
 batch_eta_label: str = "ETA: Estimating..."
+
+# --- Onboarding Wizard Bindings ---
+onboarding_wizard_active: bool = False

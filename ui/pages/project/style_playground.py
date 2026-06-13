@@ -84,6 +84,69 @@ def load_associated_loras():
         print(f"[Style-Playground] Error reading loras.csv: {str(e)}")
 
 
+def resolve_best_model_match(available_checkpoints: List[str], workflow_name: str) -> Optional[str]:
+    """Resolves the most appropriate available model filename based on the workflow context."""
+    if not available_checkpoints or not workflow_name:
+        return None
+        
+    workflow_lower = workflow_name.lower()
+    
+    # 1. Establish priority keywords based on target workflow
+    if "sdxl" in workflow_lower:
+        keywords = ["sdxl", "juggernaut", "lightning", "xl", "pony"]
+    elif "z_image" in workflow_lower or "zit" in workflow_lower:
+        keywords = ["z-image", "zit", "auraflow", "flux"]
+    elif "anima" in workflow_lower:
+        keywords = ["anima", "turbo"]
+    else:
+        keywords = []
+
+    # 2. Search for the first checkpoint containing these priority identifiers
+    for kw in keywords:
+        for ckpt in available_checkpoints:
+            if kw in ckpt.lower():
+                return ckpt
+                
+    # 3. Fallback: return first alphabetically sorted choice if no match is found
+    return available_checkpoints[0]
+
+
+def save_default_to_workflow(workflow_name: str, node_id: str, param_key: str, value: Any) -> bool:
+    """Writes an updated input value directly back to the active ComfyUI workflow JSON file."""
+    if not workflow_name or not value:
+        return False
+        
+    wf_path = Path("./workflows") / workflow_name
+    if not wf_path.exists():
+        wf_path = Path("./Comfy_Workflows") / workflow_name
+        
+    if wf_path.exists():
+        try:
+            with open(wf_path, "r", encoding="utf-8") as f:
+                wf_json = json.load(f)
+            
+            if node_id in wf_json:
+                if "inputs" not in wf_json[node_id]:
+                    wf_json[node_id]["inputs"] = {}
+                wf_json[node_id]["inputs"][param_key] = value
+                
+                with open(wf_path, "w", encoding="utf-8") as f:
+                    json.dump(wf_json, f, indent=2)
+                
+                # Clear active style overrides for this field since it is now the workflow default baseline
+                if node_id in state.style_workflow_overrides:
+                    state.style_workflow_overrides[node_id].pop(param_key, None)
+                    if not state.style_workflow_overrides[node_id]:
+                        state.style_workflow_overrides.pop(node_id, None)
+                        
+                ui.notify(f"Saved default '{value}' into '{workflow_name}'!", type="positive")
+                render_workflow_overrides_ui.refresh()
+                return True
+        except Exception as e:
+            ui.notify(f"Failed to update workflow file: {str(e)}", type="negative")
+    return False
+
+
 async def async_load_comfy_and_lora_choices():
     """Fetches model and sampler selection options from ComfyUI API object_info in a background task."""
     global comfy_options_cache
@@ -111,11 +174,16 @@ async def async_load_comfy_and_lora_choices():
             param_keys = ["lora_name"]
         elif node_type == "clip_loader":
             param_keys = [params.get("clip_param_key", "clip_name")]
+            if "clip_param_key2" in params:
+                param_keys.append(params["clip_param_key2"])
         elif node_type == "vae_loader":
             param_keys = ["vae_name"]
         elif node_type == "sampler":
-            # Automatically request lists of both samplers and schedulers from node class
             param_keys = ["sampler_name", "scheduler"]
+        elif node_type == "basic_scheduler":
+            param_keys = ["scheduler"]
+        elif node_type == "sampler_select":
+            param_keys = ["sampler_name"]
             
         for param_key in param_keys:
             try:
@@ -125,7 +193,17 @@ async def async_load_comfy_and_lora_choices():
                         res_json = resp.json()
                         choices = res_json.get(class_type, {}).get("input", {}).get("required", {}).get(param_key, [[]])[0]
                         if isinstance(choices, list) and choices:
-                            comfy_options_cache[f"{node_id}:{param_key}"] = sorted(choices)
+                            cache_key = f"{node_id}:{param_key}"
+                            comfy_options_cache[cache_key] = sorted(choices)
+                            
+                            # --- SMART MODEL AUTO-POPULATION ---
+                            if node_type == "model_loader" and param_key not in state.style_workflow_overrides.get(node_id, {}):
+                                current_val = params.get(param_key, "")
+                                if not current_val or current_val not in choices:
+                                    best_match = resolve_best_model_match(choices, state.style_selected_workflow)
+                                    if best_match:
+                                        update_override_state(node_id, param_key, best_match)
+                                        
             except Exception:
                 pass
                 
@@ -989,7 +1067,111 @@ def render_workflow_overrides_ui():
                                 value=current_scheduler,
                                 on_change=lambda e, nid=node_id: update_override_state(nid, "scheduler", e.value)
                             ).classes('w-full')
+
+                    elif node_type == "basic_scheduler":
+                        current_steps = state.style_workflow_overrides.get(node_id, {}).get("steps", params["steps"])
+                        current_scheduler = state.style_workflow_overrides.get(node_id, {}).get("scheduler", params.get("scheduler", "normal"))
+                        current_denoise = state.style_workflow_overrides.get(node_id, {}).get("denoise", params.get("denoise", 1.0))
                         
+                        with ui.row().classes('w-full items-end gap-2'):
+                            ui.number(
+                                label="Steps",
+                                value=current_steps,
+                                min=1, max=150, step=1,
+                                on_change=lambda e, nid=node_id: update_override_state(nid, "steps", int(e.value) if e.value is not None else None)
+                            ).classes('flex-1')
+                            
+                            ui.button(
+                                icon='save',
+                                on_click=lambda nid=node_id, val=current_steps: save_default_to_workflow(state.style_selected_workflow, nid, "steps", val)
+                            ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default steps to workflow file (.json)")
+
+                        comfy_scheduler_key = f"{node_id}:scheduler"
+                        if comfy_scheduler_key in comfy_options_cache:
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.select(
+                                    options=comfy_options_cache[comfy_scheduler_key],
+                                    value=current_scheduler if current_scheduler in comfy_options_cache[comfy_scheduler_key] else None,
+                                    label="Scheduler",
+                                    on_change=lambda e, nid=node_id: (update_override_state(nid, "scheduler", e.value), render_workflow_overrides_ui.refresh())
+                                ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, val=current_scheduler: save_default_to_workflow(state.style_selected_workflow, nid, "scheduler", val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default scheduler to workflow file (.json)")
+                        else:
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.input(
+                                    label="Scheduler",
+                                    value=current_scheduler,
+                                    on_change=lambda e, nid=node_id: update_override_state(nid, "scheduler", e.value)
+                                ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, val=current_scheduler: save_default_to_workflow(state.style_selected_workflow, nid, "scheduler", val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default scheduler to workflow file (.json)")
+                                
+                        with ui.row().classes('w-full items-end gap-2'):
+                            ui.number(
+                                label="Denoise Factor",
+                                value=current_denoise,
+                                min=0.0, max=1.0, step=0.05,
+                                on_change=lambda e, nid=node_id: update_override_state(nid, "denoise", e.value)
+                            ).classes('flex-1')
+                            
+                            ui.button(
+                                icon='save',
+                                on_click=lambda nid=node_id, val=current_denoise: save_default_to_workflow(state.style_selected_workflow, nid, "denoise", val)
+                            ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default denoise to workflow file (.json)")
+
+                    elif node_type == "sampler_select":
+                        current_sampler = state.style_workflow_overrides.get(node_id, {}).get("sampler_name", params.get("sampler_name", "euler"))
+                        
+                        comfy_sampler_key = f"{node_id}:sampler_name"
+                        if comfy_sampler_key in comfy_options_cache:
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.select(
+                                    options=comfy_options_cache[comfy_sampler_key],
+                                    value=current_sampler if current_sampler in comfy_options_cache[comfy_sampler_key] else None,
+                                    label="Sampler Name",
+                                    on_change=lambda e, nid=node_id: (update_override_state(nid, "sampler_name", e.value), render_workflow_overrides_ui.refresh())
+                                ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, val=current_sampler: save_default_to_workflow(state.style_selected_workflow, nid, "sampler_name", val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default sampler name to workflow file (.json)")
+                        else:
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.input(
+                                    label="Sampler Name",
+                                    value=current_sampler,
+                                    on_change=lambda e, nid=node_id: update_override_state(nid, "sampler_name", e.value)
+                                ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, val=current_sampler: save_default_to_workflow(state.style_selected_workflow, nid, "sampler_name", val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default sampler name to workflow file (.json)")
+
+                    elif node_type == "custom_sampler":
+                        current_cfg = state.style_workflow_overrides.get(node_id, {}).get("cfg", params["cfg"])
+                        
+                        with ui.row().classes('w-full items-end gap-2'):
+                            ui.number(
+                                label="CFG Scale",
+                                value=current_cfg,
+                                min=0.0, max=30.0, step=0.1,
+                                on_change=lambda e, nid=node_id: update_override_state(nid, "cfg", e.value)
+                            ).classes('flex-1')
+                            
+                            ui.button(
+                                icon='save',
+                                on_click=lambda nid=node_id, val=current_cfg: save_default_to_workflow(state.style_selected_workflow, nid, "cfg", val)
+                            ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default CFG to workflow file (.json)")
+
                     elif node_type == "resolution":
                         current_width = state.style_workflow_overrides.get(node_id, {}).get("width", params["width"])
                         current_height = state.style_workflow_overrides.get(node_id, {}).get("height", params["height"])
@@ -1023,6 +1205,11 @@ def render_workflow_overrides_ui():
                                 ).classes('flex-1')
                                 
                                 ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, val=current_lora_name: save_default_to_workflow(state.style_selected_workflow, nid, "lora_name", val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default LoRA name inside workflow file (.json)")
+                                
+                                ui.button(
                                     icon="palette",
                                     on_click=lambda nid=node_id: open_lora_chooser_modal(nid)
                                 ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Open Visual LoRA Chooser")
@@ -1033,6 +1220,11 @@ def render_workflow_overrides_ui():
                                     value=current_lora_name,
                                     on_change=lambda e, nid=node_id: update_override_state(nid, "lora_name", e.value)
                                 ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, val=current_lora_name: save_default_to_workflow(state.style_selected_workflow, nid, "lora_name", val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default LoRA name inside workflow file (.json)")
                                 
                                 ui.button(
                                     icon="palette",
@@ -1085,20 +1277,30 @@ def render_workflow_overrides_ui():
                         
                         comfy_key = f"{node_id}:{param_key}"
                         if comfy_key in comfy_options_cache:
-                            # Dropdown only if ComfyUI online and data loaded successfully
-                            ui.select(
-                                options=comfy_options_cache[comfy_key],
-                                value=current_model_name if current_model_name in comfy_options_cache[comfy_key] else None,
-                                label=f"Select Model ({param_key})",
-                                on_change=lambda e, nid=node_id, pk=param_key: (update_override_state(nid, pk, e.value), render_workflow_overrides_ui.refresh())
-                            ).classes('w-full')
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.select(
+                                    options=comfy_options_cache[comfy_key],
+                                    value=current_model_name if current_model_name in comfy_options_cache[comfy_key] else None,
+                                    label=f"Select Model ({param_key})",
+                                    on_change=lambda e, nid=node_id, pk=param_key: (update_override_state(nid, pk, e.value), render_workflow_overrides_ui.refresh())
+                                ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, pk=param_key, val=current_model_name: save_default_to_workflow(state.style_selected_workflow, nid, pk, val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default model name to workflow file (.json)")
                         else:
-                            # Self-healing text input fallback if ComfyUI is offline
-                            ui.input(
-                                label=f"Model Filename ({param_key})",
-                                value=current_model_name,
-                                on_change=lambda e, nid=node_id, pk=param_key: update_override_state(nid, pk, e.value)
-                            ).classes('w-full')
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.input(
+                                    label=f"Model Filename ({param_key})",
+                                    value=current_model_name,
+                                    on_change=lambda e, nid=node_id, pk=param_key: update_override_state(nid, pk, e.value)
+                                ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, pk=param_key, val=current_model_name: save_default_to_workflow(state.style_selected_workflow, nid, pk, val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default model name to workflow file (.json)")
 
                     elif node_type == "clip_loader":
                         param_key = params.get("clip_param_key", "clip_name")
@@ -1106,36 +1308,60 @@ def render_workflow_overrides_ui():
                         
                         comfy_key = f"{node_id}:{param_key}"
                         if comfy_key in comfy_options_cache:
-                            ui.select(
-                                options=comfy_options_cache[comfy_key],
-                                value=current_clip_name if current_clip_name in comfy_options_cache[comfy_key] else None,
-                                label=f"Select CLIP Model ({param_key})",
-                                on_change=lambda e, nid=node_id, pk=param_key: (update_override_state(nid, pk, e.value), render_workflow_overrides_ui.refresh())
-                            ).classes('w-full')
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.select(
+                                    options=comfy_options_cache[comfy_key],
+                                    value=current_clip_name if current_clip_name in comfy_options_cache[comfy_key] else None,
+                                    label=f"Select CLIP Model ({param_key})",
+                                    on_change=lambda e, nid=node_id, pk=param_key: (update_override_state(nid, pk, e.value), render_workflow_overrides_ui.refresh())
+                                ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, pk=param_key, val=current_clip_name: save_default_to_workflow(state.style_selected_workflow, nid, pk, val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default CLIP name to workflow file (.json)")
                         else:
-                            ui.input(
-                                label=f"CLIP Filename ({param_key})",
-                                value=current_clip_name,
-                                on_change=lambda e, nid=node_id, pk=param_key: update_override_state(nid, pk, e.value)
-                            ).classes('w-full')
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.input(
+                                    label=f"CLIP Filename ({param_key})",
+                                    value=current_clip_name,
+                                    on_change=lambda e, nid=node_id, pk=param_key: update_override_state(nid, pk, e.value)
+                                ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, pk=param_key, val=current_clip_name: save_default_to_workflow(state.style_selected_workflow, nid, pk, val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default CLIP name to workflow file (.json)")
 
                     elif node_type == "vae_loader":
                         current_vae_name = state.style_workflow_overrides.get(node_id, {}).get("vae_name", params.get("vae_name", ""))
                         
                         comfy_key = f"{node_id}:vae_name"
                         if comfy_key in comfy_options_cache:
-                            ui.select(
-                                options=comfy_options_cache[comfy_key],
-                                value=current_vae_name if current_vae_name in comfy_options_cache[comfy_key] else None,
-                                label="Select VAE Model",
-                                on_change=lambda e, nid=node_id: (update_override_state(nid, "vae_name", e.value), render_workflow_overrides_ui.refresh())
-                            ).classes('w-full')
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.select(
+                                    options=comfy_options_cache[comfy_key],
+                                    value=current_vae_name if current_vae_name in comfy_options_cache[comfy_key] else None,
+                                    label="Select VAE Model",
+                                    on_change=lambda e, nid=node_id: (update_override_state(nid, "vae_name", e.value), render_workflow_overrides_ui.refresh())
+                                ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, val=current_vae_name: save_default_to_workflow(state.style_selected_workflow, nid, "vae_name", val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default VAE name to workflow file (.json)")
                         else:
-                            ui.input(
-                                label="VAE Filename",
-                                value=current_vae_name,
-                                on_change=lambda e, nid=node_id: update_override_state(nid, "vae_name", e.value)
-                            ).classes('w-full')
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.input(
+                                    label="VAE Filename",
+                                    value=current_vae_name,
+                                    on_change=lambda e, nid=node_id: update_override_state(nid, "vae_name", e.value)
+                                ).classes('flex-1')
+                                
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, val=current_vae_name: save_default_to_workflow(state.style_selected_workflow, nid, "vae_name", val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default VAE name to workflow file (.json)")
 
 
 @ui.refreshable

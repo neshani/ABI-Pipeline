@@ -32,6 +32,7 @@ from services.transcription import (
 )
 
 from ui.components.settings_modal import SettingsModal
+from ui.components.onboarding_wizard import OnboardingWizard
 
 # Modularized states and pages imports
 from ui import state
@@ -137,7 +138,8 @@ DEFAULT_SETTINGS = {
     "batch_size": 30,
     "output_dir": "./output",
     "enable_desktop_notifications": False,
-    "notification_threshold": 30
+    "notification_threshold": 30,
+    "wizard_completed": False
 }
 
 app_settings = {}
@@ -1086,6 +1088,12 @@ def render_split_panel_shell(project_id: int):
 # --- Dynamic Main Page Wrapper ---
 @ui.refreshable
 def main_layout():
+    # If the setup wizard is not marked completed, open it once on startup safely
+    if not app_settings.get("wizard_completed") in (True, "True"):
+        if not getattr(state, "onboarding_wizard_active", False):
+            state.onboarding_wizard_active = True
+            ui.timer(0.5, onboarding_wizard.open, once=True)
+
     if state.active_tool == "lora_contact_sheet":
         render_lora_contact_sheet(exit_to_portal)
     elif state.active_project_id is None:
@@ -1097,8 +1105,9 @@ def main_layout():
 # Register layout reference inside rendering module
 register_main_layout(main_layout)
 
-# Initialize settings modal
+# Initialize settings modal & onboarding wizard
 settings_modal = SettingsModal(app_settings, restart_app)
+onboarding_wizard = OnboardingWizard(app_settings, on_complete_callback=refresh_dashboard)
 
 
 # --- TOPBAR HEADERS & CONTROLS ---
@@ -1314,8 +1323,8 @@ with ui.dialog() as clear_comfy_dialog, ui.card().classes('w-full max-w-md p-6 r
         ).classes('bg-rose-600 text-white font-semibold')
 
 
-def free_all_memory():
-    """Unloads model weights and clears memory caches from ComfyUI and any active LLM providers using a shotgun strategy."""
+async def free_all_memory():
+    """Unloads model weights and clears memory caches from ComfyUI and active LLM providers asynchronously to prevent UI freeze."""
     ui.notify("Dispatching VRAM/RAM clearance commands...", type="info")
     
     # 1. Clear ComfyUI Cache and Unload Models
@@ -1323,21 +1332,6 @@ def free_all_memory():
     if "http" in comfy_url:
         comfy_url = comfy_url.replace("http://", "").replace("https://", "").strip("/")
         
-    import requests
-    try:
-        resp = requests.post(
-            f"http://{comfy_url}/free", 
-            json={"unload_models": True, "free_memory": True}, 
-            timeout=4.0
-        )
-        if resp.status_code == 200:
-            state.add_console_log("[Memory-Engine] Successfully requested ComfyUI model unload and cache clear.")
-        else:
-            state.add_console_log(f"[Memory-Engine] ComfyUI free returned status code: {resp.status_code}")
-    except Exception as e:
-        state.add_console_log(f"[Memory-Engine] ComfyUI clearance skipped or host offline: {str(e)}")
-
-    # 2. Shotgun dynamic LLM clearance against the resolved host endpoint
     llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
     model_name = get_setting("llm_model", "local-model")
     
@@ -1349,69 +1343,57 @@ def free_all_memory():
     except Exception:
         base_host_url = llm_url
 
-    state.add_console_log(f"[Memory-Engine] Dispatching shotgun VRAM clear requests to: {base_host_url}")
+    state.add_console_log(f"[Memory-Engine] Dispatching asynchronous target VRAM clear requests for configured model '{model_name}' to: {base_host_url}")
 
-    # --- SHOTGUN TARGET A: LM Studio Models & Instances ---
-    try:
-        models_resp = requests.get(f"{base_host_url}/api/v1/models", timeout=3.0)
-        if models_resp.status_code == 200:
-            models_data = models_resp.json()
-            models_list = models_data.get("models", []) or models_data.get("data", [])
-            for model in models_list:
-                m_id = model.get("id")
-                if m_id:
-                    requests.post(f"{base_host_url}/api/v1/models/unload", json={"instance_id": m_id}, timeout=3.0)
-                    state.add_console_log(f"[Memory-Engine] Sent LM Studio ID unload: {m_id}")
-                for instance in model.get("loaded_instances", []):
-                    inst_id = instance.get("id")
-                    if inst_id:
-                        requests.post(f"{base_host_url}/api/v1/models/unload", json={"instance_id": inst_id}, timeout=3.0)
-                        state.add_console_log(f"[Memory-Engine] Sent LM Studio instance unload: {inst_id}")
-    except Exception:
-        pass
-
-    # Generic manual LM Studio fallback using our configured setting name
-    try:
-        requests.post(f"{base_host_url}/api/v1/models/unload", json={"instance_id": model_name}, timeout=3.0)
-    except Exception:
-        pass
-
-    # --- SHOTGUN TARGET B: llama-server Router Mode ---
-    # Query both standard paths /models and /v1/models to capture different server configurations
-    for model_endpoint in [f"{base_host_url}/models", f"{base_host_url}/v1/models"]:
+    import httpx
+    async with httpx.AsyncClient() as client:
+        # --- TARGET 1: ComfyUI Model Unload & Cache Clear ---
         try:
-            llama_resp = requests.get(model_endpoint, timeout=3.0)
-            if llama_resp.status_code == 200:
-                llama_data = llama_resp.json()
-                models_list = llama_data if isinstance(llama_data, list) else llama_data.get("data", [])
-                if isinstance(models_list, list):
-                    for m in models_list:
-                        m_name = m.get("name") or m.get("id") or m.get("model")
-                        if m_name:
-                            requests.post(f"{base_host_url}/models/unload", json={"model": m_name}, timeout=3.0)
-                            state.add_console_log(f"[Memory-Engine] Sent llama-server model unload: {m_name}")
+            resp = await client.post(
+                f"http://{comfy_url}/free", 
+                json={"unload_models": True, "free_memory": True}, 
+                timeout=2.0
+            )
+            if resp.status_code == 200:
+                state.add_console_log("[Memory-Engine] Successfully requested ComfyUI model unload and cache clear.")
+            else:
+                state.add_console_log(f"[Memory-Engine] ComfyUI free returned status code: {resp.status_code}")
+        except Exception as e:
+            state.add_console_log(f"[Memory-Engine] ComfyUI clearance skipped or host offline: {str(e)}")
+
+        # --- TARGET 2: Target-Specific LM Studio Unload ---
+        try:
+            # Send targeted unload specifically for the model name saved in settings
+            await client.post(
+                f"{base_host_url}/api/v1/models/unload", 
+                json={"instance_id": model_name}, 
+                timeout=1.5
+            )
+            state.add_console_log(f"[Memory-Engine] Sent LM Studio targeted unload command for: {model_name}")
         except Exception:
             pass
 
-    # Generic manual llama-server fallback using our configured setting path
-    try:
-        requests.post(f"{base_host_url}/models/unload", json={"model": model_name}, timeout=3.0)
-    except Exception:
-        pass
-
-    # --- SHOTGUN TARGET C: Ollama ---
-    try:
-        requests.post(
-            f"{base_host_url}/api/generate", 
-            json={"model": model_name, "keep_alive": 0, "prompt": ""}, 
-            timeout=3.0
-        )
-        state.add_console_log(f"[Memory-Engine] Sent Ollama clearance for: {model_name}")
-    except Exception:
-        pass
+        # --- TARGET 3: Target-Specific llama-server Unload ---
+        try:
+            # Send targeted unload specifically for the model name saved in settings
+            await client.post(
+                f"{base_host_url}/models/unload", 
+                json={"model": model_name}, 
+                timeout=1.5
+            )
+            state.add_console_log(f"[Memory-Engine] Sent llama-server targeted unload command for: {model_name}")
+        except Exception:
+            pass
 
     ui.notify("VRAM and RAM clearance commands successfully sent!", type="positive")
 
+# Initialize Onboarding Wizard safely if not already done earlier in the file
+if 'onboarding_wizard' not in globals():
+    onboarding_wizard = OnboardingWizard(
+        app_settings, 
+        on_complete_callback=refresh_dashboard,
+        launch_comfy_callback=launch_comfyui
+    )
 
 # --- Header & Top Bar Navigation Layout ---
 with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justify-between items-center'):
@@ -1448,6 +1430,7 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
             tools_btn.classes('text-white text-sm capitalize rounded-lg')
             with ui.menu() as menu:
                 ui.menu_item('LoRA Contact Sheets', on_click=lambda: open_tool('lora_contact_sheet'))
+                ui.menu_item('Rerun Setup Wizard', on_click=onboarding_wizard.open)
                 ui.menu_item('Clear Comfy Outputs (abi_*)', on_click=clear_comfy_dialog.open)
         ui.button(icon='settings', on_click=lambda: settings_modal.open()).props('flat round color=white')
 
@@ -1462,4 +1445,9 @@ ui.timer(2.0, check_for_active_transcriptions)
 
 # Launch our app
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(title="ABI-Pipeline", favicon="static/favicon.png", port=8910)
+    ui.run(
+        title="ABI-Pipeline", 
+        favicon="static/favicon.png", 
+        port=8910,
+        uvicorn_reload_excludes="workflows/**/*.json, database/**/*.db, database/**/*.db-journal, .venv/**/*, **/temp_workspaces/**/*, *.db, *.db-journal, .git/**/*"
+    )

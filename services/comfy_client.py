@@ -15,7 +15,7 @@ class ComfyClient:
     def analyze_workflow(self, workflow_json: Dict[str, Any]) -> Dict[str, Any]:
         """
         Dynamically analyzes any ComfyUI API JSON workflow to see what overrides can be applied.
-        Scans for KSamplers, resolution encoders, checkpoint loaders, etc.
+        Scans for standard KSamplers, custom samplers, schedulers, checkpoint loaders, etc.
         """
         discovered = {}
         for node_id, node_data in workflow_json.items():
@@ -35,7 +35,36 @@ class ComfyClient:
                         "scheduler": inputs.get("scheduler", "normal")
                     }
                 }
-            elif class_type in ["EmptyLatentImage", "EmptySD3LatentImage"]:
+            elif class_type == "BasicScheduler":
+                discovered[node_id] = {
+                    "type": "basic_scheduler",
+                    "title": title,
+                    "class_type": class_type,
+                    "params": {
+                        "steps": inputs.get("steps", 10),
+                        "scheduler": inputs.get("scheduler", "normal"),
+                        "denoise": inputs.get("denoise", 1.0)
+                    }
+                }
+            elif class_type == "KSamplerSelect":
+                discovered[node_id] = {
+                    "type": "sampler_select",
+                    "title": title,
+                    "class_type": class_type,
+                    "params": {
+                        "sampler_name": inputs.get("sampler_name", "euler")
+                    }
+                }
+            elif class_type == "SamplerCustom":
+                discovered[node_id] = {
+                    "type": "custom_sampler",
+                    "title": title,
+                    "class_type": class_type,
+                    "params": {
+                        "cfg": inputs.get("cfg", 8.0)
+                    }
+                }
+            elif class_type in ["EmptyLatentImage", "EmptySD3LatentImage", "FluxEmptyLatentImage"]:
                 discovered[node_id] = {
                     "type": "resolution",
                     "title": title,
@@ -63,19 +92,27 @@ class ComfyClient:
                     "class_type": class_type,
                     "params": {
                         "lora_name": inputs.get("lora_name", ""),
-                        "strength_model": inputs.get("strength_model", 1.0)
+                        "strength_model": inputs.get("strength_model", 1.0),
+                        "strength_clip": inputs.get("strength_clip", 1.0)
                     }
                 }
             elif class_type in ["CLIPLoader", "DualCLIPLoader"]:
-                clip_param = "clip_name1" if "clip_name1" in inputs else "clip_name"
+                clip_param1 = "clip_name1" if "clip_name1" in inputs else "clip_name"
+                clip_param2 = "clip_name2" if "clip_name2" in inputs else None
+                
+                discovered_params = {
+                    "clip_param_key": clip_param1,
+                    clip_param1: inputs.get(clip_param1, "")
+                }
+                if clip_param2:
+                    discovered_params["clip_param_key2"] = clip_param2
+                    discovered_params[clip_param2] = inputs.get(clip_param2, "")
+                    
                 discovered[node_id] = {
                     "type": "clip_loader",
                     "title": title,
                     "class_type": class_type,
-                    "params": {
-                        "clip_param_key": clip_param,
-                        clip_param: inputs.get(clip_param, "")
-                    }
+                    "params": discovered_params
                 }
             elif class_type == "VAELoader":
                 discovered[node_id] = {
