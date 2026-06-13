@@ -591,6 +591,7 @@ def render_project_tabs(
         tab_dash = ui.tab('Dashboard', icon='dashboard')
         tab_style = ui.tab('Style & Workflows', icon='brush')
         tab_play = ui.tab('Prompt-Gen Playground', icon='science')
+        tab_pack = ui.tab('OIS Packager', icon='inventory_2')
         
     project_tabs.bind_value(state, 'active_project_tab')
         
@@ -656,3 +657,10 @@ def render_project_tabs(
         with ui.tab_panel(tab_play):
             # Delegates rendering directly to the modular prompt_playground page!
             render_prompt_playground_tab(project, books)
+
+        with ui.tab_panel(tab_pack):
+            # Lazy import to keep startup footprint small and avoid workspace dependency conflicts
+            from ui.pages.project.packager_playground import PackagerPlayground
+            if not hasattr(state, 'packager_playground') or state.packager_playground.project_id != project.id:
+                state.packager_playground = PackagerPlayground(project.id, project.name)
+            state.packager_playground.render(project, books)

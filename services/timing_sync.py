@@ -137,34 +137,63 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
     timing_map = {}
     cumulative_time = 0.0
 
-    for ch in chapters_db:
-        c_num = ch.chapter_num
-        start_t = 0.0
-        dur = 0.0
+    # Write and persist probed duration metadata on Chapters and the Book to the DB
+    with Session(engine) as write_session:
+        # Re-fetch chapters to bind them to the active write session
+        write_chapters = write_session.exec(
+            select(Chapter).where(Chapter.book_id == book_id).order_by(Chapter.chapter_num)
+        ).all()
+        
+        for ch in write_chapters:
+            c_num = ch.chapter_num
+            start_t = 0.0
+            dur = 0.0
 
-        if ch.type == 'segment':
-            # Single-file structure: Chapter start and end times are absolute offsets in the original audio
-            start_t = ch.start_time or 0.0
-            if ch.end_time is not None:
-                dur = ch.end_time - start_t
+            if ch.type == 'segment':
+                # Single-file structure: Chapter start and end times are absolute offsets in the original audio
+                start_t = ch.start_time or 0.0
+                if ch.end_time is not None:
+                    dur = ch.end_time - start_t
+                else:
+                    try:
+                        total_dur = get_audio_duration_with_ffmpeg(ch.input_file)
+                        dur = total_dur - start_t
+                        # Persist back to DB
+                        ch.start_time = start_t
+                        ch.end_time = total_dur
+                        write_session.add(ch)
+                    except Exception as e:
+                        log(f"[Timing-Sync] Probe failed for segment chapter {c_num}: {str(e)}")
+                        dur = 0.0
             else:
+                # Multi-file structure: Chapter is a whole track file
+                start_t = cumulative_time
                 try:
-                    total_dur = get_audio_duration_with_ffmpeg(ch.input_file)
-                    dur = total_dur - start_t
+                    dur = get_audio_duration_with_ffmpeg(ch.input_file)
+                    # Persist back to DB
+                    ch.start_time = start_t
+                    ch.end_time = start_t + dur
+                    write_session.add(ch)
                 except Exception as e:
-                    log(f"[Timing-Sync] Probe failed for segment chapter {c_num}: {str(e)}")
+                    log(f"[Timing-Sync] Probe failed for track file chapter {c_num}: {str(e)}")
                     dur = 0.0
-        else:
-            # Multi-file structure: Chapter is a whole track file
-            start_t = cumulative_time
-            try:
-                dur = get_audio_duration_with_ffmpeg(ch.input_file)
-            except Exception as e:
-                log(f"[Timing-Sync] Probe failed for track file chapter {c_num}: {str(e)}")
-                dur = 0.0
-            cumulative_time += dur
+                cumulative_time += dur
 
-        timing_map[c_num] = (start_t, dur)
+            timing_map[c_num] = (start_t, dur)
+            
+        # Cache total book duration directly on Book row
+        db_book = write_session.get(Book, book_id)
+        if db_book:
+            if cumulative_time > 0:
+                db_book.duration = cumulative_time
+            elif timing_map:
+                # For single-file segments, get max end_time
+                max_end = max((t[0] + t[1]) for t in timing_map.values())
+                if max_end > 0:
+                    db_book.duration = max_end
+            write_session.add(db_book)
+            
+        write_session.commit()
 
     # Read the current prompts.csv
     rows = []

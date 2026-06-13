@@ -26,6 +26,7 @@ class Book(SQLModel, table=True):
     total_images: Optional[int] = Field(default=None)
     completed_images: Optional[int] = Field(default=None)
     prompts_mtime: Optional[float] = Field(default=None)  # Dynamic cache syncing timestamp
+    duration: Optional[float] = Field(default=None)       # Cached audiobook total duration in seconds
 
 class Chapter(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
