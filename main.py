@@ -14,6 +14,38 @@ from typing import Optional, List, Dict, Any
 
 from nicegui import ui, app
 
+# --- Register CUDA & cuDNN DLL Directories (Windows Isolation) ---
+def setup_cuda_dll_directories():
+    """
+    Dynamically registers Pip-installed CUDA and cuDNN DLL directories on Windows.
+    This resolves "cudnn64_9.dll missing" errors by letting ONNX Runtime and Whisper
+    discover DLLs inside the .venv site-packages without requiring a global CUDA install.
+    """
+    if os.name != 'nt':
+        return
+    try:
+        venv_base = Path(sys.executable).parent.parent
+        nvidia_base_path = venv_base / 'Lib' / 'site-packages' / 'nvidia'
+        if nvidia_base_path.exists():
+            subfolders = [
+                nvidia_base_path / 'cuda_runtime' / 'bin',
+                nvidia_base_path / 'cublas' / 'bin',
+                nvidia_base_path / 'cudnn' / 'bin',
+                nvidia_base_path / 'cuda_nvrtc' / 'bin'
+            ]
+            for path in subfolders:
+                if path.exists():
+                    try:
+                        os.add_dll_directory(str(path))
+                        print(f"[CUDA-Loader] Successfully registered DLL directory: {path}")
+                    except Exception as e:
+                        print(f"[CUDA-Loader] Failed to register DLL directory {path.name}: {e}")
+    except Exception as ex:
+        print(f"[CUDA-Loader] Error setting up DLL directories: {ex}")
+
+# Execute DLL path setups immediately before project submodules are imported
+setup_cuda_dll_directories()
+
 # --- Configure WebSockets for Large Payloads ---
 # This overrides the default 1MB Socket.IO limit to prevent connection drops on large transcript.txt files.
 from nicegui import core
@@ -109,12 +141,32 @@ app.on_startup(run_startup_recovery)
 
 # --- Programmatic App Restart Engine ---
 def restart_app():
-    """Kills the active Python web server and restarts a clean instance."""
-    ui.notify("Restarting ABI-Pipeline...", type="warning")
+    """
+    Attempts a zero-zombie hot reload by touching a dedicated sentinel Python file 
+    inside the services folder (services/reload_sentinel.py) to trigger Uvicorn cleanly.
+    Falls back to a hard restart if reloading is disabled.
+    """
+    ui.notify("Refreshing application modules...", type="warning")
     asyncio.create_task(async_restart())
 
 async def async_restart():
-    await asyncio.sleep(0.5)
+    # 1. Attempt a Uvicorn hot-reload using a sentinel file inside the services/ folder.
+    # This keeps the root directory clutter-free and avoids triggering editor warnings.
+    # Note: We do not start the name with a dot so that Uvicorn's ".*" ignore rule doesn't skip it.
+    try:
+        sentinel_path = Path(__file__).resolve().parent / "services" / "reload_sentinel.py"
+        if not sentinel_path.exists():
+            sentinel_path.write_text("# Programmatic reload sentinel file for ABI-Pipeline. Safe to ignore/delete.\n")
+        
+        sentinel_path.touch()
+        # Wait a brief moment to allow Uvicorn to receive the event and shut down this worker.
+        await asyncio.sleep(2.0)
+    except Exception as e:
+        print(f"[Restart-Engine] Hot-reload sentinel touch failed: {e}")
+
+    # 2. Hard Restart Fallback
+    # (This step is only reached if hot-reloading is disabled or inactive)
+    print("[Restart-Engine] Hot-reload not active. Executing programmatic hard restart fallback...")
     script_path = os.path.abspath(sys.argv[0])
     
     if os.name == 'nt':  # Windows
@@ -129,7 +181,7 @@ async def async_restart():
 # --- Default App Configurations ---
 DEFAULT_SETTINGS = {
     "comfy_url": "http://127.0.0.1:8188",
-    "comfy_path": "F:/AI/ComfyUI/ComfyUI",
+    "comfy_path": "F:/AI/ComfyUI",
     "comfy_args": "--windows-standalone-build",
     "llm_url": "http://127.0.0.1:11434",
     "llm_api_key": "",
@@ -1603,5 +1655,7 @@ if __name__ in {"__main__", "__mp_main__"}:
         title="ABI-Pipeline", 
         favicon="static/favicon.png", 
         port=8910,
-        uvicorn_reload_excludes="workflows/**/*.json, database/**/*.db, database/**/*.db-journal, .venv/**/*, **/temp_workspaces/**/*, *.db, *.db-journal, .git/**/*"
+        # We append Uvicorn's default ignore patterns (.*, .py[cod], .sw.*, ~*) back to our project-specific list.
+        # This prevents the watcher from traversing tens of thousands of files in .venv, .git, and __pycache__.
+        uvicorn_reload_excludes="workflows/**/*.json, database/**/*.db, database/**/*.db-journal, **/temp_workspaces/**/*, *.db, *.db-journal, .*, .py[cod], .sw.*, ~*"
     )

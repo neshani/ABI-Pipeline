@@ -26,11 +26,16 @@ MODEL_REPOS = {
 def check_dependencies(engine_name: str, device: str = "CPU") -> dict:
     """
     Checks if all packages for a given engine are installed in the environment.
-    Differentiates between CPU (onnxruntime) and GPU (onnxruntime-gpu) packages
-    by inspecting package distribution metadata rather than top-level imports.
+    Differentiates between CPU and GPU packages and ensures necessary 
+    NVIDIA CUDA/cuDNN wheels are verified when running in GPU mode.
     """
     reqs = []
     runtime_pkg = None
+    nvidia_reqs = []
+
+    if device == "GPU/CUDA":
+        # Both engines require CUDA and cuDNN runtimes when running on GPU
+        nvidia_reqs = ["nvidia-cuda-runtime-cu12", "nvidia-cublas-cu12", "nvidia-cudnn-cu12"]
 
     if engine_name == "Parakeet ONNX":
         reqs = ["onnx_asr", "soundfile"]
@@ -47,9 +52,16 @@ def check_dependencies(engine_name: str, device: str = "CPU") -> dict:
         except ImportError:
             missing.append(package)
             
-    # 2. Check the specific distribution package metadata to avoid namespace overlap bugs
+    # 2. Verify NVIDIA CUDA/cuDNN package metadata to prevent missing DLLs
+    from importlib.metadata import version, PackageNotFoundError
+    for pkg in nvidia_reqs:
+        try:
+            version(pkg)
+        except PackageNotFoundError:
+            missing.append(pkg)
+            
+    # 3. Check the specific distribution package metadata to avoid namespace overlap bugs
     if runtime_pkg:
-        from importlib.metadata import version, PackageNotFoundError
         try:
             version(runtime_pkg)
         except PackageNotFoundError:
