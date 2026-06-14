@@ -434,8 +434,8 @@ def build_illumination_pack(
         else:
             log(0.25, "Cover injection requested but no source cover image was located on disk. Skipping.")
 
-    # --- Compress scenes to WebP in a parallel thread pool ---
-    log(0.30, "Compressing, optimizing, and downscaling imagery in parallel threads...")
+    # --- Compress scenes to WebP in a parallel process pool ---
+    log(0.30, "Compressing, optimizing, and downscaling imagery in parallel processes...")
     compression_tasks = []
     scene_image_mappings = {}
 
@@ -469,15 +469,19 @@ def build_illumination_pack(
         else:
             scene_image_mappings[idx] = None
 
-    # Run thread executor
+    # Run multi-process executor to bypass Python's GIL and use all CPU cores
     processed_count = 0
     total_tasks = len(compression_tasks)
     
     if total_tasks > 0:
-        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        with ProcessPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
             futures = [executor.submit(process_and_compress_image, *t) for t in compression_tasks]
-            for f in futures:
-                f.result()
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as ex:
+                    log(0.30, f"Warning: Individual process failed: {str(ex)}")
                 processed_count += 1
                 progress_step = 0.30 + (0.40 * (processed_count / total_tasks))
                 log(progress_step, f"Processing scene frames: {processed_count}/{total_tasks} processed...")
@@ -497,7 +501,7 @@ def build_illumination_pack(
             mobile_keyframes.append({
                 "image": cover_dest_filename,
                 "start": format_seconds_to_timestamp(p_time),
-                "title": "Introduction",
+                "title": None,
                 "notes": None,
                 "quote": None,
                 "view": {
@@ -513,7 +517,7 @@ def build_illumination_pack(
             desktop_keyframes.append({
                 "image": cover_dest_filename,
                 "start": format_seconds_to_timestamp(p_time),
-                "title": "Introduction",
+                "title": None,
                 "notes": None,
                 "quote": None,
                 "view": {
@@ -526,7 +530,7 @@ def build_illumination_pack(
         static_keyframes.append({
             "image": cover_dest_filename,
             "start": "00:00:00.00",
-            "title": "Introduction",
+            "title": None,
             "notes": None,
             "quote": None,
             "view": {"scale": 1.0, "pan_x": 0.5, "pan_y": 0.5}
@@ -553,9 +557,7 @@ def build_illumination_pack(
 
         raw_quote = scene.get("quote", "").strip()
         quote_text = raw_quote if raw_quote else None
-        
-        chapter_title = f"Chapter {int(float(scene.get('chapter', 1)))}"
-        
+
         # A. Compile PORTRAIT / MOBILE timeline variations
         m_preset = PORTRAIT_PRESETS[idx % len(PORTRAIT_PRESETS)]
         for kp_idx, pt in enumerate(m_preset):
@@ -563,7 +565,7 @@ def build_illumination_pack(
             mobile_keyframes.append({
                 "image": img_name,
                 "start": format_seconds_to_timestamp(kp_time),
-                "title": chapter_title if (kp_idx == 0 and idx == 0) else ".",
+                "title": None,
                 "notes": "",
                 "quote": quote_text if kp_idx == 0 else ".",
                 "view": {
@@ -580,7 +582,7 @@ def build_illumination_pack(
             desktop_keyframes.append({
                 "image": img_name,
                 "start": format_seconds_to_timestamp(kp_time),
-                "title": chapter_title if (kp_idx == 0 and idx == 0) else ".",
+                "title": None,
                 "notes": "",
                 "quote": quote_text if kp_idx == 0 else ".",
                 "view": {
@@ -594,7 +596,7 @@ def build_illumination_pack(
         static_keyframes.append({
             "image": img_name,
             "start": format_seconds_to_timestamp(start_sec),
-            "title": chapter_title if idx == 0 else ".",
+            "title": None,
             "notes": "",
             "quote": quote_text,
             "view": {"scale": 1.0, "pan_x": 0.5, "pan_y": 0.5}

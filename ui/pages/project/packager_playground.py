@@ -256,15 +256,29 @@ class PackagerPlayground:
         ui.notify("Global description propagated successfully!", type="positive")
         self.volumes_list_panel.refresh()
 
+    def apply_author_to_all_volumes(self, books: list, source_book_id: int):
+        """Propagates the author from a specific book volume to all other volumes in the active project."""
+        if source_book_id not in self.book_metadata_overrides:
+            return
+            
+        source_author = self.book_metadata_overrides[source_book_id].get("book_author", "")
+        for book in books:
+            if book.id in self.book_metadata_overrides:
+                self.book_metadata_overrides[book.id]["book_author"] = source_author
+                self.save_single_book_override_file(book.id, book.name)
+                
+        ui.notify(f"Author '{source_author}' applied to all project volumes!", type="positive")
+        self.volumes_list_panel.refresh()
+
     async def execute_packager(self, project: Project, books: list):
         if self.is_running:
             return
             
         client = ui.context.client
 
-        # Filter books based on user checkboxes
-        books_to_package = [b for b in books if self.selected_books.get(b.id, False)]
-        if not books_to_package:
+        # Gather selected book IDs directly from the local UI selection state
+        selected_book_ids = [b_id for b_id, selected in self.selected_books.items() if selected]
+        if not selected_book_ids:
             with client:
                 ui.notify("Please select at least one valid, compiled volume to package.", type="warning")
             return
@@ -294,6 +308,17 @@ class PackagerPlayground:
             "pack_creation_date": time.strftime("%Y-%m-%d")
         }
 
+        # Query fresh, session-bound data blocks to guarantee no DetachedInstanceError raises
+        books_data = []
+        with Session(engine) as session:
+            db_books = session.exec(select(Book).where(Book.id.in_(selected_book_ids))).all()
+            for b in db_books:
+                books_data.append({
+                    "id": b.id,
+                    "name": b.name,
+                    "path": b.path
+                })
+
         loop = asyncio.get_running_loop()
 
         def progress_tracker(p: float, msg: str):
@@ -305,18 +330,21 @@ class PackagerPlayground:
             loop.call_soon_threadsafe(update)
 
         try:
-            for idx, book in enumerate(books_to_package):
-                with client:
-                    self.add_log(f"=== Starting Packager for Volume: '{book.name}' ({idx + 1}/{len(books_to_package)}) ===")
+            for idx, b_data in enumerate(books_data):
+                book_id = b_data["id"]
+                book_name = b_data["name"]
                 
-                overrides = self.book_metadata_overrides.get(book.id, {})
+                with client:
+                    self.add_log(f"=== Starting Packager for Volume: '{book_name}' ({idx + 1}/{len(books_data)}) ===")
+                
+                overrides = self.book_metadata_overrides.get(book_id, {})
                 book_metadata = metadata_config.copy()
                 book_metadata.update(overrides)
                 
                 zip_result = await asyncio.to_thread(
                     build_illumination_pack,
                     project.name,
-                    book.name,
+                    book_name,
                     book_metadata,
                     progress_tracker
                 )
@@ -325,10 +353,13 @@ class PackagerPlayground:
                     self.add_log("SUCCESS: Package successfully generated!")
                     self.add_log(f"Saved directly to: {zip_result}\n")
                 
-                book.status = "Finished"
+                # Persist final status to SQLite via fresh local session
                 with Session(engine) as session:
-                    session.add(book)
-                    session.commit()
+                    db_book = session.get(Book, book_id)
+                    if db_book:
+                        db_book.status = "Finished"
+                        session.add(db_book)
+                        session.commit()
                 
             with client:
                 self.progress_value = 1.0
@@ -446,11 +477,17 @@ class PackagerPlayground:
                                     on_change=lambda e, b_id=book.id, b_name=book.name: self.update_override(b_id, "book_title", e.value, b_name)
                                 ).classes('w-full').props('dense outlined')
                                 
-                                ui.input(
-                                    'Book Author', 
-                                    value=override["book_author"], 
-                                    on_change=lambda e, b_id=book.id, b_name=book.name: self.update_override(b_id, "book_author", e.value, b_name)
-                                ).classes('w-full').props('dense outlined')
+                                with ui.row().classes('w-full items-center gap-2'):
+                                    ui.input(
+                                        'Book Author', 
+                                        value=override["book_author"], 
+                                        on_change=lambda e, b_id=book.id, b_name=book.name: self.update_override(b_id, "book_author", e.value, b_name)
+                                    ).classes('flex-1').props('dense outlined')
+                                    with ui.button(
+                                        icon='reply_all',
+                                        on_click=lambda _, b_id=book.id: self.apply_author_to_all_volumes(books, b_id)
+                                    ).props('flat dense').classes('text-blue-600'):
+                                        ui.tooltip('Apply this author to all volumes')
                             
                             with ui.grid(columns=2).classes('w-full gap-4'):
                                 ui.input(

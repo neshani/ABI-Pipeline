@@ -116,3 +116,14 @@ batch_eta_label: str = "ETA: Estimating..."
 
 # --- Onboarding Wizard Bindings ---
 onboarding_wizard_active: bool = False
+
+# --- GPU / VRAM NVML Telemetry State ---
+gpu_telemetry_supported: bool = False
+gpu_name: str = ""
+gpu_utilization: int = 0
+gpu_vram_used: float = 0.0      # GB used
+gpu_vram_total: float = 0.0     # GB total
+gpu_vram_pct: float = 0.0       # 0.0 to 1.0
+gpu_temp: int = 0               # °C
+gpu_power_used: float = 0.0     # Watts
+gpu_power_limit: float = 0.0    # Watts

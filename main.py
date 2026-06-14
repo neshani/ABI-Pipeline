@@ -93,9 +93,12 @@ window.addEventListener('focus', () => {
 # --- Initialize SQLite Database & Recovery Engines (One-time Startup Event) ---
 
 def run_startup_recovery():
-    """Clears stuck tasks and recovers workspaces exactly once on startup."""
+    """Clears stuck tasks, initializes GPU telemetry, and recovers workspaces on startup."""
     # Ensure stuck tasks are cleared
     reset_stuck_transcriptions()
+
+    # Safely initialize telemetry bindings
+    init_gpu_telemetry()
 
     # Run workspace recovery to restore wiped database entries
     with Session(engine) as session:
@@ -168,6 +171,14 @@ def select_project(project_id: int):
     
     # Fast load settings from project folder
     load_project_settings_from_disk(project_id)
+    
+    # Dynamically rescan project database state on load to align database with disk
+    try:
+        from ui.pages.project.dashboard import rescan_project_database_state
+        rescan_project_database_state(project_id)
+    except Exception as ex:
+        print(f"[ProjectLoad-Sync] Error during load synchronization: {ex}")
+
     header_controls.refresh()
     main_layout.refresh()
 
@@ -208,6 +219,14 @@ def select_book_from_portal(project_id: int, book_id: int):
     """Sets the active project, loads its settings from disk, and opens the target book workspace."""
     state.active_project_id = project_id
     load_project_settings_from_disk(project_id)
+    
+    # Dynamically rescan project database state on load to align database with disk
+    try:
+        from ui.pages.project.dashboard import rescan_project_database_state
+        rescan_project_database_state(project_id)
+    except Exception as ex:
+        print(f"[ProjectLoad-Sync] Error during load synchronization: {ex}")
+
     state.active_book_id = book_id
     state.active_book_tab = 'Dashboard'
     state.active_log_widget = None
@@ -804,6 +823,7 @@ async def check_for_active_transcriptions():
                         "id": b.id,
                         "progress": b.progress,
                         "status": b.status,
+                        "duration": b.duration or 0.0,  # Grab book duration
                         "stats": stats
                     })
                 return updates
@@ -873,11 +893,15 @@ async def check_for_active_transcriptions():
                 else:
                     state.books_subtitle[b_id] = f"Rendered: {stats['generated_images']}/{total_scenes} ({stats['approved_prompts']} approved)"
 
-        books_count = len(res["books"])
-        if books_count > 0:
-            avg_progress = sum(b["progress"] for b in res["books"]) / books_count
+        # --- CORRECTION: Duration-Weighted Batch Progress Calculation ---
+        total_duration = sum(b["duration"] for b in res["books"])
+        if total_duration > 0:
+            completed_duration = sum(b["progress"] * b["duration"] for b in res["books"])
+            avg_progress = completed_duration / total_duration
         else:
-            avg_progress = 0.0
+            books_count = len(res["books"])
+            avg_progress = sum(b["progress"] for b in res["books"]) / books_count if books_count > 0 else 0.0
+
         state.project_progress = avg_progress
         state.project_progress_label = f"Batch Progress ({int(avg_progress * 100)}%)"
 
@@ -914,7 +938,6 @@ async def check_for_active_transcriptions():
         # 2. State Transition Completion Event Detector (Process Just Ended)
         elif old_status in active_statuses and new_status not in active_statuses:
             if was_cancelled:
-                # Reset cancellation state and silently reset UI elements without notification triggers
                 state.was_manually_cancelled = False
                 ui.run_javascript('''
                     document.title = "ABI-Pipeline";
@@ -931,7 +954,6 @@ async def check_for_active_transcriptions():
                 enable_notif = get_setting("enable_desktop_notifications") in ("True", True)
                 notif_threshold = int(get_setting("notification_threshold", 30))
                 
-                # Sum up total items across books to verify alert threshold rules
                 total_items = 0
                 for b_data in res["books"]:
                     stats = b_data["stats"]
@@ -956,7 +978,6 @@ async def check_for_active_transcriptions():
                 }
             ''')
 
-        # Update transition tracking anchor
         state.last_known_status = new_status
 
 # Register the statistics refresh callback on the safe state module
@@ -976,7 +997,13 @@ def render_split_panel_shell(project_id: int):
     # Seed static binding dictionaries and initial progress on initial layout rendering
     state.project_status = project.status
     if books:
-        initial_avg = sum(b.progress for b in books) / len(books)
+        # --- CORRECTION: Duration-Weighted Initial Progress Evaluation ---
+        total_duration = sum(b.duration or 0.0 for b in books)
+        if total_duration > 0:
+            completed_duration = sum((b.progress or 0.0) * (b.duration or 0.0) for b in books)
+            initial_avg = completed_duration / total_duration
+        else:
+            initial_avg = sum(b.progress for b in books) / len(books)
     else:
         initial_avg = 0.0
     state.project_progress = initial_avg
@@ -1395,6 +1422,129 @@ if 'onboarding_wizard' not in globals():
         launch_comfy_callback=launch_comfyui
     )
 
+# --- GPU/VRAM Telemetry Helper & Widget ---
+
+def init_gpu_telemetry():
+    """Attempts to initialize NVML and detect the primary NVIDIA GPU safely."""
+    try:
+        from pynvml import (
+            nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetName,
+            nvmlDeviceGetPowerManagementLimit
+        )
+        nvmlInit()
+        # Get handle for first GPU (index 0)
+        handle = nvmlDeviceGetHandleByIndex(0)
+        
+        # Get card model name
+        name_raw = nvmlDeviceGetName(handle)
+        state.gpu_name = name_raw.decode('utf-8') if isinstance(name_raw, bytes) else str(name_raw)
+        
+        # Get max design power limit (returned in milliwatts, convert to Watts)
+        try:
+            limit_mw = nvmlDeviceGetPowerManagementLimit(handle)
+            state.gpu_power_limit = limit_mw / 1000.0
+        except Exception:
+            state.gpu_power_limit = 0.0
+            
+        state.gpu_telemetry_supported = True
+        state.add_console_log(f"[NVML-Telemetry] Detected NVIDIA GPU: {state.gpu_name} (Max Power Limit: {state.gpu_power_limit:.1f}W)")
+    except Exception as e:
+        state.gpu_telemetry_supported = False
+        state.add_console_log(f"[NVML-Telemetry] NVIDIA Management Library (NVML) initialization bypassed: {str(e)}")
+
+
+def update_gpu_telemetry():
+    """Polls NVML at regular intervals for temperature, memory, utilization, and power stats."""
+    if not state.gpu_telemetry_supported:
+        return
+        
+    try:
+        from pynvml import (
+            nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizationRates,
+            nvmlDeviceGetMemoryInfo, nvmlDeviceGetTemperature,
+            nvmlDeviceGetPowerUsage, NVML_TEMPERATURE_GPU
+        )
+        handle = nvmlDeviceGetHandleByIndex(0)
+        
+        # 1. Utilization percentage (GPU core load)
+        util = nvmlDeviceGetUtilizationRates(handle)
+        state.gpu_utilization = util.gpu
+        
+        # 2. VRAM allocation stats (Convert bytes to GB)
+        mem = nvmlDeviceGetMemoryInfo(handle)
+        state.gpu_vram_used = mem.used / (1024**3)
+        state.gpu_vram_total = mem.total / (1024**3)
+        state.gpu_vram_pct = mem.used / mem.total if mem.total > 0 else 0.0
+        
+        # 3. Core Temperature in °C
+        state.gpu_temp = nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU)
+        
+        # 4. Power usage (Convert milliwatts to Watts)
+        try:
+            power_mw = nvmlDeviceGetPowerUsage(handle)
+            state.gpu_power_used = power_mw / 1000.0
+        except Exception:
+            state.gpu_power_used = 0.0
+            
+        # Refresh the UI widget to display new readings
+        gpu_telemetry_widget.refresh()
+            
+    except Exception as e:
+        state.add_console_log(f"[NVML-Telemetry] Error polling GPU statistics: {str(e)}")
+
+
+@ui.refreshable
+def gpu_telemetry_widget():
+    """Renders a compact, color-coded dual-bar telemetry layout with detailed hover card."""
+    if not state.gpu_telemetry_supported:
+        return
+
+    # Color threshold evaluations matching load states
+    vram_color = 'emerald-500'
+    if state.gpu_vram_pct > 0.85:
+        vram_color = 'rose-500'
+    elif state.gpu_vram_pct > 0.60:
+        vram_color = 'amber-500'
+
+    gpu_color = 'blue-400'
+    if state.gpu_utilization > 85:
+        gpu_color = 'rose-400'
+    elif state.gpu_utilization > 50:
+        gpu_color = 'amber-400'
+
+    with ui.row().classes('items-center gap-2 bg-slate-700/30 px-2 py-1 rounded border border-slate-600/30 text-xs').style('height: 32px; cursor: help;'):
+        # Dynamic Hover Breakdown Card
+        with ui.tooltip().classes('bg-slate-950 text-slate-200 p-3 rounded-lg border border-slate-700 shadow-2xl gap-1 text-[11px] min-w-[210px]'):
+            ui.label(state.gpu_name or "NVIDIA GPU").classes('font-bold text-blue-400 text-xs')
+            ui.separator().classes('my-1 bg-slate-800')
+            with ui.grid(columns=2).classes('w-full gap-x-2 gap-y-1 font-mono'):
+                ui.label('Core Load:')
+                ui.label(f"{state.gpu_utilization}%").classes('text-right font-bold')
+                
+                ui.label('VRAM Allocated:')
+                ui.label(f"{state.gpu_vram_used:.1f} / {state.gpu_vram_total:.1f} GB").classes('text-right font-bold')
+                
+                ui.label('VRAM Pct:')
+                ui.label(f"{int(state.gpu_vram_pct * 100)}%").classes('text-right font-bold')
+                
+                ui.label('Temperature:')
+                ui.label(f"{state.gpu_temp}°C").classes('text-right font-bold')
+                
+                ui.label('Power Draw:')
+                ui.label(f"{state.gpu_power_used:.1f}W / {state.gpu_power_limit:.1f}W").classes('text-right font-bold')
+
+        # Thermometer display (always visible)
+        with ui.row().classes('items-center gap-0.5'):
+            ui.icon('thermostat', size='15px', color='orange-400')
+            ui.label(f"{state.gpu_temp}°C").classes('font-mono font-black text-[11px] text-slate-300')
+
+        # Vertical alignment of core and allocation micro bars
+        with ui.column().classes('gap-1 w-14 justify-center py-0.5'):
+            # Core GPU utilization (0.0 to 1.0 representation)
+            ui.linear_progress(value=state.gpu_utilization / 100.0, color=gpu_color, show_value=False, size='4px').classes('rounded-full')
+            # VRAM allocated saturation (0.0 to 1.0 representation)
+            ui.linear_progress(value=state.gpu_vram_pct, color=vram_color, show_value=False, size='4px').classes('rounded-full')
+
 # --- Header & Top Bar Navigation Layout ---
 with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justify-between items-center'):
     with ui.row().classes('items-center gap-3'):
@@ -1426,6 +1576,9 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
             on_click=free_all_memory
         ).props('flat dense').classes('text-xs text-rose-400 hover:text-rose-300 font-bold px-2 py-1 bg-slate-700/50 rounded border border-slate-600/30')
 
+        # GPU Telemetry Indicator Widget
+        gpu_telemetry_widget()
+
         with ui.button(icon='construction', color='slate-600') as tools_btn:
             tools_btn.classes('text-white text-sm capitalize rounded-lg')
             with ui.menu() as menu:
@@ -1442,6 +1595,7 @@ with ui.column().classes('w-full max-w-7xl mx-auto p-6 gap-6'):
 
 # --- Polling Update Refresh Timer ---
 ui.timer(2.0, check_for_active_transcriptions)
+ui.timer(3.0, update_gpu_telemetry)
 
 # Launch our app
 if __name__ in {"__main__", "__mp_main__"}:

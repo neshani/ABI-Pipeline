@@ -10,7 +10,8 @@ from database.models import Project, Book, Chapter, ScenePrompt
 def sync_project_status(project_id: int, session: Session) -> None:
     """
     Dynamically calculates and updates the parent Project status
-    based on the status of all of its child Books.
+    based on the status of all of its child Books. Evaluates the
+    child statuses from the earliest bottleneck state to the latest.
     """
     project = session.get(Project, project_id)
     if not project:
@@ -22,21 +23,22 @@ def sync_project_status(project_id: int, session: Session) -> None:
 
     book_statuses = [b.status for b in books]
 
-    # Priority status hierarchy to determine the bottleneck state
+    # 1. Active pipeline execution states take priority immediately to show running animations
     if "Rendering Images" in book_statuses:
         project.status = "Rendering Images"
     elif "Transcribing" in book_statuses:
         project.status = "Transcribing"
     elif "Generating Prompts" in book_statuses:
         project.status = "Generating Prompts"
-    elif "Prompts Created" in book_statuses:
-        project.status = "Prompts Created"
+    # 2. Base static states default to the earliest incomplete bottleneck state
+    elif "Imported" in book_statuses:
+        project.status = "Imported"
     elif "Transcribed" in book_statuses:
         project.status = "Transcribed"
-    elif "Images Created" in book_statuses:
-        project.status = "Images Created"
+    elif "Prompts Created" in book_statuses:
+        project.status = "Prompts Created"
     else:
-        project.status = "Imported"
+        project.status = "Images Created"
 
     session.add(project)
     session.flush()
@@ -111,47 +113,13 @@ def sync_prompts_csv_to_db_cache(book_id: int, session: Session) -> None:
         print(f"[Sync-Engine] Error caching prompts.csv to SQLite: {e}")
 
 
-def sync_project_status(project_id: int, session: Session) -> None:
-    """
-    Dynamically calculates and updates the parent Project status
-    based on the status of all of its child Books.
-    """
-    project = session.get(Project, project_id)
-    if not project:
-        return
-
-    books = session.exec(select(Book).where(Book.project_id == project_id)).all()
-    if not books:
-        return
-
-    book_statuses = [b.status for b in books]
-
-    # Priority status hierarchy to determine the bottleneck state
-    if "Rendering Images" in book_statuses:
-        project.status = "Rendering Images"
-    elif "Transcribing" in book_statuses:
-        project.status = "Transcribing"
-    elif "Generating Prompts" in book_statuses:
-        project.status = "Generating Prompts"
-    elif "Prompts Created" in book_statuses:
-        project.status = "Prompts Created"
-    elif "Transcribed" in book_statuses:
-        project.status = "Transcribed"
-    elif "Images Created" in book_statuses:
-        project.status = "Images Created"
-    else:
-        project.status = "Imported"
-
-    session.add(project)
-    session.flush()
-
 
 def sync_book_from_disk(book_id: int, session: Session) -> None:
     """
     Parses compiled transcript.txt and prompts.csv to update 
     the SQLite database index metrics (word counts, total/completed images)
     and status (Imported, Transcribed, Prompts Created, Images Created)
-    for a book and its chapters on demand.
+    for a book and its chapters on demand. Calculates logical phase-aware progress.
     """
     book = session.get(Book, book_id)
     if not book:
@@ -293,7 +261,6 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
             # Update book-level exact tallies
             book.total_images = global_total
             book.completed_images = global_completed
-            book.progress = global_completed / global_total if global_total > 0 else 0.0
             session.add(book)
 
             # Update chapter-level exact tallies
@@ -309,7 +276,6 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
         # If prompts don't exist, reset image metrics on books and chapters
         book.total_images = 0
         book.completed_images = 0
-        book.progress = 0.0
         session.add(book)
         
         chapters = session.exec(select(Chapter).where(Chapter.book_id == book_id)).all()
@@ -329,6 +295,17 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
             book.status = "Transcribed"
     else:
         book.status = "Imported"
+
+    # 4. Phase-Aware Logical Book Progress Bar Calculation
+    if book.status in ("Imported", "Transcribing"):
+        chapters = session.exec(select(Chapter).where(Chapter.book_id == book_id)).all()
+        completed_chapters = len([c for c in chapters if c.status == "Completed"])
+        total_chapters = len(chapters)
+        book.progress = completed_chapters / total_chapters if total_chapters > 0 else 0.0
+    elif book.status in ("Transcribed", "Generating Prompts"):
+        book.progress = 1.0  # Transcription stage is fully complete
+    else:  # "Prompts Created", "Rendering Images", "Images Created"
+        book.progress = global_completed / global_total if global_total > 0 else 0.0
 
     session.add(book)
     session.flush()
@@ -447,10 +424,18 @@ def recover_from_temp_workspaces(session: Session) -> None:
             total_chapters = len(chapters)
             if total_chapters > 0:
                 book.progress = completed_count / total_chapters
-                if completed_count == total_chapters:
+                
+                # --- CORRECTION: Verify the merged transcript.txt actually exists on disk before declaring "Transcribed" ---
+                project = session.get(Project, book.project_id) if book.project_id else None
+                project_name = project.name if project else "Default_Project"
+                base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
+                transcript_file = base_output_dir / project_name / book.name / "transcript.txt"
+
+                if completed_count == total_chapters and transcript_file.exists():
                     book.status = "Transcribed"
                 else:
                     book.status = "Imported"
+                    
             session.add(book)
             session.commit()
             
