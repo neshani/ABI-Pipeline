@@ -80,7 +80,7 @@ class SettingsModal:
             self.dep_label.classes('text-emerald-600', remove='text-rose-500 text-slate-500')
         else:
             missing_str = ", ".join(self.dep_status["missing"])
-            self.dep_label.set_text(f"✗ Missing packages: {missing_str}")
+            self.dep_label.set_text(f"— Missing packages: {missing_str}")
             self.dep_label.classes('text-rose-500', remove='text-emerald-600 text-slate-500')
             
         # Model File Indicator
@@ -88,7 +88,7 @@ class SettingsModal:
             self.model_label.set_text("✓ Model weights downloaded locally.")
             self.model_label.classes('text-emerald-600', remove='text-rose-500 text-slate-500')
         else:
-            self.model_label.set_text("✗ Model weights missing.")
+            self.model_label.set_text("— Model weights missing.")
             self.model_label.classes('text-rose-500', remove='text-emerald-600 text-slate-500')
 
         # Main Button Controller
@@ -162,6 +162,8 @@ class SettingsModal:
             if current not in models:
                 self.settings["llm_model"] = models[0]
                 self.model_select.value = models[0]
+            else:
+                self.model_select.value = current
             self.model_select.update()
             ui.notify(f"Discovered {len(models)} model options!", type="positive")
         else:
@@ -183,6 +185,33 @@ class SettingsModal:
         self.dialog.close()
 
     def open(self) -> None:
+        """Syncs settings with current database values and opens settings dialog."""
+        # 1. Sync settings in memory with latest database entries to prevent out-of-sync states
+        from database.connection import get_setting
+        for k in list(self.settings.keys()):
+            db_val = get_setting(k)
+            if db_val is not None:
+                if db_val == "True":
+                    self.settings[k] = True
+                elif db_val == "False":
+                    self.settings[k] = False
+                elif isinstance(db_val, str) and db_val.isdigit():
+                    self.settings[k] = int(db_val)
+                else:
+                    self.settings[k] = db_val
+
+        # 2. Prevent NiceGUI's blank dropdown bug by ensuring the saved value is in the options list
+        saved_model = self.settings.get('llm_model', '')
+        if not saved_model:
+            saved_model = 'local-model'
+            self.settings['llm_model'] = saved_model
+
+        if saved_model not in self.model_select.options:
+            self.model_select.options = [saved_model]
+        
+        self.model_select.value = saved_model
+        self.model_select.update()
+
         self.update_installation_statuses()
         self.dialog.open()
 
@@ -211,8 +240,7 @@ class SettingsModal:
                         
                         self.model_select = ui.select(
                             options=initial_options,
-                            label='Target LLM Model',
-                            value=saved_model if saved_model else 'local-model'
+                            label='Target LLM Model'
                         ).bind_value(self.settings, 'llm_model').classes('flex-1')
                         
                         ui.button(
@@ -265,8 +293,8 @@ class SettingsModal:
                         
                         # Subtext with the newly uncovered file sizes and speed benchmarks
                         with ui.column().classes('bg-slate-50 p-3 rounded-lg border border-slate-100 mt-1 gap-1.5 text-[11px] text-slate-600 leading-normal'):
-                            ui.label('â€¢ Parakeet ONNX: Ultra-fast parallel sequential batching. Transcribes a 20-hour audiobook in ~5 to 8 minutes on GPU. Footprint: ~300 MB packages + ~2.5 GB model weights.').classes('font-medium')
-                            ui.label('â€¢ Faster-Whisper: Highly detailed phrase-level timing maps, but processes audio sequentially. Transcribes a 20-hour audiobook in ~35 minutes on GPU. Footprint: ~3.5 GB PyTorch packages + ~484 MB model weights.').classes('font-medium')
+                            ui.label('• Parakeet ONNX: Ultra-fast parallel sequential batching. Transcribes a 20-hour audiobook in ~5 to 8 minutes on GPU. Footprint: ~300 MB packages + ~2.5 GB model weights.').classes('font-medium')
+                            ui.label('• Faster-Whisper: Highly detailed phrase-level timing maps, but processes audio sequentially. Transcribes a 20-hour audiobook in ~35 minutes on GPU. Footprint: ~3.5 GB PyTorch packages + ~484 MB model weights.').classes('font-medium')
 
                     ui.separator()
 
