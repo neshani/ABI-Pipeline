@@ -4,6 +4,12 @@ import httpx
 from pathlib import Path
 import json
 from database.connection import set_setting, get_setting
+from services.installer import (
+    check_dependencies,
+    check_model_downloaded,
+    run_pip_install,
+    download_model_weights
+)
 
 class OnboardingWizard:
     def __init__(self, app_settings: dict, on_complete_callback=None, launch_comfy_callback=None) -> None:
@@ -22,6 +28,12 @@ class OnboardingWizard:
         self.scanning_comfy = False
         self.comfy_online = False
         
+        # STT installation states inside wizard
+        self.dep_status = {"status": False, "missing": []}
+        self.model_status = False
+        self.installing = False
+        self.download_progress = 0.0
+        
         # Buffer for wizard changes (written to DB only on completion)
         self.temp_settings = {
             "stt_engine": self.settings.get("stt_engine", "Parakeet ONNX"),
@@ -34,12 +46,16 @@ class OnboardingWizard:
             "wizard_completed": False
         }
 
+        # Run an initial check of package states on initialization
+        self.update_installation_statuses()
+
         # Build persistent dialogue overlay
         with ui.dialog().props('persistent') as self.dialog, ui.card().classes('w-full max-w-2xl p-6 rounded-2xl shadow-xl bg-white'):
             self.wizard_ui()
 
     def open(self) -> None:
         self.step = 1
+        self.update_installation_statuses()
         self.wizard_ui.refresh()
         self.dialog.open()
         # Trigger an LLM scan automatically on start
@@ -47,6 +63,74 @@ class OnboardingWizard:
 
     def close(self) -> None:
         self.dialog.close()
+
+    def update_installation_statuses(self) -> None:
+        """Checks if selected STT engine packages and models are fully downloaded."""
+        engine = self.temp_settings.get("stt_engine", "Parakeet ONNX")
+        device = self.temp_settings.get("stt_device", "GPU/CUDA")
+        if engine == "Text Only":
+            self.dep_status = {"status": True, "missing": []}
+            self.model_status = True
+        else:
+            self.dep_status = check_dependencies(engine, device)
+            self.model_status = check_model_downloaded(engine, device)
+
+    async def execute_installation_pipeline(self) -> None:
+        """Performs Python package installs and downloads model weights sequentially inside the wizard."""
+        self.installing = True
+        self.wizard_ui.refresh()
+        
+        if hasattr(self, 'terminal_log') and self.terminal_log:
+            self.terminal_log.clear()
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.set_value(0.0)
+            
+        engine = self.temp_settings.get("stt_engine", "Parakeet ONNX")
+        device = self.temp_settings.get("stt_device", "GPU/CUDA")
+        
+        # Step 1: Install Python Libraries (if missing)
+        if not self.dep_status["status"]:
+            success = await run_pip_install(self.dep_status["missing"], self.write_to_terminal)
+            if not success:
+                ui.notify("Installation failed during library deployment.", type="negative")
+                self.installing = False
+                self.update_installation_statuses()
+                self.wizard_ui.refresh()
+                return
+            
+        # Step 2: Download Model Weights (if missing)
+        if not self.model_status:
+            success = await download_model_weights(
+                engine, 
+                device,
+                self.update_download_progress, 
+                self.write_to_terminal
+            )
+            if not success:
+                ui.notify("Download failed. Check your internet connection.", type="negative")
+                self.installing = False
+                self.update_installation_statuses()
+                self.wizard_ui.refresh()
+                return
+
+        ui.notify("Engine setup successfully completed!", type="positive")
+        self.installing = False
+        self.update_installation_statuses()
+        self.wizard_ui.refresh()
+        
+        if len(self.dep_status["missing"]) > 0:
+            ui.notify("Libraries containing binaries installed. Restart recommended.", type="warning", timeout=10)
+
+    def write_to_terminal(self, text: str) -> None:
+        """Pipes subprocess outputs into the terminal widget inside the active step."""
+        if hasattr(self, 'terminal_log') and self.terminal_log:
+            self.terminal_log.push(text)
+
+    def update_download_progress(self, val: float) -> None:
+        """Updates linear download progress bar state."""
+        self.download_progress = val
+        if hasattr(self, 'progress_bar') and self.progress_bar:
+            self.progress_bar.set_value(val)
 
     def ensure_default_workflows(self) -> None:
         """Pre-packages default ComfyUI JSON workflows to ./workflows/ directory based on user selections."""
@@ -558,6 +642,8 @@ class OnboardingWizard:
         
         # Apply all buffered configurations
         for k, v in self.temp_settings.items():
+            if k == "selected_starters":
+                continue  # Skip raw selection array (not an active configuration string)
             set_setting(k, v)
             self.settings[k] = v
             
@@ -622,6 +708,7 @@ class OnboardingWizard:
             # Audio Engine Choices
             def select_stt(engine_name: str):
                 self.temp_settings["stt_engine"] = engine_name
+                self.update_installation_statuses()
                 self.wizard_ui.refresh()
 
             engines = [
@@ -662,13 +749,52 @@ class OnboardingWizard:
                 ui.separator().classes('my-2')
                 ui.label('Select Hardware Acceleration Target').classes('text-xs font-bold text-slate-500 uppercase tracking-wider')
                 
-                with ui.row().classes('w-full gap-4'):
-                    ui.radio(
-                        options={
-                            'GPU/CUDA': 'GPU / CUDA (Recommended for Nvidia GPU systems)',
-                            'CPU': 'CPU (Not recommended - Slow)'
-                        }
-                    ).bind_value(self.temp_settings, 'stt_device').classes('text-sm')
+                def on_device_change(e):
+                    self.temp_settings["stt_device"] = e.value
+                    self.update_installation_statuses()
+                    self.wizard_ui.refresh()
+
+                ui.radio(
+                    options={
+                        'GPU/CUDA': 'GPU / CUDA (Recommended for Nvidia GPU systems)',
+                        'CPU': 'CPU (Not recommended - Slow)'
+                    },
+                    value=self.temp_settings["stt_device"],
+                    on_change=on_device_change
+                ).classes('text-sm')
+
+                # Real-Time Installation Status Indicators
+                ui.separator().classes('my-1')
+                with ui.column().classes('gap-1 mt-1'):
+                    if self.dep_status["status"]:
+                        ui.label("✓ Python dependencies installed.").classes('text-xs text-emerald-600 font-medium')
+                    else:
+                        missing_str = ", ".join(self.dep_status["missing"])
+                        ui.label(f"✗ Missing packages: {missing_str}").classes('text-xs text-rose-500 font-medium')
+
+                    if self.model_status:
+                        ui.label("✓ Model weights downloaded locally.").classes('text-xs text-emerald-600 font-medium')
+                    else:
+                        ui.label("✗ Model weights missing.").classes('text-xs text-rose-500 font-medium')
+
+                # Installation controls
+                ready = self.dep_status["status"] and self.model_status
+                btn_text = "Engine Ready" if ready else "Install & Download Engine"
+                btn_color = "bg-emerald-600" if ready else "bg-blue-600"
+                
+                self.action_btn = ui.button(
+                    btn_text, 
+                    on_click=lambda: asyncio.create_task(self.execute_installation_pipeline())
+                ).classes(f'w-full mt-2 {btn_color} text-white rounded-lg text-sm')
+                
+                if ready or self.installing:
+                    self.action_btn.disable()
+
+                self.progress_bar = ui.linear_progress(value=self.download_progress).classes('w-full mt-1')
+
+                # Installation Console Log Output
+                ui.label('Installation Console Output').classes('text-[11px] font-bold text-slate-500 mt-2')
+                self.terminal_log = ui.log().classes('h-28 w-full bg-slate-950 p-2 text-emerald-400 font-mono text-[10px] rounded-lg')
 
     # Step 2: LLM Configurer
     def render_step_2(self) -> None:
@@ -789,7 +915,7 @@ class OnboardingWizard:
     # Step 4: Summary Confirmation
     def render_step_4(self) -> None:
         ui.label('Ready to Build Your Workspace').classes('text-md font-bold text-slate-700')
-        ui.label('Your system settings have been configured successfully. Letâ€™s double check your configurations:').classes('text-xs text-slate-500')
+        ui.label('Your system settings have been configured successfully. Let’s double check your configurations:').classes('text-xs text-slate-500')
         
         with ui.column().classes('w-full gap-2 mt-2 bg-slate-50 p-4 border rounded-xl text-xs text-slate-700'):
             
