@@ -114,9 +114,6 @@ batch_start_time: Optional[float] = None
 batch_elapsed_sec: float = 0.0
 batch_eta_label: str = "ETA: Estimating..."
 
-# --- Onboarding Wizard Bindings ---
-onboarding_wizard_active: bool = False
-
 # --- GPU / VRAM NVML Telemetry State ---
 gpu_telemetry_supported: bool = False
 gpu_name: str = ""

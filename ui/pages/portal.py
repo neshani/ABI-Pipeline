@@ -210,9 +210,32 @@ def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, re
         ).classes('bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-lg shadow-sm text-sm font-semibold capitalize')
 
     if not filtered:
-        with ui.column().classes('w-full items-center justify-center p-12 text-slate-400'):
-            ui.icon('search', size='lg')
-            ui.label('No projects found. Use "+ New Project" to import audiobooks.').classes('text-lg text-center')
+        with ui.card().classes('w-full max-w-xl mx-auto border border-slate-200 rounded-2xl shadow-md p-8 bg-slate-50/50 mt-12 items-center text-center gap-4'):
+            ui.icon('auto_awesome', size='xl', color='blue-500').classes('animate-pulse')
+            ui.label('Welcome to ABI-Pipeline!').classes('text-xl font-bold text-slate-800')
+            ui.label(
+                "Let's get your workspace configured. Complete the guided setup wizard to verify "
+                "your transcription, LLM, and ComfyUI integrations, or jump straight into importing your first novel."
+            ).classes('text-sm text-slate-500 leading-normal max-w-sm')
+            
+            with ui.column().classes('w-full gap-2.5 mt-2'):
+                def trigger_wizard():
+                    if hasattr(state, 'show_onboarding_wizard') and state.show_onboarding_wizard:
+                        state.show_onboarding_wizard()
+                    else:
+                        ui.notify("Onboarding wizard callback is not registered.", type="warning")
+                
+                ui.button(
+                    'Run Setup Wizard', 
+                    icon='construction', 
+                    on_click=trigger_wizard
+                ).classes('w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl shadow-sm')
+                
+                ui.button(
+                    'Import Audiobook or Novel', 
+                    icon='add', 
+                    on_click=lambda: open_new_project_dialog(new_project_dialog, path_input)
+                ).props('outline color=slate').classes('w-full text-slate-700 font-semibold py-3 rounded-xl hover:bg-slate-100 border-slate-300')
     else:
         for project in filtered:
             is_expanded = project["id"] in state.expanded_projects

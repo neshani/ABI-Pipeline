@@ -1192,11 +1192,7 @@ def render_split_panel_shell(project_id: int):
 # --- Dynamic Main Page Wrapper ---
 @ui.refreshable
 def main_layout():
-    # If the setup wizard is not marked completed, open it once on startup safely
-    if not app_settings.get("wizard_completed") in (True, "True"):
-        if not getattr(state, "onboarding_wizard_active", False):
-            state.onboarding_wizard_active = True
-            ui.timer(0.5, onboarding_wizard.open, once=True)
+    # The onboarding wizard is now launched via an app.on_connect event handler.
 
     if state.active_tool == "lora_contact_sheet":
         render_lora_contact_sheet(exit_to_portal)
@@ -1211,10 +1207,19 @@ register_main_layout(main_layout)
 
 # Initialize settings modal & onboarding wizard
 settings_modal = SettingsModal(app_settings, restart_app)
-onboarding_wizard = OnboardingWizard(app_settings, on_complete_callback=refresh_dashboard)
+onboarding_wizard = OnboardingWizard(
+    app_settings, 
+    on_complete_callback=refresh_dashboard,
+    launch_comfy_callback=lambda: launch_comfyui()
+)
+
+# Register onboarding wizard trigger globally to prevent circular imports
+state.show_onboarding_wizard = onboarding_wizard.open
+
 
 
 # --- TOPBAR HEADERS & CONTROLS ---
+
 
 def render_topbar_stepper(status: str):
     """Compacts the horizontal pipeline progress stepper to fit beautifully inside the global sticky header."""
