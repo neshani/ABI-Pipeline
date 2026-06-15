@@ -459,7 +459,8 @@ def get_book_stats(project_name: str, book_name: str) -> dict:
         "estimated_scenes": 0
     }
     
-    book_dir = Path(f"./output/{project_name}/{book_name}")
+    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    book_dir = base_output_dir / project_name / book_name
     transcript_path = book_dir / "transcript.txt"
     prompts_path = book_dir / "prompts.csv"
     images_dir = book_dir / "images"
@@ -513,7 +514,8 @@ def get_book_stats(project_name: str, book_name: str) -> dict:
 def get_book_stats_cached(project_name: str, book_name: str) -> dict:
     """Checks timestamps on disk before parsing, preventing I/O overhead on polling ticks."""
     from ui import state
-    book_dir = Path(f"./output/{project_name}/{book_name}")
+    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    book_dir = base_output_dir / project_name / book_name
     transcript_path = book_dir / "transcript.txt"
     prompts_path = book_dir / "prompts.csv"
     images_dir = book_dir / "images"

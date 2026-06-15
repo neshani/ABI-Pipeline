@@ -18,28 +18,53 @@ from nicegui import ui, app
 def setup_cuda_dll_directories():
     """
     Dynamically registers Pip-installed CUDA and cuDNN DLL directories on Windows.
-    This resolves "cudnn64_9.dll missing" errors by letting ONNX Runtime and Whisper
-    discover DLLs inside the .venv site-packages without requiring a global CUDA install.
+    Resolves cudnn64_9.dll errors by appending to os.environ["PATH"] (for transitive C++ loads),
+    calling os.add_dll_directory() (for Python 3.8+ direct imports), and triggering ort.preload_dlls().
     """
     if os.name != 'nt':
         return
     try:
         venv_base = Path(sys.executable).parent.parent
         nvidia_base_path = venv_base / 'Lib' / 'site-packages' / 'nvidia'
+        
+        candidate_dirs = []
         if nvidia_base_path.exists():
-            subfolders = [
-                nvidia_base_path / 'cuda_runtime' / 'bin',
-                nvidia_base_path / 'cublas' / 'bin',
-                nvidia_base_path / 'cudnn' / 'bin',
-                nvidia_base_path / 'cuda_nvrtc' / 'bin'
-            ]
-            for path in subfolders:
-                if path.exists():
-                    try:
-                        os.add_dll_directory(str(path))
-                        print(f"[CUDA-Loader] Successfully registered DLL directory: {path}")
-                    except Exception as e:
-                        print(f"[CUDA-Loader] Failed to register DLL directory {path.name}: {e}")
+            # Scan all pip-installed NVIDIA wheel folders and locate any /bin subdirectories
+            for item in nvidia_base_path.iterdir():
+                if item.is_dir():
+                    bin_dir = item / "bin"
+                    if bin_dir.exists() and bin_dir.is_dir():
+                        candidate_dirs.append(bin_dir)
+                        
+        # Check and include PyTorch's complementary CUDA library directory if present
+        torch_lib_path = venv_base / 'Lib' / 'site-packages' / 'torch' / 'lib'
+        if torch_lib_path.exists() and torch_lib_path.is_dir():
+            candidate_dirs.append(torch_lib_path)
+            
+        for path in candidate_dirs:
+            path_str = str(path.resolve())
+            
+            # 1. Prepend to Windows PATH environment variable.
+            # Critical for C++ libraries (like onnxruntime_providers_cuda.dll) performing transitive
+            # LoadLibrary calls internally for dependency DLLs (e.g. cudnn64_9.dll loading cudnn_ops64_9.dll).
+            os.environ["PATH"] = path_str + os.pathsep + os.environ.get("PATH", "")
+            
+            # 2. Register with Python's direct DLL search pathways
+            try:
+                os.add_dll_directory(path_str)
+                print(f"[CUDA-Loader] Registered DLL directory: {path_str}")
+            except Exception as e:
+                print(f"[CUDA-Loader] Warning: Failed to add DLL directory {path.name}: {e}")
+                
+        # 3. Call ONNX Runtime's native preloader if available (available in ORT 1.19+)
+        try:
+            import onnxruntime as ort
+            if hasattr(ort, "preload_dlls"):
+                ort.preload_dlls()
+                print("[CUDA-Loader] Successfully executed onnxruntime.preload_dlls()")
+        except Exception as e:
+            pass
+            
     except Exception as ex:
         print(f"[CUDA-Loader] Error setting up DLL directories: {ex}")
 
