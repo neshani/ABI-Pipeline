@@ -75,6 +75,7 @@ image_gen_active: bool = False
 cancel_image_gen_flag: bool = False
 
 # --- Style Playground & Workflow Analyzer Bindings ---
+comfy_online: bool = False
 style_selected_preset: str = "retro_graphic_novel"
 style_preset_save_name: str = ""
 style_selected_workflow: str = ""

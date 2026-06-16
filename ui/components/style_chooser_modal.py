@@ -32,12 +32,12 @@ DEFAULT_PRESETS = {
         "negative_prompt": "photorealistic, photography, modern, futuristic, neon, 3d render, plastic, low quality, bad anatomy, text, watermark",
         "overrides": {}
     },
-    "sci_fi": {
+"sci_fi": {
         "name": "Sci-Fi & Cyberpunk",
         "workflow": "",
-        "prompt_prefix": "cinematic digital concept art, futuristic sci-fi aesthetic, dramatic volumetric lighting, crisp focus, matte painting style, ",
-        "prompt_suffix": ", rich sci-fi details, ultra-high-definition, atmospheric depth, epic composition",
-        "negative_prompt": "canvas texture, watercolor, hand-drawn, cozy, medieval, low quality, text, watermark, bad anatomy, paint strokes",
+        "prompt_prefix": "bold sci-fi illustration, stylized digital painting, expressive concept art, futuristic sci-fi aesthetic, vivid color accents, ",
+        "prompt_suffix": ", visible artistic brushstrokes, painterly style, graphic sci-fi novel art, striking composition",
+        "negative_prompt": "photorealistic, photography, hyperrealistic, 3d render, CGI, octane render, raytraced, DSLR, plastic, real-world texture, text, watermark, bad anatomy",
         "overrides": {}
     },
     "historical_classic": {

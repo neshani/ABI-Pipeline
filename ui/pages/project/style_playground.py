@@ -140,6 +140,14 @@ def save_default_to_workflow(workflow_name: str, node_id: str, param_key: str, v
                         state.style_workflow_overrides.pop(node_id, None)
                         
                 ui.notify(f"Saved default '{value}' into '{workflow_name}'!", type="positive")
+                
+                # Force reset active analyzed workflow cache to bypass matching guards
+                global _last_analyzed_workflow
+                _last_analyzed_workflow = None
+                
+                # Re-analyze fresh workflow defaults and hydrate parameters
+                handle_style_workflow_change(workflow_name, clear_overrides=False)
+                
                 render_workflow_overrides_ui.refresh()
                 return True
         except Exception as e:
@@ -159,6 +167,17 @@ async def async_load_comfy_and_lora_choices():
     if "http" in comfy_url:
         comfy_url = comfy_url.replace("http://", "").replace("https://", "").strip("/")
         
+    from services.comfy_client import ComfyClient
+    client = ComfyClient(comfy_url)
+    
+    # Quick connection heartbeat test
+    is_online = await asyncio.to_thread(client.check_connection)
+    state.comfy_online = is_online
+    
+    if not is_online:
+        render_workflow_overrides_ui.refresh()
+        return
+
     for node_id, data in list(state.style_discovered_params.items()):
         node_type = data["type"]
         params = data["params"]
@@ -187,8 +206,8 @@ async def async_load_comfy_and_lora_choices():
             
         for param_key in param_keys:
             try:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.get(f"http://{comfy_url}/object_info/{class_type}", timeout=2.0)
+                async with httpx.AsyncClient() as client_http:
+                    resp = await client_http.get(f"http://{comfy_url}/object_info/{class_type}", timeout=2.0)
                     if resp.status_code == 200:
                         res_json = resp.json()
                         choices = res_json.get(class_type, {}).get("input", {}).get("required", {}).get(param_key, [[]])[0]
@@ -787,6 +806,29 @@ def update_override_state(node_id: str, key: str, value: Any):
     state.style_workflow_overrides[node_id][key] = value
 
 
+def analyze_node_for_warnings(node_id: str, data: dict) -> List[str]:
+    """Analyzes a discovered node and returns a list of warnings if configurations are blank."""
+    warnings = []
+    node_type = data["type"]
+    params = data.get("params", {})
+    overrides = state.style_workflow_overrides.get(node_id, {})
+    
+    if node_type == "lora_loader":
+        lora_name = overrides.get("lora_name", params.get("lora_name", ""))
+        if not lora_name or lora_name == "":
+            warnings.append("No LoRA specified. This node will be bypassed or may cause an error.")
+    elif node_type == "model_loader":
+        pk = params.get("model_param_key", "ckpt_name")
+        model_name = overrides.get(pk, params.get(pk, ""))
+        if not model_name or model_name == "":
+            warnings.append("No checkpoint selected. A checkpoint model is required to load.")
+    elif node_type == "vae_loader":
+        vae_name = overrides.get("vae_name", params.get("vae_name", ""))
+        if not vae_name or vae_name == "":
+            warnings.append("No VAE selected. Verify if your workflow relies on a loaded VAE or baked checkpoint VAE.")
+    return warnings
+
+
 def handle_style_workflow_change(val: str, clear_overrides: bool = True):
     """Reads a ComfyUI JSON, introspects active sampler/latents, and rebuilds dynamic UI sliders."""
     global _last_analyzed_workflow
@@ -823,6 +865,14 @@ def handle_style_workflow_change(val: str, clear_overrides: bool = True):
             _last_analyzed_workflow = val
             ui.notify(f"Analyzed workflow '{val}'. Discovered {len(state.style_discovered_params)} overrides.", type="info")
             
+            # Auto-expand nodes with active configuration warnings
+            for node_id, data in state.style_discovered_params.items():
+                warnings = analyze_node_for_warnings(node_id, data)
+                if warnings:
+                    expansion_states[node_id] = True
+                else:
+                    expansion_states[node_id] = expansion_states.get(node_id, False)
+
             # Fire-and-forget back-end loading of drop-down options from ComfyUI API and CSV
             asyncio.create_task(async_load_comfy_and_lora_choices())
             
@@ -909,6 +959,10 @@ async def execute_style_playground_batch(project_name: str):
     """Executes the test batch against ComfyUI, passing the correct dynamic prompt key."""
     if not state.style_selected_workflow:
         ui.notify("Please select a workflow first.", type="warning")
+        return
+        
+    if not state.comfy_online:
+        ui.notify("Cannot run test: ComfyUI is offline. Please launch ComfyUI and retry connection.", type="negative", icon="cloud_off")
         return
         
     comfy_url = get_setting("comfy_url", "127.0.0.1:8188")
@@ -1003,8 +1057,24 @@ def render_workflow_overrides_ui():
         return
 
     with ui.column().classes('w-full gap-3 bg-slate-50 p-3 rounded-lg border mt-2'):
-        ui.label("Workflow Parameters (Auto-Discovered)").classes('text-xs font-bold text-slate-700')
-        
+        # Heartbeat connection state header
+        with ui.row().classes('w-full items-center justify-between'):
+            ui.label("Workflow Parameters (Auto-Discovered)").classes('text-xs font-bold text-slate-700')
+            if state.comfy_online:
+                ui.badge("🟢 ComfyUI Online", color="emerald").classes('text-[10px] font-bold')
+            else:
+                ui.badge("🔴 ComfyUI Offline", color="rose").classes('text-[10px] font-bold').tooltip("Boot up ComfyUI on port 8188 to sync checkpoints and samplers")
+
+        # Connection error details and fallback prompt
+        if not state.comfy_online:
+            with ui.column().classes('w-full p-3 bg-rose-50 border border-rose-200 text-rose-800 rounded-lg gap-1 text-xs'):
+                with ui.row().classes('items-center gap-1.5'):
+                    ui.icon('cloud_off', color='rose', size='xs')
+                    ui.label("ComfyUI Connection Missing").classes('font-bold text-[12px]')
+                ui.label("Your local ComfyUI application is offline or unreachable. Dropdowns will be empty or limited to cached fallbacks. Launch ComfyUI to reload models.").classes('text-[10px] leading-relaxed text-rose-700')
+                ui.button("Retry Connection", icon="sync", on_click=lambda: asyncio.create_task(async_load_comfy_and_lora_choices())) \
+                    .classes('bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-bold px-2 py-1 h-7 mt-1 rounded self-start')
+
         for node_id, data in state.style_discovered_params.items():
             node_title = data["title"]
             node_type = data["type"]
@@ -1013,10 +1083,27 @@ def render_workflow_overrides_ui():
             # Ensure we track the expanded state across UI refreshes
             if node_id not in expansion_states:
                 expansion_states[node_id] = False
+            
+            # Evaluate warnings on the active node
+            node_warnings = analyze_node_for_warnings(node_id, data)
+            
+            # Apply visual feedback color and prefix icon labels
+            if node_warnings:
+                border_color = "border-amber-400 bg-amber-50/10"
+                display_title = f"⚠️ {node_title} (ID: {node_id})"
+            else:
+                border_color = "border-slate-200"
+                display_title = f"{node_title} (ID: {node_id})"
                 
-            with ui.expansion(f"{node_title} (ID: {node_id})").classes('w-full border rounded bg-white text-xs') as exp:
+            with ui.expansion(display_title).classes(f'w-full border rounded bg-white text-xs {border_color}') as exp:
                 exp.bind_value(expansion_states, node_id)
                 with ui.column().classes('w-full p-3 gap-3'):
+                    # Render warning banners directly inside card if any
+                    for warning in node_warnings:
+                        with ui.row().classes('w-full items-center gap-2 bg-amber-50 text-amber-800 p-2 rounded border border-amber-200 text-[10px] font-semibold'):
+                            ui.icon('warning', size='xs', color='amber')
+                            ui.label(warning)
+
                     if node_type == "sampler":
                         current_steps = state.style_workflow_overrides.get(node_id, {}).get("steps", params["steps"])
                         current_cfg = state.style_workflow_overrides.get(node_id, {}).get("cfg", params["cfg"])

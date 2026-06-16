@@ -12,6 +12,16 @@ class ComfyClient:
         self.api_address = api_address
         self.client_id = str(uuid.uuid4())
 
+    def check_connection(self) -> bool:
+        """
+        Performs a lightweight heartbeat request to ComfyUI to verify it is online.
+        """
+        try:
+            resp = requests.get(f"http://{self.api_address}/system_stats", timeout=2.0)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
     def analyze_workflow(self, workflow_json: Dict[str, Any]) -> Dict[str, Any]:
         """
         Dynamically analyzes any ComfyUI API JSON workflow to see what overrides can be applied.
