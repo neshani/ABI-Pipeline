@@ -1123,13 +1123,14 @@ def render_workflow_overrides_ui():
                             on_change=lambda e, nid=node_id: update_override_state(nid, "cfg", e.value)
                         ).classes('w-full')
                         
-                        # Sampler Dropdown with API lookup
+                        # Sampler Dropdown with API lookup (Live filter enabled)
                         comfy_sampler_key = f"{node_id}:sampler_name"
                         if comfy_sampler_key in comfy_options_cache:
                             ui.select(
                                 options=comfy_options_cache[comfy_sampler_key],
                                 value=current_sampler if current_sampler in comfy_options_cache[comfy_sampler_key] else None,
                                 label="Sampler Name",
+                                with_input=True,
                                 on_change=lambda e, nid=node_id: (update_override_state(nid, "sampler_name", e.value), render_workflow_overrides_ui.refresh())
                             ).classes('w-full')
                         else:
@@ -1139,13 +1140,14 @@ def render_workflow_overrides_ui():
                                 on_change=lambda e, nid=node_id: update_override_state(nid, "sampler_name", e.value)
                             ).classes('w-full')
                             
-                        # Scheduler Dropdown with API lookup
+                        # Scheduler Dropdown with API lookup (Live filter enabled)
                         comfy_scheduler_key = f"{node_id}:scheduler"
                         if comfy_scheduler_key in comfy_options_cache:
                             ui.select(
                                 options=comfy_options_cache[comfy_scheduler_key],
                                 value=current_scheduler if current_scheduler in comfy_options_cache[comfy_scheduler_key] else None,
                                 label="Scheduler",
+                                with_input=True,
                                 on_change=lambda e, nid=node_id: (update_override_state(nid, "scheduler", e.value), render_workflow_overrides_ui.refresh())
                             ).classes('w-full')
                         else:
@@ -1180,6 +1182,7 @@ def render_workflow_overrides_ui():
                                     options=comfy_options_cache[comfy_scheduler_key],
                                     value=current_scheduler if current_scheduler in comfy_options_cache[comfy_scheduler_key] else None,
                                     label="Scheduler",
+                                    with_input=True,
                                     on_change=lambda e, nid=node_id: (update_override_state(nid, "scheduler", e.value), render_workflow_overrides_ui.refresh())
                                 ).classes('flex-1')
                                 
@@ -1223,6 +1226,7 @@ def render_workflow_overrides_ui():
                                     options=comfy_options_cache[comfy_sampler_key],
                                     value=current_sampler if current_sampler in comfy_options_cache[comfy_sampler_key] else None,
                                     label="Sampler Name",
+                                    with_input=True,
                                     on_change=lambda e, nid=node_id: (update_override_state(nid, "sampler_name", e.value), render_workflow_overrides_ui.refresh())
                                 ).classes('flex-1')
                                 
@@ -1280,7 +1284,7 @@ def render_workflow_overrides_ui():
                         current_lora_name = state.style_workflow_overrides.get(node_id, {}).get("lora_name", params["lora_name"])
                         current_strength_model = state.style_workflow_overrides.get(node_id, {}).get("strength_model", params["strength_model"])
                         
-                        # Render ComfyUI dropdown alongside the visual palette chooser button
+                        # Render ComfyUI dropdown alongside the visual palette chooser button (Live filter enabled)
                         comfy_lora_key = f"{node_id}:lora_name"
                         if comfy_lora_key in comfy_options_cache:
                             with ui.row().classes('w-full items-end gap-2'):
@@ -1288,6 +1292,7 @@ def render_workflow_overrides_ui():
                                     options=comfy_options_cache[comfy_lora_key],
                                     value=current_lora_name if current_lora_name in comfy_options_cache[comfy_lora_key] else None,
                                     label="Select LoRA",
+                                    with_input=True,
                                     on_change=lambda e, nid=node_id: (update_override_state(nid, "lora_name", e.value), render_workflow_overrides_ui.refresh())
                                 ).classes('flex-1')
                                 
@@ -1362,6 +1367,7 @@ def render_workflow_overrides_ui():
                         param_key = params.get("model_param_key", "ckpt_name")
                         current_model_name = state.style_workflow_overrides.get(node_id, {}).get(param_key, params.get(param_key, ""))
                         
+                        # Render ComfyUI dropdown alongside the save button (Live filter enabled)
                         comfy_key = f"{node_id}:{param_key}"
                         if comfy_key in comfy_options_cache:
                             with ui.row().classes('w-full items-end gap-2'):
@@ -1369,6 +1375,7 @@ def render_workflow_overrides_ui():
                                     options=comfy_options_cache[comfy_key],
                                     value=current_model_name if current_model_name in comfy_options_cache[comfy_key] else None,
                                     label=f"Select Model ({param_key})",
+                                    with_input=True,
                                     on_change=lambda e, nid=node_id, pk=param_key: (update_override_state(nid, pk, e.value), render_workflow_overrides_ui.refresh())
                                 ).classes('flex-1')
                                 
@@ -1393,6 +1400,7 @@ def render_workflow_overrides_ui():
                         param_key = params.get("clip_param_key", "clip_name")
                         current_clip_name = state.style_workflow_overrides.get(node_id, {}).get(param_key, params.get(param_key, ""))
                         
+                        # Render ComfyUI dropdown alongside the save button (Live filter enabled)
                         comfy_key = f"{node_id}:{param_key}"
                         if comfy_key in comfy_options_cache:
                             with ui.row().classes('w-full items-end gap-2'):
@@ -1400,6 +1408,7 @@ def render_workflow_overrides_ui():
                                     options=comfy_options_cache[comfy_key],
                                     value=current_clip_name if current_clip_name in comfy_options_cache[comfy_key] else None,
                                     label=f"Select CLIP Model ({param_key})",
+                                    with_input=True,
                                     on_change=lambda e, nid=node_id, pk=param_key: (update_override_state(nid, pk, e.value), render_workflow_overrides_ui.refresh())
                                 ).classes('flex-1')
                                 
@@ -1423,6 +1432,7 @@ def render_workflow_overrides_ui():
                     elif node_type == "vae_loader":
                         current_vae_name = state.style_workflow_overrides.get(node_id, {}).get("vae_name", params.get("vae_name", ""))
                         
+                        # Render ComfyUI dropdown alongside the save button (Live filter enabled)
                         comfy_key = f"{node_id}:vae_name"
                         if comfy_key in comfy_options_cache:
                             with ui.row().classes('w-full items-end gap-2'):
@@ -1430,6 +1440,7 @@ def render_workflow_overrides_ui():
                                     options=comfy_options_cache[comfy_key],
                                     value=current_vae_name if current_vae_name in comfy_options_cache[comfy_key] else None,
                                     label="Select VAE Model",
+                                    with_input=True,
                                     on_change=lambda e, nid=node_id: (update_override_state(nid, "vae_name", e.value), render_workflow_overrides_ui.refresh())
                                 ).classes('flex-1')
                                 
@@ -1449,7 +1460,7 @@ def render_workflow_overrides_ui():
                                     icon='save',
                                     on_click=lambda nid=node_id, val=current_vae_name: save_default_to_workflow(state.style_selected_workflow, nid, "vae_name", val)
                                 ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default VAE name to workflow file (.json)")
-
+                                
 
 @ui.refreshable
 def render_style_playground_cards(project_name: str = ""):
