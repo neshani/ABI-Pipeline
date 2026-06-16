@@ -14,6 +14,67 @@ BENCHMARK_PROMPTS = {
     "architecture": "A majestic stone cathedral interior, high gothic arches, dust motes dancing in shafts of light from stained glass windows."
 }
 
+# The 7 Default Built-in Style Presets
+DEFAULT_PRESETS = {
+    "retro_graphic_novel": {
+        "name": "Retro Graphic Novel",
+        "workflow": "",
+        "prompt_prefix": "space opera adventure graphic novel illustration, sharp ink sketch, crisp outlines, retro-futuristic sci-fi aesthetic, cosmic wonder, detailed, ",
+        "prompt_suffix": ", high-contrast shadows, selective color accents, bold ink-wash shading",
+        "negative_prompt": "blurry, bad quality, text, watermark, photorealistic, photography, dystopian, gritty, grimy, decay, cyberpunk",
+        "overrides": {}
+    },
+    "fantasy_adventure": {
+        "name": "Fantasy & Adventure",
+        "workflow": "",
+        "prompt_prefix": "whimsical storybook illustration, watercolor and ink wash, vibrant fantasy scene, detailed ink outlines, magical atmosphere, ",
+        "prompt_suffix": ", soft magical glow, highly detailed, storybook aesthetic, charming, clean composition",
+        "negative_prompt": "photorealistic, photography, modern, futuristic, neon, 3d render, plastic, low quality, bad anatomy, text, watermark",
+        "overrides": {}
+    },
+    "sci_fi": {
+        "name": "Sci-Fi & Cyberpunk",
+        "workflow": "",
+        "prompt_prefix": "cinematic digital concept art, futuristic sci-fi aesthetic, dramatic volumetric lighting, crisp focus, matte painting style, ",
+        "prompt_suffix": ", rich sci-fi details, ultra-high-definition, atmospheric depth, epic composition",
+        "negative_prompt": "canvas texture, watercolor, hand-drawn, cozy, medieval, low quality, text, watermark, bad anatomy, paint strokes",
+        "overrides": {}
+    },
+    "historical_classic": {
+        "name": "Historical Fiction & Drama",
+        "workflow": "",
+        "prompt_prefix": "classical oil painting, rich academic art style, dramatic chiaroscuro lighting, textured canvas, elegant visible brushstrokes, ",
+        "prompt_suffix": ", timeless masterpiece, warm dramatic tones, fine art gallery quality",
+        "negative_prompt": "anime, neon, digital art, line art, modern, futuristic, low-poly, vector, comic, cartoon, text, watermark, photorealistic",
+        "overrides": {}
+    },
+    "anime": {
+        "name": "Anime & Manga",
+        "workflow": "",
+        "prompt_prefix": "vibrant anime visual novel key art, clean digital line work, colorful cel shading, beautiful detailed anime background, expressive dynamic lighting, ",
+        "prompt_suffix": ", high-quality anime illustration, crisp colors, modern anime aesthetic",
+        "negative_prompt": "photorealistic, oil painting, watercolor, rough sketch, grimy, textured canvas, 3d render, real-world texture, text, watermark, bad proportions",
+        "overrides": {}
+    },
+    "cozy_mystery": {
+        "name": "Cozy Mystery & Slice of Life",
+        "workflow": "",
+        "prompt_prefix": "stylized cozy mystery book cover art, modern flat vector illustration with subtle grain texture, warm and inviting atmosphere, clean lines, charming color palette, ",
+        "prompt_suffix": ", whimsical layout, minimalist details, cozy slice-of-life aesthetic",
+        "negative_prompt": "gritty, violent, terrifying, dark fantasy, heavy metallic, photorealistic, photography, messy sketches, text, watermark, messy lines",
+        "overrides": {}
+    },
+    "childrens_fiction": {
+        "name": "Children's Fiction",
+        "workflow": "",
+        "prompt_prefix": "soft gouache and colored pencil illustration, whimsical children's book style, gentle textures, cozy and warm atmosphere, pastel color palette, ",
+        "prompt_suffix": ", adorable and friendly aesthetic, clean storytelling layout, cozy magic",
+        "negative_prompt": "dark, gritty, scary, photorealistic, neon, high contrast shadows, cyberpunk, complex digital painting, text, watermark, violent, gloomy",
+        "overrides": {}
+    }
+}
+
+
 def get_image_base64_or_placeholder(image_path: Path) -> Optional[str]:
     """Reads a local file and encodes it as a base64 string for direct rendering."""
     if image_path.exists():
@@ -27,32 +88,94 @@ def get_image_base64_or_placeholder(image_path: Path) -> Optional[str]:
     return None
 
 
-def ensure_default_style_exists():
-    """Ensures a default.json style preset file exists inside ./styles."""
+def get_available_workflows() -> List[str]:
+    """Scans workflow directories and returns a unique list of available json files on disk."""
+    workflows = []
+    for d in [Path("./workflows"), Path("./Comfy_Workflows")]:
+        if d.exists():
+            workflows.extend([f.name for f in d.glob("*.json")])
+    return sorted(list(set(workflows)))
+
+
+def heal_style_workflow(preset_name: str, preset_data: dict) -> dict:
+    """Checks if the assigned workflow is missing or blank, then resolves the best match dynamically."""
+    current_wf = preset_data.get("workflow", "")
+    
+    # 1. Check if the currently bound workflow already exists on disk
+    wf_valid = False
+    if current_wf:
+        for d in [Path("./workflows"), Path("./Comfy_Workflows")]:
+            if (d / current_wf).exists():
+                wf_valid = True
+                break
+                
+    if wf_valid:
+        return preset_data
+
+    # 2. Since it is missing or blank, load available workflows
+    workflows = get_available_workflows()
+    if not workflows:
+        preset_data["workflow"] = "default_comfy_api.json"
+        return preset_data
+
+    # 3. Apply keyword matching strategies
+    resolved_wf = ""
+    name_lower = preset_name.lower()
+    
+    if "anime" in name_lower:
+        for wf in workflows:
+            wf_lower = wf.lower()
+            if "anima" in wf_lower or "anime" in wf_lower:
+                resolved_wf = wf
+                break
+        if not resolved_wf:
+            for wf in workflows:
+                if "turbo" in wf.lower() or "lightning" in wf.lower():
+                    resolved_wf = wf
+                    break
+    elif "sci_fi" in name_lower:
+        for wf in workflows:
+            wf_lower = wf.lower()
+            if "scifi" in wf_lower or "sci-fi" in wf_lower or "flux" in wf_lower or "sdxl" in wf_lower:
+                resolved_wf = wf
+                break
+
+    # 4. Fallback to the first available alphabetical choice
+    if not resolved_wf:
+        resolved_wf = workflows[0]
+
+    preset_data["workflow"] = resolved_wf
+
+    # 5. Save healed preset back to disk so the decision is persisted
+    file_path = Path("./styles") / f"{preset_name}.json"
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(preset_data, f, indent=2)
+    except Exception:
+        pass
+
+    return preset_data
+
+
+def ensure_default_presets_exist():
+    """Seeds the styles directory with core genre presets only if the directory contains zero JSON files."""
     styles_dir = Path("./styles")
     styles_dir.mkdir(parents=True, exist_ok=True)
-    default_file = styles_dir / "default.json"
-    if not default_file.exists():
-        # Look for first available workflow on disk
-        workflows = []
-        for d in [Path("./workflows"), Path("./Comfy_Workflows")]:
-            if d.exists():
-                workflows.extend([f.name for f in d.glob("*.json")])
-        default_wf = workflows[0] if workflows else "default_comfy_api.json"
-        
-        default_content = {
-            "name": "default",
-            "workflow": default_wf,
-            "prompt_prefix": "ArsMJStyle, 1890s Victorian illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. ",
-            "prompt_suffix": "",
-            "negative_prompt": "blurry, bad quality, text, watermark, photorealistic, photography",
-            "overrides": {}
-        }
-        try:
-            with open(default_file, "w", encoding="utf-8") as f:
-                json.dump(default_content, f, indent=2)
-        except Exception:
-            pass
+    
+    existing_presets = list(styles_dir.glob("*.json"))
+    if not existing_presets:
+        for preset_key, content in DEFAULT_PRESETS.items():
+            file_path = styles_dir / f"{preset_key}.json"
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(content, f, indent=2)
+            except Exception:
+                pass
+
+
+def ensure_default_style_exists():
+    """Backward-compatible wrapper to maintain visual dashboard entry points during refactoring imports."""
+    ensure_default_presets_exist()
 
 
 class StyleChooserModal:
@@ -63,7 +186,7 @@ class StyleChooserModal:
         self.preview_title = None
         self.preview_image_widget = None
         self.search_query = ""
-        self.selected_style = "default"
+        self.selected_style = "retro_graphic_novel"
         
         # Loaded metadata details
         self.style_prefix = ""
@@ -83,15 +206,15 @@ class StyleChooserModal:
 
     def list_styles(self) -> List[str]:
         """Discovers .json files inside local styles directory."""
-        ensure_default_style_exists()
+        ensure_default_presets_exist()
         styles_dir = Path("./styles")
         styles_dir.mkdir(parents=True, exist_ok=True)
         presets = [f.stem for f in styles_dir.glob("*.json")]
         return sorted(presets)
 
     def load_preset_details(self, name: str):
-        """Parses style json presets, seeding prompt/negative prompt variables."""
-        ensure_default_style_exists()
+        """Parses style json presets, seeding prompt/negative prompt variables with dynamic healer fallback."""
+        ensure_default_presets_exist()
         self.selected_style = name
         
         styles_dir = Path("./styles")
@@ -99,8 +222,12 @@ class StyleChooserModal:
         
         if file_path.exists():
             try:
-                with open(file_path, "r") as f:
+                with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                
+                # Heal and persist missing/broken workflow definitions dynamically
+                data = heal_style_workflow(name, data)
+                
                 self.style_prefix = data.get("prompt_prefix", "")
                 self.style_suffix = data.get("prompt_suffix", "")
                 self.style_negative = data.get("negative_prompt", "")
@@ -324,7 +451,7 @@ class StyleChooserModal:
         if self.dialog:
             self.dialog.close()
 
-    def open(self, current_selection: str = "default"):
+    def open(self, current_selection: str = "retro_graphic_novel"):
         """Instantiates the modal in memory and opens the dialog."""
         self.selected_style = current_selection
         self.load_preset_details(current_selection)

@@ -44,7 +44,7 @@ def save_project_settings_to_disk(project_id: int) -> None:
 
 
 def load_project_settings_from_disk(project_id: int) -> None:
-    """Deserializes project_settings.json and restores active configurations to state bindings."""
+    """Deserializes project_settings.json and restores active configurations to state bindings with legacy redirection."""
     with Session(engine) as session:
         project = session.get(Project, project_id)
         if not project:
@@ -53,13 +53,13 @@ def load_project_settings_from_disk(project_id: int) -> None:
 
     settings_path = get_project_settings_path(project_name)
     if not settings_path.exists():
-        # Fallback to default state values if no custom settings exist yet
+        # Fallback to new default state values if no custom settings exist yet
         state.playground_selected_template = "default"
-        state.style_selected_preset = "default"
+        state.style_selected_preset = "retro_graphic_novel"
         state.style_selected_workflow = ""
-        state.style_prompt_prefix = "ArsMJStyle, 1890s Victorian illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. "
-        state.style_prompt_suffix = ""
-        state.style_negative_prompt = "blurry, bad quality, text, watermark, photorealistic, photography"
+        state.style_prompt_prefix = "space opera adventure graphic novel illustration, sharp ink sketch, crisp outlines, retro-futuristic sci-fi aesthetic, cosmic wonder, detailed, "
+        state.style_prompt_suffix = ", high-contrast shadows, selective color accents, bold ink-wash shading"
+        state.style_negative_prompt = "blurry, bad quality, text, watermark, photorealistic, photography, dystopian, gritty, grimy, decay, cyberpunk"
         state.style_use_random_image_seed = True
         state.style_image_seed = 42
         state.style_workflow_overrides = {}
@@ -73,22 +73,17 @@ def load_project_settings_from_disk(project_id: int) -> None:
 
         state.playground_selected_template = data.get("active_template", "default")
         
-        # 1. Load the base Style Preset first to ensure all preset defaults are fully populated
-        preset_name = data.get("active_style_preset", "default")
+        # 1. Load the base Style Preset first. Redirect legacy "default" presets to the new "retro_graphic_novel" default.
+        preset_name = data.get("active_style_preset", "retro_graphic_novel")
+        if preset_name == "default":
+            preset_name = "retro_graphic_novel"
+            
         state.style_selected_preset = preset_name
         
-        if preset_name != "default":
-            from ui.pages.project.style_playground import load_style_preset_by_name
-            load_style_preset_by_name(preset_name)
-        else:
-            # Fallback default values if no preset is selected
-            state.style_selected_workflow = ""
-            state.style_prompt_prefix = "ArsMJStyle, 1890s Victorian illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. "
-            state.style_prompt_suffix = ""
-            state.style_negative_prompt = "blurry, bad quality, text, watermark, photorealistic, photography"
-            state.style_workflow_overrides = {}
+        from ui.pages.project.style_playground import load_style_preset_by_name
+        load_style_preset_by_name(preset_name)
 
-        # 2. Apply/Overlay any customized project-level settings on top of the preset (only if they exist and are non-empty in project_settings.json)
+        # 2. Apply/Overlay any customized project-level settings on top of the preset (only if they exist and are non-empty)
         if data.get("active_workflow"):
             state.style_selected_workflow = data.get("active_workflow")
         if data.get("style_prompt_prefix"):
@@ -111,7 +106,12 @@ def load_project_settings_from_disk(project_id: int) -> None:
         # Re-analyze active workflow parameters to repopulate active sliders
         if state.style_selected_workflow:
             from ui.pages.project.style_playground import handle_style_workflow_change
+            from ui.pages.project.style_playground import render_workflow_overrides_ui
             handle_style_workflow_change(state.style_selected_workflow, clear_overrides=False)
+            try:
+                render_workflow_overrides_ui.refresh()
+            except Exception:
+                pass
 
         state.add_console_log(f"[FaST-Engine] Restored project configurations from: {settings_path.name}")
     except Exception as e:

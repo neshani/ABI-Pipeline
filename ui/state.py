@@ -75,12 +75,12 @@ image_gen_active: bool = False
 cancel_image_gen_flag: bool = False
 
 # --- Style Playground & Workflow Analyzer Bindings ---
-style_selected_preset: str = "default"
+style_selected_preset: str = "retro_graphic_novel"
 style_preset_save_name: str = ""
 style_selected_workflow: str = ""
-style_prompt_prefix: str = "ArsMJStyle, 1890s Victorian illustration, detailed pen and ink with soft watercolor wash, Sidney Paget style. "
-style_prompt_suffix: str = ""
-style_negative_prompt: str = "blurry, bad quality, text, watermark, photorealistic, photography"
+style_prompt_prefix: str = "space opera adventure graphic novel illustration, sharp ink sketch, crisp outlines, retro-futuristic sci-fi aesthetic, cosmic wonder, detailed, "
+style_prompt_suffix: str = ", high-contrast shadows, selective color accents, bold ink-wash shading"
+style_negative_prompt: str = "blurry, bad quality, text, watermark, photorealistic, photography, dystopian, gritty, grimy, decay, cyberpunk"
 style_test_prompts: List[Dict[str, Any]] = []
 style_test_images: List[Optional[str]] = []  # List of Base64-encoded strings or None
 style_test_seeds: List[int] = []

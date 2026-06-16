@@ -75,51 +75,53 @@ class OnboardingWizard:
             self.dep_status = check_dependencies(engine, device)
             self.model_status = check_model_downloaded(engine, device)
 
-    async def execute_installation_pipeline(self) -> None:
+    async def execute_installation_pipeline(self, client) -> None:
         """Performs Python package installs and downloads model weights sequentially inside the wizard."""
         self.installing = True
-        self.wizard_ui.refresh()
         
-        if hasattr(self, 'terminal_log') and self.terminal_log:
-            self.terminal_log.clear()
-        if hasattr(self, 'progress_bar') and self.progress_bar:
-            self.progress_bar.set_value(0.0)
+        with client:
+            self.wizard_ui.refresh()
             
-        engine = self.temp_settings.get("stt_engine", "Parakeet ONNX")
-        device = self.temp_settings.get("stt_device", "GPU/CUDA")
-        
-        # Step 1: Install Python Libraries (if missing)
-        if not self.dep_status["status"]:
-            success = await run_pip_install(self.dep_status["missing"], self.write_to_terminal)
-            if not success:
-                ui.notify("Installation failed during library deployment.", type="negative")
-                self.installing = False
-                self.update_installation_statuses()
-                self.wizard_ui.refresh()
-                return
+            if hasattr(self, 'terminal_log') and self.terminal_log:
+                self.terminal_log.clear()
+            if hasattr(self, 'progress_bar') and self.progress_bar:
+                self.progress_bar.set_value(0.0)
+                
+            engine = self.temp_settings.get("stt_engine", "Parakeet ONNX")
+            device = self.temp_settings.get("stt_device", "GPU/CUDA")
             
-        # Step 2: Download Model Weights (if missing)
-        if not self.model_status:
-            success = await download_model_weights(
-                engine, 
-                device,
-                self.update_download_progress, 
-                self.write_to_terminal
-            )
-            if not success:
-                ui.notify("Download failed. Check your internet connection.", type="negative")
-                self.installing = False
-                self.update_installation_statuses()
-                self.wizard_ui.refresh()
-                return
+            # Step 1: Install Python Libraries (if missing)
+            if not self.dep_status["status"]:
+                success = await run_pip_install(self.dep_status["missing"], self.write_to_terminal)
+                if not success:
+                    ui.notify("Installation failed during library deployment.", type="negative")
+                    self.installing = False
+                    self.update_installation_statuses()
+                    self.wizard_ui.refresh()
+                    return
+                
+            # Step 2: Download Model Weights (if missing)
+            if not self.model_status:
+                success = await download_model_weights(
+                    engine, 
+                    device,
+                    self.update_download_progress, 
+                    self.write_to_terminal
+                )
+                if not success:
+                    ui.notify("Download failed. Check your internet connection.", type="negative")
+                    self.installing = False
+                    self.update_installation_statuses()
+                    self.wizard_ui.refresh()
+                    return
 
-        ui.notify("Engine setup successfully completed!", type="positive")
-        self.installing = False
-        self.update_installation_statuses()
-        self.wizard_ui.refresh()
-        
-        if len(self.dep_status["missing"]) > 0:
-            ui.notify("Libraries containing binaries installed. Restart recommended.", type="warning", timeout=10)
+            ui.notify("Engine setup successfully completed!", type="positive")
+            self.installing = False
+            self.update_installation_statuses()
+            self.wizard_ui.refresh()
+            
+            if len(self.dep_status["missing"]) > 0:
+                ui.notify("Libraries containing binaries installed. Restart recommended.", type="warning", timeout=10)
 
     def write_to_terminal(self, text: str) -> None:
         """Pipes subprocess outputs into the terminal widget inside the active step."""
@@ -784,7 +786,7 @@ class OnboardingWizard:
                 
                 self.action_btn = ui.button(
                     btn_text, 
-                    on_click=lambda: asyncio.create_task(self.execute_installation_pipeline())
+                    on_click=lambda: asyncio.create_task(self.execute_installation_pipeline(ui.context.client))
                 ).classes(f'w-full mt-2 {btn_color} text-white rounded-lg text-sm')
                 
                 if ready or self.installing:
