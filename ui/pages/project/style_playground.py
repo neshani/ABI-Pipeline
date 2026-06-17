@@ -17,6 +17,16 @@ from ui.components.style_chooser_modal import StyleChooserModal
 # Module-level dialog and state holders
 contact_sheet_dialog_ref = None
 contact_sheet_base64 = ""
+lora_chooser_dialog_ref = None
+playground_image_dialog_ref = None
+
+# Static element references for the detail preview modal (prevents refresh bugs)
+modal_title_label = None
+modal_image_el = None
+modal_no_image_placeholder = None
+modal_prompt_label = None
+modal_quote_container = None
+modal_quote_label = None
 
 # Cache holders for ComfyUI API selections and local Benchmarked LoRAs
 comfy_options_cache: Dict[str, List[str]] = {}
@@ -446,6 +456,41 @@ def create_contact_sheet(base64_list: list, overlay_text: str = "") -> Optional[
     out_buf = io.BytesIO()
     grid_img.save(out_buf, format="PNG")
     return out_buf.getvalue()
+
+def open_playground_image_modal(img_src: str, title: str, prompt: str, quote: str = ""):
+    """Safely mutates the persistent dialog elements in-place and triggers the overlay."""
+    global playground_image_dialog_ref, modal_title_label, modal_image_el, modal_no_image_placeholder, modal_prompt_label, modal_quote_container, modal_quote_label
+    
+    if not playground_image_dialog_ref:
+        return
+    
+    # 1. Update text metadata
+    if modal_title_label:
+        modal_title_label.set_text(title)
+    if modal_prompt_label:
+        modal_prompt_label.set_text(prompt)
+    
+    # 2. Toggle and update the image container vs. placeholder
+    if modal_image_el and modal_no_image_placeholder:
+        if img_src:
+            modal_image_el.set_source(img_src)
+            modal_image_el.visible = True
+            modal_no_image_placeholder.visible = False
+        else:
+            modal_image_el.set_source("")
+            modal_image_el.visible = False
+            modal_no_image_placeholder.visible = True
+            
+    # 3. Handle quote display context
+    if modal_quote_container and modal_quote_label:
+        if quote:
+            modal_quote_label.set_text(f'"{quote}"')
+            modal_quote_container.visible = True
+        else:
+            modal_quote_label.set_text("")
+            modal_quote_container.visible = False
+            
+    playground_image_dialog_ref.open()
 
 
 def _get_resolved_workflow_settings() -> List[str]:
@@ -1461,12 +1506,12 @@ def render_workflow_overrides_ui():
 @ui.refreshable
 def render_style_playground_cards(project_name: str = ""):
     if not state.style_test_prompts:
-        with ui.column().classes('w-full items-center justify-center p-12 text-slate-400 border border-dashed rounded-xl bg-slate-50'):
-            ui.icon('brush', size='lg', color='slate-300')
-            ui.label("Visual Playground is empty. Use the settings panel above to draw or customize test scenes.").classes('text-xs text-center max-w-sm')
+        with ui.column().classes('w-full items-center justify-center p-6 text-slate-400 border border-dashed rounded-xl bg-slate-50'):
+            ui.icon('brush', size='md', color='slate-300')
+            ui.label("Visual Playground is empty. Use the controls to load test scenes.").classes('text-[10px] text-center max-w-[200px]')
         return
 
-    with ui.grid(columns='1fr 1fr').classes('w-full gap-4'):
+    with ui.column().classes('w-full gap-3'):
         for idx, item in enumerate(state.style_test_prompts):
             img_data = state.style_test_images[idx] if idx < len(state.style_test_images) else None
             
@@ -1475,48 +1520,49 @@ def render_style_playground_cards(project_name: str = ""):
             scene_num = item.get("scene", idx + 1) if is_dict else idx + 1
             book_title = item.get("book", "Novel") if is_dict else "Novel"
             prompt_str = item.get("prompt", "") if is_dict else item
+            quote = item.get("quote", "") if is_dict else ""
             seed = state.style_test_seeds[idx] if idx < len(state.style_test_seeds) else state.style_image_seed
 
             card_title = f"Ch {chapter}, Scene {scene_num}"
             full_title_header = f"{card_title} • {book_title}"
 
-            with ui.card().classes('w-full border p-4 rounded-xl shadow-xs gap-3 bg-white'):
+            with ui.card().classes('w-full border p-2.5 rounded-lg shadow-xs gap-2 bg-white'):
                 with ui.row().classes('w-full justify-between items-center pb-1 border-b border-dashed'):
-                    with ui.column().classes('gap-0'):
-                        ui.label(card_title).classes('text-xs font-black text-slate-700 uppercase')
-                        ui.label(book_title).classes('text-[9px] text-slate-400 truncate max-w-[150px]')
+                    ui.label(card_title).classes('text-[10px] font-black text-slate-700 uppercase')
                     
                     # Clickable Interactive Seed Badge
                     ui.badge(f"Seed: {seed}", color="slate") \
-                        .classes('text-[10px] font-bold cursor-pointer hover:bg-slate-700 transition-all') \
+                        .classes('text-[9px] font-bold cursor-pointer hover:bg-slate-700 transition-all') \
                         .on('click', lambda _, i=idx: regenerate_single_card(project_name, i)) \
-                        .tooltip('Click to randomize seed and regenerate just this scene!')
+                        .tooltip('Click to randomize seed and regenerate just this card!')
 
-                from ui.pages.project.dashboard import open_large_image
-                
                 if img_data == "LOADING":
-                    with ui.column().classes('w-full h-48 items-center justify-center bg-slate-50 rounded-lg border border-dashed'):
-                        ui.spinner(size='md', color='blue')
-                        ui.label("Rendering single card...").classes('text-[9px] text-slate-400 mt-1')
+                    with ui.column().classes('w-full h-40 items-center justify-center bg-slate-50 rounded border border-dashed') \
+                            .tooltip(prompt_str):
+                        ui.spinner(size='sm', color='blue')
+                        ui.label("Rendering...").classes('text-[8px] text-slate-400 mt-1')
                 elif img_data:
-                    ui.image(img_data).props('fit=contain').classes('w-full h-48 bg-slate-50 rounded-lg border shadow-sm cursor-zoom-in hover:brightness-95 transition-all') \
-                        .on('click', lambda _, img=img_data, title=full_title_header: open_large_image(img, title))
+                    ui.image(img_data).props('fit=contain').classes('w-full h-40 bg-slate-50 rounded border shadow-sm cursor-zoom-in hover:brightness-95 transition-all') \
+                        .on('click', lambda _, img=img_data, title=full_title_header, p=prompt_str, q=quote: open_playground_image_modal(img, title, p, q)) \
+                        .tooltip(prompt_str)
                 elif state.style_playground_loading:
-                    with ui.column().classes('w-full h-48 items-center justify-center bg-slate-50 rounded-lg border border-dashed'):
-                        ui.spinner(size='md', color='blue')
-                        ui.label("Rendering...").classes('text-[9px] text-slate-400 mt-1')
+                    with ui.column().classes('w-full h-40 items-center justify-center bg-slate-50 rounded border border-dashed') \
+                            .tooltip(prompt_str):
+                        ui.spinner(size='sm', color='blue')
+                        ui.label("Rendering batch...").classes('text-[8px] text-slate-400 mt-1')
                 else:
-                    with ui.column().classes('w-full h-48 items-center justify-center bg-slate-50 rounded-lg border border-dashed text-slate-400'):
-                        ui.icon('photo_library', size='md', color='slate-300')
-                        ui.label("Awaiting Style Generation").classes('text-[10px]')
-
-                with ui.column().classes('gap-1 bg-emerald-50/20 p-2.5 rounded border border-emerald-50/50 w-full'):
-                    ui.label("Extracted Image Prompt:").classes('text-[8px] font-black text-slate-400 uppercase tracking-wider')
-                    ui.label(prompt_str[:160] + "..." if len(prompt_str) > 160 else prompt_str).classes('text-xs font-semibold text-slate-700 leading-normal')
+                    # Allow clicking the empty placeholder to inspect the queued prompt before generation
+                    with ui.column().classes('w-full h-40 items-center justify-center bg-slate-50 rounded border border-dashed text-slate-400 cursor-pointer') \
+                            .on('click', lambda _, p=prompt_str, q=quote: open_playground_image_modal("", full_title_header, p, q)) \
+                            .tooltip(prompt_str):
+                        ui.icon('photo_library', size='sm', color='slate-300')
+                        ui.label("Awaiting Style Gen").classes('text-[9px] font-semibold text-slate-500 mt-1')
+                        ui.label("Click to see prompt details").classes('text-[8px] text-slate-400')
 
 
 def render_style_playground_tab(project, save_project_settings_cb=None):
-    global contact_sheet_dialog_ref, lora_chooser_dialog_ref
+    global contact_sheet_dialog_ref, lora_chooser_dialog_ref, playground_image_dialog_ref
+    global modal_title_label, modal_image_el, modal_no_image_placeholder, modal_prompt_label, modal_quote_container, modal_quote_label
     
     # Query current volume listings inside database index
     with Session(engine) as session:
@@ -1527,6 +1573,10 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
     if books and (not state.playground_book_selection or state.playground_book_selection not in book_names):
         state.playground_book_selection = books[0].name
         
+    # Ensure style playground starts with a default test count of 4 images
+    if not hasattr(state, 'style_chunk_count') or state.style_chunk_count is None:
+        state.style_chunk_count = 4
+
     # Auto-initialize visual test prompts so workspace is never left empty
     if not state.style_test_prompts and state.playground_book_selection:
         draw_style_test_sample(project.name, state.playground_book_selection)
@@ -1536,177 +1586,163 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
     if state.style_selected_workflow:
         asyncio.create_task(async_load_comfy_and_lora_choices())
 
-    with ui.grid(columns='420px 1fr').classes('w-full gap-6 items-start'):
-        # LEFT CONFIG PANEL
-        with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
-            ui.label('Style Preset & Workflow Config').classes('text-sm font-bold text-slate-800')
-            
-            # 1. Style Preset Library Loader (The Parent Concept)
-            with ui.row().classes('w-full items-center justify-between p-3 bg-slate-50 rounded border border-slate-200 mt-1'):
-                with ui.column().classes('gap-0 flex-1'):
-                    ui.label('Active Preset').classes('text-[10px] font-bold text-slate-400 uppercase')
-                    ui.label().classes('text-xs font-bold text-slate-800').bind_text_from(state, 'style_selected_preset')
-                ui.button(
-                    'Browse Library', 
-                    icon='photo_library', 
-                    on_click=lambda: open_style_chooser_modal_globally()
-                ).classes('bg-blue-600 text-white text-xs h-9 font-semibold')
-            
-            # 2. Preset Save Field (Grouped with Preset Management)
-            with ui.row().classes('w-full items-end gap-2'):
-                custom_style_name = ui.input(placeholder="Preset Name", label="Save Current Preset") \
-                    .classes('flex-1') \
-                    .bind_value(state, 'style_preset_save_name') \
-                    .tooltip("Saves current prompts and overrides as a global, reusable preset in your styles library")
-                ui.button(
-                    icon="save",
-                    on_click=lambda: (
-                        save_style_preset_by_name(custom_style_name.value)
-                    )
-                ).props('outline').classes('h-10 text-blue-600').tooltip("Save or overwrite this preset in the global styles library")
-
-            ui.separator()
-
-            # 3. Workflow Selector (Child Engine of the Selected Style)
-            available_workflows = list_available_workflows()
-            if not state.style_selected_workflow or state.style_selected_workflow not in available_workflows:
-                if available_workflows:
-                    state.style_selected_workflow = available_workflows[0]
-                    handle_style_workflow_change(available_workflows[0])
-                    
-            ui.select(
-                options=available_workflows,
-                label="ComfyUI Base Workflow (.json)",
-                on_change=lambda e: handle_style_workflow_change(e.value)
-            ).classes('w-full').bind_value(state, 'style_selected_workflow')
-            
-            ui.separator()
-            
-            ui.textarea(
-                label="Style Prompt Prefix"
-            ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_prompt_prefix')
-
-            ui.textarea(
-                label="Style Prompt Suffix"
-            ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_prompt_suffix')
-            
-            ui.textarea(
-                label="Style Negative Prompt"
-            ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_negative_prompt')
-            
-            render_workflow_overrides_ui()
-            
-            
-        # RIGHT: Visual Style Playground Grid
+    # 75% Left Column (3fr), 25% Right Column (1fr) split
+    with ui.grid(columns='3fr 1fr').classes('w-full gap-4 items-start'):
+        
+        # ==================== LEFT CONFIG PANEL (75%) ====================
         with ui.column().classes('w-full gap-4'):
-            with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
-                with ui.row().classes('w-full items-center justify-between'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon('tune', size='sm', color='blue-500')
-                        ui.label('Style Visual Playground Settings').classes('text-sm font-bold text-slate-800')
+            
+            # ---------------- CARD 1: PLAYGROUND RUN CONTROLS (Top) ----------------
+            with ui.card().classes('w-full border p-4 shadow-sm bg-white gap-3'):
+                with ui.row().classes('w-full items-center justify-between border-b pb-1.5'):
+                    ui.label('Playground Run Controls').classes('text-sm font-bold text-slate-800')
                     
-                    # Relocated project settings save button with disk icon and tooltip helper
-                    ui.button(
-                        icon='save',
-                        on_click=lambda: save_project_settings_cb(project.id) if save_project_settings_cb else None
-                    ).props('flat round size=md').classes('text-blue-600') \
-                     .tooltip("Saves active preset selection and manual seed choices specifically for this project")
-                    
-                with ui.column().classes('w-full gap-4 bg-slate-50 p-4 rounded-lg border'):
-                    # Step 1: Volume Select & Number of scenes slider
-                    with ui.row().classes('w-full items-center justify-between gap-4'):
+                with ui.column().classes('w-full gap-2 p-3 bg-slate-50 rounded-lg border text-xs'):
+                    with ui.row().classes('w-full items-center justify-between gap-3'):
+                        # Volume Source Dropdown
                         ui.select(
                             options=book_names,
-                            label="Book/Volume Source",
+                            label="Source Volume",
                             on_change=lambda e: (setattr(state, 'playground_book_selection', e.value), draw_style_test_sample(project.name, e.value))
-                        ).classes('w-48 bg-white').bind_value(state, 'playground_book_selection')
+                        ).classes('flex-1 bg-white').props('dense outlined').bind_value(state, 'playground_book_selection')
                         
-                        ui.slider(
-                            min=1, max=8, step=1,
+                        # Compact scenes count dropdown (replacing the giant slider)
+                        ui.select(
+                            options=[1, 2, 3, 4, 5, 6, 7, 8],
+                            label="Test Count",
                             on_change=lambda e: (
                                 setattr(state, 'style_chunk_count', int(e.value)) if e.value is not None else None, 
                                 draw_style_test_sample(project.name, state.playground_book_selection)
                             )
-                        ).classes('flex-1 mx-2').props('label-always').bind_value(state, 'style_chunk_count')
-                        ui.label('Test Count').classes('text-xs font-bold text-slate-400')
-
-                    # Step 2: Reroll controllers
-                    with ui.row().classes('w-full gap-2 justify-end mt-1'):
-                        ui.button(
-                            'Reroll Scenes',
-                            icon='casino',
-                            on_click=lambda: reroll_test_scenes(project.name, state.playground_book_selection)
-                        ).classes('bg-slate-700 text-white text-xs font-semibold h-9') \
-                         .tooltip('Pulls a completely new set of random visual scenes from the selected volume')
-                        
-                        ui.button(
-                            'Reroll Seeds',
-                            icon='refresh',
-                            on_click=reroll_image_seeds
-                        ).classes('bg-slate-700 text-white text-xs font-semibold h-9') \
-                         .tooltip('Keeps current text prompts but randomizes all of their image generation seeds')
-
-                    ui.separator()
-
-                    # Step 3: Seed locks & Main execution action
-                    with ui.row().classes('w-full items-center justify-between gap-4'):
-                        with ui.row().classes('items-center gap-4'):
-                            ui.switch("Random Seeds").bind_value(state, 'style_use_random_image_seed').classes('text-xs')
+                        ).classes('w-24 bg-white').props('dense outlined').bind_value(state, 'style_chunk_count')
+                    
+                    with ui.row().classes('w-full items-center justify-between gap-2'):
+                        with ui.row().classes('gap-1'):
+                            # Micro Dice button
+                            ui.button(
+                                icon='casino',
+                                on_click=lambda: reroll_test_scenes(project.name, state.playground_book_selection)
+                            ).props('flat dense').classes('text-slate-600').tooltip('Reroll Scenes (pull new random passages)')
                             
-                            ui.number(
-                                label="Manual Image Seed",
-                                precision=0
-                            ).bind_value(state, 'style_image_seed').classes('w-32 bg-white').props('outlined dense').bind_visibility_from(
-                                state, 'style_use_random_image_seed', value=False
-                            )
-
+                            # Micro Seeds refresh button
+                            ui.button(
+                                icon='refresh',
+                                on_click=reroll_image_seeds
+                        ).props('flat dense').classes('text-slate-600').tooltip('Reroll Seeds (keep prompts, randomize image generation seeds)')
+                        
+                        # Large prominent execution button - High visibility Positive Semantic Green
                         ui.button(
                             'Test Style Preset',
                             icon='bolt',
+                            color='positive',
                             on_click=lambda: execute_style_playground_batch(project.name)
-                        ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs px-5 h-10') \
+                        ).classes('font-bold text-xs h-9 px-5 shadow-sm') \
                          .tooltip('Submits all active prompts to ComfyUI for rendering')
 
-                # --- AI Integration Toolkit Panel ---
-                with ui.column().classes('w-full bg-blue-50/50 p-3 rounded-lg border border-blue-100/50 mt-1 gap-2.5'):
-                    # Row 1: Header Line on its own row
-                    with ui.row().classes('items-center gap-1.5 w-full'):
-                        ui.icon('smart_toy', color='blue', size='sm')
-                        ui.label('AI Toolkit').classes('text-xs font-black text-slate-700 uppercase tracking-wide')
+            # ---------------- CARD 2: STYLE TEMPLATE & ENGINE DEFINITION ----------------
+            with ui.card().classes('w-full border p-4 shadow-sm bg-white gap-4'):
+                with ui.row().classes('w-full items-center justify-between border-b pb-1.5'):
+                    ui.label('Style & Workflow Definition').classes('text-sm font-bold text-slate-800')
                     
-                    # Row 2: Controls grouped and wrapping logically
-                    with ui.row().classes('w-full items-center justify-between gap-3 flex-wrap'):
-                        # Left grouping: Copy utility buttons
-                        with ui.row().classes('items-center gap-2'):
-                            ui.button(
-                                'Copy Primer',
-                                icon='psychology',
-                                on_click=lambda: copy_style_primer_to_clipboard(project.name)
-                            ).classes('bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold h-9') \
-                             .tooltip('Formats diagnostic visual parameters and prompt runs specifically for debugging chats with external LLMs')
+                # A. Style Preset Library Loader & Saver (Streamlined Compact Bar)
+                with ui.row().classes('w-full items-center justify-between gap-3 p-2 bg-slate-50 rounded border border-slate-200'):
+                    with ui.column().classes('gap-0 flex-grow min-w-0'):
+                        ui.label('Active Style Preset').classes('text-[9px] font-bold text-slate-400 uppercase')
+                        ui.label().classes('text-xs font-bold text-slate-800 truncate').bind_text_from(state, 'style_selected_preset')
+                    
+                    ui.button(
+                        'Browse', 
+                        icon='photo_library', 
+                        on_click=lambda: open_style_chooser_modal_globally()
+                    ).classes('bg-blue-600 text-white text-[11px] h-8 font-semibold')
+                    
+                    # Save preset inputs inline
+                    with ui.row().classes('items-center gap-1.5 flex-shrink-0'):
+                        custom_style_name = ui.input(placeholder="Save Preset Name") \
+                            .classes('w-36 text-xs bg-white').props('outlined dense') \
+                            .bind_value(state, 'style_preset_save_name') \
+                            .tooltip("Enter a name to save these prompt templates & parameters as a reusable style preset")
+                        ui.button(
+                            icon="save",
+                            on_click=lambda: save_style_preset_by_name(custom_style_name.value)
+                        ).props('flat round size=sm').classes('text-blue-600').tooltip("Save or overwrite this preset")
 
-                            ui.button(
-                                'Copy Prompt Pack',
-                                icon='content_copy',
-                                on_click=lambda: copy_style_settings_to_clipboard(project.name)
-                            ).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold h-9')
-                        
-                        # Right grouping: Contact Sheet config (guaranteed on a single line)
-                        with ui.row().classes('items-center gap-2 flex-nowrap'):
-                            ui.input(
-                                placeholder='Overlay text...'
-                            ).classes('w-44 text-xs bg-white').props('outlined dense').bind_value(state, 'style_contact_sheet_overlay') \
-                             .tooltip('Text written onto bottom-center of generated contact sheets')
+                # B. Artistic Templates (Prefix, Suffix, Negative)
+                with ui.column().classes('w-full gap-3'):
+                    ui.textarea(
+                        label="Style Prompt Prefix"
+                    ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_prompt_prefix')
 
-                            ui.button(
-                                'Contact Sheet',
-                                icon='grid_view',
-                                on_click=open_contact_sheet_modal
-                            ).classes('bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold h-9 flex-shrink-0')
+                    ui.textarea(
+                        label="Style Prompt Suffix"
+                    ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_prompt_suffix')
+                    
+                    ui.textarea(
+                        label="Style Negative Prompt"
+                    ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_negative_prompt')
+
+                # C. Engine & Parameters (Relocated Base Workflow JSON Selector & Dynamic Parameters)
+                with ui.column().classes('w-full gap-3 border-t pt-3'):
+                    ui.label('Engine & Workflow Settings').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wider')
+                    
+                    # Relocated Base Workflow Selector
+                    available_workflows = list_available_workflows()
+                    if not state.style_selected_workflow or state.style_selected_workflow not in available_workflows:
+                        if available_workflows:
+                            state.style_selected_workflow = available_workflows[0]
+                            handle_style_workflow_change(available_workflows[0])
+                            
+                    ui.select(
+                        options=available_workflows,
+                        label="ComfyUI Base Workflow (.json)",
+                        on_change=lambda e: handle_style_workflow_change(e.value)
+                    ).classes('w-full text-xs').bind_value(state, 'style_selected_workflow')
+                    
+                    # Dynamic Node Parameter Sliders/Dropdowns Drawer
+                    render_workflow_overrides_ui()
             
+            
+        # ==================== RIGHT IMAGE FEED & TOOLKIT (25%) ====================
+        with ui.column().classes('w-full gap-4'):
+            
+            # 1. AI Toolkit Panel (Optimized for 25% stacked column layout)
+            with ui.card().classes('w-full border p-3.5 shadow-sm bg-white gap-2.5'):
+                with ui.row().classes('items-center gap-1.5 w-full'):
+                    ui.icon('smart_toy', color='blue', size='xs')
+                    ui.label('AI Toolkit').classes('text-[10px] font-black text-slate-500 uppercase tracking-wide')
+                
+                with ui.column().classes('w-full gap-2'):
+                    ui.button(
+                        'Copy LLM Primer',
+                        icon='psychology',
+                        on_click=lambda: copy_style_primer_to_clipboard(project.name)
+                    ).classes('w-full bg-slate-700 hover:bg-slate-800 text-white text-[11px] font-semibold h-8') \
+                     .tooltip('Copy visual settings & prompts formatted for external ChatGPT/Ollama troubleshooting')
+
+                    ui.button(
+                        'Copy Prompt Pack',
+                        icon='content_copy',
+                        on_click=lambda: copy_style_settings_to_clipboard(project.name)
+                    ).classes('w-full bg-slate-700 hover:bg-slate-800 text-white text-[11px] font-semibold h-8')
+                    
+                    ui.separator()
+                    
+                    with ui.row().classes('w-full items-center gap-1.5 flex-nowrap'):
+                        ui.input(
+                            placeholder='Overlay text...'
+                        ).classes('flex-grow text-xs bg-white').props('outlined dense').bind_value(state, 'style_contact_sheet_overlay') \
+                         .tooltip('Text printed onto bottom-center of generated contact sheets')
+
+                        ui.button(
+                            icon='grid_view',
+                            on_click=open_contact_sheet_modal
+                        ).classes('bg-indigo-600 hover:bg-indigo-700 text-white h-8 w-10 flex-shrink-0') \
+                         .tooltip('Stitch completed renderings into a numbered contact sheet')
+            
+            # 2. Rendered Cards Vertical Stack
             render_style_playground_cards(project.name)
 
-    # Declare Dialog Overlay inside workspace hierarchy
+    # Declare Dialog Overlays inside workspace hierarchy
     with ui.dialog() as contact_sheet_dialog:
         with ui.card().classes('w-full max-w-4xl p-6 rounded-xl gap-4 bg-white'):
             with ui.row().classes('w-full justify-between items-center pb-2 border-b'):
@@ -1725,7 +1761,6 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                 ui.label('Tip: Right-click the image to copy it directly, or click Download.')
                 ui.button('Close', on_click=contact_sheet_dialog.close).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs')
 
-    # Declare Lora Chooser Dialog Overlay inside workspace hierarchy
     with ui.dialog() as lora_chooser_dialog:
         with ui.card().classes('w-full max-w-4xl p-5 rounded-xl gap-4 bg-white'):
             with ui.row().classes('w-full justify-between items-center pb-1 border-b'):
@@ -1736,5 +1771,28 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                 
             render_lora_chooser_content()
 
+    # Create the static, persistent modal structure once
+    with ui.dialog() as playground_image_dialog:
+        with ui.card().classes('w-full max-w-2xl p-5 rounded-xl gap-4 bg-white'):
+            with ui.row().classes('w-full justify-between items-center border-b pb-2'):
+                modal_title_label = ui.label("Preview").classes('text-base font-bold text-slate-800')
+                ui.button(icon='close', on_click=playground_image_dialog.close).props('flat round dense').classes('text-slate-400')
+            
+            modal_image_el = ui.image("").props('fit=contain').classes('w-full max-h-[60vh] rounded-lg border bg-slate-50')
+            
+            with ui.column().classes('w-full h-48 items-center justify-center bg-slate-50 rounded border border-dashed text-slate-400') as modal_no_image_placeholder:
+                ui.icon('photo_library', size='lg', color='slate-300')
+                ui.label("Rendering not yet completed.").classes('text-xs mt-1')
+
+            with ui.column().classes('w-full gap-2.5 bg-slate-50 p-4 rounded-lg border text-xs'):
+                ui.label("EXTRACTED IMAGE PROMPT").classes('text-[10px] font-black text-slate-400 uppercase tracking-wider')
+                modal_prompt_label = ui.label("").classes('font-semibold text-slate-700 leading-normal')
+                
+                with ui.column().classes('w-full gap-2') as modal_quote_container:
+                    ui.separator()
+                    ui.label("SOURCE AUDIO QUOTE").classes('text-[10px] font-black text-slate-400 uppercase tracking-wider')
+                    modal_quote_label = ui.label("").classes('italic text-slate-600 leading-normal')
+
     contact_sheet_dialog_ref = contact_sheet_dialog
     lora_chooser_dialog_ref = lora_chooser_dialog
+    playground_image_dialog_ref = playground_image_dialog
