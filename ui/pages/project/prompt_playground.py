@@ -14,6 +14,63 @@ from services.prompt_engine import (
 )
 from database.connection import get_setting
 
+# Module-level references
+source_text_dialog_ref = None
+source_text_modal_title_label = None
+source_text_modal_body_label = None
+active_project_name = ""
+
+
+def help_icon(title: str, description: str, additional_details: list = None):
+    """Renders a styled custom help icon with a clean, dark-themed structured tooltip."""
+    icon_el = ui.icon('help_outline').classes('text-slate-400 hover:text-blue-500 cursor-help ml-1.5 text-sm transition-colors')
+    with icon_el:
+        with ui.tooltip().classes('bg-slate-950 text-slate-200 p-4 rounded-xl border border-slate-800 max-w-sm shadow-2xl flex flex-col gap-1.5'):
+            ui.label(title).classes('text-blue-400 text-[11px] font-black uppercase tracking-wider')
+            ui.separator().classes('bg-slate-800/80 my-0.5')
+            ui.label(description).classes('text-[11px] leading-relaxed text-slate-300 font-medium')
+            if additional_details:
+                ui.separator().classes('bg-slate-800/80 my-0.5')
+                with ui.column().classes('gap-1 w-full'):
+                    for line in additional_details:
+                        ui.label(line).classes('text-[10px] text-slate-400 font-medium leading-normal')
+
+
+def get_chunk_percentage(project_name: str, book_name: str, chunk: str) -> int:
+    """Calculates approximate percentage depth of a chunk inside the book transcript file."""
+    if not chunk or not project_name or not book_name:
+        return 0
+    possible_paths = [
+        Path(f"./output/{project_name}/{book_name}/transcript.txt"),
+        Path(f"./output/{project_name}/{book_name}_transcript.txt"),
+        Path(f"./output/{project_name}/transcript.txt"),
+        Path(f"./{book_name}_transcript.txt"),
+        Path(f"./transcript.txt")
+    ]
+    for path in possible_paths:
+        if path.exists():
+            try:
+                content = path.read_text(encoding="utf-8")
+                pos = content.find(chunk)
+                if pos != -1:
+                    return int((pos / len(content)) * 100)
+            except Exception:
+                pass
+    return 0
+
+
+def open_source_text_modal(idx: int, chunk: str):
+    """Binds text values to the persistent overlay structure and opens the modal."""
+    global source_text_dialog_ref, source_text_modal_title_label, source_text_modal_body_label
+    if not source_text_dialog_ref:
+        return
+    if source_text_modal_title_label:
+        source_text_modal_title_label.set_text(f"Source Text Passage (Segment Chunk {idx + 1})")
+    if source_text_modal_body_label:
+        source_text_modal_body_label.set_text(f'"{chunk}"')
+    source_text_dialog_ref.open()
+
+
 def handle_template_dropdown_selection(val: str, prompt_editor_widget):
     """Loads a named prompt template and updates the text editor binding."""
     if not val:
@@ -51,7 +108,6 @@ def handle_delete_template(template_dropdown, prompt_editor_widget):
         ui.notify("The default template cannot be deleted.", type="negative")
         return
 
-    from pathlib import Path
     templates_dir = Path("./prompt_templates")
     target_file = templates_dir / f"{target_name}.txt"
     if target_file.exists():
@@ -72,24 +128,21 @@ def handle_delete_template(template_dropdown, prompt_editor_widget):
     state.playground_template = loaded_default
     prompt_editor_widget.set_value(loaded_default)
 
+
 def copy_diagnostic_primer_to_clipboard():
     """Formats a diagnostic framework primer with active run results for external larger AIs and copies it to clipboard."""
     if not state.playground_results:
         ui.notify("Please run a prompt test first to populate current run data.", type="warning")
         return
 
-    # Dynamically compile the current run results
     run_data_lines = []
     run_data_lines.append("### Active Prompt Template:")
     run_data_lines.append(f"```text\n{state.playground_template}\n```\n")
     
     run_data_lines.append("### Pipeline Run Parameters:")
     run_data_lines.append(f"- **Volume:** {state.playground_book_selection}")
-    run_data_lines.append(f"- **Mode:** {state.playground_selection_mode}")
-    if state.playground_selection_mode == "Static Segment":
-        run_data_lines.append(f"- **Start Index:** {state.playground_start_index}")
-    else:
-        run_data_lines.append(f"- **Seed:** {state.playground_seed}")
+    run_data_lines.append(f"- **Mode:** Seeded Random")
+    run_data_lines.append(f"- **Seed:** {state.playground_seed}")
     run_data_lines.append(f"- **Chunk Count Tested:** {state.playground_chunk_count}\n")
 
     run_data_lines.append("### Segment Evaluation Output:")
@@ -146,11 +199,8 @@ def copy_results_to_clipboard():
     
     markdown_lines.append("### Pipeline Run Parameters:")
     markdown_lines.append(f"- **Volume:** {state.playground_book_selection}")
-    markdown_lines.append(f"- **Mode:** {state.playground_selection_mode}")
-    if state.playground_selection_mode == "Static Segment":
-        markdown_lines.append(f"- **Start Index:** {state.playground_start_index}")
-    else:
-        markdown_lines.append(f"- **Seed:** {state.playground_seed}")
+    markdown_lines.append(f"- **Mode:** Seeded Random")
+    markdown_lines.append(f"- **Seed:** {state.playground_seed}")
     markdown_lines.append(f"- **Chunk Count Tested:** {state.playground_chunk_count}\n")
 
     markdown_lines.append("### Segment Evaluation Output:")
@@ -176,17 +226,12 @@ def copy_condensed_results_to_clipboard():
     markdown_lines = []
     markdown_lines.append("### Pipeline Run Parameters (Condensed):")
     markdown_lines.append(f"- **Volume:** {state.playground_book_selection}")
-    markdown_lines.append(f"- **Mode:** {state.playground_selection_mode}")
-    if state.playground_selection_mode == "Static Segment":
-        markdown_lines.append(f"- **Start Index:** {state.playground_start_index}")
-    else:
-        markdown_lines.append(f"- **Seed:** {state.playground_seed}")
+    markdown_lines.append(f"- **Seed:** {state.playground_seed}")
     markdown_lines.append(f"- **Chunk Count Tested:** {state.playground_chunk_count}\n")
 
     markdown_lines.append("### Segment Evaluation (Prompt & Quote Only):")
     for idx, res in enumerate(state.playground_results):
-        status_label = "Refusal Skipped" if res.get("status") == "refusal" else "Extraction Match"
-        markdown_lines.append(f"#### Segment Chunk {idx + 1} ({status_label})")
+        markdown_lines.append(f"#### Segment Chunk {idx + 1}")
         markdown_lines.append(f"- **Extracted Verbatim Quote:** \"{res['quote']}\"")
         markdown_lines.append(f"- **Generated Visual Prompt:** {res['prompt']}\n")
 
@@ -233,41 +278,35 @@ def render_playground_results_container():
         return
 
     with ui.column().classes('w-full gap-4'):
-        with ui.row().classes('w-full justify-between items-center bg-slate-100 p-3 rounded-lg border'):
-            with ui.column().classes('gap-0'):
-                ui.label("Evaluation Iteration Ready").classes('text-xs font-bold text-slate-700')
-                ui.label("Format optimized for sharing with diagnostic AIs").classes('text-[10px] text-slate-500')
-            with ui.row().classes('gap-2'):
-                ui.button("Copy AI Primer", icon="psychology", on_click=copy_diagnostic_primer_to_clipboard).classes('bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold px-3')
-                ui.button("Copy Full", icon="content_copy", on_click=copy_results_to_clipboard).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold px-3')
-                ui.button("Copy Condensed", icon="compress", on_click=copy_condensed_results_to_clipboard).classes('bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold px-3')
-
         for idx, res in enumerate(state.playground_results):
             is_refusal = res.get("status") == "refusal"
             border_color = "border-red-200 bg-red-50/20" if is_refusal else "border-slate-200 bg-white"
             badge_color = "bg-red-100 text-red-800" if is_refusal else "bg-emerald-100 text-emerald-800"
             badge_label = "Refusal Skipped" if is_refusal else "Extraction Match"
 
-            with ui.card().classes(f'w-full border p-4 rounded-xl shadow-xs gap-3 {border_color}'):
+            with ui.card().classes(f'w-full border p-4 rounded-xl shadow-xs gap-3 cursor-pointer hover:bg-slate-50/60 transition-colors {border_color}') \
+                    .on('click', lambda _, i=idx, chunk=res["chunk"]: open_source_text_modal(i, chunk)) \
+                    .tooltip("Click to view full Source Text Passage"):
+                
                 with ui.row().classes('w-full justify-between items-center pb-2 border-b border-dashed'):
-                    ui.label(f"Segment Chunk {idx + 1}").classes('text-xs font-bold text-slate-600 uppercase')
+                    pct = get_chunk_percentage(active_project_name, state.playground_book_selection, res["chunk"])
+                    ui.label(f"Segment Chunk {idx + 1} • Excerpt at {pct}%").classes('text-xs font-bold text-slate-600 uppercase')
                     ui.badge(badge_label).classes(f'px-2 py-0.5 rounded text-[10px] font-bold {badge_color}')
 
-                with ui.grid(columns='1fr 1fr').classes('w-full gap-4'):
-                    with ui.column().classes('gap-1 bg-blue-50/30 p-3 rounded-lg border border-blue-50/50'):
-                        ui.label("Source Text Passage:").classes('text-[10px] font-black text-slate-400 uppercase')
-                        ui.label(f'"{res["chunk"][:320]}..."').classes('text-xs text-slate-600 italic leading-relaxed')
-
-                    with ui.column().classes('gap-2 p-3 bg-emerald-50/20 rounded-lg border border-emerald-50/50'):
-                        with ui.column().classes('gap-0.5'):
-                            ui.label("Extracted Verbatim Quote:").classes('text-[10px] font-black text-slate-400 uppercase')
-                            ui.label(f'"{res["quote"]}"').classes('text-xs font-semibold text-slate-700')
-                        with ui.column().classes('gap-0.5 mt-2'):
-                            ui.label("Generated Visual Prompt:").classes('text-[10px] font-black text-slate-400 uppercase')
-                            ui.label(res["prompt"]).classes('text-xs font-semibold text-blue-700 leading-relaxed')
+                with ui.column().classes('w-full gap-3'):
+                    with ui.column().classes('gap-0.5 w-full'):
+                        ui.label("Extracted Verbatim Quote:").classes('text-[9px] font-black text-slate-400 uppercase tracking-wide')
+                        ui.label(f'"{res["quote"]}"').classes('text-xs font-semibold text-slate-700 italic leading-relaxed')
+                    
+                    with ui.column().classes('gap-0.5 w-full'):
+                        ui.label("Generated Visual Prompt:").classes('text-[9px] font-black text-slate-400 uppercase tracking-wide')
+                        ui.label(res["prompt"]).classes('text-xs font-semibold text-blue-700 leading-relaxed')
 
 
 async def execute_playground_test(project_name: str):
+    global active_project_name
+    active_project_name = project_name
+
     if not state.playground_book_selection:
         ui.notify("Please select a target book to test.", type="warning")
         return
@@ -280,8 +319,8 @@ async def execute_playground_test(project_name: str):
         project_name=project_name,
         book_name=state.playground_book_selection,
         count=state.playground_chunk_count,
-        mode=state.playground_selection_mode,
-        start_index=state.playground_start_index,
+        mode="Seeded Random",
+        start_index=0,
         seed=state.playground_seed
     )
 
@@ -313,82 +352,147 @@ async def execute_playground_test(project_name: str):
 
 
 def render_prompt_playground_tab(project, books):
+    global source_text_dialog_ref, source_text_modal_title_label, source_text_modal_body_label, active_project_name
+    active_project_name = project.name
+    
     available_templates = list_stored_templates()
     
-    with ui.grid(columns='380px 1fr').classes('w-full gap-6 items-start'):
-        # LEFT CONFIG PANEL
-        with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
-            ui.label('Testing Configuration').classes('text-sm font-bold text-slate-800')
+    with ui.grid(columns='1.2fr 1fr').classes('w-full gap-6 items-start'):
+        # LEFT COLUMN (Prompt Architecture & Parameters)
+        with ui.column().classes('w-full gap-4'):
             
-            ui.select(
-                options=[b.name for b in books],
-                label="Select Book Volume",
-                value=state.playground_book_selection
-            ).bind_value(state, 'playground_book_selection').classes('w-full')
-
-            with ui.row().classes('w-full items-center gap-2'):
-                template_dropdown = ui.select(
-                    options=available_templates,
-                    label="Saved Template",
-                    value=state.playground_selected_template,
-                    on_change=lambda e: handle_template_dropdown_selection(e.value, prompt_editor)
-                ).classes('flex-1')
-                
-                ui.button(
-                    icon="delete",
-                    on_click=lambda: handle_delete_template(template_dropdown, prompt_editor)
-                ).props('flat color=red').classes('h-10').bind_visibility_from(
-                    state, 'playground_selected_template', backward=lambda val: val not in ('default', '')
-                )
-            
-            with ui.row().classes('w-full items-end gap-2'):
-                custom_name_input = ui.input(placeholder="Template Name", label="Save Custom Name").classes('flex-1')
-                ui.button(
-                    icon="save", 
-                    on_click=lambda: handle_save_custom_template(custom_name_input.value, template_dropdown)
-                ).props('outline').classes('h-10 text-blue-600')
-
-            prompt_editor = ui.textarea(
-                label="Prompt Instructions (contains <text>)",
-                value=state.playground_template,
-                on_change=lambda e: setattr(state, 'playground_template', e.value)
-            ).classes('w-full font-mono text-xs leading-relaxed').props('outlined input-style="height: 280px"')
-
-            with ui.row().classes('w-full gap-3 justify-between items-end'):
-                ui.number(
-                    label="Chunk Count", 
-                    value=state.playground_chunk_count,
-                    min=1, max=5
-                ).bind_value_to(state, 'playground_chunk_count').classes('w-20')
+            # CARD 1: RUN PARAMETERS (Top Aligned)
+            with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
+                with ui.row().classes('w-full items-center justify-between'):
+                    with ui.row().classes('items-center gap-1'):
+                        ui.label('Run Parameters').classes('text-sm font-bold text-slate-800')
+                        help_icon(
+                            title="Iterative Testing Workflow",
+                            description="ABI-Pipeline is built for rapid, real-time prompt engineering directly in your browser.",
+                            additional_details=[
+                                "• Sandbox Mode: You can type and modify prompt text and test them immediately without saving first.",
+                                "• Interactive Tuning: Tweak instructions, run a test, share results with an LLM chat via the AI Toolkit, and refine.",
+                                "• Save to Commit: Once the output is optimized, type a Custom Name below and click Save to lock in your template before switching tabs!"
+                            ]
+                        )
 
                 ui.select(
-                    options=["Seeded Random", "Static Segment"],
-                    label="Selection Mode",
-                    value=state.playground_selection_mode
-                ).bind_value_to(state, 'playground_selection_mode').classes('flex-1')
+                    options=[b.name for b in books],
+                    label="Select Book Volume",
+                    value=state.playground_book_selection
+                ).bind_value(state, 'playground_book_selection').classes('w-full')
 
-            ui.number(
-                label="Start Chunk Index",
-                value=state.playground_start_index,
-                min=0, precision=0
-            ).bind_value_to(state, 'playground_start_index').classes('w-full').bind_visibility_from(
-                state, 'playground_selection_mode', value='Static Segment'
-            )
+                with ui.row().classes('w-full gap-4'):
+                    ui.number(
+                        label="Chunk Count", 
+                        value=state.playground_chunk_count,
+                        min=1, max=10
+                    ).bind_value_to(state, 'playground_chunk_count').classes('flex-1')
 
-            ui.number(
-                label="Random Seed",
-                value=state.playground_seed,
-                precision=0
-            ).bind_value_to(state, 'playground_seed').classes('w-full').bind_visibility_from(
-                state, 'playground_selection_mode', value='Seeded Random'
-            )
+                    ui.number(
+                        label="Random Seed",
+                        value=state.playground_seed,
+                        precision=0
+                    ).bind_value_to(state, 'playground_seed').classes('flex-1')
 
-            ui.button(
-                'Test Prompt Template', 
-                icon='bolt', 
-                on_click=lambda: execute_playground_test(project.name)
-            ).classes('w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold')
+                ui.button(
+                    'Test Prompt Template', 
+                    icon='bolt', 
+                    color='positive',
+                    on_click=lambda: execute_playground_test(project.name)
+                ).classes('w-full text-white font-bold text-xs h-10 shadow-sm')
 
-        # RIGHT: Live Render Output Panel
+            # CARD 2: PROMPT ARCHITECTURE
+            with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-4'):
+                ui.label('Prompt Architecture').classes('text-sm font-bold text-slate-800')
+                
+                # Dropdown Selector
+                with ui.row().classes('w-full items-center gap-2'):
+                    template_dropdown = ui.select(
+                        options=available_templates,
+                        label="Saved Template",
+                        value=state.playground_selected_template,
+                        on_change=lambda e: handle_template_dropdown_selection(e.value, prompt_editor)
+                    ).classes('flex-1')
+                    
+                    ui.button(
+                        icon="delete",
+                        on_click=lambda: handle_delete_template(template_dropdown, prompt_editor)
+                    ).props('flat color=red').classes('h-10').bind_visibility_from(
+                        state, 'playground_selected_template', backward=lambda val: val not in ('default', '')
+                    )
+                
+                # Custom Save Name
+                with ui.row().classes('w-full items-end gap-2'):
+                    custom_name_input = ui.input(placeholder="Template Name", label="Save Custom Name").classes('flex-1')
+                    ui.button(
+                        icon="save", 
+                        on_click=lambda: handle_save_custom_template(custom_name_input.value, template_dropdown)
+                    ).props('outline').classes('h-10 text-blue-600')
+
+                # Flat, borderless autogrow text editor wrapper
+                with ui.column().classes('w-full gap-1'):
+                    ui.label("Prompt Instructions (<text> tag is required and will be replaced by book chunks)")\
+                      .classes('text-[10px] font-bold text-slate-500 tracking-wide')
+                    
+                    prompt_editor = ui.textarea(
+                        value=state.playground_template,
+                        on_change=lambda e: setattr(state, 'playground_template', e.value)
+                    ).classes('w-full font-mono text-xs leading-relaxed bg-slate-50 rounded-lg p-3 border border-slate-200')\
+                     .props('autogrow borderless shadow-none')
+
+        # RIGHT COLUMN (AI Toolkit & Results)
         with ui.column().classes('w-full gap-4'):
+            # CARD 3: AI TOOLKIT
+            with ui.card().classes('w-full border p-4 shadow-sm bg-white gap-3'):
+                with ui.row().classes('w-full items-center justify-between'):
+                    with ui.row().classes('items-center gap-1.5'):
+                        ui.icon('smart_toy', color='blue', size='xs')
+                        ui.label('AI Toolkit').classes('text-[10px] font-black text-slate-500 uppercase tracking-wide')
+                    help_icon(
+                        title="AI Companion Toolkit",
+                        description="Bridge active visual metadata to external conversational AI models.",
+                        additional_details=[
+                            "• Copy AI Primer: Generates a complete system prompt with active scene data and parser safety rules for ChatGPT/Claude/Ollama.",
+                            "• Copy Full: Copies active prompt guidelines alongside complete evaluation outputs.",
+                            "• Copy Condensed: Excludes prompt instructions, copying only quote and prompt tuples."
+                        ]
+                    )
+                
+                with ui.column().classes('w-full gap-2'):
+                    ui.button(
+                        "Copy AI Primer", 
+                        icon="psychology", 
+                        on_click=copy_diagnostic_primer_to_clipboard
+                    ).classes('w-full bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold h-9 shadow-sm')
+                    
+                    ui.button(
+                        "Copy Full", 
+                        icon="content_copy", 
+                        on_click=copy_results_to_clipboard
+                    ).classes('w-full bg-slate-700 hover:bg-slate-800 text-white text-xs font-semibold h-9 shadow-sm')
+                    
+                    ui.button(
+                        "Copy Condensed", 
+                        icon="compress", 
+                        on_click=copy_condensed_results_to_clipboard
+                    ).classes('w-full bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold h-9 shadow-sm')
+
+            # Rendered results output feed
             render_playground_results_container()
+
+    # Declare Dialog Overlays inside workspace hierarchy
+    with ui.dialog() as source_text_dialog:
+        with ui.card().classes('w-full max-w-2xl p-5 rounded-xl gap-4 bg-white'):
+            with ui.row().classes('w-full justify-between items-center border-b pb-2'):
+                source_text_modal_title_label = ui.label("Source Text Passage").classes('text-base font-bold text-slate-800')
+                ui.button(icon='close', on_click=source_text_dialog.close).props('flat round dense').classes('text-slate-400')
+            
+            with ui.column().classes('w-full bg-slate-50 p-4 rounded-lg border text-xs leading-relaxed max-h-[50vh] overflow-y-auto'):
+                source_text_modal_body_label = ui.label("").classes('italic text-slate-700 font-medium')
+            
+            with ui.row().classes('w-full justify-end border-t pt-2'):
+                ui.button('Close', on_click=source_text_dialog.close).classes('bg-slate-700 hover:bg-slate-800 text-white text-xs')
+
+    # Bind elements to global scope reference variables
+    source_text_dialog_ref = source_text_dialog
