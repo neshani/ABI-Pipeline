@@ -266,8 +266,12 @@ def process_and_compress_image(src_path: Path, dest_path: Path, max_dim: int, qu
 
 def find_prompts_csv(project_name: str, book_name: str) -> Optional[Path]:
     """Locates the prompts.csv file inside the output directory without calling main.py."""
-    from database.connection import get_setting
-    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    from database.connection import engine, get_setting
+    from sqlmodel import Session
+    
+    with Session(engine) as session:
+        base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
+        
     csv_path = base_output_dir / project_name / book_name / "prompts.csv"
     if csv_path.exists():
         return csv_path
@@ -434,8 +438,8 @@ def build_illumination_pack(
         else:
             log(0.25, "Cover injection requested but no source cover image was located on disk. Skipping.")
 
-    # --- Compress scenes to WebP in a parallel process pool ---
-    log(0.30, "Compressing, optimizing, and downscaling imagery in parallel processes...")
+    # --- Compress scenes to WebP in a parallel thread pool ---
+    log(0.30, "Compressing, optimizing, and downscaling imagery in parallel threads...")
     compression_tasks = []
     scene_image_mappings = {}
 
@@ -469,19 +473,22 @@ def build_illumination_pack(
         else:
             scene_image_mappings[idx] = None
 
-    # Run multi-process executor to bypass Python's GIL and use all CPU cores
+    # Run multi-threaded executor; Pillow releases the GIL for core resizing/compression
+    # operations, bypassing Python's GIL block and avoiding spawning system process overhead.
     processed_count = 0
     total_tasks = len(compression_tasks)
     
     if total_tasks > 0:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        with ProcessPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+        from concurrent.futures import as_completed
+        # Limit worker thread allocation dynamically to preserve UI responsiveness
+        max_workers = min(32, (os.cpu_count() or 4) * 2)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(process_and_compress_image, *t) for t in compression_tasks]
             for f in as_completed(futures):
                 try:
                     f.result()
                 except Exception as ex:
-                    log(0.30, f"Warning: Individual process failed: {str(ex)}")
+                    log(0.30, f"Warning: Individual compression thread failed: {str(ex)}")
                 processed_count += 1
                 progress_step = 0.30 + (0.40 * (processed_count / total_tasks))
                 log(progress_step, f"Processing scene frames: {processed_count}/{total_tasks} processed...")

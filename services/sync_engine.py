@@ -459,7 +459,10 @@ def get_book_stats(project_name: str, book_name: str) -> dict:
         "estimated_scenes": 0
     }
     
-    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    # Establish a safe local session to guarantee correct resolution of the output directory
+    with Session(engine) as session:
+        base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
+        
     book_dir = base_output_dir / project_name / book_name
     transcript_path = book_dir / "transcript.txt"
     prompts_path = book_dir / "prompts.csv"
@@ -501,9 +504,13 @@ def get_book_stats(project_name: str, book_name: str) -> dict:
     for d in [images_dir, book_dir]:
         if d.exists() and d.is_dir():
             try:
-                png_count = len([f for f in os.listdir(d) if f.lower().endswith('.png')])
-                if png_count > 0:
-                    stats["generated_images"] = png_count
+                # Count both png and webp assets
+                img_count = len([
+                    f for f in os.listdir(d) 
+                    if f.lower().endswith('.png') or f.lower().endswith('.webp')
+                ])
+                if img_count > 0:
+                    stats["generated_images"] = img_count
                     break
             except Exception:
                 pass
@@ -514,17 +521,30 @@ def get_book_stats(project_name: str, book_name: str) -> dict:
 def get_book_stats_cached(project_name: str, book_name: str) -> dict:
     """Checks timestamps on disk before parsing, preventing I/O overhead on polling ticks."""
     from ui import state
-    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    
+    # Establish a safe local session to guarantee correct resolution of the output directory
+    with Session(engine) as session:
+        base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
+        
     book_dir = base_output_dir / project_name / book_name
     transcript_path = book_dir / "transcript.txt"
     prompts_path = book_dir / "prompts.csv"
     images_dir = book_dir / "images"
     
-    # Build signature based on file modified times
+    # Build signature based on file modified times for text files
     sig = ""
-    for p in [transcript_path, prompts_path, images_dir]:
+    for p in [transcript_path, prompts_path]:
         if p.exists():
             sig += f"{p.name}:{p.stat().st_mtime}|"
+            
+    # Invalidate cache on directory file count changes instead of folder mtime (extremely reliable on Windows)
+    for d in [images_dir, book_dir]:
+        if d.exists() and d.is_dir():
+            try:
+                file_count = len(os.listdir(d))
+                sig += f"{d.name}_count:{file_count}|"
+            except Exception:
+                pass
             
     cache_key = f"{project_name}:{book_name}"
     if cache_key in state._stats_cache:

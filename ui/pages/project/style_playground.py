@@ -524,9 +524,7 @@ def copy_style_settings_to_clipboard(project_name: str = "Active Project"):
         quote = item.get("quote", "") if is_dict else ""
         seed = state.style_test_seeds[idx] if idx < len(state.style_test_seeds) else state.style_image_seed
 
-        row_num = (idx // 4) + 1
-        col_letter = chr(65 + (idx % 4))
-        label = f"{row_num}{col_letter}"
+        label = str(idx + 1)
 
         lines.append(f"- **[{label}] Ch {chap}, Scene {sec}** (Seed: {seed})")
         if quote:
@@ -551,9 +549,7 @@ def copy_style_primer_to_clipboard(project_name: str):
         quote = item.get("quote", "") if is_dict else ""
         seed = state.style_test_seeds[idx] if idx < len(state.style_test_seeds) else state.style_image_seed
 
-        row_num = (idx // 4) + 1
-        col_letter = chr(65 + (idx % 4))
-        label = f"{row_num}{col_letter}"
+        label = str(idx + 1)
 
         scenes_lines.append(f"- **[{label}] Ch {chap}, Scene {sec}** (Seed: {seed})")
         if quote:
@@ -587,7 +583,7 @@ def copy_style_primer_to_clipboard(project_name: str):
     
     ui.clipboard.write(primer_text)
     ui.notify("Style AI Primer copied! Paste this first, then upload or paste your results.", type="positive", icon="psychology")
-
+    
 
 def download_contact_sheet():
     """Generates and triggers download of the stitched contact sheet PNG file."""
@@ -1460,7 +1456,7 @@ def render_workflow_overrides_ui():
                                     icon='save',
                                     on_click=lambda nid=node_id, val=current_vae_name: save_default_to_workflow(state.style_selected_workflow, nid, "vae_name", val)
                                 ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default VAE name to workflow file (.json)")
-                                
+
 
 @ui.refreshable
 def render_style_playground_cards(project_name: str = ""):

@@ -163,7 +163,9 @@ class PackagerPlayground:
     async def async_load_telemetry(self, project: Project, books: list):
         """Asynchronously loads timing, ID3 tags and caches stats from disk to keep UI instant."""
         from database.connection import get_setting
-        base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+        
+        with Session(engine) as session:
+            base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
 
         for book in books:
             duration_sec = await asyncio.to_thread(get_book_total_duration, project.name, book.name)
