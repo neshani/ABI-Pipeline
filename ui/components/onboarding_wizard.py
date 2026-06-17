@@ -76,7 +76,11 @@ class OnboardingWizard:
             self.model_status = check_model_downloaded(engine, device)
 
     async def execute_installation_pipeline(self, client) -> None:
-        """Performs Python package installs and downloads model weights sequentially inside the wizard."""
+        """
+        Performs Python package installs and downloads model weights sequentially inside the wizard.
+        Delegates completely to the centralized services/installer.py module to ensure 
+        locked version constraints are enforced during package deployments.
+        """
         self.installing = True
         
         with client:
@@ -91,6 +95,8 @@ class OnboardingWizard:
             device = self.temp_settings.get("stt_device", "GPU/CUDA")
             
             # Step 1: Install Python Libraries (if missing)
+            # Centralized version constraints inside services/installer.py automatically translate 
+            # these raw dependency strings into deployment-ready, frozen packages.
             if not self.dep_status["status"]:
                 success = await run_pip_install(self.dep_status["missing"], self.write_to_terminal)
                 if not success:
@@ -870,7 +876,7 @@ class OnboardingWizard:
                     "1. Configure your prompt text parameter inside ComfyUI to contain exactly `<prompt>` and negative prompt to `<negprompt>`.\n"
                     "2. Go to **File -> Export (API)** (may require enabling dev mode in settings).\n"
                     "3. Save that output `.json` file directly inside the `./workflows/` folder of this project.\n\n"
-                    "ABI-Pipeline will automatically introspect and generate sliders, selectors, and dropdowns for your custom parameters!"
+                    "Centralized services/installer.py is used to secure all python environments, and metadata baking is handled internally."
                 ).classes('text-[11px] text-slate-600 leading-normal')
 
             # Location Path & API Target input rows

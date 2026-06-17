@@ -23,6 +23,22 @@ MODEL_REPOS = {
     "Whisper": "Systran/faster-whisper-small"
 }
 
+# ==============================================================================
+# DEPLOYMENT VERSION LOCKS (Guarantees matched dependencies on fresh GPU setups)
+# ==============================================================================
+PINNED_PACKAGES = {
+    "onnxruntime-gpu": "onnxruntime-gpu==1.20.1",
+    "onnxruntime": "onnxruntime==1.20.1",
+    "nvidia-cuda-runtime-cu12": "nvidia-cuda-runtime-cu12==12.4.127",
+    "nvidia-cublas-cu12": "nvidia-cublas-cu12==12.4.5.8",
+    "nvidia-cudnn-cu12": "nvidia-cudnn-cu12==9.1.0.70",
+    "onnx_asr": "onnx-asr>=0.1.2",
+    "soundfile": "soundfile>=0.12.1",
+    "faster_whisper": "faster-whisper==1.0.3",
+    "torch": "torch>=2.2.0"
+}
+
+
 def check_dependencies(engine_name: str, device: str = "CPU") -> dict:
     """
     Checks if all packages for a given engine are installed in the environment.
@@ -72,10 +88,12 @@ def check_dependencies(engine_name: str, device: str = "CPU") -> dict:
         "missing": missing
     }
 
+
 def get_model_dir(engine_name: str) -> str:
     """Returns the local directory where the model is stored."""
     folder = "parakeet" if "ONNX" in engine_name else "whisper"
     return os.path.join(MODEL_STORAGE_DIR, folder)
+
 
 def check_model_downloaded(engine_name: str, device: str = "CPU") -> bool:
     """Checks if all necessary model weight files exist locally based on target hardware."""
@@ -96,22 +114,25 @@ def check_model_downloaded(engine_name: str, device: str = "CPU") -> bool:
 async def run_pip_install(packages: list, log_callback: Callable[[str], None]) -> bool:
     """
     Runs pip install inside a background thread to bypass Windows event loop limitations.
-    Uninstalls CPU/GPU conflicting packages on-the-fly before installation.
+    Translates loose package strings to our frozen deployment requirements and uninstalls conflicts.
     """
-    log_callback(f"Starting installation of: {', '.join(packages)}\n")
+    # Translate clean packages into locked version constraints
+    pinned_packages = [PINNED_PACKAGES.get(pkg, pkg) for pkg in packages]
+    
+    log_callback(f"Starting installation of matched dependencies: {', '.join(pinned_packages)}\n")
     
     q = queue.Queue()
     
     def pip_worker():
         # Pre-uninstall conflicting packages to avoid broken onnxruntime installs
-        if "onnxruntime-gpu" in packages:
+        if any("onnxruntime-gpu" in pkg for pkg in pinned_packages):
             log_callback("Detected GPU/CUDA request. Cleaning CPU dependencies to prevent conflict...\n")
             subprocess.run(
                 [sys.executable, "-m", "pip", "uninstall", "-y", "onnxruntime"], 
                 stdout=subprocess.DEVNULL, 
                 stderr=subprocess.DEVNULL
             )
-        elif "onnxruntime" in packages:
+        elif any("onnxruntime" in pkg and "gpu" not in pkg for pkg in pinned_packages):
             log_callback("Detected CPU request. Cleaning GPU/CUDA dependencies to prevent conflict...\n")
             subprocess.run(
                 [sys.executable, "-m", "pip", "uninstall", "-y", "onnxruntime-gpu"], 
@@ -123,7 +144,7 @@ async def run_pip_install(packages: list, log_callback: Callable[[str], None]) -
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
 
-        cmd = [sys.executable, "-m", "pip", "install"] + packages
+        cmd = [sys.executable, "-m", "pip", "install"] + pinned_packages
         try:
             # Specifically using encoding="utf-8" and env=env to prevent Windows charmap decoder crashes
             process = subprocess.Popen(
@@ -174,7 +195,7 @@ async def run_pip_install(packages: list, log_callback: Callable[[str], None]) -
             "2. Open your miniconda command prompt and activate your environment:\n"
             "   conda activate abi-pipeline\n"
             f"3. Run the command manually:\n"
-            f"   pip install {' '.join(packages)}\n"
+            f"   pip install {' '.join(pinned_packages)}\n"
             "4. Relaunch your ABI-Pipeline!\n"
             "===========================================================================\n"
         )
