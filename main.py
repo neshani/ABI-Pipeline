@@ -23,6 +23,12 @@ def setup_cuda_dll_directories():
     """
     if os.name != 'nt':
         return
+        
+    # 1. Process-level singleton guard to prevent redundant execution on duplicate module imports
+    if getattr(sys, "_abi_cuda_setup_done", False):
+        return
+    sys._abi_cuda_setup_done = True
+    
     try:
         venv_base = Path(sys.executable).parent.parent
         nvidia_base_path = venv_base / 'Lib' / 'site-packages' / 'nvidia'
@@ -44,26 +50,28 @@ def setup_cuda_dll_directories():
         for path in candidate_dirs:
             path_str = str(path.resolve())
             
-            # 1. Prepend to Windows PATH environment variable.
+            # Prepend to Windows PATH environment variable.
             # Critical for C++ libraries (like onnxruntime_providers_cuda.dll) performing transitive
             # LoadLibrary calls internally for dependency DLLs (e.g. cudnn64_9.dll loading cudnn_ops64_9.dll).
             os.environ["PATH"] = path_str + os.pathsep + os.environ.get("PATH", "")
             
-            # 2. Register with Python's direct DLL search pathways
+            # Register with Python's direct DLL search pathways
             try:
                 os.add_dll_directory(path_str)
                 print(f"[CUDA-Loader] Registered DLL directory: {path_str}")
             except Exception as e:
                 print(f"[CUDA-Loader] Warning: Failed to add DLL directory {path.name}: {e}")
                 
-        # 3. Call ONNX Runtime's native preloader if available (available in ORT 1.19+)
-        try:
-            import onnxruntime as ort
-            if hasattr(ort, "preload_dlls"):
-                ort.preload_dlls()
-                print("[CUDA-Loader] Successfully executed onnxruntime.preload_dlls()")
-        except Exception as e:
-            pass
+        # 2. Call ONNX Runtime's native preloader ONLY if local DLL paths were found and registered.
+        # This completely avoids ugly console warning logs on non-CUDA / CPU-only environments.
+        if candidate_dirs:
+            try:
+                import onnxruntime as ort
+                if hasattr(ort, "preload_dlls"):
+                    ort.preload_dlls()
+                    print("[CUDA-Loader] Successfully executed onnxruntime.preload_dlls()")
+            except Exception:
+                pass
             
     except Exception as ex:
         print(f"[CUDA-Loader] Error setting up DLL directories: {ex}")
