@@ -1074,6 +1074,21 @@ async def execute_style_playground_batch(project_name: str):
 
 style_chooser_instance = None
 
+def help_icon(title: str, description: str, additional_details: Optional[List[str]] = None):
+    """Renders a styled custom help icon with a clean, dark-themed structured tooltip."""
+    icon_el = ui.icon('help_outline').classes('text-slate-400 hover:text-blue-500 cursor-help ml-1.5 text-sm transition-colors')
+    with icon_el:
+        with ui.tooltip().classes('bg-slate-950 text-slate-200 p-4 rounded-xl border border-slate-800 max-w-sm shadow-2xl flex flex-col gap-1.5'):
+            ui.label(title).classes('text-blue-400 text-[11px] font-black uppercase tracking-wider')
+            ui.separator().classes('bg-slate-800/80 my-0.5')
+            ui.label(description).classes('text-[11px] leading-relaxed text-slate-300 font-medium')
+            if additional_details:
+                ui.separator().classes('bg-slate-800/80 my-0.5')
+                with ui.column().classes('gap-1 w-full'):
+                    for line in additional_details:
+                        ui.label(line).classes('text-[10px] text-slate-400 font-medium leading-normal')
+
+
 def open_style_chooser_modal_globally():
     """Triggers the StyleChooserModal instantly from any page view."""
     global style_chooser_instance
@@ -1100,11 +1115,21 @@ def render_workflow_overrides_ui():
     with ui.column().classes('w-full gap-3 bg-slate-50 p-3 rounded-lg border mt-2'):
         # Heartbeat connection state header
         with ui.row().classes('w-full items-center justify-between'):
-            ui.label("Workflow Parameters (Auto-Discovered)").classes('text-xs font-bold text-slate-700')
+            with ui.row().classes('items-center gap-1'):
+                ui.label("Workflow overrides (Auto-Discovered)").classes('text-xs font-bold text-slate-700')
+                help_icon(
+                    title="Workflow Overrides",
+                    description="Dynamically adjust ComfyUI node variables local to this style preset.",
+                    additional_details=[
+                        "• Preset Override: Parameter edits here apply exclusively to the active preset.",
+                        "• Save (Disk Icon): Writes settings back to the base workflow JSON file, setting new baseline defaults for all styles using it."
+                    ]
+                )
+            
             if state.comfy_online:
-                ui.badge("🟢 ComfyUI Online", color="emerald").classes('text-[10px] font-bold')
+                ui.badge("ðŸŸ¢ ComfyUI Online", color="emerald").classes('text-[10px] font-bold')
             else:
-                ui.badge("🔴 ComfyUI Offline", color="rose").classes('text-[10px] font-bold').tooltip("Boot up ComfyUI on port 8188 to sync checkpoints and samplers")
+                ui.badge("ðŸ”´ ComfyUI Offline", color="rose").classes('text-[10px] font-bold').tooltip("Boot up ComfyUI on port 8188 to sync checkpoints and samplers")
 
         # Connection error details and fallback prompt
         if not state.comfy_online:
@@ -1131,7 +1156,7 @@ def render_workflow_overrides_ui():
             # Apply visual feedback color and prefix icon labels
             if node_warnings:
                 border_color = "border-amber-400 bg-amber-50/10"
-                display_title = f"⚠️ {node_title} (ID: {node_id})"
+                display_title = f"âš ï¸  {node_title} (ID: {node_id})"
             else:
                 border_color = "border-slate-200"
                 display_title = f"{node_title} (ID: {node_id})"
@@ -1502,7 +1527,6 @@ def render_workflow_overrides_ui():
                                     on_click=lambda nid=node_id, val=current_vae_name: save_default_to_workflow(state.style_selected_workflow, nid, "vae_name", val)
                                 ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default VAE name to workflow file (.json)")
 
-
 @ui.refreshable
 def render_style_playground_cards(project_name: str = ""):
     if not state.style_test_prompts:
@@ -1592,10 +1616,20 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
         # ==================== LEFT CONFIG PANEL (75%) ====================
         with ui.column().classes('w-full gap-4'):
             
-            # ---------------- CARD 1: PLAYGROUND RUN CONTROLS (Top) ----------------
+            # ---------------- CARD 1: STYLE PLAYGROUND CONTROLS (Top) ----------------
             with ui.card().classes('w-full border p-4 shadow-sm bg-white gap-3'):
                 with ui.row().classes('w-full items-center justify-between border-b pb-1.5'):
-                    ui.label('Playground Run Controls').classes('text-sm font-bold text-slate-800')
+                    with ui.row().classes('items-center gap-1'):
+                        ui.label('Style Playground Controls').classes('text-sm font-bold text-slate-800')
+                        help_icon(
+                            title="Playground Controls",
+                            description="Configure sample limits and execute localized image render tests to evaluate art styles.",
+                            additional_details=[
+                                "• Source Volume: Pulls text passages from the designated volume.",
+                                "• Casino (Dice): Selects entirely new random scene chunks.",
+                                "• Refresh Icon: Randomizes image seeds while retaining the current scene text."
+                            ]
+                        )
                     
                 with ui.column().classes('w-full gap-2 p-3 bg-slate-50 rounded-lg border text-xs'):
                     with ui.row().classes('w-full items-center justify-between gap-3'):
@@ -1642,7 +1676,17 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
             # ---------------- CARD 2: STYLE TEMPLATE & ENGINE DEFINITION ----------------
             with ui.card().classes('w-full border p-4 shadow-sm bg-white gap-4'):
                 with ui.row().classes('w-full items-center justify-between border-b pb-1.5'):
-                    ui.label('Style & Workflow Definition').classes('text-sm font-bold text-slate-800')
+                    with ui.row().classes('items-center gap-1'):
+                        ui.label('Style & Workflow Definition').classes('text-sm font-bold text-slate-800')
+                        help_icon(
+                            title="Style & Workflow Definition",
+                            description="A Style Preset wraps prompt modifiers and engine overrides over a selected ComfyUI graph.",
+                            additional_details=[
+                                "• Style Prompt Prefix: Applied to the beginning of every scene prompt.",
+                                "• Style Prompt Suffix: Appended to the end of every scene prompt.",
+                                "• Style Negative Prompt: Visual attributes and styles the generator must avoid."
+                            ]
+                        )
                     
                 # A. Style Preset Library Loader & Saver (Streamlined Compact Bar)
                 with ui.row().classes('w-full items-center justify-between gap-3 p-2 bg-slate-50 rounded border border-slate-200'):
@@ -1707,9 +1751,19 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
             
             # 1. AI Toolkit Panel (Optimized for 25% stacked column layout)
             with ui.card().classes('w-full border p-3.5 shadow-sm bg-white gap-2.5'):
-                with ui.row().classes('items-center gap-1.5 w-full'):
-                    ui.icon('smart_toy', color='blue', size='xs')
-                    ui.label('AI Toolkit').classes('text-[10px] font-black text-slate-500 uppercase tracking-wide')
+                with ui.row().classes('w-full items-center justify-between'):
+                    with ui.row().classes('items-center gap-1.5'):
+                        ui.icon('smart_toy', color='blue', size='xs')
+                        ui.label('AI Toolkit').classes('text-[10px] font-black text-slate-500 uppercase tracking-wide')
+                    help_icon(
+                        title="AI Companion Toolkit",
+                        description="Bridge active visual metadata to external conversational AI models.",
+                        additional_details=[
+                            "• Copy LLM Primer: Generates a complete system prompt with style rules and active scene data for ChatGPT/Claude.",
+                            "• Copy Prompt Pack: Grabs only raw formatted prompt outputs.",
+                            "• Contact Sheet: Combines grid coordinates onto one image. Right-click to copy and paste directly into an LLM window."
+                        ]
+                    )
                 
                 with ui.column().classes('w-full gap-2'):
                     ui.button(
