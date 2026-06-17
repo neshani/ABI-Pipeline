@@ -149,7 +149,7 @@ def get_onnx_model():
         gpu_options = {
             "device_id": "0",
             "arena_extend_strategy": "kNextPowerOfTwo",
-            "cudnn_conv_algo_search": "HEURISTIC",   # <--- Changed from EXHAUSTIVE to prevent CUDNN_STATUS_NOT_SUPPORTED crashes on FP16
+            "cudnn_conv_algo_search": "HEURISTIC",   # <--- Restored fast HEURISTIC search
             "cudnn_conv_use_max_workspace": "1",      # Allows RTX 3090 to use its massive VRAM for math
             "do_copy_in_default_stream": "1",
         }

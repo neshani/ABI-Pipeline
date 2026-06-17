@@ -24,18 +24,18 @@ MODEL_REPOS = {
 }
 
 # ==============================================================================
-# DEPLOYMENT VERSION LOCKS (Guarantees matched dependencies on fresh GPU setups)
+# DEPLOYMENT VERSION LOCKS (Sourced directly from your working configuration)
 # ==============================================================================
 PINNED_PACKAGES = {
-    "onnxruntime-gpu": "onnxruntime-gpu==1.20.1",
-    "onnxruntime": "onnxruntime==1.20.1",
+    "onnxruntime-gpu": "onnxruntime-gpu==1.23.2",
+    "onnxruntime": "onnxruntime==1.23.2",
     "nvidia-cuda-runtime-cu12": "nvidia-cuda-runtime-cu12==12.4.127",
     "nvidia-cublas-cu12": "nvidia-cublas-cu12==12.4.5.8",
-    "nvidia-cudnn-cu12": "nvidia-cudnn-cu12==9.1.0.70",
-    "onnx_asr": "onnx-asr>=0.1.2",
-    "soundfile": "soundfile>=0.12.1",
-    "faster_whisper": "faster-whisper==1.0.3",
-    "torch": "torch>=2.2.0"
+    "nvidia-cudnn-cu12": "nvidia-cudnn-cu12==9.23.1.3",  # Bumped to stable, patched cuDNN release
+    "onnx_asr": "onnx-asr==0.11.0",
+    "soundfile": "soundfile==0.13.1",
+    "faster_whisper": "faster-whisper==1.2.1",
+    "torch": "torch==2.12.0"                              # Aligned to your exact dev environment
 }
 
 
@@ -115,6 +115,7 @@ async def run_pip_install(packages: list, log_callback: Callable[[str], None]) -
     """
     Runs pip install inside a background thread to bypass Windows event loop limitations.
     Translates loose package strings to our frozen deployment requirements and uninstalls conflicts.
+    Resilient against Windows encoding issues (UnicodeDecodeError).
     """
     # Translate clean packages into locked version constraints
     pinned_packages = [PINNED_PACKAGES.get(pkg, pkg) for pkg in packages]
@@ -146,12 +147,13 @@ async def run_pip_install(packages: list, log_callback: Callable[[str], None]) -
 
         cmd = [sys.executable, "-m", "pip", "install"] + pinned_packages
         try:
-            # Specifically using encoding="utf-8" and env=env to prevent Windows charmap decoder crashes
+            # Using errors="replace" to prevent Windows localized charmap decoder crashes
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 encoding="utf-8",
+                errors="replace",
                 env=env,
                 bufsize=1
             )
