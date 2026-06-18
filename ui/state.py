@@ -10,6 +10,7 @@ lora_tool_active_lora_id: Optional[str] = None
 lora_tool_generating: bool = False
 lora_tool_cancel_flag: bool = False
 lora_tool_progress: Dict[str, Any] = {}  # Tracks {"lora_id": str, "current": int, "total": int}
+needs_restart: bool = False  # Set to True when native binaries are installed on-the-fly
 
 # Tab selections (bound to persist state during navigation)
 active_project_tab: str = 'Dashboard'

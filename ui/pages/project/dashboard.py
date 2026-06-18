@@ -1,7 +1,7 @@
 import asyncio
 import os
 from pathlib import Path
-from nicegui import ui
+from nicegui import ui, app
 from sqlmodel import Session, select
 from database.models import Project, Book
 from ui import state
@@ -171,6 +171,27 @@ def render_transcription_step_view(project, books, start_transcribe_cb, stop_tra
             ui.icon('info', color='blue', size='sm')
             ui.label(f'Active STT Config: {get_setting("stt_engine", "Parakeet ONNX")} | Device: {get_setting("stt_device", "GPU/CUDA")}').classes('text-xs font-semibold text-slate-700')
             
+        # Contextual warning card dynamically bound to the pending restart state
+        with ui.card().classes('w-full bg-amber-50 border border-amber-200 p-4 rounded-xl gap-2 mt-1') \
+                .bind_visibility_from(state, 'needs_restart'):
+            with ui.row().classes('items-center gap-2 text-amber-900 font-bold text-xs'):
+                ui.icon('warning', size='18px', color='amber')
+                ui.label('Engine Ready — App Restart Required')
+            ui.label(
+                "Dynamic transcription libraries were successfully installed but cannot be loaded in this session. "
+                "Please shut down and restart the application cleanly to initialize the transcription engine."
+            ).classes('text-[11px] text-amber-800 leading-normal')
+            with ui.row().classes('w-full justify-end mt-1'):
+                async def do_shutdown():
+                    ui.notify("Shutting down cleanly... Please restart from your launcher.", type="warning", timeout=5)
+                    await asyncio.sleep(1.5)
+                    app.shutdown()
+                ui.button(
+                    'Shutdown App Safely', 
+                    icon='power_settings_new', 
+                    on_click=do_shutdown
+                ).classes('bg-amber-600 text-white font-semibold text-xs')
+            
         with ui.row().classes('w-full justify-between items-center mt-2 pt-2 border-t border-slate-100'):
             if state.project_status == "Transcribing":
                 with ui.row().classes('items-center gap-2'):
@@ -184,11 +205,15 @@ def render_transcription_step_view(project, books, start_transcribe_cb, stop_tra
                 ).classes('px-4 font-semibold text-xs')
             else:
                 ui.label('Awaiting transcription pipeline initiation.').classes('text-xs font-semibold text-slate-400')
-                ui.button(
+                
+                start_btn = ui.button(
                     'Start Transcription', 
                     icon='play_arrow', 
                     on_click=lambda: start_transcribe_cb(project.id)
                 ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs px-5')
+                
+                # Safe-guard action execution by binding its availability inversely to needs_restart
+                start_btn.bind_enabled_from(state, 'needs_restart', backward=lambda x: not x)
 
 
 def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb):

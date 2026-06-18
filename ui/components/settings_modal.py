@@ -1,6 +1,7 @@
-from nicegui import ui
+from nicegui import ui, app
 import asyncio
 import httpx
+import sys
 from database.connection import set_setting
 from services.installer import (
     check_dependencies, 
@@ -8,6 +9,7 @@ from services.installer import (
     run_pip_install, 
     download_model_weights
 )
+from ui import state
 
 async def fetch_llm_models(url: str, api_key: str = "") -> list[str]:
     """Queries standard local or remote endpoints for available model IDs."""
@@ -113,6 +115,7 @@ class SettingsModal:
         device = self.settings.get("stt_device", "CPU")
         
         # Step 1: Install Python Libraries (if missing)
+        had_missing_deps = len(self.dep_status["missing"]) > 0
         if not self.dep_status["status"]:
             success = await run_pip_install(self.dep_status["missing"], self.write_to_terminal)
             if not success:
@@ -140,8 +143,9 @@ class SettingsModal:
         self.installing = False
         self.update_installation_statuses()
         
-        # If we had to install Python libraries containing DLLs, prompt for restart
-        if len(self.dep_status["missing"]) > 0:
+        # Flag a clean restart requirement if new libraries containing DLLs/binaries were deployed
+        if had_missing_deps:
+            state.needs_restart = True
             ui.notify("Libraries containing binaries installed. Restart recommended.", type="warning", timeout=10)
 
     async def refresh_llm_models(self) -> None:
@@ -172,6 +176,8 @@ class SettingsModal:
     def write_to_terminal(self, text: str) -> None:
         """Pipes console logs into our terminal widget."""
         self.terminal_log.push(text)
+        # Force auto-scroll to the bottom of all active NiceGUI log views
+        ui.run_javascript('const logs = document.querySelectorAll(".nicegui-log"); logs.forEach(el => el.scrollTop = el.scrollHeight);')
 
     def update_download_progress(self, val: float) -> None:
         """Updates progress bar."""
@@ -215,11 +221,35 @@ class SettingsModal:
         self.update_installation_statuses()
         self.dialog.open()
 
+    async def shutdown_application(self) -> None:
+        """Performs a clean shutdown sequence, allowing launchers to exit cleanly."""
+        ui.notify("Shutting down safely... Please restart from your active launcher.", type="warning", timeout=5)
+        await asyncio.sleep(1.5)
+        app.shutdown()
+
     def build_ui(self) -> None:
         """Draws the modular Settings Layout"""
         ui.label('Global Configuration').classes('text-xl font-bold text-slate-800 mb-2')
         
         with ui.column().classes('w-full gap-4'):
+            # Dynamic warning card bound to restart state
+            with ui.card().classes('w-full bg-amber-50 border border-amber-200 p-4 rounded-xl gap-2') \
+                    .bind_visibility_from(state, 'needs_restart'):
+                with ui.row().classes('items-center gap-2 text-amber-900 font-bold text-xs'):
+                    ui.icon('warning', size='18px', color='amber')
+                    ui.label('Restart Required to Apply Transcription Libraries')
+                ui.label(
+                    "You have successfully installed external Python packages containing native binaries (C++ DLLs). "
+                    "These modules cannot be loaded into the current active memory workspace. "
+                    "Please shut down and restart ABI-Pipeline to transcription-enable the app."
+                ).classes('text-[11px] text-amber-800 leading-normal')
+                with ui.row().classes('w-full justify-end mt-1'):
+                    ui.button(
+                        'Shutdown App Safely', 
+                        icon='power_settings_new', 
+                        on_click=self.shutdown_application
+                    ).classes('bg-amber-600 text-white font-semibold text-xs')
+
             # 1. ComfyUI and LLM settings (Expanded by default)
             with ui.expansion('AI Server & Connections', icon='settings', value=True).classes('w-full border rounded-lg'):
                 with ui.column().classes('w-full p-4 gap-3'):

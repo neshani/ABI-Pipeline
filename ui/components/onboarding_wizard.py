@@ -1,4 +1,4 @@
-from nicegui import ui
+from nicegui import ui, app
 import asyncio
 import httpx
 from pathlib import Path
@@ -10,6 +10,7 @@ from services.installer import (
     run_pip_install,
     download_model_weights
 )
+from ui import state
 
 class OnboardingWizard:
     def __init__(self, app_settings: dict, on_complete_callback=None, launch_comfy_callback=None) -> None:
@@ -95,8 +96,7 @@ class OnboardingWizard:
             device = self.temp_settings.get("stt_device", "GPU/CUDA")
             
             # Step 1: Install Python Libraries (if missing)
-            # Centralized version constraints inside services/installer.py automatically translate 
-            # these raw dependency strings into deployment-ready, frozen packages.
+            had_missing_deps = len(self.dep_status["missing"]) > 0
             if not self.dep_status["status"]:
                 success = await run_pip_install(self.dep_status["missing"], self.write_to_terminal)
                 if not success:
@@ -126,13 +126,16 @@ class OnboardingWizard:
             self.update_installation_statuses()
             self.wizard_ui.refresh()
             
-            if len(self.dep_status["missing"]) > 0:
+            if had_missing_deps:
+                state.needs_restart = True
                 ui.notify("Libraries containing binaries installed. Restart recommended.", type="warning", timeout=10)
 
     def write_to_terminal(self, text: str) -> None:
         """Pipes subprocess outputs into the terminal widget inside the active step."""
         if hasattr(self, 'terminal_log') and self.terminal_log:
             self.terminal_log.push(text)
+            # Force auto-scroll to the bottom of all active NiceGUI log views
+            ui.run_javascript('const logs = document.querySelectorAll(".nicegui-log"); logs.forEach(el => el.scrollTop = el.scrollHeight);')
 
     def update_download_progress(self, val: float) -> None:
         """Updates linear download progress bar state."""
@@ -496,7 +499,8 @@ class OnboardingWizard:
         """Pings potential local loopback endpoints in parallel to find active server wrappers."""
         self.scanning_llm = True
         self.scan_results = []
-        self.wizard_ui.refresh()
+        if self.step == 2:
+            self.wizard_ui.refresh()
         
         scans = [
             {"name": "LM Studio", "url": "http://localhost:1234", "test_path": "/v1/models"},
@@ -523,7 +527,8 @@ class OnboardingWizard:
             self.temp_settings["llm_url"] = active[0]["url"]
             asyncio.create_task(self.scan_llm_models())
             
-        self.wizard_ui.refresh()
+        if self.step == 2:
+            self.wizard_ui.refresh()
 
     async def scan_llm_models(self) -> None:
         """Queries the currently resolved LLM Base URL for its active model strings."""
@@ -533,7 +538,8 @@ class OnboardingWizard:
             
         self.scanning_models = True
         self.models_list = []
-        self.wizard_ui.refresh()
+        if self.step == 2:
+            self.wizard_ui.refresh()
         
         headers = {}
         async with httpx.AsyncClient() as client:
@@ -567,7 +573,8 @@ class OnboardingWizard:
             self.temp_settings["llm_model"] = "local-model"
             
         self.scanning_models = False
-        self.wizard_ui.refresh()
+        if self.step == 2:
+            self.wizard_ui.refresh()
 
     async def async_scan_comfy_api_models(self) -> None:
         """Connects directly to active ComfyUI backend port to retrieve active available models."""
@@ -580,7 +587,8 @@ class OnboardingWizard:
         self.comfy_online = False
         self.detected_checkpoints = []
         self.suggested_workflow = "None"
-        self.wizard_ui.refresh()
+        if self.step == 3:
+            self.wizard_ui.refresh()
         
         async with httpx.AsyncClient() as client:
             # 1. Verify if ComfyUI is online
@@ -630,7 +638,8 @@ class OnboardingWizard:
                         self.suggested_workflow = "sdxl_lora.json"
 
         self.scanning_comfy = False
-        self.wizard_ui.refresh()
+        if self.step == 3:
+            self.wizard_ui.refresh()
 
     def trigger_launch_comfy(self) -> None:
         """Persists custom path directory and runs background ComfyUI launcher callback."""
@@ -659,6 +668,12 @@ class OnboardingWizard:
         self.close()
         if self.on_complete:
             self.on_complete()
+
+    async def shutdown_application(self) -> None:
+        """Performs a clean shutdown sequence, allowing launchers to exit cleanly."""
+        ui.notify("Shutting down safely... Please restart from your active launcher.", type="warning", timeout=5)
+        await asyncio.sleep(1.5)
+        app.shutdown()
 
     @ui.refreshable
     def wizard_ui(self) -> None:
@@ -692,7 +707,13 @@ class OnboardingWizard:
             if self.step < 4:
                 ui.button('Next Step', on_click=self.next_step).classes('bg-blue-600 text-white font-semibold px-6')
             else:
-                ui.button('Complete Setup', on_click=self.save_and_complete).classes('bg-emerald-600 text-white font-bold px-8')
+                # If a restart is pending, replace complete button with shutdown or place it alongside
+                if state.needs_restart:
+                    with ui.row().classes('gap-2'):
+                        ui.button('Shutdown & Restart', icon='power_settings_new', on_click=self.shutdown_application).classes('bg-amber-600 text-white font-bold px-4')
+                        ui.button('Complete Setup', on_click=self.save_and_complete).classes('bg-emerald-600 text-white font-bold px-6')
+                else:
+                    ui.button('Complete Setup', on_click=self.save_and_complete).classes('bg-emerald-600 text-white font-bold px-8')
 
     def next_step(self) -> None:
         self.step += 1
@@ -951,6 +972,18 @@ class OnboardingWizard:
             with ui.row().classes('w-full justify-between py-1.5 last:border-0'):
                 ui.label('ComfyUI URL:').classes('font-bold text-slate-500')
                 ui.label(self.temp_settings["comfy_url"]).classes('font-semibold font-mono')
+
+        # Conditional Amber callout warning inside Step 4 summary
+        with ui.card().classes('w-full bg-amber-50 border border-amber-200 p-3 rounded-lg gap-2 mt-3') \
+                .bind_visibility_from(state, 'needs_restart'):
+            with ui.row().classes('items-center gap-2 text-amber-950 font-bold text-xs'):
+                ui.icon('warning', size='16px', color='amber')
+                ui.label('Audio Transcription Needs Restart')
+            ui.label(
+                "Libraries have been downloaded, but transcription will not work during this session. "
+                "You can safely click 'Complete Setup' now and proceed, but remember to restart the app "
+                "before starting any transcription tasks."
+            ).classes('text-[10px] text-amber-800 leading-normal')
 
         with ui.row().classes('w-full justify-start items-center gap-2 text-emerald-700 bg-emerald-50/50 p-3 rounded-lg border border-emerald-100/50 mt-3 text-xs'):
             ui.icon('check_circle', size='18px')
