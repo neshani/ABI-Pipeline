@@ -140,11 +140,7 @@ class PackagerPlayground:
         if len(self.logs) > 100:
             self.logs.pop(0)
         if self.log_area:
-            self.log_area.value = "\n".join(self.logs)
-            try:
-                ui.run_javascript("var el = document.getElementById('packer-log-container'); if (el) el.scrollTop = el.scrollHeight;")
-            except Exception:
-                pass
+            self.log_area.push(msg)
 
     def set_all_selection(self, books: list, selection_state: bool):
         """Helper to modify all qualified books selection flags and refresh the panel."""
@@ -714,12 +710,12 @@ class PackagerPlayground:
 
             with ui.column().classes('w-full bg-slate-900 border rounded-xl p-4 gap-2'):
                 ui.label('Packaging Studio Terminal Output').classes('text-[10px] font-bold text-slate-400 tracking-wider uppercase')
-                self.log_area = ui.textarea().classes(
-                    'w-full font-mono text-[10px] text-emerald-400 bg-slate-900 border-none resize-none'
-                ).props('readonly borderless rows=8 id="packer-log-container" dark') \
-                 .style('color: #34d399 !important; background-color: #0f172a !important;')
+                self.log_area = ui.log(max_lines=100).classes(
+                    'w-full font-mono text-[10px] text-emerald-400 bg-slate-900 border-none h-48'
+                ).style('color: #34d399 !important; background-color: #0f172a !important;')
                 
                 if self.logs:
-                    self.log_area.value = "\n".join(self.logs)
+                    for log in self.logs:
+                        self.log_area.push(log)
 
             self.action_buttons(project, books)

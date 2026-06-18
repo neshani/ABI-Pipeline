@@ -683,8 +683,9 @@ def build_illumination_pack(
     output_zip_dir.mkdir(parents=True, exist_ok=True)
     output_zip_path = output_zip_dir / pack_name
 
-    # Roll over and archive any older version inside output folder
-    archive_existing_pack(output_zip_path)
+    # Roll over and archive any older version inside output folder only if we cannot copy to book path later
+    if not (original_book_path and original_book_path.exists()):
+        archive_existing_pack(output_zip_path)
 
     with zipfile.ZipFile(output_zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for file_path in staging_dir.iterdir():
@@ -699,6 +700,15 @@ def build_illumination_pack(
         archive_existing_pack(destination_copy)
         try:
             shutil.copy2(output_zip_path, destination_copy)
+            
+            # Clean up the duplicate copy and old archive files inside output folder since copy was successful
+            try:
+                output_zip_path.unlink(missing_ok=True)
+                for old_zip in output_zip_dir.glob("Old_Illuminations_*.zip"):
+                    old_zip.unlink(missing_ok=True)
+            except Exception:
+                pass
+                
             log(1.0, f"Successfully created pack inside audiobook folder! Path: '{destination_copy}'")
             return str(destination_copy)
         except Exception as ex:
