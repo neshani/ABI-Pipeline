@@ -281,7 +281,7 @@ def render_playground_results_container():
         for idx, res in enumerate(state.playground_results):
             is_refusal = res.get("status") == "refusal"
             border_color = "border-red-200 bg-red-50/20" if is_refusal else "border-slate-200 bg-white"
-            badge_color = "bg-red-100 text-red-800" if is_refusal else "bg-emerald-100 text-emerald-800"
+            badge_color = "bg-red-50 text-red-700 border border-red-200" if is_refusal else "bg-blue-50 text-blue-700 border border-blue-200"
             badge_label = "Refusal Skipped" if is_refusal else "Extraction Match"
 
             with ui.card().classes(f'w-full border p-4 rounded-xl shadow-xs gap-3 cursor-pointer hover:bg-slate-50/60 transition-colors {border_color}') \
@@ -291,7 +291,7 @@ def render_playground_results_container():
                 with ui.row().classes('w-full justify-between items-center pb-2 border-b border-dashed'):
                     pct = get_chunk_percentage(active_project_name, state.playground_book_selection, res["chunk"])
                     ui.label(f"Segment Chunk {idx + 1} • Excerpt at {pct}%").classes('text-xs font-bold text-slate-600 uppercase')
-                    ui.badge(badge_label).classes(f'px-2 py-0.5 rounded text-[10px] font-bold {badge_color}')
+                    ui.label(badge_label).classes(f'px-2 py-0.5 rounded text-[10px] font-bold {badge_color}')
 
                 with ui.column().classes('w-full gap-3'):
                     with ui.column().classes('gap-0.5 w-full'):
@@ -301,7 +301,6 @@ def render_playground_results_container():
                     with ui.column().classes('gap-0.5 w-full'):
                         ui.label("Generated Visual Prompt:").classes('text-[9px] font-black text-slate-400 uppercase tracking-wide')
                         ui.label(res["prompt"]).classes('text-xs font-semibold text-blue-700 leading-relaxed')
-
 
 async def execute_playground_test(project_name: str):
     global active_project_name

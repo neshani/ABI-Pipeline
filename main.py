@@ -1156,8 +1156,8 @@ def render_split_panel_shell(project_id: int):
                     .on('click', lambda: select_project(project.id)):
                 with ui.row().classes('items-center gap-2 w-full justify-between'):
                     ui.icon('folder' if project.is_batch else 'menu_book', size='sm', color='slate-700')
-                    # Dynamic Project Status Badge mapped to active step
-                    ui.badge().classes('px-2 py-0.5 text-[10px] font-bold rounded-full bg-blue-100 text-blue-800') \
+                    # Dynamic Project Status Badge using ui.label to avoid default background overrides
+                    ui.label().classes('px-2 py-0.5 text-[10px] font-bold rounded-full bg-blue-50 text-blue-700 border border-blue-200/60') \
                         .bind_text_from(state, 'project_status', backward=lambda val: display_mapping.get(val, val))
                     
                 # Applying break-words and whitespace-normal to prevent overflows

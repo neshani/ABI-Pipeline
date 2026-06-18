@@ -1127,9 +1127,10 @@ def render_workflow_overrides_ui():
                 )
             
             if state.comfy_online:
-                ui.badge("ðŸŸ¢ ComfyUI Online", color="emerald").classes('text-[10px] font-bold')
+                ui.badge("🟢 ComfyUI Online", color="emerald").classes('text-[10px] font-bold')
             else:
-                ui.badge("ðŸ”´ ComfyUI Offline", color="rose").classes('text-[10px] font-bold').tooltip("Boot up ComfyUI on port 8188 to sync checkpoints and samplers")
+                ui.badge("🔴 ComfyUI Offline", color="rose").classes('text-[10px] font-bold').tooltip("Boot up ComfyUI on port 8188 to sync checkpoints and samplers")
+
 
         # Connection error details and fallback prompt
         if not state.comfy_online:
@@ -1554,11 +1555,12 @@ def render_style_playground_cards(project_name: str = ""):
                 with ui.row().classes('w-full justify-between items-center pb-1 border-b border-dashed'):
                     ui.label(card_title).classes('text-[10px] font-black text-slate-700 uppercase')
                     
-                    # Clickable Interactive Seed Badge
-                    ui.badge(f"Seed: {seed}", color="slate") \
-                        .classes('text-[9px] font-bold cursor-pointer hover:bg-slate-700 transition-all') \
-                        .on('click', lambda _, i=idx: regenerate_single_card(project_name, i)) \
-                        .tooltip('Click to randomize seed and regenerate just this card!')
+                    # Clickable Interactive Seed Badge with native Material dice icon
+                    with ui.badge(color="slate").classes('text-[9px] font-bold cursor-pointer hover:bg-slate-700 transition-all flex items-center gap-1') \
+                            .on('click', lambda _, i=idx: regenerate_single_card(project_name, i)) \
+                            .tooltip('Click to randomize seed and regenerate just this card!'):
+                        ui.label(f"Seed: {seed}")
+                        ui.icon("casino", size="11px")
 
                 if img_data == "LOADING":
                     with ui.column().classes('w-full h-40 items-center justify-center bg-slate-50 rounded border border-dashed') \
@@ -1757,7 +1759,7 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                         ui.label('AI Toolkit').classes('text-[10px] font-black text-slate-500 uppercase tracking-wide')
                     help_icon(
                         title="AI Companion Toolkit",
-                        description="Bridge active visual metadata to external conversational AI models.",
+                        description="Copy formatted prompts and settings for external LLM troubleshooting or use the contact sheet generator to create a visual reference for prompt tuning.",
                         additional_details=[
                             "• Copy LLM Primer: Generates a complete system prompt with style rules and active scene data for ChatGPT/Claude.",
                             "• Copy Prompt Pack: Grabs only raw formatted prompt outputs.",

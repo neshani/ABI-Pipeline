@@ -22,12 +22,12 @@ def get_status_badge(status: str):
     display_status = display_mapping.get(status, status)
     
     styles = {
-        "Transcription": "bg-slate-200 text-slate-700",
-        "Prompt Gen": "bg-blue-100 text-blue-800 border-blue-200",
-        "Image Gen": "bg-purple-100 text-purple-800 border-purple-200"
+        "Transcription": "bg-slate-100 text-slate-700 border border-slate-200",
+        "Prompt Gen": "bg-blue-50 text-blue-700 border border-blue-200/60",
+        "Image Gen": "bg-indigo-50 text-indigo-700 border border-indigo-200/60"
     }
-    style = styles.get(display_status, "bg-slate-100 text-slate-800")
-    return ui.badge(display_status).classes(f'px-2.5 py-0.5 text-[10px] rounded-full font-semibold {style}')
+    style = styles.get(display_status, "bg-slate-100 text-slate-800 border border-slate-200")
+    return ui.label(display_status).classes(f'px-2.5 py-0.5 text-[10px] rounded-full font-semibold {style}')
 
 
 @ui.refreshable
@@ -310,7 +310,15 @@ def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, re
 
                                 # Direct Book Selection Navigation Trigger
                                 with ui.row().classes('items-center gap-2'):
-                                    ui.badge(b["status"]).classes('px-1.5 py-0.5 text-[9px] rounded bg-slate-200 text-slate-700 font-medium')
+                                    book_status = b["status"]
+                                    if book_status in ["Imported", "Transcribing"]:
+                                        book_style = "bg-slate-100 text-slate-600 border border-slate-200"
+                                    elif book_status in ["Transcribed", "Generating Prompts"]:
+                                        book_style = "bg-blue-50 text-blue-700 border border-blue-200/60 font-semibold"
+                                    else:
+                                        book_style = "bg-indigo-50 text-indigo-700 border border-indigo-200/60 font-semibold"
+                                        
+                                    ui.label(book_status).classes(f'px-1.5 py-0.5 text-[9px] rounded {book_style}')
                                     ui.button(
                                         'Jump',
                                         icon='chevron_right',
