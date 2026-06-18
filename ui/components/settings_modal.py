@@ -176,9 +176,11 @@ class SettingsModal:
     def write_to_terminal(self, text: str) -> None:
         """Pipes console logs into our terminal widget."""
         self.terminal_log.push(text)
-        # Force auto-scroll to the bottom of all active NiceGUI log views
-        ui.run_javascript('const logs = document.querySelectorAll(".nicegui-log"); logs.forEach(el => el.scrollTop = el.scrollHeight);')
+        # Safe client-bound JavaScript execution eliminates Client Deletion warning alerts
+        if self.terminal_log.client.has_socket_connection:
+            self.terminal_log.client.run_javascript('const logs = document.querySelectorAll(".nicegui-log"); logs.forEach(el => el.scrollTop = el.scrollHeight);')
 
+            
     def update_download_progress(self, val: float) -> None:
         """Updates progress bar."""
         self.progress_bar.set_value(val)

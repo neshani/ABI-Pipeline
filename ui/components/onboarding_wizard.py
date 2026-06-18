@@ -84,58 +84,58 @@ class OnboardingWizard:
         """
         self.installing = True
         
-        with client:
-            self.wizard_ui.refresh()
+        # Only refresh the localized installer sub-panel to preserve parent scroll position
+        self.render_installer_controls.refresh()
+        
+        # Give a micro-yield so the UI redraw can complete
+        await asyncio.sleep(0.05)
             
-            if hasattr(self, 'terminal_log') and self.terminal_log:
-                self.terminal_log.clear()
-            if hasattr(self, 'progress_bar') and self.progress_bar:
-                self.progress_bar.set_value(0.0)
-                
-            engine = self.temp_settings.get("stt_engine", "Parakeet ONNX")
-            device = self.temp_settings.get("stt_device", "GPU/CUDA")
+        engine = self.temp_settings.get("stt_engine", "Parakeet ONNX")
+        device = self.temp_settings.get("stt_device", "GPU/CUDA")
+        
+        # Step 1: Install Python Libraries (if missing)
+        had_missing_deps = len(self.dep_status["missing"]) > 0
+        if not self.dep_status["status"]:
+            success = await run_pip_install(self.dep_status["missing"], self.write_to_terminal)
+            if not success:
+                ui.notify("Installation failed during library deployment.", type="negative")
+                self.installing = False
+                self.update_installation_statuses()
+                self.render_installer_controls.refresh()
+                return
             
-            # Step 1: Install Python Libraries (if missing)
-            had_missing_deps = len(self.dep_status["missing"]) > 0
-            if not self.dep_status["status"]:
-                success = await run_pip_install(self.dep_status["missing"], self.write_to_terminal)
-                if not success:
-                    ui.notify("Installation failed during library deployment.", type="negative")
-                    self.installing = False
-                    self.update_installation_statuses()
-                    self.wizard_ui.refresh()
-                    return
-                
-            # Step 2: Download Model Weights (if missing)
-            if not self.model_status:
-                success = await download_model_weights(
-                    engine, 
-                    device,
-                    self.update_download_progress, 
-                    self.write_to_terminal
-                )
-                if not success:
-                    ui.notify("Download failed. Check your internet connection.", type="negative")
-                    self.installing = False
-                    self.update_installation_statuses()
-                    self.wizard_ui.refresh()
-                    return
+        # Step 2: Download Model Weights (if missing)
+        if not self.model_status:
+            success = await download_model_weights(
+                engine, 
+                device,
+                self.update_download_progress, 
+                self.write_to_terminal
+            )
+            if not success:
+                ui.notify("Download failed. Check your internet connection.", type="negative")
+                self.installing = False
+                self.update_installation_statuses()
+                self.render_installer_controls.refresh()
+                return
 
-            ui.notify("Engine setup successfully completed!", type="positive")
-            self.installing = False
-            self.update_installation_statuses()
-            self.wizard_ui.refresh()
-            
-            if had_missing_deps:
-                state.needs_restart = True
-                ui.notify("Libraries containing binaries installed. Restart recommended.", type="warning", timeout=10)
+        ui.notify("Engine setup successfully completed!", type="positive")
+        self.installing = False
+        self.update_installation_statuses()
+        self.render_installer_controls.refresh()
+        
+        if had_missing_deps:
+            state.needs_restart = True
+            ui.notify("Libraries containing binaries installed. Restart recommended.", type="warning", timeout=10)
 
     def write_to_terminal(self, text: str) -> None:
         """Pipes subprocess outputs into the terminal widget inside the active step."""
         if hasattr(self, 'terminal_log') and self.terminal_log:
             self.terminal_log.push(text)
-            # Force auto-scroll to the bottom of all active NiceGUI log views
-            ui.run_javascript('const logs = document.querySelectorAll(".nicegui-log"); logs.forEach(el => el.scrollTop = el.scrollHeight);')
+            # Safe client-bound JavaScript execution eliminates Client Deletion warning alerts
+            if self.terminal_log.client.has_socket_connection:
+                self.terminal_log.client.run_javascript('const logs = document.querySelectorAll(".nicegui-log"); logs.forEach(el => el.scrollTop = el.scrollHeight);')
+
 
     def update_download_progress(self, val: float) -> None:
         """Updates linear download progress bar state."""
@@ -773,58 +773,65 @@ class OnboardingWizard:
                             ui.label(eng["title"]).classes('text-sm font-bold')
                             ui.label(eng["desc"]).classes('text-[11px] text-slate-500 leading-tight')
 
-            # Hardware Device target (Only visible if not text-only skip mode)
-            if self.temp_settings["stt_engine"] != "Text Only":
-                ui.separator().classes('my-2')
-                ui.label('Select Hardware Acceleration Target').classes('text-xs font-bold text-slate-500 uppercase tracking-wider')
-                
-                def on_device_change(e):
-                    self.temp_settings["stt_device"] = e.value
-                    self.update_installation_statuses()
-                    self.wizard_ui.refresh()
+            # Render the sub-refreshable installer controls
+            self.render_installer_controls()
 
-                ui.radio(
-                    options={
-                        'GPU/CUDA': 'GPU / CUDA (Recommended for Nvidia GPU systems)',
-                        'CPU': 'CPU (Not recommended - Slow)'
-                    },
-                    value=self.temp_settings["stt_device"],
-                    on_change=on_device_change
-                ).classes('text-sm')
+    @ui.refreshable
+    def render_installer_controls(self) -> None:
+        """Isolated status and installer card to protect parent scroll containers."""
+        # Hardware Device target (Only visible if not text-only skip mode)
+        if self.temp_settings["stt_engine"] != "Text Only":
+            ui.separator().classes('my-2')
+            ui.label('Select Hardware Acceleration Target').classes('text-xs font-bold text-slate-500 uppercase tracking-wider')
+            
+            def on_device_change(e):
+                self.temp_settings["stt_device"] = e.value
+                self.update_installation_statuses()
+                self.render_installer_controls.refresh()
 
-                # Real-Time Installation Status Indicators
-                ui.separator().classes('my-1')
-                with ui.column().classes('gap-1 mt-1'):
-                    if self.dep_status["status"]:
-                        ui.label("✓ Python dependencies installed.").classes('text-xs text-emerald-600 font-medium')
-                    else:
-                        missing_str = ", ".join(self.dep_status["missing"])
-                        ui.label(f"✗ Missing packages: {missing_str}").classes('text-xs text-rose-500 font-medium')
+            ui.radio(
+                options={
+                    'GPU/CUDA': 'GPU / CUDA (Recommended for Nvidia GPU systems)',
+                    'CPU': 'CPU (Not recommended - Slow)'
+                },
+                value=self.temp_settings["stt_device"],
+                on_change=on_device_change
+            ).classes('text-sm')
 
-                    if self.model_status:
-                        ui.label("✓ Model weights downloaded locally.").classes('text-xs text-emerald-600 font-medium')
-                    else:
-                        ui.label("✗ Model weights missing.").classes('text-xs text-rose-500 font-medium')
+            # Real-Time Installation Status Indicators
+            ui.separator().classes('my-1')
+            with ui.column().classes('gap-1 mt-1'):
+                if self.dep_status["status"]:
+                    ui.label("✓ Python dependencies installed.").classes('text-xs text-emerald-600 font-medium')
+                else:
+                    missing_str = ", ".join(self.dep_status["missing"])
+                    ui.label(f"✗ Missing packages: {missing_str}").classes('text-xs text-rose-500 font-medium')
 
-                # Installation controls
-                ready = self.dep_status["status"] and self.model_status
-                btn_text = "Engine Ready" if ready else "Install & Download Engine"
-                btn_color = "bg-emerald-600" if ready else "bg-blue-600"
-                
-                self.action_btn = ui.button(
-                    btn_text, 
-                    on_click=lambda: asyncio.create_task(self.execute_installation_pipeline(ui.context.client))
-                ).classes(f'w-full mt-2 {btn_color} text-white rounded-lg text-sm')
-                
-                if ready or self.installing:
-                    self.action_btn.disable()
+                if self.model_status:
+                    ui.label("✓ Model weights downloaded locally.").classes('text-xs text-emerald-600 font-medium')
+                else:
+                    ui.label("✗ Model weights missing.").classes('text-xs text-rose-500 font-medium')
 
-                self.progress_bar = ui.linear_progress(value=self.download_progress).classes('w-full mt-1')
+            # Installation controls
+            ready = self.dep_status["status"] and self.model_status
+            btn_text = "Engine Ready" if ready else "Install & Download Engine"
+            btn_color = "bg-emerald-600" if ready else "bg-blue-600"
+            
+            self.action_btn = ui.button(
+                btn_text, 
+                on_click=lambda: asyncio.create_task(self.execute_installation_pipeline(ui.context.client))
+            ).classes(f'w-full mt-2 {btn_color} text-white rounded-lg text-sm')
+            
+            if ready or self.installing:
+                self.action_btn.disable()
 
-                # Installation Console Log Output
-                ui.label('Installation Console Output').classes('text-[11px] font-bold text-slate-500 mt-2')
-                self.terminal_log = ui.log().classes('h-28 w-full bg-slate-950 p-2 text-emerald-400 font-mono text-[10px] rounded-lg')
+            self.progress_bar = ui.linear_progress(value=self.download_progress).classes('w-full mt-1')
 
+            # Installation Console Log Output
+            ui.label('Installation Console Output').classes('text-[11px] font-bold text-slate-500 mt-2')
+            self.terminal_log = ui.log().classes('h-28 w-full bg-slate-950 p-2 text-emerald-400 font-mono text-[10px] rounded-lg')
+
+            
     # Step 2: LLM Configurer
     def render_step_2(self) -> None:
         ui.label('Verify Local LLM Server').classes('text-md font-bold text-slate-700')
