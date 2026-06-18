@@ -223,6 +223,31 @@ def render_book_tabs(book_id: int):
     import platform
     import subprocess
     
+    # Aggressively deallocate and clear any stale workspace timers & keyboards
+    # to prevent background execution leakage and active binding propagation bloat.
+    if getattr(state, 'book_scroll_timer', None):
+        try:
+            state.book_scroll_timer.cancel()
+            state.book_scroll_timer.delete()
+        except Exception:
+            pass
+        state.book_scroll_timer = None
+
+    if getattr(state, 'book_update_timer', None):
+        try:
+            state.book_update_timer.cancel()
+            state.book_update_timer.delete()
+        except Exception:
+            pass
+        state.book_update_timer = None
+
+    if getattr(state, 'book_keyboard', None):
+        try:
+            state.book_keyboard.delete()
+        except Exception:
+            pass
+        state.book_keyboard = None
+
     with Session(engine) as session:
         book = session.get(Book, book_id)
         if not book:
@@ -947,7 +972,7 @@ def render_book_tabs(book_id: int):
             elif k == state.key_prev:
                 prev_scene()
 
-    ui.keyboard(on_key=handle_key)
+    state.book_keyboard = ui.keyboard(on_key=handle_key)
 
     # --- Gallery Grid View Rendering (Dynamic In-Place Appending) ---
     
@@ -1072,7 +1097,7 @@ def render_book_tabs(book_id: int):
             pass
 
     # Non-blocking scroll checking timer
-    ui.timer(0.3, check_scroll)
+    state.book_scroll_timer = ui.timer(0.3, check_scroll)
 
  # --- Real-Time Background Image Pop-in Timer (Offloaded!) ---
     last_file_count = [len(images_cache)]
@@ -1118,4 +1143,4 @@ def render_book_tabs(book_id: int):
                 update_active_scene_ui()
 
     # Check for newly generated images every 3 seconds
-    ui.timer(3.0, check_for_image_updates)
+    state.book_update_timer = ui.timer(3.0, check_for_image_updates)

@@ -246,9 +246,37 @@ from services.project_settings import (
     load_project_settings_from_disk
 )
 
+def cleanup_book_workspace_resources():
+    """Aggressively stops and deallocates book-specific timers and keyboard listeners to prevent VRAM/RAM leakage."""
+    if getattr(state, 'book_scroll_timer', None):
+        try:
+            state.book_scroll_timer.cancel()
+            state.book_scroll_timer.delete()
+        except Exception:
+            pass
+        state.book_scroll_timer = None
+
+    if getattr(state, 'book_update_timer', None):
+        try:
+            state.book_update_timer.cancel()
+            state.book_update_timer.delete()
+        except Exception:
+            pass
+        state.book_update_timer = None
+
+    if getattr(state, 'book_keyboard', None):
+        try:
+            state.book_keyboard.delete()
+        except Exception:
+            pass
+        state.book_keyboard = None
+
+
 # --- Navigation State Control Handlers ---
 def select_project(project_id: int):
     """Sets the active project in memory and restores its saved settings from disk."""
+    cleanup_book_workspace_resources()
+    
     state.active_project_id = project_id
     state.active_book_id = None
     state.active_project_tab = 'Dashboard'
@@ -302,6 +330,8 @@ def select_book(book_id: int):
 
 def select_book_from_portal(project_id: int, book_id: int):
     """Sets the active project, loads its settings from disk, and opens the target book workspace."""
+    cleanup_book_workspace_resources()
+    
     state.active_project_id = project_id
     load_project_settings_from_disk(project_id)
     
@@ -321,6 +351,8 @@ def select_book_from_portal(project_id: int, book_id: int):
 
 
 def exit_to_portal():
+    cleanup_book_workspace_resources()
+    
     state.active_project_id = None
     state.active_book_id = None
     state.active_tool = None
@@ -329,6 +361,8 @@ def exit_to_portal():
     main_layout.refresh()
 
 def open_tool(tool_name: str):
+    cleanup_book_workspace_resources()
+    
     state.active_project_id = None
     state.active_book_id = None
     state.active_tool = tool_name

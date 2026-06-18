@@ -125,3 +125,8 @@ gpu_vram_pct: float = 0.0       # 0.0 to 1.0
 gpu_temp: int = 0               # °C
 gpu_power_used: float = 0.0     # Watts
 gpu_power_limit: float = 0.0    # Watts
+
+# --- Active Workspace Event Subscriptions (Prevention of Timer/Keyboard Leaks) ---
+book_scroll_timer: Optional[Any] = None
+book_update_timer: Optional[Any] = None
+book_keyboard: Optional[Any] = None
