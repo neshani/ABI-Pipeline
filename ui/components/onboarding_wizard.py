@@ -85,7 +85,8 @@ class OnboardingWizard:
         self.installing = True
         
         # Only refresh the localized installer sub-panel to preserve parent scroll position
-        self.render_installer_controls.refresh()
+        with client:
+            self.render_installer_controls.refresh()
         
         # Give a micro-yield so the UI redraw can complete
         await asyncio.sleep(0.05)
@@ -98,10 +99,12 @@ class OnboardingWizard:
         if not self.dep_status["status"]:
             success = await run_pip_install(self.dep_status["missing"], self.write_to_terminal)
             if not success:
-                ui.notify("Installation failed during library deployment.", type="negative")
+                with client:
+                    ui.notify("Installation failed during library deployment.", type="negative")
                 self.installing = False
                 self.update_installation_statuses()
-                self.render_installer_controls.refresh()
+                with client:
+                    self.render_installer_controls.refresh()
                 return
             
         # Step 2: Download Model Weights (if missing)
@@ -113,20 +116,25 @@ class OnboardingWizard:
                 self.write_to_terminal
             )
             if not success:
-                ui.notify("Download failed. Check your internet connection.", type="negative")
+                with client:
+                    ui.notify("Download failed. Check your internet connection.", type="negative")
                 self.installing = False
                 self.update_installation_statuses()
-                self.render_installer_controls.refresh()
+                with client:
+                    self.render_installer_controls.refresh()
                 return
 
-        ui.notify("Engine setup successfully completed!", type="positive")
+        with client:
+            ui.notify("Engine setup successfully completed!", type="positive")
         self.installing = False
         self.update_installation_statuses()
-        self.render_installer_controls.refresh()
+        with client:
+            self.render_installer_controls.refresh()
         
         if had_missing_deps:
             state.needs_restart = True
-            ui.notify("Libraries containing binaries installed. Restart recommended.", type="warning", timeout=10)
+            with client:
+                ui.notify("Libraries containing binaries installed. Restart recommended.", type="warning", timeout=10)
 
     def write_to_terminal(self, text: str) -> None:
         """Pipes subprocess outputs into the terminal widget inside the active step."""
@@ -831,7 +839,7 @@ class OnboardingWizard:
             ui.label('Installation Console Output').classes('text-[11px] font-bold text-slate-500 mt-2')
             self.terminal_log = ui.log().classes('h-28 w-full bg-slate-950 p-2 text-emerald-400 font-mono text-[10px] rounded-lg')
 
-            
+
     # Step 2: LLM Configurer
     def render_step_2(self) -> None:
         ui.label('Verify Local LLM Server').classes('text-md font-bold text-slate-700')
