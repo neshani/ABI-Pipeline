@@ -124,17 +124,16 @@ class OnboardingWizard:
                     self.render_installer_controls.refresh()
                 return
 
-        with client:
-            ui.notify("Engine setup successfully completed!", type="positive")
         self.installing = False
         self.update_installation_statuses()
-        with client:
-            self.render_installer_controls.refresh()
         
-        if had_missing_deps:
-            state.needs_restart = True
-            with client:
-                ui.notify("Libraries containing binaries installed. Restart recommended.", type="warning", timeout=10)
+        with client:
+            if had_missing_deps:
+                state.needs_restart = True
+                ui.notify("Engine setup completed! Please quit the app and run start.bat again to apply libraries.", type="warning", timeout=0)
+            else:
+                ui.notify("Engine setup successfully completed!", type="positive")
+            self.render_installer_controls.refresh()
 
     def write_to_terminal(self, text: str) -> None:
         """Pipes subprocess outputs into the terminal widget inside the active step."""
@@ -717,12 +716,15 @@ class OnboardingWizard:
             else:
                 # If a restart is pending, replace complete button with shutdown or place it alongside
                 if state.needs_restart:
-                    with ui.row().classes('gap-2'):
-                        ui.button('Shutdown & Restart', icon='power_settings_new', on_click=self.shutdown_application).classes('bg-amber-600 text-white font-bold px-4')
+                    with ui.row().classes('gap-2 items-center'):
+                        with ui.column().classes('items-center gap-0'):
+                            ui.button('Quit App', icon='power_settings_new', on_click=self.shutdown_application).classes('bg-amber-600 text-white font-bold px-4')
+                            ui.label('Manually launch start.bat afterwards').classes('text-[9px] text-amber-600 mt-1 font-semibold text-center')
                         ui.button('Complete Setup', on_click=self.save_and_complete).classes('bg-emerald-600 text-white font-bold px-6')
                 else:
                     ui.button('Complete Setup', on_click=self.save_and_complete).classes('bg-emerald-600 text-white font-bold px-8')
 
+                    
     def next_step(self) -> None:
         self.step += 1
         if self.step == 2:

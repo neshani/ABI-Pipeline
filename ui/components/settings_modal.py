@@ -139,14 +139,15 @@ class SettingsModal:
                 return
 
         # Success!
-        ui.notify("Engine set up successfully!", type="positive")
         self.installing = False
         self.update_installation_statuses()
         
         # Flag a clean restart requirement if new libraries containing DLLs/binaries were deployed
         if had_missing_deps:
             state.needs_restart = True
-            ui.notify("Libraries containing binaries installed. Restart recommended.", type="warning", timeout=10)
+            ui.notify("Engine setup completed! Please quit the app and run start.bat again to apply libraries.", type="warning", timeout=0)
+        else:
+            ui.notify("Engine setup successfully completed!", type="positive")
 
     async def refresh_llm_models(self) -> None:
         """Queries current connection details and updates options in the model selector."""
@@ -243,14 +244,16 @@ class SettingsModal:
                 ui.label(
                     "You have successfully installed external Python packages containing native binaries (C++ DLLs). "
                     "These modules cannot be loaded into the current active memory workspace. "
-                    "Please shut down and restart ABI-Pipeline to transcription-enable the app."
+                    "Please quit the app and run start.bat again to apply these changes."
                 ).classes('text-[11px] text-amber-800 leading-normal')
                 with ui.row().classes('w-full justify-end mt-1'):
-                    ui.button(
-                        'Shutdown App Safely', 
-                        icon='power_settings_new', 
-                        on_click=self.shutdown_application
-                    ).classes('bg-amber-600 text-white font-semibold text-xs')
+                    with ui.column().classes('items-end gap-0'):
+                        ui.button(
+                            'Quit App Safely', 
+                            icon='power_settings_new', 
+                            on_click=self.shutdown_application
+                        ).classes('bg-amber-600 text-white font-semibold text-xs')
+                        ui.label('Manually launch start.bat afterwards').classes('text-[8px] text-amber-600 mt-1 font-semibold')
 
             # 1. ComfyUI and LLM settings (Expanded by default)
             with ui.expansion('AI Server & Connections', icon='settings', value=True).classes('w-full border rounded-lg'):

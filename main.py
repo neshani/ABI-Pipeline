@@ -173,43 +173,25 @@ def run_startup_recovery():
 app.on_startup(run_startup_recovery)
 
 # --- Programmatic App Restart Engine ---
+should_restart = False
+
 def restart_app():
     """
-    Attempts a zero-zombie hot reload by touching a dedicated sentinel Python file 
-    inside the services folder (services/reload_sentinel.py) to trigger Uvicorn cleanly.
-    Falls back to a hard restart if reloading is disabled.
+    Triggers a clean app reload. Sets the restart flag and shuts down the NiceGUI app cleanly.
+    The batch file start.bat intercepts exit code 123 to loop and restart the process instantly.
     """
+    global should_restart
+    should_restart = True
     ui.notify("Refreshing application modules...", type="warning")
     asyncio.create_task(async_restart())
 
 async def async_restart():
-    # 1. Attempt a Uvicorn hot-reload using a sentinel file inside the services/ folder.
-    # This keeps the root directory clutter-free and avoids triggering editor warnings.
-    # Note: We do not start the name with a dot so that Uvicorn's ".*" ignore rule doesn't skip it.
-    try:
-        sentinel_path = Path(__file__).resolve().parent / "services" / "reload_sentinel.py"
-        if not sentinel_path.exists():
-            sentinel_path.write_text("# Programmatic reload sentinel file for ABI-Pipeline. Safe to ignore/delete.\n")
-        
-        sentinel_path.touch()
-        # Wait a brief moment to allow Uvicorn to receive the event and shut down this worker.
-        await asyncio.sleep(2.0)
-    except Exception as e:
-        print(f"[Restart-Engine] Hot-reload sentinel touch failed: {e}")
+    # Allow the notification to display before shutting down
+    await asyncio.sleep(1.0)
+    app.shutdown()
 
-    # 2. Hard Restart Fallback
-    # (This step is only reached if hot-reloading is disabled or inactive)
-    print("[Restart-Engine] Hot-reload not active. Executing programmatic hard restart fallback...")
-    script_path = os.path.abspath(sys.argv[0])
-    
-    if os.name == 'nt':  # Windows
-        cmd = f'timeout 2 && "{sys.executable}" "{script_path}"'
-        subprocess.Popen(cmd, shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
-    else:  # macOS / Linux
-        cmd = f'sleep 1.5 && "{sys.executable}" "{script_path}"'
-        subprocess.Popen(cmd, shell=True)
-        
-    os._exit(0)
+# Register shutdown hook to cleanly handle restarts vs normal closures
+app.on_shutdown(lambda: os._exit(123) if should_restart else os._exit(0))
 
 # --- Default App Configurations ---
 DEFAULT_SETTINGS = {
@@ -1538,6 +1520,13 @@ async def free_all_memory():
 
     ui.notify("VRAM and RAM clearance commands successfully sent!", type="positive")
 
+
+async def quit_app():
+    """Performs a clean shutdown sequence, automatically closing the browser-initiated process console."""
+    ui.notify("Shutting down cleanly...", type="warning", timeout=3)
+    await asyncio.sleep(1.0)
+    app.shutdown()
+
 # Initialize Onboarding Wizard safely if not already done earlier in the file
 if 'onboarding_wizard' not in globals():
     onboarding_wizard = OnboardingWizard(
@@ -1709,6 +1698,8 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
                 ui.menu_item('LoRA Contact Sheets', on_click=lambda: open_tool('lora_contact_sheet'))
                 ui.menu_item('Rerun Setup Wizard', on_click=onboarding_wizard.open)
                 ui.menu_item('Clear Comfy Outputs (abi_*)', on_click=clear_comfy_dialog.open)
+                ui.separator()
+                ui.menu_item('Quit App', on_click=quit_app)
         ui.button(icon='settings', on_click=lambda: settings_modal.open()).props('flat round color=white')
 
 
