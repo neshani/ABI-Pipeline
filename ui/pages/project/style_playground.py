@@ -1157,7 +1157,7 @@ def render_workflow_overrides_ui():
             # Apply visual feedback color and prefix icon labels
             if node_warnings:
                 border_color = "border-amber-400 bg-amber-50/10"
-                display_title = f"âš ï¸  {node_title} (ID: {node_id})"
+                display_title = f"⚠️ {node_title} (ID: {node_id})"
             else:
                 border_color = "border-slate-200"
                 display_title = f"{node_title} (ID: {node_id})"
@@ -1527,7 +1527,7 @@ def render_workflow_overrides_ui():
                                     icon='save',
                                     on_click=lambda nid=node_id, val=current_vae_name: save_default_to_workflow(state.style_selected_workflow, nid, "vae_name", val)
                                 ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default VAE name to workflow file (.json)")
-
+                                
 @ui.refreshable
 def render_style_playground_cards(project_name: str = ""):
     if not state.style_test_prompts:
