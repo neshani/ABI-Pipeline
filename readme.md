@@ -169,3 +169,146 @@ As the LLM processes your volumes, scrolling down the Dashboard will display a l
 ![Live Prompt Generation Feed](docs/screenshots/promptGen.png)
 
 All active progress, quotes, and prompt parameters are persistently populated in real-time directly inside each book's local master record at `./output/<project name>/<book name>/prompts.csv`.
+
+---
+
+### Preparing for Image Generation
+
+Generating high-volume image sets is resource-intensive. Before transitioning from text processing to rendering, it is recommended to clear your system's VRAM.
+
+![GPU Telemetry and Free VRAM Utility](docs/screenshots/freeVRAM.png)
+
+* **Free VRAM:** Click the **Free VRAM** button in the header. This dispatches an asynchronous command to unload model weights and clear cache from both your LLM host (such as Ollama or LM Studio) and ComfyUI, reclaiming vital system memory for image generation.
+* **Telemetry Monitoring:** Keep an eye on your GPU temperature, power draw, and VRAM utilization via the real-time telemetry widget in the topbar.
+
+---
+
+### ComfyUI Workflow Integration
+
+While ABI-Pipeline comes with pre-packaged starter workflows, you will eventually want to use your own custom pipelines.
+
+![Exporting API JSON in ComfyUI](docs/screenshots/comfyExport.png)
+
+To integrate a custom ComfyUI workflow:
+1. Open your workflow in ComfyUI.
+2. Locate your text conditioning nodes. Replace your literal positive prompt text with the exact placeholder `<prompt>`, and your negative prompt text with `<negprompt>`.
+3. Open ComfyUI settings, ensure **Developer Mode** is enabled, and navigate to **File -> Export (API)**.
+4. Save the generated `.json` file directly inside your local `./workflows/` folder. The pipeline will automatically scan and detect this file.
+
+---
+
+### The LoRA Contact Sheet Tool
+
+Before committing to a specific style, you can test and catalog various LoRA models to understand their trigger words and aesthetic behavior. This tool is accessible under the topbar's tools menu.
+
+1. Define the target LoRAs you wish to test using the following format:
+   ```text
+   <relative path>|<trigger words or "." for none>|<strength>
+   ```
+   *Example input configuration:*
+   ```text
+   SDXL\Hyperdetailed_Illustration.safetensors|ArsMJStyle, HyperDetailed Illustration|0.9
+   SDXL\Lucid_Verdant_Dream.safetensors|Lucid Verdant Dream|0.5
+   SDXL\MoviePoster03-02_CE_SDXL_128OT.safetensors|mvpstrCE style, movie poster|1.0
+   SDXL\Neo-Nihonga_Pop_Surrealism.safetensors|Neo-Nihonga Pop Surrealism|0.7
+   ```
+2. Click **Generate Contact Sheet**. The tool will automatically render a grid of 20 benchmark images across a diverse set of prompts, embedding coordinate labels on the final composite sheet.
+
+![LoRA Contact Sheet Generator Library](docs/screenshots/contactSheet.png)
+
+*Note: Once generated, these tested LoRAs, trigger words, and target strengths are automatically cached and made available in the style overrides panel.*
+
+---
+
+### The Style Playground
+
+The Style Playground is a comprehensive layout where you configure, test, and save style presets before running batch rendering operations.
+
+The interface is divided into five functional areas:
+
+#### 1. Playground Controls
+
+![Style Playground Controls](docs/screenshots/styleControls.png)
+
+Use this card to run targeted aesthetic test renders. You can select your target volume, randomly pull scene prompts using the dice button, randomize or fix seeds, set the test image count, and run immediate tests.
+
+#### 2. Style & Workflow Definition
+This card houses the **Style Preset Chooser** and **Style Preset Saver**.
+
+![Style & Workflow Definition Options](docs/screenshots/styleDefinition.png)
+
+Use this area to define:
+* **Style Prompt Prefix:** Global styling instructions prepended to every prompt (e.g., medium, core aesthetic parameters).
+* **Style Prompt Suffix:** Global styling instructions appended to every prompt (e.g., lighting, rendering style).
+* **Style Negative Prompt:** Global negative modifiers.
+
+#### 3. Engine & Workflow Settings (Overrides)
+This panel lets you bind a saved style to a specific ComfyUI workflow and override native node parameters without modifying the underlying workflow file.
+
+![Engine Workflow Overrides Configuration](docs/screenshots/workflowOverrides.png)
+
+* **Runtime Overrides:** The pipeline dynamically discovers key nodes in your API JSON (such as Latent Image size, Sampler parameters, Checkpoints, and LoRAs). Overrides set here are saved with the style preset.
+* **Saving Workflow Defaults:** Clicking the disk icon next to an override updates the raw `.json` workflow file. *Warning: Saving a change to the raw workflow changes it for all styles utilizing that workflow.*
+* **Automatic Trigger Words:** When choosing a LoRA, you can click the palette icon to automatically inject its configured trigger words directly into your prompt prefix. Or you can use the drop down. Type in the field to filter the dropdown menu.
+
+![Automatic LoRA Selection and Trigger Word Injection](docs/screenshots/loraChooser.png)
+
+#### 4. AI Toolkit
+The AI Toolkit provides tools to evaluate your generated style combinations with external LLMs.
+
+![AI Toolkit Utilities](docs/screenshots/aiToolkit.png)
+
+* **Copy LLM Primer:** Copies detailed instructions explaining your current project objectives to an external chat interface.
+* **Copy Prompt Pack:** Copies the current style rules, active prompts, and associated quotes to analyze.
+* **Generate Contact Sheet:** Clicking the icon on the right automatically compiles your latest playground test renders into a single composite image, allowing you to right-click, copy, and paste the grid directly into ChatGPT or Claude for aesthetic analysis.
+
+#### 5. Image Preview Cards
+Every generated playground image displays in an interactive card. Clicking an image expands a modal showing the scene prompt and target subtitle quote. A dedicated seed button allows you to regenerate that specific card with a new seed.
+
+---
+
+### Batch Image Generation
+
+Once your style preset is calibrated and saved, you are ready to render the complete visual sequence for your project.
+
+![Visual Style Preset Selector Dialog](docs/screenshots/selectStyle.png)
+
+1. Return to the main project Dashboard.
+2. Click **Choose Style** and select your saved preset.
+3. Click **Render Images**.
+
+![Live Rendering and Batch Telemetry](docs/screenshots/imageGen.png)
+
+* **Dynamic Telemetry:** The sidebar displays real-time telemetry, calculating an Estimated Time Remaining (ETA) based on remaining scene count and your hardware's active rendering speed.
+* **Live Feed:** The dashboard displays a live feed of the most recently completed images as they are output from ComfyUI.
+
+---
+
+### Proofreading, Approvals, and Selective Regeneration
+
+ABI-Pipeline operates with a human-in-the-loop review process. You can approve or edit scenes during live generation, or complete your review once the batch finishes.
+
+#### The Workspace Grid
+Clicking any book in the sidebar opens its dedicated illustration workspace. This page displays a grid of all scenes, visual prompts, and completed images.
+
+* **Interactive Preview:** Clicking any image card launches the detailed approval viewer.
+
+![Detailed Image Approval and Formatting Interface](docs/screenshots/imageApproval.png)
+
+* **Keyboard Shortcuts:** For high-speed proofreading, use your keyboard:
+  * Press `A` to approve the image and advance to the next scene.
+  * Press `D` to delete the image if it does not match the scene context.
+  * Press `F` or `S` to navigate manually between cards.
+* **Live Prompt Edits:** If an image fails due to a poorly structured visual prompt, you can edit the text directly in this modal. The edited prompt is saved when you click delete, ensuring the next rendering attempt uses the updated instructions.
+
+#### Selective Regeneration
+If you have deleted low-quality images or modified scene prompts, you do not need to rerender the entire book. 
+
+![Workspace Image Review Grid](docs/screenshots/regenBatch.png)
+
+Clicking the **Restart Batch / Regen** button tells the pipeline to:
+1. Finish rendering the current active queue item.
+2. Restart the pipeline from the beginning of the volume.
+3. Scan your local files, skipping all existing images.
+4. Selectively regenerate only the missing images.
+```
