@@ -209,8 +209,9 @@ def render_transcription_step_view(project, books, start_transcribe_cb, stop_tra
                 start_btn = ui.button(
                     'Start Transcription', 
                     icon='play_arrow', 
+                    color='positive',
                     on_click=lambda: start_transcribe_cb(project.id)
-                ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs px-5')
+                ).classes('text-white font-bold text-xs px-5')
                 
                 # Safe-guard action execution by binding its availability inversely to needs_restart
                 start_btn.bind_enabled_from(state, 'needs_restart', backward=lambda x: not x)
@@ -358,8 +359,9 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
                 ui.button(
                     'Generate Prompts', 
                     icon='bolt', 
+                    color='positive',
                     on_click=confirm_and_generate_prompts
-                ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-5')
+                ).classes('text-white font-bold text-xs px-5')
 
 
 def render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb):
@@ -401,8 +403,9 @@ def render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcri
                 ui.button(
                     'Render Images', 
                     icon='play_circle_filled', 
+                    color='positive',
                     on_click=lambda: start_image_gen_cb(project.id) if start_image_gen_cb else None
-                ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-5')
+                ).classes('text-white font-bold text-xs px-5')
 
 
 def render_completed_step_view(project, books):

@@ -219,16 +219,10 @@ def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, re
             ).classes('text-sm text-slate-500 leading-normal max-w-sm')
             
             with ui.column().classes('w-full gap-2.5 mt-2'):
-                def trigger_wizard():
-                    if hasattr(state, 'show_onboarding_wizard') and state.show_onboarding_wizard:
-                        state.show_onboarding_wizard()
-                    else:
-                        ui.notify("Onboarding wizard callback is not registered.", type="warning")
-                
                 ui.button(
                     'Run Setup Wizard', 
                     icon='construction', 
-                    on_click=trigger_wizard
+                    on_click=lambda: state.show_onboarding_wizard() if getattr(state, 'show_onboarding_wizard', None) else ui.notify("Onboarding wizard callback is not registered.", type="warning")
                 ).classes('w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl shadow-sm')
                 
                 ui.button(
@@ -325,7 +319,7 @@ def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, re
                                         on_click=lambda p_id=project["id"], b_id=b["id"]: select_book_cb(p_id, b_id)
                                     ).props('flat dense').classes('text-xs text-blue-600 font-bold capitalize')
 
-    with ui.dialog() as new_project_dialog, ui.card().classes('w-full max-w-2xl p-6 rounded-xl'):
+    with ui.dialog() as new_project_dialog, ui.card().classes('w-full max-w-2xl p-6 rounded-xl max-h-[85vh] overflow-y-auto'):
         ui.label('Import New Project').classes('text-xl font-bold text-slate-800 mb-2')
         
         # Elegant header navigation tabs
