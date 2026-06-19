@@ -319,7 +319,7 @@ def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, re
                                         on_click=lambda p_id=project["id"], b_id=b["id"]: select_book_cb(p_id, b_id)
                                     ).props('flat dense').classes('text-xs text-blue-600 font-bold capitalize')
 
-    with ui.dialog() as new_project_dialog, ui.card().classes('w-full max-w-2xl p-6 rounded-xl max-h-[85vh] overflow-y-auto'):
+    with ui.dialog() as new_project_dialog, ui.card().classes('w-full max-w-2xl p-6 rounded-xl overflow-hidden'):
         ui.label('Import New Project').classes('text-xl font-bold text-slate-800 mb-2')
         
         # Elegant header navigation tabs
@@ -328,7 +328,7 @@ def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, re
             txt_tab = ui.tab('Text Transcripts', icon='description')
             epub_tab = ui.tab('EPUB Novels', icon='book')
             
-        with ui.tab_panels(tabs, value=audiobook_tab).classes('w-full bg-transparent p-0') as panels:
+        with ui.tab_panels(tabs, value=audiobook_tab).classes('w-full bg-transparent p-0 max-h-[55vh] overflow-y-auto') as panels:
             
             # TAB 1: Standard Audiobook Directories Importer
             with ui.tab_panel(audiobook_tab).classes('p-0 gap-4 column w-full'):
