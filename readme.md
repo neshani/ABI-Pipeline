@@ -311,4 +311,3 @@ Clicking the **Restart Batch / Regen** button tells the pipeline to:
 2. Restart the pipeline from the beginning of the volume.
 3. Scan your local files, skipping all existing images.
 4. Selectively regenerate only the missing images.
-```

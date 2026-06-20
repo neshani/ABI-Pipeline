@@ -196,7 +196,7 @@ app.on_shutdown(lambda: os._exit(123) if should_restart else os._exit(0))
 # --- Default App Configurations ---
 DEFAULT_SETTINGS = {
     "comfy_url": "http://127.0.0.1:8188",
-    "comfy_path": "F:/AI/ComfyUI",
+    "comfy_path": "",
     "comfy_args": "--windows-standalone-build",
     "llm_url": "http://127.0.0.1:11434",
     "llm_api_key": "",
@@ -369,6 +369,7 @@ def start_transcribing(project_id: int):
 
     # Clear cancellation tracking status
     state.was_manually_cancelled = False
+    state.active_task_type = "transcription"
 
     start_project_transcription(project_id)
     ui.notify("Background audiobook transcription started!", type="positive")
@@ -436,6 +437,7 @@ def start_prompt_generation(project_id: int):
     
     # Clear cancellation tracking status
     state.was_manually_cancelled = False
+    state.active_task_type = "prompt_gen"
 
     # Reset all books to start prompt generation at 0% progress
     with Session(engine) as session:
@@ -746,6 +748,12 @@ async def async_run_project_image_gen_logic(project_id: int):
                     await asyncio.to_thread(save_and_bake)
                     state.add_console_log(f"[Image-Gen] Saved and baked metadata into: {target_filename}")
                     
+                    # Increment count of newly rendered images
+                    if hasattr(state, 'newly_generated_count'):
+                        state.newly_generated_count += 1
+                    else:
+                        state.newly_generated_count = 1
+                    
                     # Store dynamic coordinate timestamp to selectively cache-bust only this card
                     if not hasattr(state, 'custom_image_timestamps'):
                         state.custom_image_timestamps = {}
@@ -865,6 +873,10 @@ def start_image_generation(project_id: int):
     state.batch_start_time = time.time()
     state.batch_elapsed_sec = 0.0
     state.batch_eta_label = "ETA: Estimating..."
+
+    # Initialize actual generation counter to bypass cached skips in notification metrics
+    state.newly_generated_count = 0
+    state.active_task_type = "image_gen"
 
     state.image_gen_active = True
     state.cancel_image_gen_flag = False
@@ -1037,7 +1049,7 @@ async def check_for_active_transcriptions():
             ui.run_javascript(f'document.title = "[{progress_pct}%] {status_text}... | ABI-Pipeline";')
             
         # 2. State Transition Completion Event Detector (Process Just Ended)
-        elif old_status in active_statuses and new_status not in active_statuses:
+        elif (old_status in active_statuses or getattr(state, "active_task_type", None) is not None) and new_status not in active_statuses:
             if was_cancelled:
                 state.was_manually_cancelled = False
                 ui.run_javascript('''
@@ -1055,29 +1067,31 @@ async def check_for_active_transcriptions():
                 enable_notif = get_setting("enable_desktop_notifications") in ("True", True)
                 notif_threshold = int(get_setting("notification_threshold", 30))
                 
-                total_items = 0
-                for b_data in res["books"]:
-                    stats = b_data["stats"]
-                    total_items += stats.get("total_prompts", 0) or stats.get("estimated_scenes", 0) or 0
+                # Check actual work accomplished rather than the static project total
+                task_type = getattr(state, "active_task_type", None)
+                if task_type == "image_gen" or old_status == "Rendering Images":
+                    actual_processed = getattr(state, "newly_generated_count", 0)
+                    notif_body = f"Successfully generated {actual_processed} new images."
+                else:
+                    # Fallback metric for transcription/prompting runs
+                    actual_processed = 0
+                    for b_data in res["books"]:
+                        stats = b_data["stats"]
+                        actual_processed += stats.get("total_prompts", 0) or stats.get("estimated_scenes", 0) or 0
+                    notif_body = f"The background process has finished successfully ({actual_processed} items processed)."
                     
-                if enable_notif and total_items >= notif_threshold:
+                if enable_notif and actual_processed >= notif_threshold:
                     ui.run_javascript(f'''
                         if ("Notification" in window && Notification.permission === "granted") {{
                             new Notification("ABI-Pipeline", {{
-                                body: "The background process has finished successfully ({total_items} items processed).",
+                                body: "{notif_body}",
                                 icon: "/static/favicon_alert.png"
                             }});
                         }}
                     ''')
-                
-        # 3. Fallback Title Check (Enforce clean Title if not actively processing/alerting)
-        elif new_status not in active_statuses:
-            ui.run_javascript('''
-                const fav = document.querySelector("link[rel~='icon']");
-                if (fav && !fav.href.includes('favicon_alert.png') && document.title !== "ABI-Pipeline") {
-                    document.title = "ABI-Pipeline";
-                }
-            ''')
+            
+            # Clear active task type once the completion event has been processed
+            state.active_task_type = None
 
         state.last_known_status = new_status
 
@@ -1667,12 +1681,13 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
     header_controls()
 
     with ui.row().classes('items-center gap-3'):
-        # Launch Comfy Button (Universal Shortcut)
+        # Launch Comfy Button (Visible only if local comfy path is populated)
         ui.button(
             'Launch Comfy', 
             icon='bolt', 
             on_click=launch_comfyui
-        ).props('flat dense').classes('text-xs text-blue-400 hover:text-blue-300 font-bold px-2 py-1 bg-slate-700/50 rounded border border-slate-600/30')
+        ).props('flat dense').classes('text-xs text-blue-400 hover:text-blue-300 font-bold px-2 py-1 bg-slate-700/50 rounded border border-slate-600/30') \
+            .bind_visibility_from(app_settings, 'comfy_path', backward=lambda val: bool(val and val.strip()))
         
         # Launch LLM Button (Visible only if path is populated)
         ui.button(
@@ -1697,7 +1712,8 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
             with ui.menu() as menu:
                 ui.menu_item('LoRA Contact Sheets', on_click=lambda: open_tool('lora_contact_sheet'))
                 ui.menu_item('Rerun Setup Wizard', on_click=onboarding_wizard.open)
-                ui.menu_item('Clear Comfy Outputs (abi_*)', on_click=clear_comfy_dialog.open)
+                ui.menu_item('Clear Comfy Outputs (abi_*)', on_click=clear_comfy_dialog.open) \
+                    .bind_visibility_from(app_settings, 'comfy_path', backward=lambda val: bool(val and val.strip()))
                 ui.separator()
                 ui.menu_item('Quit App', on_click=quit_app)
         ui.button(icon='settings', on_click=lambda: settings_modal.open()).props('flat round color=white')
