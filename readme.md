@@ -62,10 +62,28 @@ ABI-Pipeline acts as an orchestrator. It does not need to run on the same physic
    * **Windows:** Run `start.bat` to launch the NiceGUI interface.
    * **Linux/macOS:** Run `start.sh`.
 
-Once launched, open your web browser and navigate to `http://127.0.0.1:8910` to access the pipeline.
+Once launched, open your web browser and navigate to `http://127.0.0.1:8910` to access the pipeline interface.
 
 ---
 
+### Environmental Footprint & Clean Uninstallation
+
+By design, ABI-Pipeline keeps your system pristine and localized:
+
+* **Automatic Isolation:** The setup scripts automatically create a Python virtual environment (`.venv`) entirely inside the `ABI-Pipeline` project directory and install all requirements there. No packages are installed globally on your machine.
+* **Easy Uninstallation:** Because all files, cache databases, configurations, and environment dependencies reside exclusively inside the project directory, uninstalling the pipeline is as simple as deleting the `ABI-Pipeline` folder. There are no registry keys, global configs, or orphan system files left behind.
+
+#### Alternative Environments (Conda / Custom Virtual Environments)
+If you prefer to manage Python dependencies yourself using Conda or another custom virtual environment manager, you can easily bypass the helper scripts:
+1. Activate your custom environment manually.
+2. Install the dependencies using pip: `pip install -r requirements.txt`.
+3. Launch the application directly from your terminal:
+   ```bash
+   python main.py
+   ```
+*Note: Do not use the provided `start.bat` or `start.sh` scripts if you are running a custom environment, as those scripts are specifically hardcoded to look for the default internal `.venv` directory.*
+
+---
 
 ### Initial Configuration
 
@@ -262,6 +280,12 @@ The AI Toolkit provides tools to evaluate your generated style combinations with
 * **Copy Prompt Pack:** Copies the current style rules, active prompts, and associated quotes to analyze.
 * **Generate Contact Sheet:** Clicking the icon on the right automatically compiles your latest playground test renders into a single composite image, allowing you to right-click, copy, and paste the grid directly into ChatGPT or Claude for aesthetic analysis.
 
+![AI Toolkit Contact Sheet](docs/screenshots/resultContactSheet.png)
+
+Change the styles and get feedback from an AI to see which style is the best for the books.
+
+![AI Toolkit Contact Sheet 2](docs/screenshots/resultContactSheet2.png)
+
 #### 5. Image Preview Cards
 Every generated playground image displays in an interactive card. Clicking an image expands a modal showing the scene prompt and target subtitle quote. A dedicated seed button allows you to regenerate that specific card with a new seed.
 
@@ -311,3 +335,77 @@ Clicking the **Restart Batch / Regen** button tells the pipeline to:
 2. Restart the pipeline from the beginning of the volume.
 3. Scan your local files, skipping all existing images.
 4. Selectively regenerate only the missing images.
+
+### Packaging Assets (The OIS Packager)
+
+Once your book illustrations are rendered and approved, you can package them into unified archives. The pipeline includes a native packaging tool that complies with the [Open Illuminations Standard (OIS)](https://github.com/neshani/open-illuminations-standard). 
+
+This step compiles your sequential images, baked metadata, and timing alignments into optimized `.zip` packages that are instantly recognized by the *Audiobooks Illuminated* players.
+
+---
+
+### Step 1: Global Pack Configuration
+
+The **Direct OIS Packager Studio** tab provides global configurations to apply across all volumes in your active project.
+
+![Global OIS Packager Configurations](docs/screenshots/packagerGlobal.png)
+
+#### Global Metadata & Compression Settings
+* **Global Metadata:** Define the default publisher/author name, website URL, search tags, content rating, and curation flags.
+* **Asset Downscaling & WebP Conversion:** To prevent excessively large output files, the packager can automatically resize images and compress them into the WebP format. Use the sliders to define the maximum width/height resolution (e.g., `1024px`) and the target WebP Quality percentage (e.g., `85%`).
+
+#### Timing Maps & Cover Art Injection
+During the transcription and alignment phases, the pipeline estimates where each quote occurs in the audio file and writes these values to the local `prompts.csv` database. 
+
+Because these timestamps correspond to actual narration, the first scene's quote rarely lands exactly at `00:00:00`. To prevent a blank screen during early-chapter silence or intro sequences, the **Inject audiobook cover art as first index keyframe** option is enabled by default. This compresses the local audiobook cover as `0000_cover.webp` and anchors it dynamically at `00:00:00.00` with smooth zoom transitions until the first narrative scene is reached.
+
+---
+
+### Step 2: Pre-Flight Integrity Check
+
+Before packaging begins, the studio runs a validation check on all project volumes in the **Project Volumes Telemetry** panel.
+
+![Project Volumes Telemetry Integrity Grid](docs/screenshots/packagerPreflight.png)
+
+The pre-flight interface indicates the status of each book:
+* **Verified (Green):** The book is complete and has all scenes successfully rendered.
+* **Warning (Yellow):** The book is missing scene renders (e.g., only 4 of 388 frames rendered). It is still packageable, but the final package will be incomplete.
+* **Blocked (Grey):** No images have been rendered for this volume. Packaging is blocked, and the volume is unselectable until frames are generated.
+
+---
+
+### Step 3: Volume Customization & Experience Variants
+
+Expanding any verified book panel opens specific metadata configurations and viewing experience toggles.
+
+![Individual Book Customization Panel](docs/screenshots/packagerBook.png)
+
+* **Metadata Overrides:** Customize individual book titles, authors, and version tags.
+* **Bulk Property Application:** If the importer incorrectly parsed metadata fields during setup, click the **Apply** (back-arrow) icon next to the Author field to copy that value across all selected volumes in the batch.
+* **Alternative Experience Variants:** Define which target viewing ratios to compile.
+  * **Include Desktop (Landscape) Variant:** Packages landscape versions of your renders.
+  * **Include Static (No Animation) Variant:** Packages flat images for players with animations disabled.
+
+---
+
+### Step 4: Compiling and Outputting
+
+Once your metadata, compression thresholds, and variants are configured, verify the selected volumes and run the packaging compiler.
+
+![OIS Package Compile Terminal Output](docs/screenshots/packagerPackaged.png)
+
+1. Click the **Build Illumination Packs** button.
+2. The compilation progress is printed in real-time in the terminal output panel, displaying folder exports, manifest creation, and zip archiving progress.
+3. Once completed, the final `illuminations.zip` archive is saved directly inside each respective audiobook’s folder.
+
+---
+
+### Playing Your Illuminated Audiobooks
+
+If you use the official desktop player, the application automatically detects, unpacks, and matches the illustrations when you open the audiobook.
+
+![Player Settings Experience Selector](docs/screenshots/desktopPlayer.png)
+
+#### Setup Tips
+* Keep the compiled `illuminations.zip` file in the same directory as your source audiobook file.
+* Once the player loads, open **Player Settings** and switch your **Illumination Variant** to **Desktop Mode** (or your target mobile portrait ratio) to ensure correct image framing, scaling, and transition animations.
