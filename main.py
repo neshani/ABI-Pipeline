@@ -267,6 +267,12 @@ def select_project(project_id: int):
     # Fast load settings from project folder
     load_project_settings_from_disk(project_id)
     
+    # Set the initial baseline for transition checking to prevent spurious complete alerts
+    with Session(engine) as session:
+        proj = session.get(Project, project_id)
+        if proj:
+            state.last_known_status = proj.status
+    
     # Dynamically rescan project database state on load to align database with disk
     try:
         from ui.pages.project.dashboard import rescan_project_database_state
@@ -317,6 +323,12 @@ def select_book_from_portal(project_id: int, book_id: int):
     state.active_project_id = project_id
     load_project_settings_from_disk(project_id)
     
+    # Set the initial baseline for transition checking to prevent spurious complete alerts
+    with Session(engine) as session:
+        proj = session.get(Project, project_id)
+        if proj:
+            state.last_known_status = proj.status
+
     # Dynamically rescan project database state on load to align database with disk
     try:
         from ui.pages.project.dashboard import rescan_project_database_state

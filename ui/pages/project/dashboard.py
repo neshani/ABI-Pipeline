@@ -145,14 +145,60 @@ def rescan_project_database_state(project_id: int) -> None:
     """Invokes sync operations across all project books to dynamically align database indexes with flat files."""
     from services.sync_engine import sync_book_from_disk
     from database.connection import touch_project
+    from services.transcription import active_projects
+    
+    # Determine active tasks for this specific project to skip destructive disk syncs
+    is_transcribing = False
+    if active_projects:
+        if isinstance(active_projects, dict):
+            is_transcribing = project_id in active_projects
+        elif isinstance(active_projects, (set, list)):
+            is_transcribing = project_id in active_projects or str(project_id) in active_projects
+
+    is_prompt_gen = getattr(state, "prompt_gen_active", False) and state.active_project_id == project_id
+    is_image_gen = getattr(state, "image_gen_active", False) and state.active_project_id == project_id
+
+    skip_sync = is_transcribing or is_prompt_gen or is_image_gen
+
     with Session(engine) as session:
-        books = session.exec(select(Book).where(Book.project_id == project_id)).all()
-        for b in books:
-            sync_book_from_disk(b.id, session)
-            
         project = session.get(Project, project_id)
-        if project:
-            state.project_status = project.status
+        if not project:
+            state.add_console_log(f"[Sync-Engine] Error: Project ID {project_id} not found.")
+            return
+
+        if not skip_sync:
+            books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+            for b in books:
+                sync_book_from_disk(b.id, session)
+            session.refresh(project)
+        else:
+            state.add_console_log(f"[Sync-Engine] Active pipeline process detected. Bypassing disk rescan to preserve runtime progress.")
+            
+            # Re-force active workflow statuses in the DB in case of transient state mismatch
+            if is_transcribing and project.status != "Transcribing":
+                project.status = "Transcribing"
+                session.add(project)
+            elif is_prompt_gen and project.status != "Generating Prompts":
+                project.status = "Generating Prompts"
+                session.add(project)
+            elif is_image_gen and project.status != "Rendering Images":
+                project.status = "Rendering Images"
+                session.add(project)
+
+        # Synchronize local UI state
+        state.project_status = project.status
+        
+        # Restore active execution properties so global timers can track progress transitions cleanly
+        if is_transcribing:
+            state.active_task_type = "transcription"
+        elif is_prompt_gen:
+            state.active_task_type = "prompt_gen"
+        elif is_image_gen:
+            state.active_task_type = "image_gen"
+        else:
+            if state.active_project_id == project_id:
+                state.active_task_type = None
+
         session.commit()
         
     # Touch the project to synchronize modified_at both in database and disk
