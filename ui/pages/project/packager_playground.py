@@ -392,10 +392,25 @@ class PackagerPlayground:
                 on_click=lambda: self.execute_packager(project, books)
             ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold').props(f'loading={self.is_running}')
 
+    def refresh_telemetry(self, project: Project, books: list):
+        """Forces a clean recaching of all book stats and audiobook preflight files from disk."""
+        if self.is_running:
+            return
+        from ui import state
+        state._stats_cache.clear()  # Purge stats cache to guarantee fresh disk scans
+        self.telemetry_loaded = False
+        self.volumes_list_panel.refresh()
+        asyncio.create_task(self.async_load_telemetry(project, books))
+
     @ui.refreshable
     def volumes_list_panel(self, project: Project, books: list):
         with ui.column().classes('w-full bg-white border rounded-xl p-5 gap-3 shadow-sm'):
-            ui.label('Project Volumes Telemetry').classes('text-xs font-black uppercase tracking-wider text-slate-400')
+            with ui.row().classes('w-full justify-between items-center mb-1'):
+                ui.label('Project Volumes Telemetry').classes('text-xs font-black uppercase tracking-wider text-slate-400')
+                ui.button(
+                    icon='refresh',
+                    on_click=lambda: self.refresh_telemetry(project, books)
+                ).props('flat round dense').classes('text-slate-500').tooltip('Rescan & Refresh Telemetry')
             
             if not self.telemetry_loaded:
                 with ui.row().classes('w-full justify-center items-center p-6 gap-2'):
