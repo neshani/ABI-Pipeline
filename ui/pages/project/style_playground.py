@@ -993,7 +993,53 @@ def draw_style_test_sample(project_name: str, book_name: str):
         state.style_test_seeds = [state.style_image_seed] * len(state.style_test_prompts)
         
     state.style_test_images = [None] * len(state.style_test_prompts)
-    render_style_playground_cards.refresh()
+    try:
+        render_style_playground_cards.refresh()
+    except Exception:
+        pass
+
+def sync_style_playground_state(project_name: str):
+    """Re-evaluates available transcripts/prompts and refreshes the style playground cards and overrides."""
+    if not state.playground_book_selection:
+        state.style_has_source_material = False
+        state.style_test_prompts = []
+        state.style_test_images = []
+        try:
+            render_style_playground_cards.refresh()
+        except Exception:
+            pass
+        return
+        
+    output_base = Path(get_setting("output_dir", "./output")).resolve()
+    book_dir = output_base / project_name / state.playground_book_selection
+    
+    transcript_exists = (book_dir / "transcript.txt").exists()
+    prompts_exists = (book_dir / "prompts.csv").exists()
+    state.style_has_source_material = transcript_exists or prompts_exists
+    
+    # Check for transition states
+    has_fallbacks = False
+    if state.style_test_prompts:
+        has_fallbacks = any(
+            (item.get("prompt", "") if isinstance(item, dict) else item).startswith("Generating from raw passage fallback:")
+            for item in state.style_test_prompts
+        )
+        
+    should_initialize = not state.style_test_prompts and state.style_has_source_material
+    should_upgrade = has_fallbacks and prompts_exists
+    
+    if should_initialize or should_upgrade:
+        draw_style_test_sample(project_name, state.playground_book_selection)
+        
+    if not state.style_has_source_material:
+        state.style_test_prompts = []
+        state.style_test_images = []
+        
+    try:
+        render_style_playground_cards.refresh()
+        render_workflow_overrides_ui.refresh()
+    except Exception:
+        pass
 
 
 async def execute_style_playground_batch(project_name: str):
@@ -1531,9 +1577,22 @@ def render_workflow_overrides_ui():
 @ui.refreshable
 def render_style_playground_cards(project_name: str = ""):
     if not state.style_test_prompts:
-        with ui.column().classes('w-full items-center justify-center p-6 text-slate-400 border border-dashed rounded-xl bg-slate-50'):
-            ui.icon('brush', size='md', color='slate-300')
-            ui.label("Visual Playground is empty. Use the controls to load test scenes.").classes('text-[10px] text-center max-w-[200px]')
+        # Evaluate if the book actually has source material on disk
+        has_source = False
+        if state.playground_book_selection:
+            output_base = Path(get_setting("output_dir", "./output")).resolve()
+            book_dir = output_base / project_name / state.playground_book_selection
+            has_source = (book_dir / "transcript.txt").exists() or (book_dir / "prompts.csv").exists()
+            
+        if not has_source:
+            with ui.column().classes('w-full items-center justify-center p-6 text-amber-600 border border-amber-300 border-dashed rounded-xl bg-amber-50/50 gap-2'):
+                ui.icon('warning', size='md', color='amber')
+                ui.label("Source Material Missing").classes('text-xs font-bold uppercase tracking-wider')
+                ui.label("Transcripts or prompts are required to generate style test scenes. Please run Speech-to-Text Transcription first.").classes('text-[10px] text-center max-w-[240px] leading-normal text-slate-500')
+        else:
+            with ui.column().classes('w-full items-center justify-center p-6 text-slate-400 border border-dashed rounded-xl bg-slate-50'):
+                ui.icon('brush', size='md', color='slate-300')
+                ui.label("Visual Playground is empty. Use the controls to load test scenes.").classes('text-[10px] text-center max-w-[200px]')
         return
 
     with ui.column().classes('w-full gap-3'):
@@ -1603,9 +1662,8 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
     if not hasattr(state, 'style_chunk_count') or state.style_chunk_count is None:
         state.style_chunk_count = 4
 
-    # Auto-initialize visual test prompts so workspace is never left empty
-    if not state.style_test_prompts and state.playground_book_selection:
-        draw_style_test_sample(project.name, state.playground_book_selection)
+    # Perform active state alignment checks
+    sync_style_playground_state(project.name)
 
     # Make sure loras list is hydrated and Comfy choices start loading asynchronously
     load_associated_loras()
@@ -1673,6 +1731,7 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                             color='positive',
                             on_click=lambda: execute_style_playground_batch(project.name)
                         ).classes('font-bold text-xs h-9 px-5 shadow-sm') \
+                         .bind_enabled_from(state, 'style_has_source_material') \
                          .tooltip('Submits all active prompts to ComfyUI for rendering')
 
             # ---------------- CARD 2: STYLE TEMPLATE & ENGINE DEFINITION ----------------
@@ -1779,8 +1838,9 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                         'Copy Prompt Pack',
                         icon='content_copy',
                         on_click=lambda: copy_style_settings_to_clipboard(project.name)
-                    ).classes('w-full bg-slate-700 hover:bg-slate-800 text-white text-[11px] font-semibold h-8')
-                    
+                    ).classes('w-full bg-slate-700 hover:bg-slate-800 text-white text-[11px] font-semibold h-8') \
+                     .bind_enabled_from(state, 'style_has_source_material')
+
                     ui.separator()
                     
                     with ui.row().classes('w-full items-center gap-1.5 flex-nowrap'):
@@ -1793,7 +1853,8 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                             icon='grid_view',
                             on_click=open_contact_sheet_modal
                         ).classes('bg-indigo-600 hover:bg-indigo-700 text-white h-8 w-10 flex-shrink-0') \
-                         .tooltip('Stitch completed renderings into a numbered contact sheet')
+                         .tooltip('Stitch completed renderings into a numbered contact sheet') \
+                         .bind_enabled_from(state, 'style_has_source_material')
             
             # 2. Rendered Cards Vertical Stack
             render_style_playground_cards(project.name)

@@ -97,6 +97,7 @@ style_prompt_seed: int = 42
 style_image_seed: int = 42
 style_use_random_image_seed: bool = True
 style_chunk_count: int = 4
+style_has_source_material: bool = False
 
 # --- Live Rendered Images Feed States ---
 recent_rendered_images: List[Dict[str, Any]] = []  # [{"filename": "", "base64": "", "chapter": 1, "scene": 1, "quote": "", "prompt": ""}]

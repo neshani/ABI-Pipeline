@@ -661,7 +661,13 @@ def render_project_tabs(
                 on_click=delete_dialog.open
             ).props('flat dense').classes('text-xs text-rose-600 hover:text-rose-800')
     
-    with ui.tabs().classes('w-full border-b') as project_tabs:
+    def handle_tab_change(e):
+        state.active_project_tab = e.value
+        if e.value == 'Style & Workflows':
+            from ui.pages.project.style_playground import sync_style_playground_state
+            sync_style_playground_state(project.name)
+
+    with ui.tabs(on_change=handle_tab_change).classes('w-full border-b') as project_tabs:
         tab_dash = ui.tab('Dashboard', icon='dashboard')
         tab_style = ui.tab('Style & Workflows', icon='brush')
         tab_play = ui.tab('Prompt-Gen Playground', icon='science')
