@@ -59,7 +59,7 @@ Because these assets are exported to clean, standard directories on your local d
 ### Optional Player Integration
 For users who wish to experience their illustrated books with synchronized audio, text, and graphics, ABI-Pipeline includes an optional packaging tool (the OIS Packager). This tool bundles the images and timing maps into a single file format optimized for the free **Audiobooks Illuminated** player ecosystem:
 * **Desktop Player (Windows):** Available at [audiobooksilluminated.com](https://audiobooksilluminated.com).
-* **Mobile Player (Android):** Available on the Google Play Store.
+* **Mobile Player (Android):** Available on the [Google Play Store](https://play.google.com/store/apps/details?id=com.audiobooksilluminated).
 
 <br>
 <img src="docs/screenshots/platforms.jpg" alt="Audiobooks Illuminated Mobile and Desktop Players" width="650">
