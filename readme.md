@@ -3,11 +3,14 @@
 ABI-Pipeline (Audiobooks Illuminated Pipeline) is a local, semi-automated book illustrator designed for audiobooks and text/EPUB files. It acts as an orchestrator that takes a book as an input and outputs thousands of highly organized, sequentially rendered images aligned with the narrative's progression.
 
 ## Table of Contents
+
+<details>
+<summary>Click to expand Table of Contents</summary>
+
 - [Core Purpose](#core-purpose)
+  - [Video Walkthrough](#video-walkthrough)
   - [Optional Player Integration](#optional-player-integration)
 - [Prerequisites & Requirements](#prerequisites--requirements)
-  - [Software & Host Requirements](#software--host-requirements)
-  - [Hardware Considerations](#hardware-considerations)
 - [Installation & Setup](#installation--setup)
 - [Environmental Footprint & Clean Uninstallation](#environmental-footprint--clean-uninstallation)
   - [Alternative Environments (Conda / Custom Virtual Environments)](#alternative-environments-conda--custom-virtual-environments)
@@ -43,7 +46,7 @@ ABI-Pipeline (Audiobooks Illuminated Pipeline) is a local, semi-automated book i
 - [Playing Your Illuminated Audiobooks](#playing-your-illuminated-audiobooks)
   - [Setup Tips](#setup-tips)
 
----
+</details>
 
 ## Core Purpose
 
@@ -55,6 +58,12 @@ The pipeline manages three main output assets:
 * **Timing and Text Alignment:** A structured map pairing every image and quote with its corresponding chapter, scene, or precise time stamp.
 
 Because these assets are exported to clean, standard directories on your local drive, you have complete ownership of the output. You can use the generated files to construct illustrated EPUBs, build video slideshows, or integrate visual narratives into any custom media player.
+
+### Video Walkthrough
+
+[![Watch the tutorial](https://img.youtube.com/vi/YebKRFvwqj8/0.jpg)](https://www.youtube.com/watch?v=YebKRFvwqj8)
+
+*A 6-minute guide demonstrating the entire end-to-end workflow from raw audiobook files to a fully completed illumination pack.*
 
 ### Optional Player Integration
 For users who wish to experience their illustrated books with synchronized audio, text, and graphics, ABI-Pipeline includes an optional packaging tool (the OIS Packager). This tool bundles the images and timing maps into a single file format optimized for the free **Audiobooks Illuminated** player ecosystem:
