@@ -34,89 +34,154 @@ class ComfyClient:
             title = node_data.get("_meta", {}).get("title", class_type)
 
             if class_type in ["KSampler", "KSamplerAdvanced"]:
+                steps = inputs.get("steps", 20)
+                cfg = inputs.get("cfg", 8.0)
+                sampler_name = inputs.get("sampler_name", "euler")
+                scheduler = inputs.get("scheduler", "normal")
+
+                if not isinstance(steps, (int, float)): steps = 20
+                if not isinstance(cfg, (int, float)): cfg = 8.0
+                if not isinstance(sampler_name, str): sampler_name = "euler"
+                if not isinstance(scheduler, str): scheduler = "normal"
+
                 discovered[node_id] = {
                     "type": "sampler",
                     "title": title,
                     "class_type": class_type,
                     "params": {
-                        "steps": inputs.get("steps", 20),
-                        "cfg": inputs.get("cfg", 8.0),
-                        "sampler_name": inputs.get("sampler_name", "euler"),
-                        "scheduler": inputs.get("scheduler", "normal")
+                        "steps": int(steps),
+                        "cfg": float(cfg),
+                        "sampler_name": sampler_name,
+                        "scheduler": scheduler
                     }
                 }
             elif class_type == "BasicScheduler":
+                steps = inputs.get("steps", 10)
+                scheduler = inputs.get("scheduler", "normal")
+                denoise = inputs.get("denoise", 1.0)
+
+                if not isinstance(steps, (int, float)): steps = 10
+                if not isinstance(scheduler, str): scheduler = "normal"
+                if not isinstance(denoise, (int, float)): denoise = 1.0
+
                 discovered[node_id] = {
                     "type": "basic_scheduler",
                     "title": title,
                     "class_type": class_type,
                     "params": {
-                        "steps": inputs.get("steps", 10),
-                        "scheduler": inputs.get("scheduler", "normal"),
-                        "denoise": inputs.get("denoise", 1.0)
+                        "steps": int(steps),
+                        "scheduler": scheduler,
+                        "denoise": float(denoise)
                     }
                 }
             elif class_type == "KSamplerSelect":
+                sampler_name = inputs.get("sampler_name", "euler")
+                if not isinstance(sampler_name, str): sampler_name = "euler"
+
                 discovered[node_id] = {
                     "type": "sampler_select",
                     "title": title,
                     "class_type": class_type,
                     "params": {
-                        "sampler_name": inputs.get("sampler_name", "euler")
+                        "sampler_name": sampler_name
                     }
                 }
             elif class_type == "SamplerCustom":
+                cfg = inputs.get("cfg", 8.0)
+                if not isinstance(cfg, (int, float)): cfg = 8.0
+
                 discovered[node_id] = {
                     "type": "custom_sampler",
                     "title": title,
                     "class_type": class_type,
                     "params": {
-                        "cfg": inputs.get("cfg", 8.0)
+                        "cfg": float(cfg)
                     }
                 }
             elif class_type in ["EmptyLatentImage", "EmptySD3LatentImage", "FluxEmptyLatentImage"]:
+                width = inputs.get("width", 512)
+                height = inputs.get("height", 512)
+
+                if not isinstance(width, (int, float)): width = 512
+                if not isinstance(height, (int, float)): height = 512
+
                 discovered[node_id] = {
                     "type": "resolution",
                     "title": title,
                     "class_type": class_type,
                     "params": {
-                        "width": inputs.get("width", 512),
-                        "height": inputs.get("height", 512)
+                        "width": int(width),
+                        "height": int(height)
+                    }
+                }
+            elif class_type == "ResolutionSelector":
+                aspect_ratio = inputs.get("aspect_ratio", "1:1 (Square)")
+                megapixels = inputs.get("megapixels", 1.0)
+                multiple = inputs.get("multiple", 8)
+
+                if not isinstance(aspect_ratio, str): aspect_ratio = "1:1 (Square)"
+                if not isinstance(megapixels, (int, float)): megapixels = 1.0
+                if not isinstance(multiple, (int, float)): multiple = 8
+
+                discovered[node_id] = {
+                    "type": "resolution_selector",
+                    "title": title,
+                    "class_type": class_type,
+                    "params": {
+                        "aspect_ratio": aspect_ratio,
+                        "megapixels": float(megapixels),
+                        "multiple": int(multiple)
                     }
                 }
             elif class_type in ["CheckpointLoaderSimple", "UNETLoader"]:
                 model_param = "ckpt_name" if "ckpt_name" in inputs else "unet_name"
+                model_val = inputs.get(model_param, "")
+                if not isinstance(model_val, str): model_val = ""
+
                 discovered[node_id] = {
                     "type": "model_loader",
                     "title": title,
                     "class_type": class_type,
                     "params": {
                         "model_param_key": model_param,
-                        model_param: inputs.get(model_param, "")
+                        model_param: model_val
                     }
                 }
             elif class_type in ["LoraLoader", "LoraLoaderModelOnly"]:
+                lora_name = inputs.get("lora_name", "")
+                strength_model = inputs.get("strength_model", 1.0)
+                strength_clip = inputs.get("strength_clip", 1.0)
+
+                if not isinstance(lora_name, str): lora_name = ""
+                if not isinstance(strength_model, (int, float)): strength_model = 1.0
+                if not isinstance(strength_clip, (int, float)): strength_clip = 1.0
+
                 discovered[node_id] = {
                     "type": "lora_loader",
                     "title": title,
                     "class_type": class_type,
                     "params": {
-                        "lora_name": inputs.get("lora_name", ""),
-                        "strength_model": inputs.get("strength_model", 1.0),
-                        "strength_clip": inputs.get("strength_clip", 1.0)
+                        "lora_name": lora_name,
+                        "strength_model": float(strength_model),
+                        "strength_clip": float(strength_clip)
                     }
                 }
             elif class_type in ["CLIPLoader", "DualCLIPLoader"]:
                 clip_param1 = "clip_name1" if "clip_name1" in inputs else "clip_name"
                 clip_param2 = "clip_name2" if "clip_name2" in inputs else None
                 
+                clip_val1 = inputs.get(clip_param1, "")
+                if not isinstance(clip_val1, str): clip_val1 = ""
+
                 discovered_params = {
                     "clip_param_key": clip_param1,
-                    clip_param1: inputs.get(clip_param1, "")
+                    clip_param1: clip_val1
                 }
                 if clip_param2:
+                    clip_val2 = inputs.get(clip_param2, "")
+                    if not isinstance(clip_val2, str): clip_val2 = ""
                     discovered_params["clip_param_key2"] = clip_param2
-                    discovered_params[clip_param2] = inputs.get(clip_param2, "")
+                    discovered_params[clip_param2] = clip_val2
                     
                 discovered[node_id] = {
                     "type": "clip_loader",
@@ -125,12 +190,28 @@ class ComfyClient:
                     "params": discovered_params
                 }
             elif class_type == "VAELoader":
+                vae_name = inputs.get("vae_name", "")
+                if not isinstance(vae_name, str): vae_name = ""
+
                 discovered[node_id] = {
                     "type": "vae_loader",
                     "title": title,
                     "class_type": class_type,
                     "params": {
-                        "vae_name": inputs.get("vae_name", "")
+                        "vae_name": vae_name
+                    }
+                }
+            elif class_type == "PrimitiveBoolean":
+                value = inputs.get("value", False)
+                if not isinstance(value, bool):
+                    value = False
+
+                discovered[node_id] = {
+                    "type": "primitive_boolean",
+                    "title": title,
+                    "class_type": class_type,
+                    "params": {
+                        "value": value
                     }
                 }
         return discovered
