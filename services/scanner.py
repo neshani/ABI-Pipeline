@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any, List
 from sqlmodel import Session
 from database.connection import engine
 from database.models import Project, Book, Chapter
+import subprocess
 
 # Supported audio extensions
 AUDIO_EXTENSIONS = {'.mp3', '.m4b', '.m4a', '.wav', '.flac', '.ogg'}
@@ -13,12 +14,59 @@ AUDIO_EXTENSIONS = {'.mp3', '.m4b', '.m4a', '.wav', '.flac', '.ogg'}
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 
 
+def extract_embedded_cover(audio_file: Path, book_dir: Path) -> Optional[str]:
+    """
+    Attempts to extract embedded artwork from an audio file using ffmpeg
+    and saves it as 'cover.jpg' inside the book's folder.
+    """
+    if not audio_file.exists():
+        return None
+        
+    output_path = book_dir / "cover.jpg"
+    
+    # ffmpeg command to extract the first video stream frame (embedded artwork)
+    # and transcode/save it as a standard JPEG file.
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(audio_file.resolve()),
+        "-an",
+        "-vframes:v", "1",
+        "-f", "image2",
+        str(output_path.resolve())
+    ]
+    
+    try:
+        # Run ffmpeg with hidden console windows and captured streams
+        result = subprocess.run(
+            cmd, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            text=True, 
+            timeout=10.0
+        )
+        if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+            print(f"[Extractor] Successfully extracted embedded cover to: {output_path.name}")
+            return str(output_path.resolve())
+    except Exception as e:
+        print(f"[Extractor] Error extracting embedded cover from {audio_file.name}: {e}")
+        
+    # Clean up empty files in case of extraction failure
+    if output_path.exists() and output_path.stat().st_size == 0:
+        try:
+            output_path.unlink()
+        except Exception:
+            pass
+            
+    return None
+
+
 def find_cover_art(book_dir: Path) -> Optional[str]:
     """
     Scans a directory for book cover art based on priority:
     1. Named exactly 'cover' (e.g. cover.jpg)
     2. Filename contains 'cover' or 'folder'
-    3. Exactly one image file exists in the directory
+    3. The image file with the largest file size on disk (to bypass tiny thumbnail files)
+    4. Fallback: Extract embedded cover art from the first discovered audio file using ffmpeg
     """
     if not book_dir.is_dir():
         return None
@@ -27,9 +75,6 @@ def find_cover_art(book_dir: Path) -> Optional[str]:
     for file in book_dir.iterdir():
         if file.is_file() and file.suffix.lower() in IMAGE_EXTENSIONS:
             image_files.append(file)
-
-    if not image_files:
-        return None
 
     # Priority 1: Named exactly "cover" (ignoring extension)
     for img in image_files:
@@ -42,9 +87,24 @@ def find_cover_art(book_dir: Path) -> Optional[str]:
         if "cover" in stem_lower or "folder" in stem_lower:
             return str(img.resolve())
 
-    # Priority 3: Exactly one image file in the directory
-    if len(image_files) == 1:
-        return str(image_files[0].resolve())
+    # Priority 3: Select the file with the largest file size on disk
+    if image_files:
+        try:
+            largest_img = max(image_files, key=lambda f: f.stat().st_size)
+            return str(largest_img.resolve())
+        except Exception as e:
+            print(f"[Scanner] Error finding largest image file: {e}")
+            return str(image_files[0].resolve())
+
+    # Priority 4: Fallback - extract embedded art from first audio source
+    try:
+        source_type, audio_files = find_audio_sources(book_dir)
+        if audio_files:
+            extracted = extract_embedded_cover(audio_files[0], book_dir)
+            if extracted:
+                return extracted
+    except Exception as e:
+        print(f"[Scanner] Failed to check or extract audio file artwork: {e}")
 
     return None
 
