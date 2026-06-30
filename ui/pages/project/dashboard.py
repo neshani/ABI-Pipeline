@@ -669,8 +669,9 @@ def render_project_tabs(
 
     with ui.tabs(on_change=handle_tab_change).classes('w-full border-b') as project_tabs:
         tab_dash = ui.tab('Dashboard', icon='dashboard')
-        tab_style = ui.tab('Style & Workflows', icon='brush')
         tab_play = ui.tab('Prompt-Gen Playground', icon='science')
+        tab_char = ui.tab('Characters', icon='face')
+        tab_style = ui.tab('Style & Workflows', icon='brush')
         tab_pack = ui.tab('OIS Packager', icon='inventory_2')
         
     project_tabs.bind_value(state, 'active_project_tab')
@@ -730,13 +731,18 @@ def render_project_tabs(
                 render_conditional_prompt_feed.refresh()
             )
                         
-        with ui.tab_panel(tab_style):
-            # Delegates rendering directly to the modular style_playground page!
-            render_style_playground_tab(project, save_project_settings_cb)
-                
         with ui.tab_panel(tab_play):
             # Delegates rendering directly to the modular prompt_playground page!
             render_prompt_playground_tab(project, books)
+
+        with ui.tab_panel(tab_char):
+            # Modular project-level characters tab view!
+            from ui.pages.project.characters_tab import render_characters_tab
+            render_characters_tab(project, books)
+
+        with ui.tab_panel(tab_style):
+            # Delegates rendering directly to the modular style_playground page!
+            render_style_playground_tab(project, save_project_settings_cb)
 
         with ui.tab_panel(tab_pack):
             # Lazy import to keep startup footprint small and avoid workspace dependency conflicts

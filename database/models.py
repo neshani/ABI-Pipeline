@@ -51,3 +51,37 @@ class ScenePrompt(SQLModel, table=True):
     quote: str
     approved: bool = Field(default=False)
     timestamp: Optional[str] = Field(default="00:00:00")
+
+class Character(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id", index=True)
+    book_id: Optional[int] = Field(default=None, foreign_key="book.id", index=True) # Null if global/static, Book ID if book-specific/dynamic
+    name: str = Field(index=True)
+    
+    # 8-Field Physical Descriptor Schema (Excluding Dynamic Clothing)
+    sex_or_gender: Optional[str] = Field(default=None)
+    approximate_age: Optional[str] = Field(default=None)
+    ethnicity_or_race: Optional[str] = Field(default=None)
+    height_or_stature: Optional[str] = Field(default=None)
+    weight_or_build: Optional[str] = Field(default=None)
+    hair_color_and_style: Optional[str] = Field(default=None)
+    facial_features: Optional[str] = Field(default=None)
+    distinguishing_marks: Optional[str] = Field(default=None)  # Acts as our 'Misc' permanent descriptor field
+    
+    is_dynamic: bool = Field(default=False) # True if scoped to a book, False if static/project-global
+    locked: bool = Field(default=False)     # True if manual curation should protect this profile from LLM extraction overwrites
+
+class CharacterAlias(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    character_id: int = Field(foreign_key="character.id", index=True)
+    alias: str = Field(index=True)  # Raw tag text without brackets, e.g., 'Dino' or 'Stone'
+
+class CharacterStateModifier(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    character_id: int = Field(foreign_key="character.id", index=True)
+    book_id: int = Field(foreign_key="book.id", index=True) # Modifiers are inherently chapter-based inside a specific book
+    name: str                      # e.g., 'Broken Arm Cast' or 'Gandalf the White'
+    modifier_text: str             # e.g., 'wearing a plaster cast on his left arm'
+    start_chapter: int
+    end_chapter: int
+    is_permanent: bool = Field(default=False) # If True, active from start_chapter through the remainder of the book
