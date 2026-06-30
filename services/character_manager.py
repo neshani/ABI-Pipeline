@@ -337,37 +337,33 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
 
 
 def get_default_character_template() -> str:
-    """Returns default visual profiling instructions with 4 simplified traits, strictly banning clothing/attire extraction."""
+    """Returns default visual profiling instructions emphasizing paintable concrete details and banning narrative plots."""
     return (
-        "You are a specialized AI function that performs character visual trait extraction.\n"
-        "Analyze the provided book text chunk and try to extract physical, observable features "
-        "for the character named {character_name} (and their known aliases: {aliases}).\n\n"
-        "### TARGET SENTENCE STRUCTURE ###\n"
-        "We are going to inject these traits directly into this exact sentence structure to describe the character in image generator prompts:\n"
+        "You are a strict, objective AI character profiler. Extract physical features for {character_name} "
+        "(aka: {aliases}) from the provided book passage.\n\n"
+        "### TARGET SENTENCE SCHEMA ###\n"
+        "We inject your output into this exact template:\n"
         "\"{character_name} (a {{demographics}}, {{hair_and_face}}, who is {{physical_build}}, and {{distinguishing_marks}})\"\n\n"
-        "To make this sentence grammatically perfect, your extracted values MUST be written as short, descriptive grammatical fragments conforming to these rules:\n"
-        "1. 'demographics': Must be a noun phrase identifying gender, race/ethnicity, and approximate age range. Do not include articles ('a' or 'an'). Examples: 'middle-aged Caucasian man', 'young African-American woman', 'elderly Asian monk'.\n"
-        "2. 'hair_and_face': Must be a prepositional phrase starting with 'with'. Examples: 'with thinning blond-brown hair and a clean-shaven face', 'with long black curls and sharp green eyes'.\n"
-        "3. 'physical_build': Must be a brief, direct descriptor of height, posture, and build. Do not write 'who is' or 'is'. Examples: 'six-foot-two and athletic', 'short and stocky with broad shoulders'.\n"
-        "4. 'distinguishing_marks': Must be a fragment describing ONLY stable physical markings, scars, tattoos, or corrective reading glasses. Do NOT extract clothing. Examples: 'with a faint scar on his left cheek', 'wearing wire-rimmed reading glasses', 'with a small anchor tattoo on his right forearm'.\n\n"
-        "### CRITICAL RULE: EXCLUDE ALL CLOTHING & ATTIRE ###\n"
-        "Do NOT extract clothing, outfits, uniforms, suits, coats, jackets, raincoats, dresses, hats, or attire of any kind. "
-        "For example, do NOT extract 'wearing a trench coat', 'wearing a silk Italian suit', or 'wearing police gear'. "
-        "Clothing is temporary, changeful, and is handled strictly at the scene level. "
-        "The base character profile must remain entirely clothing-free. Focus ONLY on their permanent body, face, skin, hair, birthmarks, tattoos, or glasses.\n\n"
-        "### RULES ###\n"
-        "1. Only extract physical, observable visual traits directly mentioned or strongly implied by the text. Do NOT guess, hypothesize, or invent details.\n"
-        "2. Focus only on stable, permanent, or long-term physical properties of their body or face. Do NOT extract temporary gestures, transient expressions, moods, sounds, or clothing.\n"
-        "3. If a trait is not described in this text chunk, return null for that field.\n"
-        "4. Your response MUST be a single, valid JSON block. Do not include conversational prefaces, explanations, or markdown commentary outside of the JSON block.\n\n"
-        "### CURRENT KNOWN DETAILS ###\n"
-        "Focus on filling the missing attributes. Do not overwrite or re-extract details already known:\n"
-        "{known_traits}\n\n"
-        "### LOOK FOR THESE UNKNOWN DETAILS ###\n"
-        "Specifically seek information for these fields:\n"
+        "Your JSON values must be short, lowercase grammatical fragments:\n"
+        "- 'demographics': Noun phrase of age, race, gender (NO articles). E.g., 'middle-aged Caucasian man', 'young Italian woman'.\n"
+        "- 'hair_and_face': Prepositional phrase starting with 'with'. E.g., 'with thinning brown hair', 'with sharp blue eyes'.\n"
+        "- 'physical_build': Height, posture, and build. E.g., 'tall and athletic', 'short and stocky'.\n"
+        "- 'distinguishing_marks': Permanent details only (tattoos, scars, glasses). E.g., 'with a scar on his cheek'.\n\n"
+        "### CRITICAL RESTRICTIONS (STRICTLY ENFORCED) ###\n"
+        "1. NO CLOTHING: Do not extract suits, jackets, raincoats, hats, or attire. The profile must be entirely clothing-free.\n"
+        "2. NO TRANSIENT GESTURES/EXPRESSIONS: Ignore voice, sounds, smiles, frowns, raised eyebrows, jaw drops, parted lips, glances, or momentary physical movements. Focus on stable, lifelong features only.\n"
+        "3. ENTITY SHIELD: Often the text describes a perp, suspect, bystander, or corpse (e.g., 'a male Caucasian 5'6\"' or 'the doctor at the bar') while {character_name} reacts or speaks. Do NOT extract these! Only extract traits if they explicitly describe {character_name}.\n"
+        "4. ONLY PAINTABLE VISUAL DETAILS: Your extractions must describe direct, concrete physical colors, textures, shapes, and tangible sizes (e.g., 'blonde hair', 'sharp green eyes'). Do NOT extract narrative, abstract, plot-heavy, or relational facts (e.g., 'hair color matching a Jane Doe', 'looked like her mother', 'with a face known to police'). If an artist cannot physically paint it, it is strictly forbidden.\n"
+        "5. Output MUST be a single, valid JSON block. No commentary.\n\n"
+        "### CURRENT PROFILE STATE ###\n"
+        "Currently recorded:\n"
+        "{known_traits}\n"
+        "Unknown (needs data):\n"
         "{unknown_traits}\n\n"
+        "### INSTRUCTIONS ###\n"
+        "Fill missing data or correct old provisional traits ONLY if this text passage clearly and explicitly contradicts them with authoritative evidence. "
+        "Do not output unchanged fields.\n\n"
         "### JSON TARGET SCHEMA ###\n"
-        "Return ONLY the fields that you have found newly described in this text chunk. Use this strict schema:\n"
         "{{\n"
         "  \"demographics\": \"string\" | null,\n"
         "  \"hair_and_face\": \"string\" | null,\n"
@@ -375,6 +371,49 @@ def get_default_character_template() -> str:
         "  \"distinguishing_marks\": \"string\" | null\n"
         "}}\n"
     )
+
+
+def is_valid_permanent_trait(key: str, new_val: str, old_val: Optional[str] = None) -> bool:
+    """
+    Determines if a newly extracted trait value is a valid permanent visual descriptor,
+    preventing transient expressions, auditory traits, actions, or overly generic single words.
+    """
+    val = new_val.lower().strip()
+    if not val or val == "null" or val == "none":
+        return False
+        
+    # 1. Surgical ban list targeting ONLY non-visual traits or highly transient action-modifiers
+    banned_terms = [
+        # Auditory/Vocal (Strictly non-visual)
+        "voice", "sound", "accent", "tone", "shout", "whisper", "screamed", "spoken", "spoke", "screaming",
+        
+        # Pure momentary facial expressions
+        "smile", "grin", "frown", "scowl", "pout", "smirk", "laugh", "giggle", "chuckle",
+        "twitching", "winking", "blinking", "crying", "tears", "shivering", "shivered", "recoiled",
+        
+        # Transient states of permanent features (allows 'eyebrows', 'lips', 'jaw', 'teeth' to be permanent)
+        "raised eyebrow", "raised eyebrows", "furrowed", "dropped jaw", "parted lip", "parted lips",
+        "gritting teeth", "gnashing", "biting lip", "chewing lip",
+        
+        # Transitive physical action verbs (prevents literal plot interactions from becoming traits)
+        "clap", "clapped", "clapping", "slap", "slapped", "slapping", "grab", "grabbed", "grabbing", 
+        "hold", "held", "holding", "press", "pressed", "pressing", "touch", "touched", "touching",
+
+        "unknown", "not specified", "unspecified", "unmentioned", "not mentioned", "not described"
+    ]
+    
+    for term in banned_terms:
+        if re.search(rf"\b{term}", val):
+            print(f"[Profiler Filter] Discarding transient/action/auditory term '{term}' in: '{new_val}'")
+            return False
+            
+    # 2. Block ultra-generic single-word filler overwrites (e.g. overwriting 'six-foot-two and athletic' with just 'tall')
+    generic_words = ["tall", "short", "thin", "fat", "man", "woman", "boy", "girl", "hair", "face"]
+    if val in generic_words and old_val and len(old_val.strip()) > 15:
+        print(f"[Profiler Filter] Discarding generic single-word update '{new_val}' over descriptive: '{old_val}'")
+        return False
+        
+    return True
 
 
 async def run_stateful_character_profiling(
@@ -387,8 +426,8 @@ async def run_stateful_character_profiling(
     """
     Executes the Code-Led Stateful Extraction Loop for a single character.
     Chronologically scans chunks mentioning the character's aliases.
-    Presents the running state to the LLM to fill in the blanks, automatically 
-    terminating early once the checklist is filled.
+    Clears out old auto-generated traits first for a clean-slate fresh pass,
+    then scans thoroughly through the specified chunks with defensive validation.
     """
     llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
     model_name = get_setting("llm_model", "local-model")
@@ -411,16 +450,26 @@ async def run_stateful_character_profiling(
             print(f"[Profiler] Character {char.name} is locked. Skipping.")
             return {}
 
+        # WIPE OLD AUTO-GENERATED TRAITS FOR A CLEAN SLATE PASS
+        char.demographics = None
+        char.physical_build = None
+        char.hair_and_face = None
+        char.distinguishing_marks = None
+        char.visual_description = None
+        session.add(char)
+        session.commit()
+
         project_name = project.name
         book_name = book.name
         aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
         alias_list = [a.alias for a in aliases]
 
+    # Initialize running state with a clean slate
     state_checklist = {
-        "demographics": char.demographics,
-        "physical_build": char.physical_build,
-        "hair_and_face": char.hair_and_face,
-        "distinguishing_marks": char.distinguishing_marks
+        "demographics": None,
+        "physical_build": None,
+        "hair_and_face": None,
+        "distinguishing_marks": None
     }
 
     chunks = get_character_mention_chunks(project_name, book_name, character_id, chunk_size_words=800)
@@ -435,15 +484,11 @@ async def run_stateful_character_profiling(
             break
 
         unknown_fields = [k for k, v in state_checklist.items() if v is None or str(v).strip() == ""]
-        if not unknown_fields:
-            print(f"[Profiler] Success! Checklist for {char.name} is complete. Terminating loop early.")
-            break
-
         scanned_count += 1
         chunk_text = chunk_data["text"]
 
         known_display = "\n".join([f"- {k}: {v}" for k, v in state_checklist.items() if v]) or "None"
-        unknown_display = "\n".join([f"- {k}" for k in unknown_fields])
+        unknown_display = "\n".join([f"- {k}" for k in unknown_fields]) or "None"
 
         try:
             system_instructions = system_instructions_raw.format(
@@ -463,8 +508,8 @@ async def run_stateful_character_profiling(
         user_prompt = (
             f"### CURRENT TEXT PASSAGE ###\n"
             f"\"\"\"\n{chunk_text}\n\"\"\"\n\n"
-            f"Task: Review the passage. Extract facts for the Unknown details. "
-            f"Respond with a single JSON block conforming to the instructions."
+            f"Task: Review the passage. Extract facts for the unknown traits or self-correct "
+            f"any contradicted provisional details. Respond with a single JSON block."
         )
 
         full_prompt = f"{system_instructions}\n\n{user_prompt}"
@@ -475,11 +520,13 @@ async def run_stateful_character_profiling(
             extracted_json = extract_json_from_text(raw_response)
 
             if extracted_json:
-                print(f"[Profiler] Received new data: {extracted_json}")
+                print(f"[Profiler] Received profiling data: {extracted_json}")
                 for key in state_checklist.keys():
                     new_val = extracted_json.get(key)
                     if new_val and str(new_val).strip() != "" and str(new_val).lower() != "null":
-                        state_checklist[key] = str(new_val).strip()
+                        # Defensive guard: prevent transient/voice traits or regressive short-form overwrites
+                        if is_valid_permanent_trait(key, str(new_val), state_checklist[key]):
+                            state_checklist[key] = str(new_val).strip()
 
             if progress_callback:
                 progress_callback(char.id, scanned_count, max_chunks_to_scan, state_checklist)
