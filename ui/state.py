@@ -66,6 +66,20 @@ playground_selection_mode: str = "Seeded Random"
 playground_loading: bool = False
 playground_results: List[Dict[str, Any]] = []  # [{"chunk": "", "quote": "", "prompt": "", "status": ""}]
 
+# Character prompt-replacement tuning states
+style_enable_character_replacement: bool = True
+style_use_sentence_structure: bool = True
+style_enabled_character_traits: Dict[str, bool] = {
+    "sex_or_gender": True,
+    "approximate_age": True,
+    "ethnicity_or_race": True,
+    "height_or_stature": True,
+    "weight_or_build": True,
+    "hair_color_and_style": True,
+    "facial_features": True,
+    "distinguishing_marks": True
+}
+
 # --- Dynamic Prompt Generation Task States ---
 recent_prompts: List[Dict[str, Any]] = []  # Stores last 5 generated prompts: [{"book": "", "chapter": 1, "scene": 1, "prompt": "", "quote": "", "status": ""}]
 prompt_gen_active: bool = False

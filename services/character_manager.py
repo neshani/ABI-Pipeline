@@ -2,6 +2,7 @@ import re
 import json
 import csv
 import asyncio
+import difflib
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 from sqlmodel import Session, select
@@ -17,6 +18,50 @@ def get_characters_json_path(project_id: int) -> Optional[Path]:
             return None
         base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
         return base_output_dir / project.name / "characters.json"
+
+
+def compile_character_visual_prompt(char: Character) -> str:
+    """
+    Assembles a descriptive, natural language physical prompt from structured traits.
+    Optimized for single-stream text encoders like Qwen (Z-Image Turbo).
+    """
+    pieces = []
+    
+    # 1. Demographics
+    demographics = [char.approximate_age, char.ethnicity_or_race, char.sex_or_gender]
+    base_demographics = " ".join([d.strip() for d in demographics if d and str(d).strip()])
+    if base_demographics:
+        pieces.append(base_demographics)
+    elif char.sex_or_gender:
+        pieces.append(char.sex_or_gender)
+
+    # 2. Frame & stature
+    if char.height_or_stature and str(char.height_or_stature).strip():
+        pieces.append(char.height_or_stature.strip())
+    if char.weight_or_build and str(char.weight_or_build).strip():
+        pieces.append(char.weight_or_build.strip())
+
+    # 3. Hair (Formatted as 'with [color/style]')
+    if char.hair_color_and_style and str(char.hair_color_and_style).strip():
+        hair = char.hair_color_and_style.strip().lower()
+        if not hair.startswith("with ") and not hair.startswith("has "):
+            pieces.append(f"with {hair}")
+        else:
+            pieces.append(hair)
+
+    # 4. Facial features
+    if char.facial_features and str(char.facial_features).strip():
+        pieces.append(char.facial_features.strip())
+
+    # 5. Distinctive visual details / accessories
+    if char.distinguishing_marks and str(char.distinguishing_marks).strip():
+        pieces.append(char.distinguishing_marks.strip())
+
+    cleaned_pieces = [p.strip() for p in pieces if p and str(p).strip()]
+    if not cleaned_pieces:
+        return f"a person named {char.name}"
+        
+    return ", ".join(cleaned_pieces)
 
 
 def save_project_characters_to_json(project_id: int):
@@ -42,6 +87,7 @@ def save_project_characters_to_json(project_id: int):
                 "is_dynamic": char.is_dynamic,
                 "locked": char.locked,
                 "book_id": char.book_id,
+                "visual_description": char.visual_description,
                 "profile": {
                     "sex_or_gender": char.sex_or_gender,
                     "approximate_age": char.approximate_age,
@@ -92,14 +138,12 @@ def sync_project_characters_from_json(project_id: int):
         # Clear out existing SQLModel character caches for this project to perform a clean sync
         old_chars = session.exec(select(Character).where(Character.project_id == project_id)).all()
         for oc in old_chars:
-            # Cleanly delete aliases via ORM
             aliases_to_del = session.exec(
                 select(CharacterAlias).where(CharacterAlias.character_id == oc.id)
             ).all()
             for a in aliases_to_del:
                 session.delete(a)
             
-            # Cleanly delete state modifiers via ORM
             mods_to_del = session.exec(
                 select(CharacterStateModifier).where(CharacterStateModifier.character_id == oc.id)
             ).all()
@@ -124,6 +168,7 @@ def sync_project_characters_from_json(project_id: int):
                 hair_color_and_style=profile.get("hair_color_and_style"),
                 facial_features=profile.get("facial_features"),
                 distinguishing_marks=profile.get("distinguishing_marks"),
+                visual_description=char_data.get("visual_description"),
                 is_dynamic=char_data.get("is_dynamic", False),
                 locked=char_data.get("locked", False)
             )
@@ -187,9 +232,7 @@ def extract_characters_from_prompts(project_id: int) -> Set[str]:
         if not discovered_tags:
             return discovered_tags
 
-        # Reconcile discovered bracketed names against existing database records
         for tag in discovered_tags:
-            # Check if this name is already mapped to any alias or canonical identity
             existing_alias = session.exec(
                 select(CharacterAlias).where(CharacterAlias.alias == tag)
             ).first()
@@ -200,12 +243,10 @@ def extract_characters_from_prompts(project_id: int) -> Set[str]:
                 select(Character).where(Character.project_id == project_id).where(Character.name == tag)
             ).first()
             if existing_char:
-                # Associate tag as an alias automatically if missing
                 new_alias = CharacterAlias(character_id=existing_char.id, alias=tag)
                 session.add(new_alias)
                 continue
 
-            # Otherwise, instantiate a new unassigned Character and self-alias mapping
             new_char = Character(project_id=project_id, name=tag)
             session.add(new_char)
             session.commit()
@@ -214,7 +255,6 @@ def extract_characters_from_prompts(project_id: int) -> Set[str]:
             session.add(new_alias)
             session.commit()
 
-    # Flush changes to file backup
     save_project_characters_to_json(project_id)
     return discovered_tags
 
@@ -236,12 +276,10 @@ def merge_character_aliases(project_id: int, target_character_id: int, source_al
 
             old_char_id = alias.character_id
             
-            # Re-associate alias to the new target character
             alias.character_id = target_character_id
             session.add(alias)
             session.commit()
 
-            # If the source character now has zero remaining aliases, remove the character record
             remaining_aliases = session.exec(
                 select(CharacterAlias).where(CharacterAlias.character_id == old_char_id)
             ).all()
@@ -250,6 +288,12 @@ def merge_character_aliases(project_id: int, target_character_id: int, source_al
                 if old_char and old_char.id != target_character_id:
                     session.delete(old_char)
                     session.commit()
+
+        # Update target's visual description if unlocked
+        if target_char and not target_char.locked:
+            target_char.visual_description = compile_character_visual_prompt(target_char)
+            session.add(target_char)
+            session.commit()
 
     save_project_characters_to_json(project_id)
 
@@ -294,7 +338,6 @@ def get_character_mention_chunks(
                 "mentions_count": mentions_count
             })
 
-    # Sort chunks primarily by chronological occurrence
     return mention_chunks
 
 
@@ -303,7 +346,6 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
     Bulletproof helper to extract and parse a valid JSON block out of raw LLM output,
     ignoring background commentary, descriptions, or markdown fence syntax.
     """
-    # 1. Check for standard Markdown JSON block
     markdown_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
     if markdown_match:
         try:
@@ -311,7 +353,6 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
-    # 2. Fallback: Find the outermost curly braces
     first_brace = text.find("{")
     last_brace = text.rfind("}")
     if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
@@ -378,11 +419,9 @@ async def run_stateful_character_profiling(
     Presents the running state to the LLM to fill in the blanks, automatically 
     terminating early once the checklist is filled.
     """
-    # Load connection parameters
     llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
     model_name = get_setting("llm_model", "local-model")
     
-    # Retrieve customized template from DB if exists, fallback to default
     custom_template = get_setting("character_profiler_template", None)
     if not custom_template or str(custom_template).strip() == "":
         system_instructions_raw = get_default_character_template()
@@ -406,7 +445,6 @@ async def run_stateful_character_profiling(
         aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
         alias_list = [a.alias for a in aliases]
 
-    # Initialize state with any existing data in the DB to allow resuming/incremental profiles
     state_checklist = {
         "sex_or_gender": char.sex_or_gender,
         "approximate_age": char.approximate_age,
@@ -418,7 +456,6 @@ async def run_stateful_character_profiling(
         "distinguishing_marks": char.distinguishing_marks
     }
 
-    # Retrieve matching chunks where the character is active
     chunks = get_character_mention_chunks(project_name, book_name, character_id, chunk_size_words=800)
     if not chunks:
         print(f"[Profiler] No mention chunks found for character: {char.name}")
@@ -430,7 +467,6 @@ async def run_stateful_character_profiling(
         if scanned_count >= max_chunks_to_scan:
             break
 
-        # Check early exit: Is our profile checklist already completely filled?
         unknown_fields = [k for k, v in state_checklist.items() if v is None or str(v).strip() == ""]
         if not unknown_fields:
             print(f"[Profiler] Success! Checklist for {char.name} is complete. Terminating loop early.")
@@ -439,11 +475,9 @@ async def run_stateful_character_profiling(
         scanned_count += 1
         chunk_text = chunk_data["text"]
 
-        # Build clean state checklist mapping
         known_display = "\n".join([f"- {k}: {v}" for k, v in state_checklist.items() if v]) or "None"
         unknown_display = "\n".join([f"- {k}" for k in unknown_fields])
 
-        # Safely format instructions dynamically
         try:
             system_instructions = system_instructions_raw.format(
                 character_name=char.name,
@@ -452,7 +486,6 @@ async def run_stateful_character_profiling(
                 unknown_traits=unknown_display
             )
         except Exception as e:
-            # Fallback if the user has custom or malformed brackets
             print(f"[Profiler] Dynamic prompt formatting error: {str(e)}")
             system_instructions = system_instructions_raw\
                 .replace("{character_name}", char.name)\
@@ -476,11 +509,9 @@ async def run_stateful_character_profiling(
 
             if extracted_json:
                 print(f"[Profiler] Received new data: {extracted_json}")
-                # Merge newly discovered non-null traits into our state checklist
                 for key in state_checklist.keys():
                     new_val = extracted_json.get(key)
                     if new_val and str(new_val).strip() != "" and str(new_val).lower() != "null":
-                        # Enforce gender category formatting restrictions
                         if key == "sex_or_gender":
                             cleaned_gender = str(new_val).lower().strip()
                             if cleaned_gender in ["man", "woman", "boy", "girl"]:
@@ -489,7 +520,6 @@ async def run_stateful_character_profiling(
                             state_checklist[key] = str(new_val).strip()
 
             if progress_callback:
-                # Trigger live UI callback update if attached
                 progress_callback(char.id, scanned_count, max_chunks_to_scan, state_checklist)
 
         except Exception as e:
@@ -497,7 +527,6 @@ async def run_stateful_character_profiling(
 
         await asyncio.sleep(0.5)
 
-    # Save finalized checklist profile to the database
     with Session(engine) as session:
         db_char = session.get(Character, character_id)
         if db_char:
@@ -509,10 +538,14 @@ async def run_stateful_character_profiling(
             db_char.hair_color_and_style = state_checklist["hair_color_and_style"]
             db_char.facial_features = state_checklist["facial_features"]
             db_char.distinguishing_marks = state_checklist["distinguishing_marks"]
+            
+            # Auto-compile visual description if character is unlocked
+            if not db_char.locked:
+                db_char.visual_description = compile_character_visual_prompt(db_char)
+                
             session.add(db_char)
             session.commit()
 
-    # Flush changes to disk (FaST serialization)
     save_project_characters_to_json(project_id)
     return state_checklist
 
@@ -537,9 +570,6 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
     into their most prominent canonical counterpart (like 'Stone').
     Utilizes difflib sequence matching, title-stripping, and substring rules.
     """
-    import difflib
-    from database.models import Setting
-    
     with Session(engine) as session:
         project = session.get(Project, project_id)
         if not project:
@@ -547,7 +577,6 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
         books = session.exec(select(Book).where(Book.project_id == project_id)).all()
         base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
 
-    # 1. Compute frequency map of raw lowercase alias text
     frequencies = {}
     bracket_regex = re.compile(r"\[(.*?)\]")
     for b in books:
@@ -570,23 +599,19 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
         if not characters:
             return []
 
-        # Build alias mapping
         char_aliases = {}
         for char in characters:
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
             char_aliases[char.id] = [a.alias for a in aliases]
 
-        # Calculate frequency per character ID
         def get_char_freq(char_id):
             return sum(frequencies.get(a.lower(), 0) for a in char_aliases.get(char_id, []))
 
-        # Sort descending by total frequency (canonical target first)
         sorted_chars = sorted(characters, key=lambda c: get_char_freq(c.id), reverse=True)
 
         merged_log = []
         merged_ids = set()
 
-        # Normalization and stripping rules (titles & possessives)
         titles = [
             "detective", "officer", "agent", "captain", "mr", "mrs", "ms", "dr", 
             "doctor", "professor", "lieutenant", "sergeant", "colonel", "general", 
@@ -606,7 +631,6 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
                     val = val[len(t) + 1:].strip()
             return val
 
-        # Greedy merge matching pass
         for i, target_char in enumerate(sorted_chars):
             if target_char.id in merged_ids:
                 continue
@@ -634,20 +658,17 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
                         if not cand_norm:
                             continue
 
-                        # Exact normalized match (e.g. "Detective Stone" -> "Stone" after stripping)
                         if target_norm == cand_norm:
                             is_match = True
                             match_reason = f"Title/Possessive Normalization"
                             break
 
-                        # Substring containment (e.g., "Stone" contained in "Detective Stone")
                         if len(target_norm) >= 4 and len(cand_norm) >= 4:
                             if target_norm in cand_norm or cand_norm in target_norm:
                                 is_match = True
                                 match_reason = f"Substring Containment"
                                 break
 
-                        # Fuzzy ratio sequence comparison
                         if len(target_norm) >= 4 and len(cand_norm) >= 4:
                             ratio = difflib.SequenceMatcher(None, target_norm, cand_norm).ratio()
                             if ratio >= similarity_threshold:
@@ -671,13 +692,11 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
 
                     existing_aliases_on_target = {a.lower() for a in target_aliases}
                     
-                    # Associate candidate name itself as an alias on target if not present
                     if candidate_char.name.lower() not in existing_aliases_on_target:
                         new_alias = CharacterAlias(character_id=target_char.id, alias=candidate_char.name)
                         session.add(new_alias)
                         target_aliases.append(candidate_char.name)
 
-                    # Re-associate other aliases to the target character
                     for alias in cand_aliases_db:
                         if alias.alias.lower() not in existing_aliases_on_target:
                             alias.character_id = target_char.id
@@ -686,7 +705,6 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
                         else:
                             session.delete(alias)
 
-                    # Re-associate any active modifiers
                     cand_mods = session.exec(
                         select(CharacterStateModifier).where(CharacterStateModifier.character_id == candidate_char.id)
                     ).all()
@@ -698,6 +716,146 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
                     session.commit()
                     merged_ids.add(candidate_char.id)
 
-    # Re-save finalized JSON file state
+            # Re-compile target visual description after all merges if unlocked
+            if target_char.id not in merged_ids and not target_char.locked:
+                target_char.visual_description = compile_character_visual_prompt(target_char)
+                session.add(target_char)
+                session.commit()
+
     save_project_characters_to_json(project_id)
     return merged_log
+
+def compile_character_description(char: Character, enabled_fields: Dict[str, bool], use_sentence_structure: bool) -> str:
+    """
+    Assembles selected character traits into either a comma-separated list 
+    or a parenthetical relative clause to bound traits and prevent bleeding.
+    """
+    gender = char.sex_or_gender if enabled_fields.get("sex_or_gender", True) else None
+    age = char.approximate_age if enabled_fields.get("approximate_age", True) else None
+    ethnicity = char.ethnicity_or_race if enabled_fields.get("ethnicity_or_race", True) else None
+    height = char.height_or_stature if enabled_fields.get("height_or_stature", True) else None
+    weight = char.weight_or_build if enabled_fields.get("weight_or_build", True) else None
+    hair = char.hair_color_and_style if enabled_fields.get("hair_color_and_style", True) else None
+    facial = char.facial_features if enabled_fields.get("facial_features", True) else None
+    marks = char.distinguishing_marks if enabled_fields.get("distinguishing_marks", True) else None
+
+    if not use_sentence_structure:
+        pieces = []
+        demographics = [age, ethnicity, gender]
+        base_demographics = " ".join([d.strip() for d in demographics if d and str(d).strip()])
+        if base_demographics:
+            pieces.append(base_demographics)
+        elif gender:
+            pieces.append(gender)
+
+        if height and str(height).strip():
+            pieces.append(height.strip())
+        if weight and str(weight).strip():
+            pieces.append(weight.strip())
+
+        if hair and str(hair).strip():
+            h = hair.strip().lower()
+            if not h.startswith("with ") and not h.startswith("has "):
+                pieces.append(f"with {h}")
+            else:
+                pieces.append(h)
+
+        if facial and str(facial).strip():
+            pieces.append(facial.strip())
+        if marks and str(marks).strip():
+            pieces.append(marks.strip())
+
+        cleaned_pieces = [p.strip() for p in pieces if p and str(p).strip()]
+        if not cleaned_pieces:
+            return f"a person named {char.name}"
+            
+        return ", ".join(cleaned_pieces)
+    
+    else:
+        # Prevent blending/cross-contamination via descriptive containment
+        noun_phrases = []
+        if age:
+            noun_phrases.append(age.strip())
+        if ethnicity:
+            noun_phrases.append(ethnicity.strip())
+        if gender:
+            noun_phrases.append(gender.strip())
+        else:
+            noun_phrases.append("person")
+            
+        base_noun = " ".join(noun_phrases)
+        
+        clauses = []
+        if hair:
+            h_clean = hair.strip().lower()
+            if h_clean.startswith("with "):
+                h_clean = h_clean[5:]
+            elif h_clean.startswith("has "):
+                h_clean = h_clean[4:]
+            clauses.append(f"has {h_clean}")
+            
+        height_weight = []
+        if height:
+            height_weight.append(height.strip())
+        if weight:
+            height_weight.append(weight.strip())
+        if height_weight:
+            clauses.append(f"is " + " and ".join(height_weight))
+            
+        features = []
+        if facial:
+            features.append(facial.strip())
+        if marks:
+            features.append(marks.strip())
+        if features:
+            clauses.append(f"with " + " and ".join(features))
+            
+        if clauses:
+            description_sentence = f"{char.name} (a {base_noun} who " + ", ".join(clauses[:-1])
+            if len(clauses) > 1:
+                description_sentence += f", and {clauses[-1]})"
+            else:
+                description_sentence += f"{clauses[0]})"
+            return description_sentence
+        else:
+            return f"{char.name} (a {base_noun})"
+
+
+def replace_character_tags_in_prompt(
+    prompt: str, 
+    project_id: int, 
+    enabled_fields: Dict[str, bool], 
+    use_sentence_structure: bool
+) -> str:
+    """
+    Scans a prompt string for bracketed tags, matches aliases to project characters, 
+    and returns a modified prompt string containing compiled descriptions.
+    If the character does not exist in the database, the brackets are stripped.
+    """
+    bracket_regex = re.compile(r"\[(.*?)\]")
+    matches = bracket_regex.findall(prompt)
+    if not matches:
+        return prompt
+
+    modified_prompt = prompt
+    with Session(engine) as session:
+        for match in matches:
+            tag = match.strip()
+            # Match Alias
+            alias = session.exec(
+                select(CharacterAlias).where(CharacterAlias.alias == tag)
+            ).first()
+            if not alias:
+                char = session.exec(
+                    select(Character).where(Character.project_id == project_id).where(Character.name == tag)
+                ).first()
+            else:
+                char = session.get(Character, alias.character_id)
+
+            if char:
+                replacement = compile_character_description(char, enabled_fields, use_sentence_structure)
+                modified_prompt = modified_prompt.replace(f"[{tag}]", replacement)
+            else:
+                # Fallback: Strip brackets for characters/pronouns not in the database
+                modified_prompt = modified_prompt.replace(f"[{tag}]", tag)
+    return modified_prompt

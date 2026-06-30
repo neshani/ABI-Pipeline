@@ -10,23 +10,27 @@ from PIL import Image, ImageDraw, ImageFont
 from nicegui import ui
 from sqlmodel import Session, select
 from database.connection import engine, get_setting
-from database.models import Book
+from database.models import Book, Project, Character
 from ui import state
 from ui.components.style_chooser_modal import StyleChooserModal
+from services.character_manager import replace_character_tags_in_prompt
 
 # Module-level dialog and state holders
 contact_sheet_dialog_ref = None
 contact_sheet_base64 = ""
 lora_chooser_dialog_ref = None
 playground_image_dialog_ref = None
+character_settings_dialog_ref = None
 
 # Static element references for the detail preview modal (prevents refresh bugs)
 modal_title_label = None
 modal_image_el = None
 modal_no_image_placeholder = None
 modal_prompt_label = None
+modal_rendered_prompt_label = None
 modal_quote_container = None
 modal_quote_label = None
+modal_download_btn = None
 
 # Cache holders for ComfyUI API selections and local Benchmarked LoRAs
 comfy_options_cache: Dict[str, List[str]] = {}
@@ -461,7 +465,8 @@ def create_contact_sheet(base64_list: list, overlay_text: str = "") -> Optional[
 
 def open_playground_image_modal(img_src: str, title: str, prompt: str, quote: str = ""):
     """Safely mutates the persistent dialog elements in-place and triggers the overlay."""
-    global playground_image_dialog_ref, modal_title_label, modal_image_el, modal_no_image_placeholder, modal_prompt_label, modal_quote_container, modal_quote_label
+    global playground_image_dialog_ref, modal_title_label, modal_image_el, modal_no_image_placeholder
+    global modal_prompt_label, modal_rendered_prompt_label, modal_quote_container, modal_quote_label, modal_download_btn
     
     if not playground_image_dialog_ref:
         return
@@ -471,6 +476,21 @@ def open_playground_image_modal(img_src: str, title: str, prompt: str, quote: st
         modal_title_label.set_text(title)
     if modal_prompt_label:
         modal_prompt_label.set_text(prompt)
+        
+    # Resolve rendered prompt
+    project_id = state.active_project_id
+    if project_id and getattr(state, "style_enable_character_replacement", True):
+        rendered_prompt = replace_character_tags_in_prompt(
+            prompt,
+            project_id,
+            getattr(state, "style_enabled_character_traits", {}),
+            getattr(state, "style_use_sentence_structure", True)
+        )
+    else:
+        rendered_prompt = prompt
+
+    if modal_rendered_prompt_label:
+        modal_rendered_prompt_label.set_text(rendered_prompt)
     
     # 2. Toggle and update the image container vs. placeholder
     if modal_image_el and modal_no_image_placeholder:
@@ -478,10 +498,15 @@ def open_playground_image_modal(img_src: str, title: str, prompt: str, quote: st
             modal_image_el.set_source(img_src)
             modal_image_el.visible = True
             modal_no_image_placeholder.visible = False
+            if modal_download_btn:
+                modal_download_btn.visible = True
+                modal_download_btn.on('click', lambda: ui.download(img_src, filename="rendered_playground_image.png"))
         else:
             modal_image_el.set_source("")
             modal_image_el.visible = False
             modal_no_image_placeholder.visible = True
+            if modal_download_btn:
+                modal_download_btn.visible = False
             
     # 3. Handle quote display context
     if modal_quote_container and modal_quote_label:
@@ -573,6 +598,11 @@ def copy_style_settings_to_clipboard(project_name: str = "Active Project"):
         "#### Generated Scenes Context Map:",
     ]
 
+    # Resolve project ID
+    with Session(engine) as session:
+        project_obj = session.exec(select(Project).where(Project.name == project_name)).first()
+        project_id = project_obj.id if project_obj else None
+
     for idx, item in enumerate(state.style_test_prompts):
         is_dict = isinstance(item, dict)
         chap = item.get("chapter", 1) if is_dict else 1
@@ -587,6 +617,16 @@ def copy_style_settings_to_clipboard(project_name: str = "Active Project"):
         if quote:
             lines.append(f"  - *Source Quote*: \"{quote}\"")
         lines.append(f"  - *Extracted Prompt*: {p_text}")
+        
+        # Append expanded Rendered Prompt
+        if project_id and getattr(state, "style_enable_character_replacement", True):
+            rendered_p = replace_character_tags_in_prompt(
+                p_text,
+                project_id,
+                getattr(state, "style_enabled_character_traits", {}),
+                getattr(state, "style_use_sentence_structure", True)
+            )
+            lines.append(f"  - *Rendered Prompt*: {rendered_p}")
 
     full_text = "\n".join(lines)
     ui.clipboard.write(full_text)
@@ -597,6 +637,11 @@ def copy_style_primer_to_clipboard(project_name: str):
     """Formats a diagnostic visual style framework primer and copies it to clipboard."""
     resolved_settings = "\n".join(_get_resolved_workflow_settings())
     
+    # Resolve project ID
+    with Session(engine) as session:
+        project_obj = session.exec(select(Project).where(Project.name == project_name)).first()
+        project_id = project_obj.id if project_obj else None
+
     scenes_lines = []
     for idx, item in enumerate(state.style_test_prompts):
         is_dict = isinstance(item, dict)
@@ -611,7 +656,17 @@ def copy_style_primer_to_clipboard(project_name: str):
         scenes_lines.append(f"- **[{label}] Ch {chap}, Scene {sec}** (Seed: {seed})")
         if quote:
             scenes_lines.append(f"  - *Source Quote*: \"{quote}\"")
-        scenes_lines.append(f"  - *Visual Prompt*: {p_text}")
+        scenes_lines.append(f"  - *Visual Prompt (Extracted)*: {p_text}")
+        
+        # Append expanded Rendered Prompt
+        if project_id and getattr(state, "style_enable_character_replacement", True):
+            rendered_p = replace_character_tags_in_prompt(
+                p_text,
+                project_id,
+                getattr(state, "style_enabled_character_traits", {}),
+                getattr(state, "style_use_sentence_structure", True)
+            )
+            scenes_lines.append(f"  - *Visual Prompt (Rendered)*: {rendered_p}")
     
     scenes_str = "\n".join(scenes_lines) if scenes_lines else "*No test scenes generated yet.*"
 
@@ -640,7 +695,7 @@ def copy_style_primer_to_clipboard(project_name: str):
     
     ui.clipboard.write(primer_text)
     ui.notify("Style AI Primer copied! Paste this first, then upload or paste your results.", type="positive", icon="psychology")
-    
+
 
 def download_contact_sheet():
     """Generates and triggers download of the stitched contact sheet PNG file."""
@@ -741,8 +796,24 @@ async def regenerate_single_card(project_name: str, idx: int):
     client = ComfyClient(comfy_url)
 
     item = state.style_test_prompts[idx]
-    prompt_text = item["prompt"] if isinstance(item, dict) else item
+    raw_prompt = item["prompt"] if isinstance(item, dict) else item
     seed = state.style_test_seeds[idx]
+
+    # Resolve project ID
+    with Session(engine) as session:
+        project_obj = session.exec(select(Project).where(Project.name == project_name)).first()
+        project_id = project_obj.id if project_obj else None
+
+    # Replace tags if enabled
+    if project_id and getattr(state, "style_enable_character_replacement", True):
+        prompt_text = replace_character_tags_in_prompt(
+            raw_prompt,
+            project_id,
+            getattr(state, "style_enabled_character_traits", {}),
+            getattr(state, "style_use_sentence_structure", True)
+        )
+    else:
+        prompt_text = raw_prompt
 
     def run_single():
         return client.generate_image_sync(
@@ -1090,7 +1161,11 @@ async def execute_style_playground_batch(project_name: str):
     from services.comfy_client import ComfyClient
     client = ComfyClient(comfy_url)
 
-    import asyncio
+    # Resolve project ID
+    with Session(engine) as session:
+        project_obj = session.exec(select(Project).where(Project.name == project_name)).first()
+        project_id = project_obj.id if project_obj else None
+
     for idx, item in enumerate(state.style_test_prompts):
         if state.style_use_random_image_seed:
             seed = state.style_test_seeds[idx]
@@ -1098,7 +1173,18 @@ async def execute_style_playground_batch(project_name: str):
             seed = state.style_image_seed
             state.style_test_seeds[idx] = seed
             
-        prompt_text = item["prompt"] if isinstance(item, dict) else item
+        raw_prompt = item["prompt"] if isinstance(item, dict) else item
+
+        # Replace tags if enabled
+        if project_id and getattr(state, "style_enable_character_replacement", True):
+            prompt_text = replace_character_tags_in_prompt(
+                raw_prompt,
+                project_id,
+                getattr(state, "style_enabled_character_traits", {}),
+                getattr(state, "style_use_sentence_structure", True)
+            )
+        else:
+            prompt_text = raw_prompt
         
         def run_image():
             return client.generate_image_sync(
@@ -1114,7 +1200,6 @@ async def execute_style_playground_batch(project_name: str):
         try:
             img_bytes, logs = await asyncio.to_thread(run_image)
             if img_bytes:
-                import base64
                 encoded = base64.b64encode(img_bytes).decode("utf-8")
                 state.style_test_images[idx] = f"data:image/png;base64,{encoded}"
             
@@ -1774,9 +1859,54 @@ def render_style_playground_cards(project_name: str = ""):
                         ui.label("Click to see prompt details").classes('text-[8px] text-slate-400')
 
 
+@ui.refreshable
+def render_character_settings_content():
+    """Renders the trait injection modifiers control panel."""
+    with ui.column().classes('w-full gap-4'):
+        ui.switch(
+            'Enable Character Visual Replacement', 
+            value=state.style_enable_character_replacement,
+            on_change=lambda e: setattr(state, 'style_enable_character_replacement', e.value)
+        ).classes('text-xs font-semibold')
+
+        ui.switch(
+            'Use Sentence-based Structure (Prevents Trait Bleeding)',
+            value=state.style_use_sentence_structure,
+            on_change=lambda e: setattr(state, 'style_use_sentence_structure', e.value)
+        ).classes('text-xs font-semibold').tooltip("Wraps character visual details inside name-associated parentheses, keeping descriptors bounded for the AI's text encoder.")
+
+        ui.separator()
+
+        ui.label('Include Physical Traits:').classes('text-xs font-bold text-slate-700')
+        
+        trait_labels = {
+            "sex_or_gender": "Gender / Sex",
+            "approximate_age": "Approximate Age",
+            "ethnicity_or_race": "Race or Ethnicity",
+            "height_or_stature": "Height / Stature",
+            "weight_or_build": "Weight / Build",
+            "hair_color_and_style": "Hair Color & Style",
+            "facial_features": "Facial Features",
+            "distinguishing_marks": "Distinguishing Marks (Misc)"
+        }
+
+        with ui.grid(columns=2).classes('w-full gap-2 bg-slate-50 p-3 rounded-lg border'):
+            for trait_key, label in trait_labels.items():
+                current_val = state.style_enabled_character_traits.get(trait_key, True)
+                
+                def make_toggle_handler(key=trait_key):
+                    return lambda e: state.style_enabled_character_traits.update({key: e.value})
+                    
+                ui.checkbox(
+                    label, 
+                    value=current_val, 
+                    on_change=make_toggle_handler(trait_key)
+                ).classes('text-xs')
+
+
 def render_style_playground_tab(project, save_project_settings_cb=None):
-    global contact_sheet_dialog_ref, lora_chooser_dialog_ref, playground_image_dialog_ref
-    global modal_title_label, modal_image_el, modal_no_image_placeholder, modal_prompt_label, modal_quote_container, modal_quote_label
+    global contact_sheet_dialog_ref, lora_chooser_dialog_ref, playground_image_dialog_ref, character_settings_dialog_ref
+    global modal_title_label, modal_image_el, modal_no_image_placeholder, modal_prompt_label, modal_rendered_prompt_label, modal_quote_container, modal_quote_label, modal_download_btn
     
     # Query current volume listings inside database index
     with Session(engine) as session:
@@ -1798,6 +1928,11 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
     load_associated_loras()
     if state.style_selected_workflow:
         asyncio.create_task(async_load_comfy_and_lora_choices())
+
+    def open_character_settings_modal():
+        if character_settings_dialog_ref:
+            character_settings_dialog_ref.open()
+            render_character_settings_content.refresh()
 
     # 75% Left Column (3fr), 25% Right Column (1fr) split
     with ui.grid(columns='3fr 1fr').classes('w-full gap-4 items-start'):
@@ -1840,7 +1975,7 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                         ).classes('w-24 bg-white').props('dense outlined').bind_value(state, 'style_chunk_count')
                     
                     with ui.row().classes('w-full items-center justify-between gap-2'):
-                        with ui.row().classes('gap-1'):
+                        with ui.row().classes('gap-1 items-center'):
                             # Micro Dice button
                             ui.button(
                                 icon='casino',
@@ -1851,7 +1986,16 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                             ui.button(
                                 icon='refresh',
                                 on_click=reroll_image_seeds
-                        ).props('flat dense').classes('text-slate-600').tooltip('Reroll Seeds (keep prompts, randomize image generation seeds)')
+                            ).props('flat dense').classes('text-slate-600').tooltip('Reroll Seeds (keep prompts, randomize image generation seeds)')
+                            
+                            # Optional Character Settings Trigger button
+                            with Session(engine) as session:
+                                has_chars = session.exec(select(Character).where(Character.project_id == project.id)).first() is not None
+                            if has_chars:
+                                ui.button(
+                                    icon='person_search',
+                                    on_click=open_character_settings_modal
+                                ).props('flat dense').classes('text-blue-600').tooltip('Configure Character Prompt Injection')
                         
                         # Large prominent execution button - High visibility Positive Semantic Green
                         ui.button(
@@ -2017,28 +2161,53 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                 
             render_lora_chooser_content()
 
+    with ui.dialog() as character_settings_dialog:
+        with ui.card().classes('w-full max-w-lg p-5 rounded-xl gap-4 bg-white'):
+            with ui.row().classes('w-full justify-between items-center pb-1 border-b'):
+                with ui.column().classes('gap-0'):
+                    ui.label('Character Injection Options').classes('text-base font-bold text-slate-800')
+                    ui.label('Configure bracketed tag replacements for rendering.').classes('text-xs text-slate-500')
+                ui.button(icon='close', on_click=character_settings_dialog.close).props('flat round size=sm').classes('text-slate-400')
+            
+            render_character_settings_content()
+            
+            with ui.row().classes('w-full justify-end border-t pt-2'):
+                ui.button('Close', on_click=character_settings_dialog.close).classes('bg-slate-700 text-white text-xs')
+
     # Create the static, persistent modal structure once
     with ui.dialog() as playground_image_dialog:
-        with ui.card().classes('w-full max-w-2xl p-5 rounded-xl gap-4 bg-white'):
-            with ui.row().classes('w-full justify-between items-center border-b pb-2'):
+        with ui.card().classes('w-full max-w-5xl p-5 rounded-xl gap-4 bg-white h-[85vh] flex flex-col'):
+            with ui.row().classes('w-full justify-between items-center border-b pb-2 flex-shrink-0'):
                 modal_title_label = ui.label("Preview").classes('text-base font-bold text-slate-800')
-                ui.button(icon='close', on_click=playground_image_dialog.close).props('flat round dense').classes('text-slate-400')
+                with ui.row().classes('items-center gap-1'):
+                    modal_download_btn = ui.button(icon='download').props('flat round dense').classes('text-slate-600').tooltip('Download Full Resolution')
+                    ui.button(icon='close', on_click=playground_image_dialog.close).props('flat round dense').classes('text-slate-400')
             
-            modal_image_el = ui.image("").props('fit=contain').classes('w-full max-h-[60vh] rounded-lg border bg-slate-50')
-            
-            with ui.column().classes('w-full h-48 items-center justify-center bg-slate-50 rounded border border-dashed text-slate-400') as modal_no_image_placeholder:
-                ui.icon('photo_library', size='lg', color='slate-300')
-                ui.label("Rendering not yet completed.").classes('text-xs mt-1')
-
-            with ui.column().classes('w-full gap-2.5 bg-slate-50 p-4 rounded-lg border text-xs'):
-                ui.label("EXTRACTED IMAGE PROMPT").classes('text-[10px] font-black text-slate-400 uppercase tracking-wider')
-                modal_prompt_label = ui.label("").classes('font-semibold text-slate-700 leading-normal')
+            with ui.row().classes('w-full flex-1 min-h-0 gap-4 flex-nowrap items-stretch'):
+                # Left Column: Image Viewport
+                with ui.column().classes('flex-grow flex-1 h-full items-center justify-center bg-slate-50 border rounded-lg overflow-hidden relative'):
+                    modal_image_el = ui.image("").props('fit=contain').classes('w-full h-full max-h-[70vh]')
+                    
+                    with ui.column().classes('w-full h-full items-center justify-center text-slate-400') as modal_no_image_placeholder:
+                        ui.icon('photo_library', size='lg', color='slate-300')
+                        ui.label("Rendering not yet completed.").classes('text-xs mt-1')
                 
-                with ui.column().classes('w-full gap-2') as modal_quote_container:
-                    ui.separator()
-                    ui.label("SOURCE AUDIO QUOTE").classes('text-[10px] font-black text-slate-400 uppercase tracking-wider')
-                    modal_quote_label = ui.label("").classes('italic text-slate-600 leading-normal')
+                # Right Column: Metadata Panel
+                with ui.column().classes('w-80 md:w-96 flex-shrink-0 h-full overflow-y-auto gap-4 p-1'):
+                    with ui.column().classes('w-full gap-2.5 bg-slate-50 p-4 rounded-lg border text-xs'):
+                        ui.label("EXTRACTED IMAGE PROMPT").classes('text-[10px] font-black text-slate-400 uppercase tracking-wider')
+                        modal_prompt_label = ui.label("").classes('font-semibold text-slate-700 leading-normal')
+                        
+                        ui.separator()
+                        ui.label("RENDERED IMAGE PROMPT").classes('text-[10px] font-black text-blue-500 uppercase tracking-wider')
+                        modal_rendered_prompt_label = ui.label("").classes('font-mono font-semibold text-blue-800 leading-normal bg-blue-50/30 p-2 rounded border border-blue-100')
+                        
+                        with ui.column().classes('w-full gap-2') as modal_quote_container:
+                            ui.separator()
+                            ui.label("SOURCE AUDIO QUOTE").classes('text-[10px] font-black text-slate-400 uppercase tracking-wider')
+                            modal_quote_label = ui.label("").classes('italic text-slate-600 leading-normal')
 
     contact_sheet_dialog_ref = contact_sheet_dialog
     lora_chooser_dialog_ref = lora_chooser_dialog
     playground_image_dialog_ref = playground_image_dialog
+    character_settings_dialog_ref = character_settings_dialog

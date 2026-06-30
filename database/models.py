@@ -67,9 +67,12 @@ class Character(SQLModel, table=True):
     hair_color_and_style: Optional[str] = Field(default=None)
     facial_features: Optional[str] = Field(default=None)
     distinguishing_marks: Optional[str] = Field(default=None)  # Acts as our 'Misc' permanent descriptor field
+
+    # The compiled natural-language text-to-image replacement string
+    visual_description: Optional[str] = Field(default=None)
     
     is_dynamic: bool = Field(default=False) # True if scoped to a book, False if static/project-global
-    locked: bool = Field(default=False)     # True if manual curation should protect this profile from LLM extraction overwrites
+    locked: bool = Field(default=False)     # True if manual curation should protect this profile from LLM extraction or compile overwrites
 
 class CharacterAlias(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
