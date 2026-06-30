@@ -22,38 +22,17 @@ def get_characters_json_path(project_id: int) -> Optional[Path]:
 
 def compile_character_visual_prompt(char: Character) -> str:
     """
-    Assembles a descriptive, natural language physical prompt from structured traits.
+    Assembles a descriptive, natural language physical prompt from simplified structured traits.
     Optimized for single-stream text encoders like Qwen (Z-Image Turbo).
     """
     pieces = []
     
-    # 1. Demographics
-    demographics = [char.approximate_age, char.ethnicity_or_race, char.sex_or_gender]
-    base_demographics = " ".join([d.strip() for d in demographics if d and str(d).strip()])
-    if base_demographics:
-        pieces.append(base_demographics)
-    elif char.sex_or_gender:
-        pieces.append(char.sex_or_gender)
-
-    # 2. Frame & stature
-    if char.height_or_stature and str(char.height_or_stature).strip():
-        pieces.append(char.height_or_stature.strip())
-    if char.weight_or_build and str(char.weight_or_build).strip():
-        pieces.append(char.weight_or_build.strip())
-
-    # 3. Hair (Formatted as 'with [color/style]')
-    if char.hair_color_and_style and str(char.hair_color_and_style).strip():
-        hair = char.hair_color_and_style.strip().lower()
-        if not hair.startswith("with ") and not hair.startswith("has "):
-            pieces.append(f"with {hair}")
-        else:
-            pieces.append(hair)
-
-    # 4. Facial features
-    if char.facial_features and str(char.facial_features).strip():
-        pieces.append(char.facial_features.strip())
-
-    # 5. Distinctive visual details / accessories
+    if char.demographics and str(char.demographics).strip():
+        pieces.append(char.demographics.strip())
+    if char.hair_and_face and str(char.hair_and_face).strip():
+        pieces.append(char.hair_and_face.strip())
+    if char.physical_build and str(char.physical_build).strip():
+        pieces.append(char.physical_build.strip())
     if char.distinguishing_marks and str(char.distinguishing_marks).strip():
         pieces.append(char.distinguishing_marks.strip())
 
@@ -89,13 +68,9 @@ def save_project_characters_to_json(project_id: int):
                 "book_id": char.book_id,
                 "visual_description": char.visual_description,
                 "profile": {
-                    "sex_or_gender": char.sex_or_gender,
-                    "approximate_age": char.approximate_age,
-                    "ethnicity_or_race": char.ethnicity_or_race,
-                    "height_or_stature": char.height_or_stature,
-                    "weight_or_build": char.weight_or_build,
-                    "hair_color_and_style": char.hair_color_and_style,
-                    "facial_features": char.facial_features,
+                    "demographics": char.demographics,
+                    "physical_build": char.physical_build,
+                    "hair_and_face": char.hair_and_face,
                     "distinguishing_marks": char.distinguishing_marks
                 },
                 "aliases": [alias.alias for alias in aliases],
@@ -116,6 +91,7 @@ def save_project_characters_to_json(project_id: int):
     json_path.parent.mkdir(parents=True, exist_ok=True)
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(serialized_data, f, indent=2, ensure_ascii=False)
+
 
 
 def sync_project_characters_from_json(project_id: int):
@@ -160,13 +136,9 @@ def sync_project_characters_from_json(project_id: int):
                 project_id=project_id,
                 book_id=char_data.get("book_id"),
                 name=char_data["name"],
-                sex_or_gender=profile.get("sex_or_gender"),
-                approximate_age=profile.get("approximate_age"),
-                ethnicity_or_race=profile.get("ethnicity_or_race"),
-                height_or_stature=profile.get("height_or_stature"),
-                weight_or_build=profile.get("weight_or_build"),
-                hair_color_and_style=profile.get("hair_color_and_style"),
-                facial_features=profile.get("facial_features"),
+                demographics=profile.get("demographics"),
+                physical_build=profile.get("physical_build"),
+                hair_and_face=profile.get("hair_and_face"),
                 distinguishing_marks=profile.get("distinguishing_marks"),
                 visual_description=char_data.get("visual_description"),
                 is_dynamic=char_data.get("is_dynamic", False),
@@ -365,43 +337,42 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
 
 
 def get_default_character_template() -> str:
-    """Returns the default system instructions for character visual profiling."""
+    """Returns default visual profiling instructions with 4 simplified traits, strictly banning clothing/attire extraction."""
     return (
-        "You are a specialized AI function that performs character visual extraction.\n"
+        "You are a specialized AI function that performs character visual trait extraction.\n"
         "Analyze the provided book text chunk and try to extract physical, observable features "
         "for the character named {character_name} (and their known aliases: {aliases}).\n\n"
+        "### TARGET SENTENCE STRUCTURE ###\n"
+        "We are going to inject these traits directly into this exact sentence structure to describe the character in image generator prompts:\n"
+        "\"{character_name} (a {{demographics}}, {{hair_and_face}}, who is {{physical_build}}, and {{distinguishing_marks}})\"\n\n"
+        "To make this sentence grammatically perfect, your extracted values MUST be written as short, descriptive grammatical fragments conforming to these rules:\n"
+        "1. 'demographics': Must be a noun phrase identifying gender, race/ethnicity, and approximate age range. Do not include articles ('a' or 'an'). Examples: 'middle-aged Caucasian man', 'young African-American woman', 'elderly Asian monk'.\n"
+        "2. 'hair_and_face': Must be a prepositional phrase starting with 'with'. Examples: 'with thinning blond-brown hair and a clean-shaven face', 'with long black curls and sharp green eyes'.\n"
+        "3. 'physical_build': Must be a brief, direct descriptor of height, posture, and build. Do not write 'who is' or 'is'. Examples: 'six-foot-two and athletic', 'short and stocky with broad shoulders'.\n"
+        "4. 'distinguishing_marks': Must be a fragment describing ONLY stable physical markings, scars, tattoos, or corrective reading glasses. Do NOT extract clothing. Examples: 'with a faint scar on his left cheek', 'wearing wire-rimmed reading glasses', 'with a small anchor tattoo on his right forearm'.\n\n"
+        "### CRITICAL RULE: EXCLUDE ALL CLOTHING & ATTIRE ###\n"
+        "Do NOT extract clothing, outfits, uniforms, suits, coats, jackets, raincoats, dresses, hats, or attire of any kind. "
+        "For example, do NOT extract 'wearing a trench coat', 'wearing a silk Italian suit', or 'wearing police gear'. "
+        "Clothing is temporary, changeful, and is handled strictly at the scene level. "
+        "The base character profile must remain entirely clothing-free. Focus ONLY on their permanent body, face, skin, hair, birthmarks, tattoos, or glasses.\n\n"
+        "### RULES ###\n"
+        "1. Only extract physical, observable visual traits directly mentioned or strongly implied by the text. Do NOT guess, hypothesize, or invent details.\n"
+        "2. Focus only on stable, permanent, or long-term physical properties of their body or face. Do NOT extract temporary gestures, transient expressions, moods, sounds, or clothing.\n"
+        "3. If a trait is not described in this text chunk, return null for that field.\n"
+        "4. Your response MUST be a single, valid JSON block. Do not include conversational prefaces, explanations, or markdown commentary outside of the JSON block.\n\n"
         "### CURRENT KNOWN DETAILS ###\n"
         "Focus on filling the missing attributes. Do not overwrite or re-extract details already known:\n"
         "{known_traits}\n\n"
         "### LOOK FOR THESE UNKNOWN DETAILS ###\n"
         "Specifically seek information for these fields:\n"
         "{unknown_traits}\n\n"
-        "### RULES ###\n"
-        "1. Only extract physical visual traits directly mentioned or strongly implied by the text. "
-        "Do NOT guess, hypothesize, or invent details.\n"
-        "2. Do NOT extract temporary clothing, temporary actions, gestures, facial expressions "
-        "(e.g., 'wrinkled her brow', 'frowned', 'smiled'), vocal attributes (e.g. 'soft voice', 'screamed'), "
-        "or passing moods. Focus ONLY on stable, permanent physical properties of their body or face.\n"
-        "3. Keep descriptions highly concise, descriptive, and clean (e.g., 'blue eyes', 'scar on left cheek'). "
-        "Do not extract single words like 'cheeks' unless accompanied by a stable physical adjective.\n"
-        "4. Your response MUST be a single, valid JSON block. Do not include conversational prefaces, "
-        "explanations, or markdown commentary outside of the JSON block.\n\n"
-        "### GENDER TAG RESTRICTION ###\n"
-        "For the 'sex_or_gender' attribute, you MUST select EXACTLY one of these four tags if found: "
-        "\"man\", \"woman\", \"boy\", \"girl\". If not explicitly clear, specify null.\n\n"
         "### JSON TARGET SCHEMA ###\n"
-        "Return ONLY the fields that you have found newly described in this text chunk. "
-        "Exclude any fields where no information is found. "
-        "Use this strict schema:\n"
+        "Return ONLY the fields that you have found newly described in this text chunk. Use this strict schema:\n"
         "{{\n"
-        "  \"sex_or_gender\": \"man\" | \"woman\" | \"boy\" | \"girl\" | null,\n"
-        "  \"approximate_age\": \"string descriptive age range\" | null,\n"
-        "  \"ethnicity_or_race\": \"string ethnicity detail\" | null,\n"
-        "  \"height_or_stature\": \"string height description\" | null,\n"
-        "  \"weight_or_build\": \"string weight or body build\" | null,\n"
-        "  \"hair_color_and_style\": \"string hair description\" | null,\n"
-        "  \"facial_features\": \"string descriptive facial traits\" | null,\n"
-        "  \"distinguishing_marks\": \"string permanent distinguishing features (e.g. wears glasses, scar)\" | null\n"
+        "  \"demographics\": \"string\" | null,\n"
+        "  \"hair_and_face\": \"string\" | null,\n"
+        "  \"physical_build\": \"string\" | null,\n"
+        "  \"distinguishing_marks\": \"string\" | null\n"
         "}}\n"
     )
 
@@ -446,13 +417,9 @@ async def run_stateful_character_profiling(
         alias_list = [a.alias for a in aliases]
 
     state_checklist = {
-        "sex_or_gender": char.sex_or_gender,
-        "approximate_age": char.approximate_age,
-        "ethnicity_or_race": char.ethnicity_or_race,
-        "height_or_stature": char.height_or_stature,
-        "weight_or_build": char.weight_or_build,
-        "hair_color_and_style": char.hair_color_and_style,
-        "facial_features": char.facial_features,
+        "demographics": char.demographics,
+        "physical_build": char.physical_build,
+        "hair_and_face": char.hair_and_face,
         "distinguishing_marks": char.distinguishing_marks
     }
 
@@ -512,12 +479,7 @@ async def run_stateful_character_profiling(
                 for key in state_checklist.keys():
                     new_val = extracted_json.get(key)
                     if new_val and str(new_val).strip() != "" and str(new_val).lower() != "null":
-                        if key == "sex_or_gender":
-                            cleaned_gender = str(new_val).lower().strip()
-                            if cleaned_gender in ["man", "woman", "boy", "girl"]:
-                                state_checklist[key] = cleaned_gender
-                        else:
-                            state_checklist[key] = str(new_val).strip()
+                        state_checklist[key] = str(new_val).strip()
 
             if progress_callback:
                 progress_callback(char.id, scanned_count, max_chunks_to_scan, state_checklist)
@@ -530,13 +492,9 @@ async def run_stateful_character_profiling(
     with Session(engine) as session:
         db_char = session.get(Character, character_id)
         if db_char:
-            db_char.sex_or_gender = state_checklist["sex_or_gender"]
-            db_char.approximate_age = state_checklist["approximate_age"]
-            db_char.ethnicity_or_race = state_checklist["ethnicity_or_race"]
-            db_char.height_or_stature = state_checklist["height_or_stature"]
-            db_char.weight_or_build = state_checklist["weight_or_build"]
-            db_char.hair_color_and_style = state_checklist["hair_color_and_style"]
-            db_char.facial_features = state_checklist["facial_features"]
+            db_char.demographics = state_checklist["demographics"]
+            db_char.physical_build = state_checklist["physical_build"]
+            db_char.hair_and_face = state_checklist["hair_and_face"]
             db_char.distinguishing_marks = state_checklist["distinguishing_marks"]
             
             # Auto-compile visual description if character is unlocked
@@ -729,96 +687,77 @@ def compile_character_description(char: Character, enabled_fields: Dict[str, boo
     """
     Assembles selected character traits into either a comma-separated list 
     or a parenthetical relative clause to bound traits and prevent bleeding.
+    If no traits are populated, returns the character's name directly.
     """
-    gender = char.sex_or_gender if enabled_fields.get("sex_or_gender", True) else None
-    age = char.approximate_age if enabled_fields.get("approximate_age", True) else None
-    ethnicity = char.ethnicity_or_race if enabled_fields.get("ethnicity_or_race", True) else None
-    height = char.height_or_stature if enabled_fields.get("height_or_stature", True) else None
-    weight = char.weight_or_build if enabled_fields.get("weight_or_build", True) else None
-    hair = char.hair_color_and_style if enabled_fields.get("hair_color_and_style", True) else None
-    facial = char.facial_features if enabled_fields.get("facial_features", True) else None
+    demo = char.demographics if enabled_fields.get("demographics", True) else None
+    build = char.physical_build if enabled_fields.get("physical_build", True) else None
+    hair_face = char.hair_and_face if enabled_fields.get("hair_and_face", True) else None
     marks = char.distinguishing_marks if enabled_fields.get("distinguishing_marks", True) else None
+
+    # Check if there are any active, populated visual details at all
+    has_any_details = any(
+        f is not None and str(f).strip() != ""
+        for f in [demo, build, hair_face, marks]
+    )
+    if not has_any_details:
+        return char.name
 
     if not use_sentence_structure:
         pieces = []
-        demographics = [age, ethnicity, gender]
-        base_demographics = " ".join([d.strip() for d in demographics if d and str(d).strip()])
-        if base_demographics:
-            pieces.append(base_demographics)
-        elif gender:
-            pieces.append(gender)
-
-        if height and str(height).strip():
-            pieces.append(height.strip())
-        if weight and str(weight).strip():
-            pieces.append(weight.strip())
-
-        if hair and str(hair).strip():
-            h = hair.strip().lower()
-            if not h.startswith("with ") and not h.startswith("has "):
-                pieces.append(f"with {h}")
-            else:
-                pieces.append(h)
-
-        if facial and str(facial).strip():
-            pieces.append(facial.strip())
-        if marks and str(marks).strip():
-            pieces.append(marks.strip())
+        if demo: pieces.append(demo.strip())
+        if hair_face: pieces.append(hair_face.strip())
+        if build: pieces.append(build.strip())
+        if marks: pieces.append(marks.strip())
 
         cleaned_pieces = [p.strip() for p in pieces if p and str(p).strip()]
         if not cleaned_pieces:
-            return f"a person named {char.name}"
+            return char.name
             
         return ", ".join(cleaned_pieces)
     
     else:
         # Prevent blending/cross-contamination via descriptive containment
-        noun_phrases = []
-        if age:
-            noun_phrases.append(age.strip())
-        if ethnicity:
-            noun_phrases.append(ethnicity.strip())
-        if gender:
-            noun_phrases.append(gender.strip())
-        else:
-            noun_phrases.append("person")
-            
-        base_noun = " ".join(noun_phrases)
+        base_noun = demo.strip() if demo else "person"
+        
+        # Determine phonetic a/an
+        first_char = base_noun[0].lower() if base_noun else 'p'
+        article = "an" if first_char in "aeiou" else "a"
         
         clauses = []
-        if hair:
-            h_clean = hair.strip().lower()
-            if h_clean.startswith("with "):
-                h_clean = h_clean[5:]
-            elif h_clean.startswith("has "):
-                h_clean = h_clean[4:]
-            clauses.append(f"has {h_clean}")
+        if hair_face:
+            clauses.append(hair_face.strip())
             
-        height_weight = []
-        if height:
-            height_weight.append(height.strip())
-        if weight:
-            height_weight.append(weight.strip())
-        if height_weight:
-            clauses.append(f"is " + " and ".join(height_weight))
+        if build:
+            b_clean = build.strip()
+            # Handle if LLM extracted starting with 'who is' or 'is'
+            if not b_clean.lower().startswith("who is ") and not b_clean.lower().startswith("is "):
+                clauses.append(f"who is {b_clean}")
+            else:
+                clauses.append(b_clean)
             
-        features = []
-        if facial:
-            features.append(facial.strip())
         if marks:
-            features.append(marks.strip())
-        if features:
-            clauses.append(f"with " + " and ".join(features))
+            clauses.append(marks.strip())
             
         if clauses:
-            description_sentence = f"{char.name} (a {base_noun} who " + ", ".join(clauses[:-1])
+            # Construct cohesive natural relative clauses
             if len(clauses) > 1:
-                description_sentence += f", and {clauses[-1]})"
+                main_clauses = ", ".join(clauses[:-1])
+                final_clause = clauses[-1]
+                if not final_clause.lower().startswith("and "):
+                    final_clause = f"and {final_clause}"
+                parenthetical = f"{article} {base_noun}, {main_clauses}, {final_clause}"
             else:
-                description_sentence += f"{clauses[0]})"
-            return description_sentence
+                parenthetical = f"{article} {base_noun}, {clauses[0]}"
+            
+            # Defensive post-processing cleanup (fix double spaces, duplicate commas, double connectives)
+            parenthetical = re.sub(r'\s*,\s*,', ',', parenthetical)
+            parenthetical = re.sub(r'\band\s+and\b', 'and', parenthetical)
+            parenthetical = re.sub(r'\bwith\s+with\b', 'with', parenthetical)
+            parenthetical = re.sub(r'\s+', ' ', parenthetical).strip()
+            
+            return f"{char.name} ({parenthetical})"
         else:
-            return f"{char.name} (a {base_noun})"
+            return f"{char.name} ({article} {base_noun})"
 
 
 def replace_character_tags_in_prompt(
@@ -830,7 +769,8 @@ def replace_character_tags_in_prompt(
     """
     Scans a prompt string for bracketed tags, matches aliases to project characters, 
     and returns a modified prompt string containing compiled descriptions.
-    If the character does not exist in the database, the brackets are stripped.
+    If the character occurs multiple times, only the first mention gets expanded 
+    to prevent redundancy, prompt bloat, and attribute bleeding.
     """
     bracket_regex = re.compile(r"\[(.*?)\]")
     matches = bracket_regex.findall(prompt)
@@ -838,6 +778,8 @@ def replace_character_tags_in_prompt(
         return prompt
 
     modified_prompt = prompt
+    expanded_character_ids = set()  # Track which characters have already been described in this prompt
+    
     with Session(engine) as session:
         for match in matches:
             tag = match.strip()
@@ -853,9 +795,16 @@ def replace_character_tags_in_prompt(
                 char = session.get(Character, alias.character_id)
 
             if char:
-                replacement = compile_character_description(char, enabled_fields, use_sentence_structure)
-                modified_prompt = modified_prompt.replace(f"[{tag}]", replacement)
+                # If we've already described this specific character ID in this prompt, just use their name!
+                if char.id in expanded_character_ids:
+                    replacement = char.name
+                else:
+                    replacement = compile_character_description(char, enabled_fields, use_sentence_structure)
+                    expanded_character_ids.add(char.id)
+                
+                # Replace ONLY the first single occurrence of this bracketed tag in the string
+                modified_prompt = modified_prompt.replace(f"[{tag}]", replacement, 1)
             else:
                 # Fallback: Strip brackets for characters/pronouns not in the database
-                modified_prompt = modified_prompt.replace(f"[{tag}]", tag)
+                modified_prompt = modified_prompt.replace(f"[{tag}]", tag, 1)
     return modified_prompt

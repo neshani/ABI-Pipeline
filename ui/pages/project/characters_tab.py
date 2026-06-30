@@ -65,7 +65,8 @@ def open_prompt_editor_dialog():
         from services.character_manager import get_default_character_template
         current_template = get_default_character_template()
 
-    with ui.dialog() as dialog, ui.card().classes('w-[800px] max-w-full p-6 rounded-xl max-h-[90vh] flex flex-col'):
+    # Added a stable height 'h-[650px]' to prevent flex-1 height collapse
+    with ui.dialog() as dialog, ui.card().classes('w-[750px] max-w-[95vw] h-[650px] max-h-[90vh] p-6 rounded-xl flex flex-col overflow-hidden'):
         
         def reset():
             from services.character_manager import get_default_character_template
@@ -77,19 +78,19 @@ def open_prompt_editor_dialog():
             ui.notify("Custom profiler prompt template saved!", type="positive")
             dialog.close()
 
-        # Fixed Header row with Actions on Top (no floating overlap)
-        with ui.row().classes('w-full justify-between items-center border-b pb-3 mb-3'):
+        # Fixed Header row with Actions on Top (no floating overlap, non-shrinkable)
+        with ui.row().classes('w-full justify-between items-center border-b pb-3 mb-3 shrink-0'):
             with ui.column().classes('gap-0.5'):
-                ui.label('Customize Character Profiler Prompt').classes('text-lg font-bold text-slate-800')
+                ui.label('Customize Character Profiler Prompt').classes('text-base font-bold text-slate-800')
                 ui.label('Configure system instructions sent to the local LLM.').classes('text-xs text-slate-500')
             
-            with ui.row().classes('gap-2'):
-                ui.button('Reset to Default', on_click=reset, color='amber').props('flat').classes('text-xs')
-                ui.button('Cancel', on_click=dialog.close, color='slate').props('flat').classes('text-xs')
-                ui.button('Save Template', on_click=save).classes('bg-blue-600 text-white font-bold text-xs px-4 py-2 rounded-lg')
+            with ui.row().classes('gap-2 items-center'):
+                ui.button('Reset', on_click=reset, color='amber').props('flat').classes('text-xs font-semibold')
+                ui.button('Cancel', on_click=dialog.close, color='slate').props('flat').classes('text-xs font-semibold')
+                ui.button('Save Template', on_click=save).classes('bg-blue-600 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')
 
-        # Scrollable Content Body Area
-        with ui.column().classes('w-full flex-1 overflow-y-auto gap-4'):
+        # Scrollable column with a robust minimum height context
+        with ui.column().classes('w-full flex-1 overflow-y-auto overflow-x-hidden gap-4 pr-1 min-w-0'):
             ui.markdown(
                 "Configure the instructions sent to the LLM during character research. "
                 "You can use these dynamic placeholder tags:\n"
@@ -97,12 +98,12 @@ def open_prompt_editor_dialog():
                 "- `{aliases}`: Comma-separated list of known aliases\n"
                 "- `{known_traits}`: Attributes already discovered\n"
                 "- `{unknown_traits}`: Attributes still needing discovery"
-            ).classes('text-xs text-slate-500 leading-relaxed bg-slate-50 p-3 rounded-lg border')
+            ).classes('text-xs text-slate-500 leading-relaxed bg-slate-50 p-3 rounded-lg border w-full')
 
             editor = ui.textarea(
                 label='System Instructions Template', 
                 value=current_template
-            ).classes('w-full flex-1 font-mono text-xs min-h-[300px]').props('outlined autogrow')
+            ).classes('w-full font-mono text-xs').props('outlined autogrow')
 
     dialog.open()
 
@@ -305,17 +306,16 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             if char.locked:
                 locked_count += 1
             fields = [
-                char.sex_or_gender, char.approximate_age, char.ethnicity_or_race,
-                char.height_or_stature, char.weight_or_build, char.hair_color_and_style,
-                char.facial_features, char.distinguishing_marks
+                char.demographics, char.physical_build, 
+                char.hair_and_face, char.distinguishing_marks
             ]
-            if sum(1 for f in fields if f and str(f).strip()) == 8:
+            if sum(1 for f in fields if f and str(f).strip()) == 4:
                 fully_profiled += 1
 
         with ui.row().classes('w-full items-center gap-4 bg-blue-50/50 border border-blue-100 p-3 rounded-xl mb-4 text-xs font-semibold text-blue-700'):
             ui.icon('info', size='xs')
             ui.label(f"Database Stats: {total_chars} total characters discovered.")
-            ui.label(f"|  {fully_profiled} fully profiled (8/8 traits)")
+            ui.label(f"|  {fully_profiled} fully profiled (4/4 traits)")
             ui.label(f"|  {locked_count} locked/manually curated")
 
     @ui.refreshable
@@ -349,9 +349,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             aliases_list = char_aliases.get(char.id, [])
             mentions = get_char_mentions(char, aliases_list)
             fields = [
-                char.sex_or_gender, char.approximate_age, char.ethnicity_or_race,
-                char.height_or_stature, char.weight_or_build, char.hair_color_and_style,
-                char.facial_features, char.distinguishing_marks
+                char.demographics, char.physical_build,
+                char.hair_and_face, char.distinguishing_marks
             ]
             completion_count = sum(1 for f in fields if f and str(f).strip())
             char_data_list.append((char, aliases_list, mentions, completion_count))
@@ -366,7 +365,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 if not (name_match or alias_match):
                     continue
             
-            if filter_status == "incomplete" and completion_count == 8:
+            if filter_status == "incomplete" and completion_count == 4:
                 continue
             elif filter_status == "locked" and not char.locked:
                 continue
@@ -411,18 +410,17 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                 ui.label(char.name).classes('text-xs truncate font-semibold')
                             
                             summary_pieces = []
-                            if char.sex_or_gender: summary_pieces.append(char.sex_or_gender)
-                            if char.approximate_age: summary_pieces.append(char.approximate_age)
-                            if char.ethnicity_or_race: summary_pieces.append(char.ethnicity_or_race)
-                            if char.hair_color_and_style: summary_pieces.append(char.hair_color_and_style)
+                            if char.demographics: summary_pieces.append(char.demographics)
+                            if char.hair_and_face: summary_pieces.append(char.hair_and_face)
+                            if char.physical_build: summary_pieces.append(char.physical_build)
                             
                             summary_text = " • ".join(summary_pieces) if summary_pieces else "No traits profiled yet"
                             ui.label(summary_text).classes('text-[10px] text-slate-400 truncate w-full')
                         
                         with ui.column().classes('items-end gap-1'):
                             ui.label(f"{mentions} hits").classes('text-[10px] font-bold bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded')
-                            bar_color = "text-green-600 font-bold" if completion_count == 8 else "text-purple-600" if completion_count >= 4 else "text-slate-400"
-                            ui.label(f"{completion_count}/8 traits").classes(f'text-[9px] font-bold {bar_color}')
+                            bar_color = "text-green-600 font-bold" if completion_count == 4 else "text-purple-600" if completion_count >= 2 else "text-slate-400"
+                            ui.label(f"{completion_count}/4 traits").classes(f'text-[9px] font-bold {bar_color}')
 
     @ui.refreshable
     def draw_details_panel():
@@ -456,9 +454,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             mentions = get_char_mentions(char, aliases)
 
             fields_list = [
-                char.sex_or_gender, char.approximate_age, char.ethnicity_or_race,
-                char.height_or_stature, char.weight_or_build, char.hair_color_and_style,
-                char.facial_features, char.distinguishing_marks
+                char.demographics, char.physical_build,
+                char.hair_and_face, char.distinguishing_marks
             ]
             completion_count = sum(1 for f in fields_list if f and str(f).strip())
 
@@ -580,7 +577,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             with ui.column().classes('w-full bg-slate-50 p-4 rounded-xl border gap-3'):
                 with ui.row().classes('w-full justify-between items-center'):
                     ui.label('Assigned Aliases & Target Tags').classes('text-[11px] font-bold text-slate-500 uppercase tracking-wider')
-                    ui.label(f'{completion_count}/8 attributes populated').classes('text-[10px] font-bold text-purple-700 bg-purple-50 px-2 py-0.5 rounded-full')
+                    ui.label(f'{completion_count}/4 attributes populated').classes('text-[10px] font-bold text-purple-700 bg-purple-50 px-2 py-0.5 rounded-full')
                 
                 with ui.row().classes('w-full gap-2 flex-wrap items-center'):
                     for alias in aliases:
@@ -701,14 +698,10 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             ui.label('Physical Description Parameters').classes('text-[11px] font-bold text-slate-500 uppercase tracking-wider mt-1')
             with ui.grid().classes('w-full grid-cols-1 md:grid-cols-2 gap-3'):
                 fields = [
-                    ("sex_or_gender", "Gender (man/woman/boy/girl)"),
-                    ("approximate_age", "Approximate Age"),
-                    ("ethnicity_or_race", "Race or Ethnicity"),
-                    ("height_or_stature", "Height or Stature"),
-                    ("weight_or_build", "Weight or Build"),
-                    ("hair_color_and_style", "Hair Color & Style"),
-                    ("facial_features", "Facial Features"),
-                    ("distinguishing_marks", "Distinguishing Marks (Misc)")
+                    ("demographics", "Demographics (Age, Race, Gender)"),
+                    ("hair_and_face", "Hair & Face Details"),
+                    ("physical_build", "Physical Build (Height/Weight/Posture)"),
+                    ("distinguishing_marks", "Distinguishing Marks & Key Accessories")
                 ]
                 
                 def make_update_handler(char_id, key):

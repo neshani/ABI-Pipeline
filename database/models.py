@@ -58,15 +58,11 @@ class Character(SQLModel, table=True):
     book_id: Optional[int] = Field(default=None, foreign_key="book.id", index=True) # Null if global/static, Book ID if book-specific/dynamic
     name: str = Field(index=True)
     
-    # 8-Field Physical Descriptor Schema (Excluding Dynamic Clothing)
-    sex_or_gender: Optional[str] = Field(default=None)
-    approximate_age: Optional[str] = Field(default=None)
-    ethnicity_or_race: Optional[str] = Field(default=None)
-    height_or_stature: Optional[str] = Field(default=None)
-    weight_or_build: Optional[str] = Field(default=None)
-    hair_color_and_style: Optional[str] = Field(default=None)
-    facial_features: Optional[str] = Field(default=None)
-    distinguishing_marks: Optional[str] = Field(default=None)  # Acts as our 'Misc' permanent descriptor field
+    # Simplified 4-Field Physical Descriptor Schema (Cohesive buckets)
+    demographics: Optional[str] = Field(default=None)         # e.g., "middle-aged Caucasian man" or "young Italian woman"
+    physical_build: Optional[str] = Field(default=None)       # e.g., "six-foot-two and athletic" or "petite and slender"
+    hair_and_face: Optional[str] = Field(default=None)        # e.g., "with thinning brown hair and a clean-shaven face"
+    distinguishing_marks: Optional[str] = Field(default=None) # e.g., "wearing wire-rimmed glasses" or "with a scar on his cheek"
 
     # The compiled natural-language text-to-image replacement string
     visual_description: Optional[str] = Field(default=None)

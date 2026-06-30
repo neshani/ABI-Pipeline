@@ -70,13 +70,9 @@ playground_results: List[Dict[str, Any]] = []  # [{"chunk": "", "quote": "", "pr
 style_enable_character_replacement: bool = True
 style_use_sentence_structure: bool = True
 style_enabled_character_traits: Dict[str, bool] = {
-    "sex_or_gender": True,
-    "approximate_age": True,
-    "ethnicity_or_race": True,
-    "height_or_stature": True,
-    "weight_or_build": True,
-    "hair_color_and_style": True,
-    "facial_features": True,
+    "demographics": True,
+    "physical_build": True,
+    "hair_and_face": True,
     "distinguishing_marks": True
 }
 
