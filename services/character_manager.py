@@ -205,8 +205,12 @@ def extract_characters_from_prompts(project_id: int) -> Set[str]:
             return discovered_tags
 
         for tag in discovered_tags:
+            # Fixed: Join with Character table to check if the alias exists in the current project scope
             existing_alias = session.exec(
-                select(CharacterAlias).where(CharacterAlias.alias == tag)
+                select(CharacterAlias)
+                .join(Character)
+                .where(CharacterAlias.alias == tag)
+                .where(Character.project_id == project_id)
             ).first()
             if existing_alias:
                 continue
@@ -271,46 +275,109 @@ def merge_character_aliases(project_id: int, target_character_id: int, source_al
 
 
 def get_character_mention_chunks(
-    project_name: str, 
-    book_name: str, 
-    character_id: int, 
+    project_id: int,
+    character_id: int,
+    book_id: Optional[int] = None,
     chunk_size_words: int = 800
 ) -> List[Dict[str, Any]]:
     """
-    Helper utility to segment book transcript.txt into discrete chunks,
-    returning chunks that contain mentions of the character's mapped aliases.
-    Useful for building highly targeted LLM reading context windows.
+    Retrieves chunks of transcript.txt containing character aliases.
+    If book_id is provided, limits scan to that book.
+    If book_id is None, scans all books in the project, returning them in chronological order.
     """
     base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
-    transcript_path = base_output_dir / project_name / book_name / "transcript.txt"
-    if not transcript_path.exists():
-        return []
-
+    
     with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if not project:
+            return []
+            
+        aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == character_id)).all()
+        alias_texts = {a.alias.lower() for a in aliases}
+        if not alias_texts:
+            return []
+
+        if book_id:
+            books = [session.get(Book, book_id)]
+        else:
+            # Query all books inside the project, ordered chronologically
+            books = session.exec(
+                select(Book).where(Book.project_id == project_id).order_by(Book.id)
+            ).all()
+
+    mention_chunks = []
+    
+    for book in books:
+        if not book:
+            continue
+        transcript_path = base_output_dir / project.name / book.name / "transcript.txt"
+        if not transcript_path.exists():
+            continue
+
+        try:
+            with open(transcript_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            print(f"[Profiler] Error reading transcript for {book.name}: {str(e)}")
+            continue
+
+        cleaned_text = content.replace("==CHAPTER==", " ").strip()
+        all_chunks = smart_chunk_text(cleaned_text, chunk_size_words)
+        
+        for idx, chunk in enumerate(all_chunks):
+            lower_chunk = chunk.lower()
+            mentions_count = sum(len(re.findall(re.escape(alias), lower_chunk)) for alias in alias_texts)
+            if mentions_count > 0:
+                mention_chunks.append({
+                    "book_id": book.id,
+                    "book_name": book.name,
+                    "chunk_index": idx,
+                    "text": chunk,
+                    "mentions_count": mentions_count
+                })
+
+    return mention_chunks
+
+
+def get_character_book_mentions(project_id: int, character_id: int) -> Dict[str, int]:
+    """
+    Scans prompts.csv files dynamically to return a mapping of Book Name -> Mention Count
+    for all aliases belonging to the given character across the project.
+    """
+    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    book_mentions = {}
+    
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if not project:
+            return {}
+        books = session.exec(select(Book).where(Book.project_id == project_id)).all()
         aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == character_id)).all()
         alias_texts = {a.alias.lower() for a in aliases}
 
     if not alias_texts:
-        return []
+        return {}
 
-    with open(transcript_path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    cleaned_text = content.replace("==CHAPTER==", " ").strip()
-    all_chunks = smart_chunk_text(cleaned_text, chunk_size_words)
-    
-    mention_chunks = []
-    for idx, chunk in enumerate(all_chunks):
-        lower_chunk = chunk.lower()
-        mentions_count = sum(len(re.findall(re.escape(alias), lower_chunk)) for alias in alias_texts)
-        if mentions_count > 0:
-            mention_chunks.append({
-                "chunk_index": idx,
-                "text": chunk,
-                "mentions_count": mentions_count
-            })
-
-    return mention_chunks
+    bracket_regex = re.compile(r"\[(.*?)\]")
+    for book in books:
+        csv_path = base_output_dir / project.name / book.name / "prompts.csv"
+        if not csv_path.exists():
+            continue
+        count = 0
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter="|")
+                for row in reader:
+                    prompt_text = row.get("prompt", "")
+                    for match in bracket_regex.findall(prompt_text):
+                        if match.strip().lower() in alias_texts:
+                            count += 1
+        except Exception:
+            pass
+        if count > 0:
+            book_mentions[book.name] = count
+            
+    return book_mentions
 
 
 def extract_json_from_text(text: str) -> Dict[str, Any]:
@@ -419,15 +486,13 @@ def is_valid_permanent_trait(key: str, new_val: str, old_val: Optional[str] = No
 async def run_stateful_character_profiling(
     project_id: int, 
     character_id: int, 
-    book_id: int, 
+    book_id: Optional[int] = None, 
     max_chunks_to_scan: int = 5,
     progress_callback: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Executes the Code-Led Stateful Extraction Loop for a single character.
-    Chronologically scans chunks mentioning the character's aliases.
-    Clears out old auto-generated traits first for a clean-slate fresh pass,
-    then scans thoroughly through the specified chunks with defensive validation.
+    Chronologically scans chunks mentioning the character's aliases from book transcripts.
     """
     llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
     model_name = get_setting("llm_model", "local-model")
@@ -440,10 +505,9 @@ async def run_stateful_character_profiling(
 
     with Session(engine) as session:
         project = session.get(Project, project_id)
-        book = session.get(Book, book_id)
         char = session.get(Character, character_id)
         
-        if not project or not book or not char:
+        if not project or not char:
             return {}
             
         if char.locked:
@@ -459,8 +523,6 @@ async def run_stateful_character_profiling(
         session.add(char)
         session.commit()
 
-        project_name = project.name
-        book_name = book.name
         aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
         alias_list = [a.alias for a in aliases]
 
@@ -472,7 +534,7 @@ async def run_stateful_character_profiling(
         "distinguishing_marks": None
     }
 
-    chunks = get_character_mention_chunks(project_name, book_name, character_id, chunk_size_words=800)
+    chunks = get_character_mention_chunks(project_id, character_id, book_id, chunk_size_words=800)
     if not chunks:
         print(f"[Profiler] No mention chunks found for character: {char.name}")
         return state_checklist
@@ -506,7 +568,7 @@ async def run_stateful_character_profiling(
                 .replace("{unknown_traits}", unknown_display)
 
         user_prompt = (
-            f"### CURRENT TEXT PASSAGE ###\n"
+            f"### CURRENT TEXT PASSAGE (from {chunk_data['book_name']}) ###\n"
             f"\"\"\"\n{chunk_text}\n\"\"\"\n\n"
             f"Task: Review the passage. Extract facts for the unknown traits or self-correct "
             f"any contradicted provisional details. Respond with a single JSON block."
@@ -515,7 +577,7 @@ async def run_stateful_character_profiling(
         full_prompt = f"{system_instructions}\n\n{user_prompt}"
 
         try:
-            print(f"[Profiler] Scanning Chunk {chunk_data['chunk_index']} for {char.name} ({scanned_count}/{max_chunks_to_scan})...")
+            print(f"[Profiler] Scanning {chunk_data['book_name']} Chunk {chunk_data['chunk_index']} for {char.name} ({scanned_count}/{max_chunks_to_scan})...")
             raw_response = await get_llm_response(full_prompt, llm_url, model_name)
             extracted_json = extract_json_from_text(raw_response)
 
@@ -524,7 +586,6 @@ async def run_stateful_character_profiling(
                 for key in state_checklist.keys():
                     new_val = extracted_json.get(key)
                     if new_val and str(new_val).strip() != "" and str(new_val).lower() != "null":
-                        # Defensive guard: prevent transient/voice traits or regressive short-form overwrites
                         if is_valid_permanent_trait(key, str(new_val), state_checklist[key]):
                             state_checklist[key] = str(new_val).strip()
 
@@ -695,20 +756,30 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
                         "aliases_added": [a.alias for a in cand_aliases_db]
                     })
 
+                    # Fixed: Collect all candidate names/aliases and verify uniquely against target
                     existing_aliases_on_target = {a.lower() for a in target_aliases}
-                    
-                    if candidate_char.name.lower() not in existing_aliases_on_target:
-                        new_alias = CharacterAlias(character_id=target_char.id, alias=candidate_char.name)
-                        session.add(new_alias)
-                        target_aliases.append(candidate_char.name)
-
+                    candidates_to_add = {candidate_char.name.lower()}
                     for alias in cand_aliases_db:
-                        if alias.alias.lower() not in existing_aliases_on_target:
-                            alias.character_id = target_char.id
-                            session.add(alias)
-                            target_aliases.append(alias.alias)
-                        else:
-                            session.delete(alias)
+                        candidates_to_add.add(alias.alias.lower())
+
+                    new_aliases_to_create = candidates_to_add - existing_aliases_on_target
+
+                    # Delete candidate aliases entirely to prevent duplicated target aliases
+                    for alias in cand_aliases_db:
+                        session.delete(alias)
+
+                    # Create fresh non-duplicate aliases assigned directly to the target
+                    for new_alias_text in new_aliases_to_create:
+                        original_case = candidate_char.name
+                        if candidate_char.name.lower() != new_alias_text:
+                            for alias in cand_aliases_db:
+                                if alias.alias.lower() == new_alias_text:
+                                    original_case = alias.alias
+                                    break
+                        
+                        new_alias_obj = CharacterAlias(character_id=target_char.id, alias=original_case)
+                        session.add(new_alias_obj)
+                        target_aliases.append(original_case)
 
                     cand_mods = session.exec(
                         select(CharacterStateModifier).where(CharacterStateModifier.character_id == candidate_char.id)
@@ -830,10 +901,14 @@ def replace_character_tags_in_prompt(
     with Session(engine) as session:
         for match in matches:
             tag = match.strip()
-            # Match Alias
+            # Fixed: Match Alias scoped strictly to the current project_id
             alias = session.exec(
-                select(CharacterAlias).where(CharacterAlias.alias == tag)
+                select(CharacterAlias)
+                .join(Character)
+                .where(CharacterAlias.alias == tag)
+                .where(Character.project_id == project_id)
             ).first()
+            
             if not alias:
                 char = session.exec(
                     select(Character).where(Character.project_id == project_id).where(Character.name == tag)

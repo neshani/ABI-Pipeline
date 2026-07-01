@@ -1,13 +1,16 @@
 import csv
 import os
 import time
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import asyncio
 from nicegui import ui, app
 from sqlmodel import Session, select
-from database.connection import engine
-from database.models import Book
+from database.connection import engine, get_setting
+from database.models import Book, Project, Character, CharacterAlias
+from services.character_manager import compile_character_visual_prompt, save_project_characters_to_json
+from ui.pages.project.characters_tab import get_character_frequency_map
 from ui import state
 
 # Ensure standard FastAPI static file serving is mounted once
@@ -223,6 +226,193 @@ def render_book_tabs(book_id: int):
     import platform
     import subprocess
     
+    # Coordinate cache to prevent resetting the user's active typing/prompt edit input
+    loaded_scene_coords = [-1, -1]
+
+    def extract_prompt_character_tags(prompt_text: str) -> List[str]:
+        """Parses bracketed tags from the prompt text area."""
+        if not prompt_text:
+            return []
+        bracket_regex = re.compile(r"\[(.*?)\]")
+        return [t.strip() for t in bracket_regex.findall(prompt_text) if t.strip()]
+
+    def open_character_edit_dialog(char_id: int):
+        """Spawns an independent edit dialog that remains open and functional during image rendering updates."""
+        with Session(engine) as session:
+            char = session.get(Character, char_id)
+            if not char:
+                ui.notify("Character not found.", type="negative")
+                return
+            
+            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
+            
+            # Count character mentions in this book's prompts.csv
+            frequencies = get_character_frequency_map(project_name, [book])
+            total_hits = sum(frequencies.get(a.alias.lower(), 0) for a in aliases)
+            if not aliases:
+                total_hits = frequencies.get(char.name.lower(), 0)
+
+        # Force mounting the dialog to the page's root client context to prevent 
+        # it from being destroyed when its triggering container clears during background refreshes.
+        with ui.context.client:
+            with ui.dialog() as char_dialog, ui.card().classes('w-[520px] max-w-[95vw] p-5 rounded-xl flex flex-col gap-3 overflow-hidden'):
+                
+                # Header
+                with ui.row().classes('w-full justify-between items-center border-b pb-2 flex-shrink-0'):
+                    with ui.column().classes('gap-0'):
+                        ui.label(f"Edit Profile: {char.name}").classes('text-sm font-bold text-slate-800')
+                        ui.label(f"{total_hits} mentions in {book_name}").classes('text-[11px] text-slate-400 font-medium')
+                    
+                    with ui.row().classes('items-center gap-2'):
+                        def toggle_modal_lock(e):
+                            with Session(engine) as session:
+                                db_char = session.get(Character, char_id)
+                                if db_char:
+                                    db_char.locked = e.value
+                                    session.add(db_char)
+                                    session.commit()
+                            save_project_characters_to_json(project.id)
+                            ui.notify(f"Profile {'Locked' if e.value else 'Unlocked'}", type="info")
+
+                        lock_switch = ui.switch(value=char.locked, on_change=toggle_modal_lock).props('dense')
+                        ui.label('Locked').classes('text-xs font-semibold text-slate-500 mr-2')
+
+                # Scrollable Body Panel
+                with ui.column().classes('w-full flex-1 overflow-y-auto pr-1 gap-3 max-h-[55vh] min-h-0'):
+                    ui.label('Physical Traits').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide')
+                    
+                    demo_input = ui.input(label="Demographics", value=char.demographics or "").classes('w-full bg-white').props('outlined dense')
+                    hair_input = ui.input(label="Hair & Face", value=char.hair_and_face or "").classes('w-full bg-white').props('outlined dense')
+                    build_input = ui.input(label="Physical Build", value=char.physical_build or "").classes('w-full bg-white').props('outlined dense')
+                    marks_input = ui.input(label="Distinguishing Marks", value=char.distinguishing_marks or "").classes('w-full bg-white').props('outlined dense')
+
+                    def get_compiled_preview() -> str:
+                        mock_char = Character(
+                            name=char.name,
+                            demographics=demo_input.value,
+                            physical_build=build_input.value,
+                            hair_and_face=hair_input.value,
+                            distinguishing_marks=marks_input.value
+                        )
+                        return compile_character_visual_prompt(mock_char)
+
+                    # Compiled Description Textarea
+                    ui.label('Compiled Visual Prompt Override').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide mt-1')
+                    
+                    desc_textarea = ui.textarea(
+                        value=char.visual_description or get_compiled_preview()
+                    ).classes('w-full font-mono text-xs').props('outlined dense autogrow')
+
+                    def on_trait_change():
+                        if not lock_switch.value:
+                            desc_textarea.value = get_compiled_preview()
+
+                    for field_el in [demo_input, hair_input, build_input, marks_input]:
+                        field_el.on('blur', on_trait_change)
+
+                    # Aliases chip manager
+                    ui.label('Mapped Alias Tags').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide mt-1')
+                    
+                    @ui.refreshable
+                    def render_modal_aliases():
+                        with Session(engine) as session:
+                            curr_aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char_id)).all()
+                        
+                        with ui.row().classes('w-full gap-1.5 flex-wrap items-center bg-slate-50 p-2 rounded-lg border border-dashed'):
+                            if not curr_aliases:
+                                ui.label('No aliases mapped.').classes('text-[11px] text-slate-400 italic')
+                            for a in curr_aliases:
+                                def remove_alias(alias_id=a.id):
+                                    with Session(engine) as session:
+                                        db_a = session.get(CharacterAlias, alias_id)
+                                        if db_a:
+                                            session.delete(db_a)
+                                            session.commit()
+                                    save_project_characters_to_json(project.id)
+                                    render_modal_aliases.refresh()
+                                    ui.notify("Alias tag removed.", type="info")
+
+                                ui.chip(a.alias, removable=True, on_value_change=lambda e, aid=a.id: remove_alias(aid) if not e.value else None).classes('bg-white text-xs')
+                            
+                            def add_alias():
+                                txt = alias_add_input.value.strip()
+                                if not txt:
+                                    return
+                                with Session(engine) as session:
+                                    dup = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char_id).where(CharacterAlias.alias == txt)).first()
+                                    if not dup:
+                                        new_a = CharacterAlias(character_id=char_id, alias=txt)
+                                        session.add(new_a)
+                                        session.commit()
+                                save_project_characters_to_json(project.id)
+                                alias_add_input.value = ""
+                                render_modal_aliases.refresh()
+                                ui.notify(f"Added alias: {txt}", type="positive")
+
+                            alias_add_input = ui.input(placeholder="Add Tag...").classes('w-24 text-xs').props('dense borderless')
+                            alias_add_input.on('keydown.enter', add_alias)
+                            ui.button(icon='add', on_click=add_alias).props('flat dense round').classes('text-slate-500 text-xs')
+
+                    render_modal_aliases()
+
+                # Footer
+                with ui.row().classes('w-full justify-end gap-2 border-t pt-2 mt-2 flex-shrink-0'):
+                    def cancel():
+                        char_dialog.close()
+
+                    def save():
+                        with Session(engine) as session:
+                            db_char = session.get(Character, char_id)
+                            if db_char:
+                                db_char.demographics = demo_input.value.strip() if demo_input.value.strip() else None
+                                db_char.physical_build = build_input.value.strip() if build_input.value.strip() else None
+                                db_char.hair_and_face = hair_input.value.strip() if hair_input.value.strip() else None
+                                db_char.distinguishing_marks = marks_input.value.strip() if marks_input.value.strip() else None
+                                db_char.visual_description = desc_textarea.value.strip() if desc_textarea.value.strip() else None
+                                db_char.locked = lock_switch.value
+                                session.add(db_char)
+                                session.commit()
+                        save_project_characters_to_json(project.id)
+                        ui.notify("Character profile updated successfully!", type="positive")
+                        char_dialog.close()
+                        if modal_prompt_input:
+                            render_scene_character_chips(modal_prompt_input.value)
+
+                    ui.button('Cancel', on_click=cancel, color='slate').props('flat').classes('text-xs font-semibold')
+                    ui.button('Save Profile', on_click=save).classes('bg-blue-600 text-white font-bold text-xs px-4 py-2 rounded-lg shadow-sm')
+
+            char_dialog.open()
+
+    # Dynamic Scene Chips Container clear and draw handler (Robust, context-safe)
+    def render_scene_character_chips(prompt_text: str):
+        """Safely clears and populates matched character tags on the scene."""
+        scene_chips_container.clear()
+        tags = extract_prompt_character_tags(prompt_text)
+        if not tags:
+            return
+        
+        with Session(engine) as session:
+            chars = session.exec(select(Character).where(Character.project_id == project.id)).all()
+            
+            matched_chars = []
+            for char in chars:
+                aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
+                alias_texts = {a.alias.lower() for a in aliases}
+                alias_texts.add(char.name.lower())
+                
+                if any(t.lower() in alias_texts for t in tags):
+                    matched_chars.append((char, aliases))
+
+        if matched_chars:
+            with scene_chips_container:
+                with ui.row().classes('w-full items-center gap-1 bg-slate-50 p-2 rounded-lg border border-dashed mt-1 flex-wrap'):
+                    ui.label('Scene Characters:').classes('text-[9px] font-black text-slate-400 uppercase tracking-wider')
+                    for char, _ in matched_chars:
+                        ui.chip(
+                            f"👤 {char.name}",
+                            on_click=lambda _, c_id=char.id: open_character_edit_dialog(c_id)
+                        ).classes('text-[11px] bg-white hover:bg-blue-50 hover:text-blue-700 cursor-pointer border py-0.5 px-2.5 rounded-md')
+
     # Aggressively deallocate and clear any stale workspace timers & keyboards
     # to prevent background execution leakage and active binding propagation bloat.
     if getattr(state, 'book_scroll_timer', None):
@@ -418,22 +608,14 @@ def render_book_tabs(book_id: int):
         # Update Modal Content In-place
         if modal_img_el:
             if img_url:
-                modal_img_el.set_source(img_url)
+                if modal_img_el.source != img_url:
+                    modal_img_el.set_source(img_url)
                 modal_img_el.visible = True
             else:
                 modal_img_el.visible = False
                 
         if modal_placeholder:
             modal_placeholder.visible = not img_url
-            
-        if modal_quote_el:
-            modal_quote_el.set_text(f'"{current_scene.get("quote", "")}"')
-            
-        if modal_prompt_input:
-            modal_prompt_input.set_value(current_scene.get("prompt", ""))
-            
-        if modal_context_html:
-            modal_context_html.set_content(find_quote_context(project_name, book_name, current_scene.get("quote", "")))
             
         if modal_title_el:
             modal_title_el.set_text(f"Chapter {current_scene.get('chapter')}, Scene {current_scene.get('scene')}")
@@ -456,6 +638,24 @@ def render_book_tabs(book_id: int):
         if (ch, sc) in grid_card_references:
             target_ref = grid_card_references[(ch, sc)]
             target_ref["card"].classes(add="ring-4 ring-blue-500 ring-offset-2")
+
+        # Only overwrite inputs and text if coordinates changed (prevent resetting cursor / active edits)
+        if loaded_scene_coords[0] != ch or loaded_scene_coords[1] != sc:
+            loaded_scene_coords[0] = ch
+            loaded_scene_coords[1] = sc
+
+            if modal_quote_el:
+                modal_quote_el.set_text(f'"{current_scene.get("quote", "")}"')
+                
+            if modal_prompt_input:
+                modal_prompt_input.set_value(current_scene.get("prompt", ""))
+                
+            if modal_context_html:
+                modal_context_html.set_content(find_quote_context(project_name, book_name, current_scene.get("quote", "")))
+
+        # Update character chips beneath prompt input
+        if modal_prompt_input:
+            render_scene_character_chips(modal_prompt_input.value)
 
     def next_scene():
         filtered = get_filtered_prompts()
@@ -942,6 +1142,9 @@ def render_book_tabs(book_id: int):
                             ui.button('Delete Image', icon='delete', on_click=delete_current).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold flex-1 py-2')
                             ui.button('Approve', icon='check', on_click=approve_current).classes('bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex-1 py-2')
 
+                    # Dynamic scene chips row (fixed below the buttons block)
+                    scene_chips_container = ui.row().classes('w-full flex-shrink-0')
+
                     with ui.column().classes('w-full gap-2 bg-slate-50 p-3 rounded border border-dashed flex-shrink-0'):
                         ui.label("Target Narration Quote").classes('text-[9px] font-black text-slate-400 uppercase tracking-wider')
                         modal_quote_el = ui.label("").classes('text-xs italic text-slate-700 leading-relaxed font-serif')
@@ -952,6 +1155,10 @@ def render_book_tabs(book_id: int):
                     
                     modal_prompt_input.on('blur', lambda: update_prompt_text(modal_prompt_input.value, active_row_ref[0]))
                     
+                    # Bind chip updates to live keystrokes / value adjustments
+                    modal_prompt_input.on('update:value', lambda e: render_scene_character_chips(e.sender.value))
+                    
+                    # Narrative Context drawer (restored)
                     with ui.expansion('Narrative Context (transcript.txt)').classes('w-full border rounded bg-slate-50 text-xs flex-shrink-0'):
                         modal_context_html = ui.html("").classes('p-3 leading-relaxed text-slate-700 bg-white font-serif')
 

@@ -13,6 +13,7 @@ from services.character_manager import (
     merge_character_aliases,
     run_stateful_character_profiling,
     get_character_mention_chunks,
+    get_character_book_mentions,
     save_setting,
     auto_merge_project_characters,
     compile_character_visual_prompt
@@ -151,7 +152,11 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             
             with ui.row().classes('items-center gap-3'):
                 ui.label('Source:').classes('text-xs font-semibold text-slate-500')
-                book_options = {b.id: b.name for b in books}
+                
+                # Upgraded: Default to dynamic Project-wide mapping
+                book_options = {None: "All Books (Project-wide)"}
+                for b in books:
+                    book_options[b.id] = b.name
                 
                 def handle_book_change(val):
                     global selected_book_id
@@ -161,7 +166,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     options=book_options,
                     value=selected_book_id,
                     on_change=lambda e: handle_book_change(e.value)
-                ).classes('w-44 bg-white').props('outlined dense')
+                ).classes('w-56 bg-white').props('outlined dense')
 
                 ui.label('Depth (Chunks):').classes('text-xs font-semibold text-slate-500 ml-1')
                 def handle_depth_change(e):
@@ -223,10 +228,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 async def profile_all_unlocked():
                     global is_profiling_all, currently_profiling_char_id, profiling_progress, profiler_scan_depth, cancel_profiling_all
                     client = ui.context.client
-                    if not selected_book_id:
-                        with client:
-                            ui.notify("Please select a profiling source book first.", type="warning")
-                        return
                     
                     is_profiling_all = True
                     cancel_profiling_all = False
@@ -241,7 +242,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         ui.notify(f"Starting batch profiling for {len(unlocked_chars)} characters...", type="info")
                     
                     for idx, char in enumerate(unlocked_chars):
-                        # Graceful stop trigger checks before beginning new character
                         if cancel_profiling_all:
                             break
 
@@ -492,10 +492,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 async def scan_single_char():
                     global currently_profiling_char_id, profiler_scan_depth
                     client = ui.context.client
-                    if not selected_book_id:
-                        with client:
-                            ui.notify("Please select a profiling source book first.", type="warning")
-                        return
                     currently_profiling_char_id = char.id
                     draw_details_panel.refresh()
                     
@@ -663,6 +659,15 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             on_click=handle_merge_click
                         ).classes('bg-blue-600 text-white font-bold text-xs px-3 py-2 rounded-lg')
 
+            # Dynamic Appearance Map across series
+            book_mentions = get_character_book_mentions(project.id, char.id)
+            if book_mentions:
+                with ui.column().classes('w-full bg-slate-50 p-4 rounded-xl border gap-2 mt-1'):
+                    ui.label('Appearance Map across Series').classes('text-[11px] font-bold text-slate-500 uppercase tracking-wider')
+                    with ui.row().classes('w-full gap-2 flex-wrap'):
+                        for b_name, m_count in book_mentions.items():
+                            ui.badge(f"{b_name} ({m_count} hits)", color='purple-50').classes('text-purple-700 text-xs font-semibold px-2 py-1 rounded')
+
             # Row 2.5: Composite prompt editor card
             with ui.column().classes('w-full bg-blue-50/20 p-4 rounded-xl border border-blue-100 gap-2'):
                 ui.label('Compiled Visual Description Prompt').classes('text-[11px] font-bold text-blue-600 uppercase tracking-wider')
@@ -687,9 +692,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             session.commit()
                     save_project_characters_to_json(project.id)
                     ui.notify("Visual Prompt overridden!", type="info")
-                    draw_character_list.refresh()
 
-                ui.textarea(
+                compiled_desc_input = ui.textarea(
                     value=char.visual_description
                 ).classes('w-full bg-white font-mono text-xs').props('outlined dense autogrow')\
                  .on('blur', handle_desc_blur)\
@@ -704,7 +708,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     ("distinguishing_marks", "Distinguishing Marks & Key Accessories")
                 ]
                 
-                def make_update_handler(char_id, key):
+                # Upgraded: Directly update the visual prompt textarea's value on-the-fly to stop layout redraw lag
+                def make_update_handler(char_id, key, text_area_el):
                     def handler(e):
                         val = e.sender.value.strip()
                         with Session(engine) as session:
@@ -713,14 +718,14 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                 setattr(db_char, key, val if val != "" else None)
                                 
                                 if not db_char.locked:
-                                    db_char.visual_description = compile_character_visual_prompt(db_char)
+                                    new_prompt = compile_character_visual_prompt(db_char)
+                                    db_char.visual_description = new_prompt
+                                    text_area_el.set_value(new_prompt)
                                     
                                 session.add(db_char)
                                 session.commit()
                         save_project_characters_to_json(project.id)
                         ui.notify("Trait saved.", type="positive", position="bottom-right", timeout=1000)
-                        draw_character_list.refresh()
-                        draw_details_panel.refresh()
                     return handler
 
                 for key, label in fields:
@@ -728,7 +733,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     ui.input(
                         label=label, 
                         value=val
-                    ).classes('w-full bg-white').props('outlined dense').on('blur', make_update_handler(char.id, key))
+                    ).classes('w-full bg-white').props('outlined dense').on('blur', make_update_handler(char.id, key, compiled_desc_input))
 
     @ui.refreshable
     def draw_workspace_layout():
