@@ -715,6 +715,19 @@ async def async_run_project_image_gen_logic(project_id: int):
                         session.commit()
                 continue
 
+            # Inject compiled character descriptions if replacement is enabled
+            if getattr(state, "style_enable_character_replacement", True):
+                from services.character_manager import replace_character_tags_in_prompt
+                original_prompt = prompt_text
+                prompt_text = replace_character_tags_in_prompt(
+                    prompt=prompt_text,
+                    project_id=project_id,
+                    enabled_fields=getattr(state, "style_enabled_character_traits", {}),
+                    use_sentence_structure=getattr(state, "style_use_sentence_structure", True)
+                )
+                if original_prompt != prompt_text:
+                    state.add_console_log(f"[Image-Gen] Character tags replaced: '{original_prompt}' -> '{prompt_text}'")
+
             # Determine seed
             if state.style_use_random_image_seed:
                 seed = random.randint(1, 4294967294)
