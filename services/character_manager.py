@@ -457,22 +457,25 @@ def get_speculative_character_template() -> str:
         "You are an expert creative casting director and character concept designer. The target character, "
         "{character_name} (aka: {aliases}), lacks complete physical descriptions in the text.\n\n"
         "### YOUR TASK ###\n"
-        "Analyze the provided passage's context—their name, honorifics, dialog tone, and social role—to "
-        "deduce their gender and approximate age. Then, cast them with a distinct, physical appearance. "
-        "Every character must look highly distinct from one another. Avoid generic, repetitive visual archetypes.\n\n"
+        "Analyze the provided passage's context—their name, honorifics (Mr., Mrs., Miss, Dr., Sir), dialog tone, age cues, "
+        "and social role—to deduce their gender, approximate age, and stylistic vibe. Then, cast them with a "
+        "highly cohesive, fitting, and visually distinct physical appearance appropriate for their character role "
+        "(e.g., an elegant female love interest, a rugged middle-aged detective, a distinguished elder, a tough bodyguard).\n\n"
+        "Every character in this series must look highly distinct from one another. Do NOT use lazy filler clichés. "
+        "Be extremely creative, "
+        "varying face structures, hair textures, colors, skin tones, heights, and builds to build a unique cast.\n\n"
         "### TARGET SENTENCE SCHEMA ###\n"
         "We inject your output into this exact template:\n"
         "\"{character_name} (a {{demographics}}, {{hair_and_face}}, who is {{physical_build}}, and {{distinguishing_marks}})\"\n\n"
         "Your JSON values must be short, lowercase grammatical fragments:\n"
-        "- 'demographics': Noun phrase defining their age and gender (do NOT use articles, do NOT list occupations, and do NOT use abstract personality words like 'reliable', 'composed', 'authoritative', or 'distinguished'). E.g., 'elderly woman', 'young man'.\n"
-        "- 'hair_and_face': Physical descriptors of hair style, hair color, or facial structure starting with 'with' (do NOT use transient expressions like 'smiling' or 'worried').\n"
-        "- 'physical_build': Physical height and body build.\n"
+        "- 'demographics': Noun phrase defining their age and gender (do NOT use articles, do NOT list occupations, and do NOT use abstract personality words like 'reliable', 'composed', or 'distinguished'). E.g., 'elderly woman', 'young man'.\n"
+        "- 'hair_and_face': Physical descriptors of hair style, hair color, or facial structure starting with 'with' (do NOT use transient expressions like 'smiling' or 'worried'). Make it highly cohesive and appropriate for their age, gender, and narrative role.\n"
+        "- 'physical_build': Physical height, stature, and body build.\n"
         "- 'distinguishing_marks': Set to null. Do NOT invent accessories, jewelry, scars, or glasses; leave this field as null.\n\n"
         "### CRITICAL RESTRICTIONS ###\n"
         "1. NO CLOTHING: Do not specify suits, jackets, raincoats, uniform details, or hats. Focus strictly on their body, face, and permanent physical features.\n"
-        "2. NO GAZE/LOOK/EXPRESSION: Do not use abstract behavioral terms like 'piercing gaze', 'cynical look', 'investigative eyes', or 'weathered brow' in distinguishing marks. Focus on concrete physical objects or permanent markings.\n"
-        "3. TRANSCRIPTION RESILIENCE (COMMON SENSE GENDER): Audiobook transcriptions contain frequent phonetic errors (e.g., transcribing 'ma'am' or 'Ames' as 'a man', or 'Mrs.' as 'misses'). Use overwhelming pronoun consistency (she, her, woman, Mrs., wife, husband) and name associations (e.g., Alison is a female name) to determine correct gender. If a character is called 'Mrs. Manning', 'the woman', or referred to as 'she/her' multiple times, they are female. Do NOT let a single transcription typo trick you into flipping their gender.\n"
-        "4. Output MUST be a single, valid JSON block. No commentary.\n\n"
+        "2. NO GAZE/LOOK/EXPRESSION: Focus on concrete, paintable physical features only.\n"
+        "3. Output MUST be a single, valid JSON block. No commentary.\n\n"
         "### CURRENT PROFILE STATE ###\n"
         "Currently recorded:\n"
         "{known_traits}\n"
@@ -489,6 +492,7 @@ def get_speculative_character_template() -> str:
 
 
 def get_default_character_template() -> str:
+    """Returns a strict, objective prompt for extracting written physical details from text."""
     return (
         "You are a strict, objective AI character profiler. Extract physical features for {character_name} "
         "(aka: {aliases}) from the provided book passage.\n\n"
@@ -496,28 +500,22 @@ def get_default_character_template() -> str:
         "We inject your output into this exact template:\n"
         "\"{character_name} (a {{demographics}}, {{hair_and_face}}, who is {{physical_build}}, and {{distinguishing_marks}})\"\n\n"
         "Your JSON values must be short, lowercase grammatical fragments:\n"
-        "- 'demographics': Noun phrase of age, race, gender (NO articles). E.g., 'middle-aged Caucasian man', 'young Italian woman', 'elderly woman'.\n"
-        "- 'hair_and_face': Prepositional phrase starting with 'with'. E.g., 'with thinning brown hair', 'with sharp blue eyes'.\n"
-        "- 'physical_build': Height, posture, and build. E.g., 'tall and athletic', 'short and stocky', 'petite and slender'.\n"
-        "- 'distinguishing_marks': Permanent details only (tattoos, scars, glasses). E.g., 'with a scar on his cheek'. Otherwise leave null.\n\n"
+        "- 'demographics': Noun phrase of age, race, gender (NO articles).\n"
+        "- 'hair_and_face': Prepositional phrase starting with 'with' describing hair, eyes, or facial features.\n"
+        "- 'physical_build': Height, posture, and build.\n"
+        "- 'distinguishing_marks': Permanent details only (tattoos, scars, glasses). Otherwise leave null.\n\n"
         "### CRITICAL RESTRICTIONS (STRICTLY ENFORCED) ###\n"
         "1. NO CLOTHING: Do not extract suits, jackets, raincoats, hats, or attire. The profile must be entirely clothing-free.\n"
         "2. NO TRANSIENT GESTURES/EXPRESSIONS: Ignore voice, sounds, smiles, frowns, raised eyebrows, jaw drops, parted lips, glances, or momentary physical movements. Focus on stable, lifelong features only.\n"
-        "3. ENTITY SHIELD: Often the text describes other individuals while {character_name} reacts or speaks. Do NOT extract these! Only extract traits if they explicitly describe {character_name}. If the passage transitions to a new scene or introduces a different character of the same gender (e.g., after a --- CHAPTER BREAK ---), do NOT attribute that new character's physical details (like pimples, scars, hair, or clothing) to {character_name}.\n"
-        "4. ONLY PAINTABLE VISUAL DETAILS: Your extractions must describe direct, concrete physical colors, textures, shapes, and tangible sizes (e.g., 'blonde hair', 'sharp green eyes'). Do NOT extract narrative, abstract, plot-heavy, or relational facts. If an artist cannot physically paint it, it is strictly forbidden.\n"
-        "5. PRONOUN & HONORIFIC TRACING: Pay close attention to gendered pronouns (she, her, hers, he, him, his) and titles (Mr., Mrs., Ms., Miss, Dr.) linked directly to {character_name} or their aliases. Only attribute a pronoun if it explicitly and directly refers to them. Do NOT guess or associate a nearby pronoun if another character of that gender is the active subject of the sentence.\n"
-        "6. TRANSCRIPTION RESILIENCE (COMMON SENSE GENDER): Audiobook/OCR transcriptions contain frequent phonetic errors (e.g., transcribing 'ma'am' or 'Ames' as 'a man', or 'Mrs.' as 'misses'). Use overwhelming pronoun consistency (she, her, woman, Mrs., wife, husband) and name associations (Alison is a female name) to determine correct gender. If a character is called 'Mrs. Manning', 'the woman', or referred to as 'she/her' multiple times, they are female. Do NOT let a single transcription typo trick you into flipping their gender.\n"
-        "7. STRICTLY FACTUAL DISTINGUISHING MARKS: Only extract distinguishing marks if explicitly and clearly stated in the passage. Never assume, infer, or invent accessories, jewelry, scars, or glasses.\n"
-        "8. Output MUST be a single, valid JSON block. No commentary.\n\n"
+        "3. ENTITY SHIELD: Often the text describes other individuals while {character_name} reacts or speaks. Do NOT extract these! Only extract traits if they explicitly describe {character_name}.\n"
+        "4. ONLY PAINTABLE VISUAL DETAILS: Your extractions must describe direct, concrete physical colors, textures, shapes, and tangible sizes (e.g., skin color, hair color, eye shape). Do NOT extract narrative, abstract, or relational facts. If an artist cannot physically paint it, it is strictly forbidden.\n"
+        "5. NO BLUEPRINT CLICHÉS: Do NOT invent, assume, or default to generic descriptors. If a detail is not explicitly written in the passage, leave it as null.\n"
+        "6. Output MUST be a single, valid JSON block. No commentary.\n\n"
         "### CURRENT PROFILE STATE ###\n"
         "Currently recorded:\n"
         "{known_traits}\n"
         "Unknown (needs data):\n"
         "{unknown_traits}\n\n"
-        "### INSTRUCTIONS ###\n"
-        "1. Fill missing data, or ENRICH and EXPAND upon existing traits if the passage provides more specific, detailed physical observations (e.g., expanding 'tall' to 'tall, trim, and athletic', or appending eye details to hair description).\n"
-        "2. Correct or overwrite traits ONLY if the text explicitly and authoritatively contradicts them.\n"
-        "3. Do not output unchanged fields if the passage contains no new or more descriptive details.\n\n"
         "### JSON TARGET SCHEMA ###\n"
         "{{\n"
         "  \"demographics\": \"string\" | null,\n"
@@ -607,21 +605,15 @@ async def run_stateful_character_profiling(
     speculate: bool = False
 ) -> Dict[str, Any]:
     """
-    Executes the Code-Led Stateful Extraction Loop for a single character.
-    Uses target context chunks to resolve pronouns and high-impact prompts.
-    Supports speculate=True to deduce and invent plausible details if none are written.
+    Executes a two-stage profiling pipeline:
+    1. ALWAYS runs an objective factual scan across the text chunks to capture real visual hints.
+    2. If speculate is True, runs a single speculative casting call ONLY for fields that remain blank,
+       letting the LLM use its contextual intelligence to deduce gender/age/role-appropriate traits.
     """
     llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
     model_name = get_setting("llm_model", "local-model")
     
-    if speculate:
-        system_instructions_raw = get_speculative_character_template()
-    else:
-        custom_template = get_setting("character_profiler_template", None)
-        if not custom_template or str(custom_template).strip() == "":
-            system_instructions_raw = get_default_character_template()
-        else:
-            system_instructions_raw = str(custom_template)
+    factual_template_raw = get_default_character_template()
 
     with Session(engine) as session:
         project = session.get(Project, project_id)
@@ -634,7 +626,7 @@ async def run_stateful_character_profiling(
             print(f"[Profiler] Character {char.name} is locked. Skipping.")
             return {}
 
-    # Handle existing traits based on clear_existing choice
+    # Reset or retrieve starting checklist state
     with Session(engine) as session:
         char = session.get(Character, character_id)
         if clear_existing:
@@ -663,29 +655,24 @@ async def run_stateful_character_profiling(
         aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
         alias_list = [a.alias for a in aliases]
 
-    # Target chunk size of 220 words (sweet spot for high density and context containment)
+    # Retrieve mention chunks (~220 words window)
     all_chunks = get_character_mention_chunks(project_id, character_id, book_id, chunk_size_words=220)
     if not all_chunks:
         print(f"[Profiler] No mention chunks found for character: {char.name}")
         return state_checklist
 
-    # Score each candidate chunk for logging and diagnostics, but do not re-sort
     for chunk in all_chunks:
         chunk["visual_score"] = score_chunk_visual_relevance(chunk["text"])
 
-    # Earliest Consecutive Chronological Selection
-    # Taking the chronological mentions preserves original introductory descriptions
     sampled_chunks = all_chunks[:max_chunks_to_scan]
 
+    # --- PHASE 1: OBJECTIVE FACTUAL EXTRACTION PASS ---
     scanned_count = 0
-
     for chunk_data in sampled_chunks:
-        # Instant cancellation hook
         if is_cancelled_fn and is_cancelled_fn():
-            print("[Profiler] Cancellation requested. Aborting character run.")
+            print("[Profiler] Cancellation requested. Aborting factual pass.")
             break
 
-        # Check early stopping conditions before scanning next chunk
         if early_stopping_traits:
             has_all_required = True
             for trait in early_stopping_traits:
@@ -694,16 +681,16 @@ async def run_stateful_character_profiling(
                     has_all_required = False
                     break
             if has_all_required:
-                print(f"[Profiler] Early stopping triggered. Specified traits populated: {early_stopping_traits}")
+                print(f"[Profiler] Early stopping triggered during factual pass: {early_stopping_traits}")
                 break
 
         unknown_fields = [k for k, v in state_checklist.items() if v is None or str(v).strip() == ""]
         scanned_count += 1
         chunk_text = chunk_data["text"]
 
-        # Raw chunk debugger output directed straight to python terminal console
+        # Log chunk target context purely for debugging
         print("\n" + "=" * 80)
-        print(f"[DEBUG PROFILER CHUNK] Character: {char.name} | Book: {chunk_data['book_name']} | Visual Score: {chunk_data.get('visual_score', 0)} | Offset: {chunk_data['chunk_index']} ({scanned_count}/{len(sampled_chunks)})")
+        print(f"[DEBUG PROFILER CHUNK - FACTUAL PASS] Character: {char.name} | Book: {chunk_data['book_name']} | Visual Score: {chunk_data.get('visual_score', 0)} | Offset: {chunk_data['chunk_index']} ({scanned_count}/{len(sampled_chunks)})")
         print("-" * 80)
         print(chunk_text)
         print("=" * 80 + "\n", flush=True)
@@ -712,15 +699,14 @@ async def run_stateful_character_profiling(
         unknown_display = "\n".join([f"- {k}" for k in unknown_fields]) or "None"
 
         try:
-            system_instructions = system_instructions_raw.format(
+            system_instructions = factual_template_raw.format(
                 character_name=char.name,
                 aliases=", ".join(alias_list),
                 known_traits=known_display,
                 unknown_traits=unknown_display
             )
         except Exception as e:
-            print(f"[Profiler] Dynamic prompt formatting error: {str(e)}")
-            system_instructions = system_instructions_raw\
+            system_instructions = factual_template_raw\
                 .replace("{character_name}", char.name)\
                 .replace("{aliases}", ", ".join(alias_list))\
                 .replace("{known_traits}", known_display)\
@@ -729,18 +715,18 @@ async def run_stateful_character_profiling(
         user_prompt = (
             f"### PASSAGE ###\n"
             f"\"\"\"\n{chunk_text}\n\"\"\"\n\n"
-            f"Task: Extract the physical characteristics for {char.name}. Output a single JSON block."
+            f"Task: Extract any written physical characteristics for {char.name}. Output a single JSON block."
         )
 
         full_prompt = f"{system_instructions}\n\n{user_prompt}"
 
         try:
-            print(f"[Profiler] Scanning {chunk_data['book_name']} Chunk {chunk_data['chunk_index']} for {char.name} ({scanned_count}/{len(sampled_chunks)})...")
+            print(f"[Profiler] Scanning {chunk_data['book_name']} Chunk {chunk_data['chunk_index']} factually ({scanned_count}/{len(sampled_chunks)})...")
             raw_response = await get_llm_response(full_prompt, llm_url, model_name)
             extracted_json = extract_json_from_text(raw_response)
 
             if extracted_json:
-                print(f"[Profiler] Received profiling data: {extracted_json}")
+                print(f"[Profiler] Received factual profiling data: {extracted_json}")
                 for key in state_checklist.keys():
                     new_val = extracted_json.get(key)
                     if new_val and str(new_val).strip() != "" and str(new_val).lower() != "null":
@@ -751,10 +737,69 @@ async def run_stateful_character_profiling(
                 progress_callback(char.id, scanned_count, len(sampled_chunks), state_checklist)
 
         except Exception as e:
-            print(f"[Profiler] Error during chunk scan loop: {str(e)}")
+            print(f"[Profiler] Error during factual pass: {str(e)}")
 
         await asyncio.sleep(0.5)
 
+    # --- PHASE 2: CREATIVE SPECULATIVE CASTING PASS ---
+    # Only executes if 'speculate=True' AND we still have core physical traits missing after scanning.
+    if speculate and not (is_cancelled_fn and is_cancelled_fn()):
+        core_fields = ["demographics", "physical_build", "hair_and_face"]
+        missing_fields = [f for f in core_fields if not state_checklist.get(f) or str(state_checklist.get(f)).strip() == ""]
+        
+        if missing_fields:
+            print(f"[Profiler] Entering Speculative Casting Pass for {char.name} to fill missing fields: {missing_fields}")
+            
+            speculative_template_raw = get_speculative_character_template()
+            
+            known_display = "\n".join([f"- {k}: {v}" for k, v in state_checklist.items() if v]) or "None"
+            unknown_display = "\n".join([f"- {k}" for k in missing_fields]) or "None"
+
+            try:
+                system_instructions = speculative_template_raw.format(
+                    character_name=char.name,
+                    aliases=", ".join(alias_list),
+                    known_traits=known_display,
+                    unknown_traits=unknown_display
+                )
+            except Exception as e:
+                system_instructions = speculative_template_raw\
+                    .replace("{character_name}", char.name)\
+                    .replace("{aliases}", ", ".join(alias_list))\
+                    .replace("{known_traits}", known_display)\
+                    .replace("{unknown_traits}", unknown_display)
+
+            # Use the first chunk (representative introduction) to anchor the tone
+            representative_chunk = sampled_chunks[0]["text"] if sampled_chunks else "No passage context available."
+            
+            user_prompt = (
+                f"### PASSAGE CONTEXT ###\n"
+                f"\"\"\"\n{representative_chunk}\n\"\"\"\n\n"
+                f"Task: Fill in only the missing traits {missing_fields} for {char.name} using your contextual understanding of their gender, age, tone, and role. Output a single JSON block."
+            )
+
+            full_prompt = f"{system_instructions}\n\n{user_prompt}"
+
+            try:
+                print(f"[Profiler] Executing casting speculation for {char.name}...")
+                raw_response = await get_llm_response(full_prompt, llm_url, model_name)
+                extracted_json = extract_json_from_text(raw_response)
+
+                if extracted_json:
+                    print(f"[Profiler] Received speculative casting data: {extracted_json}")
+                    for key in missing_fields:
+                        new_val = extracted_json.get(key)
+                        if new_val and str(new_val).strip() != "" and str(new_val).lower() != "null":
+                            if is_valid_permanent_trait(key, str(new_val), state_checklist[key]):
+                                state_checklist[key] = str(new_val).strip()
+
+                if progress_callback:
+                    progress_callback(char.id, len(sampled_chunks), len(sampled_chunks), state_checklist)
+
+            except Exception as e:
+                print(f"[Profiler] Error during speculative casting call: {str(e)}")
+
+    # Save finalized profiling results to database
     with Session(engine) as session:
         db_char = session.get(Character, character_id)
         if db_char:
@@ -763,7 +808,6 @@ async def run_stateful_character_profiling(
             db_char.hair_and_face = state_checklist["hair_and_face"]
             db_char.distinguishing_marks = state_checklist["distinguishing_marks"]
             
-            # Auto-compile visual description if character is unlocked
             if not db_char.locked:
                 db_char.visual_description = compile_character_visual_prompt(db_char)
                 

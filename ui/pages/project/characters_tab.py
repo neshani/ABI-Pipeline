@@ -481,31 +481,43 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
     # Keep selected_book_id as None to default to Project-wide All Books scans
 
     # --- SCROLL PRESERVATION UTILITIES ---
-    async def refresh_workspace_with_scroll():
-        """Refreshes the entire workspace while maintaining the exact scroll offset of the character list."""
+    async def restore_scroll_position():
+        """Scrolls the currently active/selected character row into view within the container."""
+        js_code = """
+        (() => {
+            let attempts = 0;
+            let timer = setInterval(() => {
+                let active = document.querySelector('.char-scroll-list .bg-blue-50');
+                if (active) {
+                    // Scrolls the list to expose the element with minimal jarring shifts
+                    active.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+                    clearInterval(timer);
+                }
+                attempts++;
+                if (attempts > 20) {
+                    clearInterval(timer);
+                }
+            }, 20);
+        })();
+        """
         try:
-            scroll_pos = await ui.run_javascript("document.querySelector('.char-scroll-list')?.scrollTop || 0")
+            await ui.run_javascript(js_code, timeout=1.0)
         except Exception:
-            scroll_pos = 0
+            pass
+
+    async def refresh_workspace_with_scroll():
+        """Refreshes individual active components in-place and aligns the active selection."""
+        draw_stats_bar.refresh()
+        draw_character_list.refresh()
+        draw_details_panel.refresh()
         
-        draw_workspace_layout.refresh()
-        
-        await asyncio.sleep(0.1)  # Allow DOM nodes to be fully created
-        if scroll_pos > 0:
-            ui.run_javascript(f"const el = document.querySelector('.char-scroll-list'); if (el) el.scrollTop = {scroll_pos};")
+        await restore_scroll_position()
 
     async def refresh_list_with_scroll():
-        """Refreshes only the list view while maintaining the exact scroll offset."""
-        try:
-            scroll_pos = await ui.run_javascript("document.querySelector('.char-scroll-list')?.scrollTop || 0")
-        except Exception:
-            scroll_pos = 0
-        
+        """Refreshes only the list view and aligns the active selection."""
         draw_character_list.refresh()
         
-        await asyncio.sleep(0.05)
-        if scroll_pos > 0:
-            ui.run_javascript(f"const el = document.querySelector('.char-scroll-list'); if (el) el.scrollTop = {scroll_pos};")
+        await restore_scroll_position()
 
     def select_char(c_id):
         """Changes focus and toggles selection styles without rebuilding the scrolling list element."""
@@ -746,40 +758,38 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
         if selected_character_id is None and filtered_list:
             selected_character_id = filtered_list[0][0].id
 
-        # Added the 'char-scroll-list' class here to easily preserve the scroll offset on refreshes
-        with ui.column().classes('w-full flex-1 overflow-y-auto gap-1 pr-1 char-scroll-list'):
-            if not filtered_list:
-                ui.label('No characters match filters.').classes('text-xs text-slate-400 text-center py-8 w-full')
-            else:
-                for char, aliases_list, mentions, completion_count in filtered_list:
-                    is_selected = char.id == selected_character_id
-                    bg_class = "bg-blue-50 border-l-4 border-blue-600 font-semibold text-blue-900" if is_selected else "hover:bg-slate-50 text-slate-700"
-                    border_class = "" if is_selected else "border-l border-slate-100"
-                    
-                    row_el = ui.row().classes(f'w-full p-2.5 rounded-lg cursor-pointer transition-colors justify-between items-center {bg_class} {border_class}')
-                    row_elements[char.id] = row_el
-                    
-                    with row_el.on('click', lambda _, c_id=char.id: select_char(c_id)):
-                        with ui.column().classes('gap-0.5 flex-1 min-w-0'):
-                            with ui.row().classes('items-center gap-1.5 min-w-0 w-full'):
-                                if char.locked:
-                                    ui.icon('lock', size='12px', color='rose-500').tooltip('Locked')
-                                else:
-                                    ui.icon('face', size='14px', color='slate-400')
-                                ui.label(char.name).classes('text-xs truncate font-semibold')
-                            
-                            summary_pieces = []
-                            if char.demographics: summary_pieces.append(char.demographics)
-                            if char.hair_and_face: summary_pieces.append(char.hair_and_face)
-                            if char.physical_build: summary_pieces.append(char.physical_build)
-                            
-                            summary_text = " • ".join(summary_pieces) if summary_pieces else "No traits profiled yet"
-                            ui.label(summary_text).classes('text-[10px] text-slate-400 truncate w-full')
+        if not filtered_list:
+            ui.label('No characters match filters.').classes('text-xs text-slate-400 text-center py-8 w-full')
+        else:
+            for char, aliases_list, mentions, completion_count in filtered_list:
+                is_selected = char.id == selected_character_id
+                bg_class = "bg-blue-50 border-l-4 border-blue-600 font-semibold text-blue-900" if is_selected else "hover:bg-slate-50 text-slate-700"
+                border_class = "" if is_selected else "border-l border-slate-100"
+                
+                row_el = ui.row().classes(f'w-full p-2.5 rounded-lg cursor-pointer transition-colors justify-between items-center {bg_class} {border_class}')
+                row_elements[char.id] = row_el
+                
+                with row_el.on('click', lambda _, c_id=char.id: select_char(c_id)):
+                    with ui.column().classes('gap-0.5 flex-1 min-w-0'):
+                        with ui.row().classes('items-center gap-1.5 min-w-0 w-full'):
+                            if char.locked:
+                                ui.icon('lock', size='12px', color='rose-500').tooltip('Locked')
+                            else:
+                                ui.icon('face', size='14px', color='slate-400')
+                            ui.label(char.name).classes('text-xs truncate font-semibold')
                         
-                        with ui.column().classes('items-end gap-1'):
-                            ui.label(f"{mentions} hits").classes('text-[10px] font-bold bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded')
-                            bar_color = "text-green-600 font-bold" if completion_count == 4 else "text-purple-600" if completion_count >= 2 else "text-slate-400"
-                            ui.label(f"{completion_count}/4 traits").classes(f'text-[9px] font-bold {bar_color}')
+                        summary_pieces = []
+                        if char.demographics: summary_pieces.append(char.demographics)
+                        if char.hair_and_face: summary_pieces.append(char.hair_and_face)
+                        if char.physical_build: summary_pieces.append(char.physical_build)
+                        
+                        summary_text = " • ".join(summary_pieces) if summary_pieces else "No traits profiled yet"
+                        ui.label(summary_text).classes('text-[10px] text-slate-400 truncate w-full')
+                    
+                    with ui.column().classes('items-end gap-1'):
+                        ui.label(f"{mentions} hits").classes('text-[10px] font-bold bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded')
+                        bar_color = "text-green-600 font-bold" if completion_count == 4 else "text-purple-600" if completion_count >= 2 else "text-slate-400"
+                        ui.label(f"{completion_count}/4 traits").classes(f'text-[9px] font-bold {bar_color}')
 
     @ui.refreshable
     def draw_details_panel():
@@ -1015,7 +1025,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             ui.label(alias.alias).classes('cursor-pointer font-medium').on(
                                 'click', 
                                 lambda _, a=alias, c_id=char.id: open_alias_explorer_dialog(
-                                    project.id, a, c_id, draw_workspace_layout.refresh
+                                    project.id, a, c_id, refresh_workspace_with_scroll
                                 )
                             ).tooltip("Click to view transcript occurrences")
                             
@@ -1220,7 +1230,9 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         on_change=on_filter_change
                     ).props('dense outlined').classes('w-32 text-xs')
                 
-                draw_character_list()
+                # Scrollable container wrapping the refreshable list
+                with ui.column().classes('w-full flex-1 overflow-y-auto gap-1 pr-1 char-scroll-list'):
+                    draw_character_list()
 
             # --- RIGHT PANEL: Selected Curation Workspace Card (col-span-8) ---
             with ui.card().classes('col-span-8 p-6 border rounded-xl bg-white h-[650px] flex flex-col gap-4'):
