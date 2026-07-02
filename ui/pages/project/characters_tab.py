@@ -20,7 +20,7 @@ from services.character_manager import (
 )
 
 # Active local state trackers
-selected_book_id: Optional[int] = None
+selected_book_id: Optional[int] = None  # None translates cleanly to "All Books"
 is_profiling_all: bool = False
 cancel_profiling_all: bool = False
 currently_profiling_char_id: Optional[int] = None
@@ -57,6 +57,308 @@ def get_character_frequency_map(project_name: str, books: List[Book]) -> Dict[st
         except Exception:
             pass
     return frequencies
+
+
+def open_batch_profiler_dialog(
+    project: Project, 
+    books: List[Book], 
+    refresh_ui_callback: Any, 
+    refresh_toolbar_callback: Any,
+    refresh_details_callback: Any
+):
+    """Opens options settings before launching character batch profiling runs."""
+    global is_profiling_all, currently_profiling_char_id, profiling_progress, cancel_profiling_all, profiler_scan_depth
+
+    # Safe refresh helper to bypass stale slot stack warnings during async tasks
+    async def safe_refresh(callback_fn):
+        try:
+            if asyncio.iscoroutinefunction(callback_fn):
+                await callback_fn()
+            else:
+                callback_fn()
+        except RuntimeError as e:
+            if "The parent element this slot belongs to" in str(e):
+                pass  # Discard stale slot lookup errors from closed modal tasks
+            else:
+                raise
+
+    with ui.dialog() as dialog, ui.card().classes('w-[520px] max-w-[95vw] p-6 rounded-xl flex flex-col gap-4 overflow-hidden'):
+        
+        # Header Row
+        with ui.row().classes('w-full justify-between items-center border-b pb-3 shrink-0'):
+            with ui.column().classes('gap-0.5'):
+                ui.label('Batch Profiler Options').classes('text-base font-bold text-slate-800')
+                ui.label('Configure rules for the automated batch sequence.').classes('text-xs text-slate-500')
+            ui.button(icon='close', on_click=dialog.close).props('flat dense').classes('text-slate-400')
+
+        # Shared Global Settings (Mentions limit)
+        with ui.row().classes('w-full items-center justify-between gap-3 bg-slate-50 p-3 rounded-lg border shrink-0'):
+            with ui.column().classes('gap-0.5'):
+                ui.label('Minimum Mentions Limit').classes('text-xs font-semibold text-slate-700')
+                ui.label('Skips low-frequency background characters.').classes('text-[10px] text-slate-400')
+            min_mentions_input = ui.number(value=5, min=1, step=1).classes('w-16 bg-white').props('outlined dense')
+
+        # Tab Navigation
+        with ui.tabs().classes('w-full border-b shrink-0') as tabs:
+            factual_tab = ui.tab('Factual').classes('text-xs font-bold')
+            creative_tab = ui.tab('Creative').classes('text-xs font-bold')
+
+        # Trigger batch execution
+        async def run_configured_batch(start_mode: str):
+            global is_profiling_all, currently_profiling_char_id, profiling_progress, cancel_profiling_all, profiler_scan_depth
+            
+            clear_existing = clear_existing_cb.value
+            min_mentions = int(min_mentions_input.value or 1)
+            run_creative_after = run_creative_after_cb.value if start_mode == "factual" else False
+            creative_target = speculate_criteria.value  # "0", "1", "all"
+
+            # Map selected stopping conditions
+            stopping_traits = []
+            if stop_demo.value: stopping_traits.append("demographics")
+            if stop_build.value: stopping_traits.append("physical_build")
+            if stop_hair.value: stopping_traits.append("hair_and_face")
+            if stop_marks.value: stopping_traits.append("distinguishing_marks")
+
+            dialog.close()
+
+            is_profiling_all = True
+            cancel_profiling_all = False
+            await safe_refresh(refresh_toolbar_callback)
+
+            client = ui.context.client
+
+            # Helper to gather base unlocked queue matching minimum mentions limit
+            def get_base_queue():
+                frequencies = get_character_frequency_map(project.name, books)
+                with Session(engine) as session:
+                    unlocked_chars = session.exec(
+                        select(Character).where(Character.project_id == project.id).where(Character.locked == False)
+                    ).all()
+                    
+                    char_aliases = {}
+                    for char in unlocked_chars:
+                        aliases = session.exec(
+                            select(CharacterAlias).where(CharacterAlias.character_id == char.id)
+                        ).all()
+                        char_aliases[char.id] = aliases
+
+                def get_char_mentions(char_obj, aliases_list):
+                    total = 0
+                    for a in aliases_list:
+                        total += frequencies.get(a.alias.lower(), 0)
+                    if not aliases_list:
+                        total = frequencies.get(char_obj.name.lower(), 0)
+                    return total
+
+                queue = []
+                for char in unlocked_chars:
+                    aliases_list = char_aliases.get(char.id, [])
+                    mentions = get_char_mentions(char, aliases_list)
+                    if mentions >= min_mentions:
+                        queue.append(char)
+                return queue
+
+            # Phase 1: Factual Extraction Pass
+            if start_mode == "factual":
+                factual_queue = get_base_queue()
+                with client:
+                    ui.notify(f"Starting factual batch for {len(factual_queue)} characters (Min. {min_mentions} mentions)...", type="info")
+
+                for idx, char in enumerate(factual_queue):
+                    if cancel_profiling_all:
+                        break
+
+                    currently_profiling_char_id = char.id
+                    profiling_progress = f"[Factual] Profiling {char.name} ({idx + 1}/{len(factual_queue)})..."
+                    await safe_refresh(refresh_toolbar_callback)
+                    
+                    if char.id == selected_character_id:
+                        await safe_refresh(refresh_details_callback)
+
+                    def make_progress_callback(char_obj=char, char_idx=idx, total_chars=len(factual_queue)):
+                        def progress_callback(c_id, scanned, total, state_checklist):
+                            global profiling_progress
+                            found_traits = [v for k, v in state_checklist.items() if v]
+                            traits_str = ", ".join(found_traits)[:40]
+                            
+                            if traits_str:
+                                profiling_progress = f"[Factual] {char_obj.name} ({char_idx + 1}/{total_chars}) [{scanned}/{total}] - {traits_str}..."
+                            else:
+                                profiling_progress = f"[Factual] {char_obj.name} ({char_idx + 1}/{total_chars}) [{scanned}/{total}]..."
+                            
+                            # Using run_coroutine to cleanly run safe_refresh asynchronously from inner sync callbacks
+                            asyncio.run_coroutine_threadsafe(safe_refresh(refresh_toolbar_callback), asyncio.get_event_loop())
+                            if char_obj.id == selected_character_id:
+                                asyncio.run_coroutine_threadsafe(safe_refresh(refresh_details_callback), asyncio.get_event_loop())
+                        return progress_callback
+                    
+                    try:
+                        await run_stateful_character_profiling(
+                            project_id=project.id, 
+                            character_id=char.id, 
+                            book_id=selected_book_id, 
+                            max_chunks_to_scan=profiler_scan_depth,
+                            clear_existing=clear_existing,
+                            early_stopping_traits=stopping_traits if stopping_traits else None,
+                            is_cancelled_fn=lambda: cancel_profiling_all,
+                            progress_callback=make_progress_callback(char, idx, len(factual_queue)),
+                            speculate=False
+                        )
+                    except Exception as ex:
+                        print(f"[Profiler] Error scanning {char.name}: {str(ex)}")
+
+            # Phase 2: Creative / Speculation Pass
+            if (start_mode == "creative" or (start_mode == "factual" and run_creative_after)) and not cancel_profiling_all:
+                base_queue = get_base_queue()
+                
+                # Helper to count non-null and non-empty traits
+                def get_trait_count(char_obj) -> int:
+                    fields = [
+                        char_obj.demographics, char_obj.physical_build, 
+                        char_obj.hair_and_face, char_obj.distinguishing_marks
+                    ]
+                    return sum(1 for f in fields if f and str(f).strip() and str(f).lower() != "null")
+
+                creative_queue = []
+                for char in base_queue:
+                    # Re-verify character record from DB to get the newly generated Factual traits
+                    with Session(engine) as session:
+                        db_char = session.get(Character, char.id)
+                        if not db_char or db_char.locked:
+                            continue
+                        traits_count = get_trait_count(db_char)
+                    
+                    if creative_target == "0" and traits_count == 0:
+                        creative_queue.append(char)
+                    elif creative_target == "1" and traits_count <= 1:
+                        creative_queue.append(char)
+                    elif creative_target == "all":
+                        creative_queue.append(char)
+
+                if creative_queue:
+                    with client:
+                        ui.notify(f"Starting creative speculation batch for {len(creative_queue)} characters...", type="info")
+
+                    for idx, char in enumerate(creative_queue):
+                        if cancel_profiling_all:
+                            break
+
+                        currently_profiling_char_id = char.id
+                        profiling_progress = f"[Creative] Casting {char.name} ({idx + 1}/{len(creative_queue)})..."
+                        await safe_refresh(refresh_toolbar_callback)
+                        
+                        if char.id == selected_character_id:
+                            await safe_refresh(refresh_details_callback)
+
+                        def make_progress_callback(char_obj=char, char_idx=idx, total_chars=len(creative_queue)):
+                            def progress_callback(c_id, scanned, total, state_checklist):
+                                global profiling_progress
+                                found_traits = [v for k, v in state_checklist.items() if v]
+                                traits_str = ", ".join(found_traits)[:40]
+                                
+                                if traits_str:
+                                    profiling_progress = f"[Creative] {char_obj.name} ({char_idx + 1}/{total_chars}) [{scanned}/{total}] - {traits_str}..."
+                                else:
+                                    profiling_progress = f"[Creative] {char_obj.name} ({char_idx + 1}/{total_chars}) [{scanned}/{total}]..."
+                                
+                                asyncio.run_coroutine_threadsafe(safe_refresh(refresh_toolbar_callback), asyncio.get_event_loop())
+                                if char_obj.id == selected_character_id:
+                                    asyncio.run_coroutine_threadsafe(safe_refresh(refresh_details_callback), asyncio.get_event_loop())
+                            return progress_callback
+
+                        try:
+                            # Run profiling with speculation enabled
+                            await run_stateful_character_profiling(
+                                project_id=project.id, 
+                                character_id=char.id, 
+                                book_id=selected_book_id, 
+                                max_chunks_to_scan=profiler_scan_depth,
+                                clear_existing=False,  # Preserve existing traits and only fill the missing ones
+                                early_stopping_traits=None,
+                                is_cancelled_fn=lambda: cancel_profiling_all,
+                                progress_callback=make_progress_callback(char, idx, len(creative_queue)),
+                                speculate=True
+                            )
+                        except Exception as ex:
+                            print(f"[Profiler] Error speculating {char.name}: {str(ex)}")
+                else:
+                    with client:
+                        ui.notify("No characters met creative target criteria.", type="info")
+
+            is_profiling_all = False
+            currently_profiling_char_id = None
+            profiling_progress = ""
+            cancel_profiling_all = False
+            
+            with client:
+                ui.notify("Batch profiling sequence completed.", type="info")
+            
+            await safe_refresh(refresh_toolbar_callback)
+            await safe_refresh(refresh_ui_callback)
+
+        # Tab Content Panels
+        with ui.tab_panels(tabs, value=factual_tab).classes('w-full flex-1 min-h-0 bg-transparent'):
+            
+            # FACTUAL PANEL
+            with ui.tab_panel(factual_tab).classes('p-0 flex flex-col gap-4 h-full justify-between'):
+                with ui.column().classes('w-full gap-4'):
+                    clear_existing_cb = ui.checkbox(
+                        'Wipe existing profile traits before profiling', 
+                        value=False
+                    ).tooltip("If checked, completely clears demographics, build, etc. before researching. If unchecked, preserves completed fields and searches only for missing traits.")
+
+                    # Early Stopping Rules
+                    with ui.column().classes('w-full gap-1.5 bg-slate-50 p-3 rounded-lg border'):
+                        ui.label('Early Stopping Criteria').classes('text-xs font-semibold text-slate-700')
+                        ui.label('Stop scanning a character as soon as selected traits are found:').classes('text-[10px] text-slate-400 mb-1')
+                        
+                        with ui.grid().classes('grid-cols-2 gap-2 w-full'):
+                            stop_demo = ui.checkbox('Demographics', value=True)
+                            stop_build = ui.checkbox('Physical Build', value=True)
+                            stop_hair = ui.checkbox('Hair & Face', value=False)
+                            stop_marks = ui.checkbox('Distinguishing Marks', value=False)
+
+                    run_creative_after_cb = ui.checkbox(
+                        'Run Creative Casting after Factual pass?', 
+                        value=False
+                    ).tooltip("If checked, characters meeting Creative Tab criteria will immediately undergo speculation following the Factual pass.")
+
+                with ui.row().classes('w-full justify-end gap-2 border-t pt-3 shrink-0 mt-auto'):
+                    ui.button('Cancel', on_click=dialog.close).props('flat').classes('text-xs text-slate-500 font-semibold')
+                    ui.button(
+                        'Run Factual', 
+                        icon='science', 
+                        on_click=lambda: run_configured_batch('factual')
+                    ).classes('bg-blue-600 text-white font-bold text-xs px-4 py-2 rounded-lg shadow-sm')
+
+            # CREATIVE PANEL
+            with ui.tab_panel(creative_tab).classes('p-0 flex flex-col gap-4 h-full justify-between'):
+                with ui.column().classes('w-full gap-4'):
+                    ui.markdown(
+                        "Creative Casting uses local LLM **speculation** to fill in sparse descriptions. "
+                        "It deduces age, demographic profiles, hair, build, or permanent accessories "
+                        "even if they are never explicitly written in the transcript."
+                    ).classes('text-xs text-slate-500 leading-relaxed bg-slate-50 p-3 rounded-lg border w-full')
+
+                    speculate_criteria = ui.select(
+                        options={
+                            "0": "Empty profiles only (0/4 traits)",
+                            "1": "Sparse profiles only (0 or 1/4 traits)",
+                            "all": "All unlocked characters"
+                        },
+                        value="0",
+                        label="Generate speculative details for characters with:"
+                    ).classes('w-full bg-white').props('outlined dense')
+
+                with ui.row().classes('w-full justify-end gap-2 border-t pt-3 shrink-0 mt-auto'):
+                    ui.button('Cancel', on_click=dialog.close).props('flat').classes('text-xs text-slate-500 font-semibold')
+                    ui.button(
+                        'Run Creative', 
+                        icon='theater_comedy', 
+                        on_click=lambda: run_configured_batch('creative')
+                    ).classes('bg-indigo-600 text-white font-bold text-xs px-4 py-2 rounded-lg shadow-sm')
+
+    dialog.open()
 
 
 def open_prompt_editor_dialog():
@@ -108,11 +410,102 @@ def open_prompt_editor_dialog():
 
     dialog.open()
 
+def open_alias_explorer_dialog(project_id: int, alias: CharacterAlias, parent_char_id: int, refresh_callback: Any):
+    """Opens a modal displaying where the selected alias occurs within project audiobook transcripts."""
+    from services.character_manager import get_alias_occurrences
+    
+    occurrences = get_alias_occurrences(project_id, alias.alias)
+    current_index = 0
+
+    with ui.dialog() as dialog, ui.card().classes('w-[600px] max-w-[95vw] p-6 rounded-xl flex flex-col gap-4 overflow-hidden'):
+        
+        with ui.row().classes('w-full justify-between items-center border-b pb-3 shrink-0'):
+            with ui.column().classes('gap-0.5'):
+                ui.label(f'Context Explorer: "{alias.alias}"').classes('text-base font-bold text-slate-800')
+                book_label = ui.label('Loading context...').classes('text-xs text-slate-500')
+            ui.button(icon='close', on_click=dialog.close).props('flat dense').classes('text-slate-400')
+
+        # Highlighted context container
+        with ui.column().classes('w-full flex-1 justify-center items-center py-6 min-h-[160px] bg-slate-50 border rounded-lg px-4 overflow-y-auto'):
+            context_html = ui.html('').classes('text-sm text-slate-700 leading-relaxed text-center')
+
+        # Footer Actions & Pagination Row (Simplified: delete button removed)
+        with ui.row().classes('w-full justify-between items-center pt-2 shrink-0'):
+            # Empty element keeps pagination elements pushed to the right
+            ui.label('').classes('flex-grow')
+
+            # Navigators
+            with ui.row().classes('gap-3 items-center'):
+                prev_btn = ui.button(icon='chevron_left', on_click=lambda: navigate(-1)).props('flat dense').classes('bg-slate-100 p-1 rounded-lg')
+                counter_label = ui.label('0 of 0').classes('text-xs font-bold text-slate-600')
+                next_btn = ui.button(icon='chevron_right', on_click=lambda: navigate(1)).props('flat dense').classes('bg-slate-100 p-1 rounded-lg')
+
+        def navigate(direction: int):
+            nonlocal current_index
+            new_idx = current_index + direction
+            if 0 <= new_idx < len(occurrences):
+                current_index = new_idx
+                update_display()
+
+        def update_display():
+            if not occurrences:
+                context_html.content = "<span class='text-slate-400 italic'>No literal transcript occurrences found for this alias.</span>"
+                counter_label.text = "0 of 0"
+                book_label.text = "No matches found"
+                prev_btn.disable()
+                next_btn.disable()
+                return
+            
+            occ = occurrences[current_index]
+            context_html.content = occ["html_context"]
+            counter_label.text = f"{current_index + 1} of {len(occurrences)}"
+            book_label.text = f"Source: {occ['book_name']}"
+            
+            # Disable buttons at boundaries
+            if current_index > 0:
+                prev_btn.enable()
+            else:
+                prev_btn.disable()
+                
+            if current_index < len(occurrences) - 1:
+                next_btn.enable()
+            else:
+                next_btn.disable()
+
+        # Load first occurrence
+        update_display()
+
+    dialog.open()
 
 def render_characters_tab(project: Project, books: List[Book], refresh_parent: Optional[Any] = None):
-    global selected_book_id
-    if selected_book_id is None and books:
-        selected_book_id = books[0].id
+    # Keep selected_book_id as None to default to Project-wide All Books scans
+
+    # --- SCROLL PRESERVATION UTILITIES ---
+    async def refresh_workspace_with_scroll():
+        """Refreshes the entire workspace while maintaining the exact scroll offset of the character list."""
+        try:
+            scroll_pos = await ui.run_javascript("document.querySelector('.char-scroll-list')?.scrollTop || 0")
+        except Exception:
+            scroll_pos = 0
+        
+        draw_workspace_layout.refresh()
+        
+        await asyncio.sleep(0.1)  # Allow DOM nodes to be fully created
+        if scroll_pos > 0:
+            ui.run_javascript(f"const el = document.querySelector('.char-scroll-list'); if (el) el.scrollTop = {scroll_pos};")
+
+    async def refresh_list_with_scroll():
+        """Refreshes only the list view while maintaining the exact scroll offset."""
+        try:
+            scroll_pos = await ui.run_javascript("document.querySelector('.char-scroll-list')?.scrollTop || 0")
+        except Exception:
+            scroll_pos = 0
+        
+        draw_character_list.refresh()
+        
+        await asyncio.sleep(0.05)
+        if scroll_pos > 0:
+            ui.run_javascript(f"const el = document.querySelector('.char-scroll-list'); if (el) el.scrollTop = {scroll_pos};")
 
     def select_char(c_id):
         """Changes focus and toggles selection styles without rebuilding the scrolling list element."""
@@ -153,7 +546,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             with ui.row().classes('items-center gap-3'):
                 ui.label('Source:').classes('text-xs font-semibold text-slate-500')
                 
-                # Upgraded: Default to dynamic Project-wide mapping
+                # Default to dynamic Project-wide mapping
                 book_options = {None: "All Books (Project-wide)"}
                 for b in books:
                     book_options[b.id] = b.name
@@ -191,7 +584,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             ui.notify(f"Discovered and indexed {len(tags)} character tags!", type="positive")
                         else:
                             ui.notify("No new bracketed character tags found in prompts.csv.", type="info")
-                    draw_workspace_layout.refresh()
+                    await refresh_workspace_with_scroll()
 
                 ui.button(
                     'Scan Tags', 
@@ -211,7 +604,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                 ui.notify(f"Merged {log['merged_name']} -> {log['target_name']}", type="info")
                         else:
                             ui.notify("No matching alias tags to merge found.", type="info")
-                    draw_workspace_layout.refresh()
+                    await refresh_workspace_with_scroll()
 
                 ui.button(
                     'Auto-Merge',
@@ -224,48 +617,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     icon='edit_note',
                     on_click=open_prompt_editor_dialog
                 ).classes('bg-slate-600 hover:bg-slate-700 text-white font-bold text-xs px-3 py-2 rounded-lg').tooltip("Customize visual profiler LLM instructions")
-
-                async def profile_all_unlocked():
-                    global is_profiling_all, currently_profiling_char_id, profiling_progress, profiler_scan_depth, cancel_profiling_all
-                    client = ui.context.client
-                    
-                    is_profiling_all = True
-                    cancel_profiling_all = False
-                    draw_header_toolbar.refresh()
-                    
-                    with Session(engine) as session:
-                        unlocked_chars = session.exec(
-                            select(Character).where(Character.project_id == project.id).where(Character.locked == False)
-                        ).all()
-
-                    with client:
-                        ui.notify(f"Starting batch profiling for {len(unlocked_chars)} characters...", type="info")
-                    
-                    for idx, char in enumerate(unlocked_chars):
-                        if cancel_profiling_all:
-                            break
-
-                        currently_profiling_char_id = char.id
-                        profiling_progress = f"Profiling {char.name} ({idx + 1}/{len(unlocked_chars)})..."
-                        draw_header_toolbar.refresh()
-                        if char.id == selected_character_id:
-                            draw_details_panel.refresh()
-                        
-                        try:
-                            await run_stateful_character_profiling(project.id, char.id, selected_book_id, max_chunks_to_scan=profiler_scan_depth)
-                        except Exception as ex:
-                            print(f"[Profiler] Error scanning {char.name}: {str(ex)}")
-
-                    is_profiling_all = False
-                    currently_profiling_char_id = None
-                    profiling_progress = ""
-                    cancel_profiling_all = False
-                    with client:
-                        ui.notify("Batch profiling sequence ended.", type="info")
-                    draw_header_toolbar.refresh()
-                    draw_character_list.refresh()
-                    draw_details_panel.refresh()
-                    draw_stats_bar.refresh()
 
                 if is_profiling_all:
                     with ui.row().classes('items-center gap-2 bg-purple-50 border border-purple-200 px-3 py-1.5 rounded-lg'):
@@ -288,8 +639,15 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     ui.button(
                         'Profile All', 
                         icon='bolt', 
-                        on_click=profile_all_unlocked
+                        on_click=lambda: open_batch_profiler_dialog(
+                            project, 
+                            books, 
+                            refresh_workspace_with_scroll, 
+                            draw_header_toolbar.refresh,
+                            draw_details_panel.refresh
+                        )
                     ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-3 py-2 rounded-lg')
+
 
     @ui.refreshable
     def draw_stats_bar():
@@ -388,7 +746,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
         if selected_character_id is None and filtered_list:
             selected_character_id = filtered_list[0][0].id
 
-        with ui.column().classes('w-full flex-1 overflow-y-auto gap-1 pr-1'):
+        # Added the 'char-scroll-list' class here to easily preserve the scroll offset on refreshes
+        with ui.column().classes('w-full flex-1 overflow-y-auto gap-1 pr-1 char-scroll-list'):
             if not filtered_list:
                 ui.label('No characters match filters.').classes('text-xs text-slate-400 text-center py-8 w-full')
             else:
@@ -467,7 +826,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             with ui.row().classes('items-center gap-3'):
                 ui.icon('face', size='md', color='blue-600')
                 
-                def handle_name_blur(e, char_id=char.id):
+                async def handle_name_blur(e, char_id=char.id):
                     new_name = e.sender.value.strip()
                     if not new_name:
                         return
@@ -479,7 +838,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             session.commit()
                     save_project_characters_to_json(project.id)
                     ui.notify(f"Renamed profile to: {new_name}", type="info")
-                    draw_character_list.refresh()
+                    await refresh_list_with_scroll()
                     draw_details_panel.refresh()
 
                 ui.input(
@@ -506,19 +865,50 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             ui.notify(f"Profiling failed: {str(ex)}", type="negative")
                     
                     currently_profiling_char_id = None
-                    draw_workspace_layout.refresh()
+                    await refresh_workspace_with_scroll()
+
+                async def speculate_single_char():
+                    global currently_profiling_char_id, profiler_scan_depth
+                    client = ui.context.client
+                    currently_profiling_char_id = char.id
+                    draw_details_panel.refresh()
+                    
+                    try:
+                        with client:
+                            ui.notify(f"Speculating character casting vibe for {char.name}...", type="info")
+                        await run_stateful_character_profiling(
+                            project.id, 
+                            char.id, 
+                            selected_book_id, 
+                            max_chunks_to_scan=profiler_scan_depth,
+                            speculate=True
+                        )
+                        with client:
+                            ui.notify("Casting speculation completed!", type="positive")
+                    except Exception as ex:
+                        with client:
+                            ui.notify(f"Speculation failed: {str(ex)}", type="negative")
+                    
+                    currently_profiling_char_id = None
+                    await refresh_workspace_with_scroll()
 
                 is_card_profiling = currently_profiling_char_id == char.id
                 if is_card_profiling:
                     with ui.row().classes('items-center gap-1.5 bg-purple-50 px-3 py-1.5 rounded-lg border border-purple-200'):
                         ui.spinner(size='xs', color='purple')
-                        ui.label('LLM Researching...').classes('text-xs text-purple-700 font-bold')
+                        ui.label('LLM Active...').classes('text-xs text-purple-700 font-bold')
                 else:
                     ui.button(
                         'Research (LLM)', 
                         icon='science', 
                         on_click=scan_single_char
-                    ).classes('text-white font-bold text-xs bg-purple-600 hover:bg-purple-700')
+                    ).classes('text-white font-bold text-xs bg-purple-600 hover:bg-purple-700').tooltip("Scan the text for actual, written physical descriptions of this character.")
+                    
+                    ui.button(
+                        'Deduce Vibe', 
+                        icon='theater_comedy', 
+                        on_click=speculate_single_char
+                    ).classes('text-white font-bold text-xs bg-indigo-600 hover:bg-indigo-700').tooltip("Deduce gender, age, job, and cast a plausible visual description when no physical descriptions are written in the text.")
 
                 def toggle_locked(c_id=char.id, val=not char.locked):
                     with Session(engine) as session:
@@ -540,7 +930,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     on_click=lambda c_id=char.id: toggle_locked(c_id)
                 ).props('flat dense').classes(f'p-1.5 rounded-lg {lock_color}').tooltip('Toggle manual editing lock')
 
-                def delete_profile(c_id=char.id):
+                async def delete_profile(c_id=char.id):
                     global selected_character_id
                     with Session(engine) as session:
                         db_char = session.get(Character, c_id)
@@ -561,7 +951,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             session.commit()
                     save_project_characters_to_json(project.id)
                     selected_character_id = None
-                    draw_workspace_layout.refresh()
+                    await refresh_workspace_with_scroll()
                     ui.notify("Character profile deleted.", type="warning")
 
                 ui.button(
@@ -577,51 +967,62 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 
                 with ui.row().classes('w-full gap-2 flex-wrap items-center'):
                     for alias in aliases:
-                        def delete_alias(a_id=alias.id, char_id=char.id):
-                            global selected_character_id
-                            with Session(engine) as session:
-                                db_alias = session.get(CharacterAlias, a_id)
-                                if db_alias:
-                                    alias_name = db_alias.alias
-                                    session.delete(db_alias)
-                                    session.commit()
-                                    
-                                    # Spin off a new standalone character if it wasn't the primary self-alias
-                                    if alias_name.lower() != char.name.lower():
-                                        new_char = Character(project_id=project.id, name=alias_name)
-                                        session.add(new_char)
+                        def make_delete_handler(alias_obj=alias, char_id=char.id):
+                            async def handle():
+                                global selected_character_id
+                                with Session(engine) as session:
+                                    db_alias = session.get(CharacterAlias, alias_obj.id)
+                                    if db_alias:
+                                        alias_name = db_alias.alias
+                                        session.delete(db_alias)
                                         session.commit()
                                         
-                                        # Self-alias the new character
-                                        new_alias = CharacterAlias(character_id=new_char.id, alias=alias_name)
-                                        session.add(new_alias)
-                                        session.commit()
-                                        
-                                        # Compile visual prompt for the new character
-                                        new_char.visual_description = compile_character_visual_prompt(new_char)
-                                        session.add(new_char)
-                                        session.commit()
-                                        
-                                        ui.notify(f"Spun off '{alias_name}' into its own standalone profile!", type="positive")
+                                        # Spin off a standalone character if it was not the primary self-alias
+                                        if alias_name.lower() != char.name.lower():
+                                            new_char = Character(project_id=project.id, name=alias_name)
+                                            session.add(new_char)
+                                            session.commit()
+                                            
+                                            new_alias = CharacterAlias(character_id=new_char.id, alias=alias_name)
+                                            session.add(new_alias)
+                                            session.commit()
+                                            
+                                            new_char.visual_description = compile_character_visual_prompt(new_char)
+                                            session.add(new_char)
+                                            session.commit()
+                                            
+                                            ui.notify(f"Spun off '{alias_name}' into standalone profile!", type="positive")
 
-                                # Clean up if Character is now empty of aliases
-                                rem = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char_id)).all()
-                                if not rem:
-                                    db_char = session.get(Character, char_id)
-                                    if db_char:
-                                        session.delete(db_char)
-                                        session.commit()
-                                        selected_character_id = None
+                                    # Clear out parent character if empty of aliases
+                                    rem = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char_id)).all()
+                                    if not rem:
+                                        db_char = session.get(Character, char_id)
+                                        if db_char:
+                                            session.delete(db_char)
+                                            session.commit()
+                                            selected_character_id = None
+                                
+                                save_project_characters_to_json(project.id)
+                                await refresh_workspace_with_scroll()
+                                ui.notify("Alias removed.", type="info")
+                            return handle
+
+                        # Interactive Custom Chip: click text for Context Modal, click cancel icon to delete
+                        with ui.row().classes(
+                            'items-center gap-1.5 bg-white border border-slate-200 px-2.5 py-1 rounded-full text-xs text-slate-800 hover:bg-slate-50 transition-colors shadow-sm'
+                        ):
+                            # Clickable Text to trigger Dialog Context Explorer
+                            ui.label(alias.alias).classes('cursor-pointer font-medium').on(
+                                'click', 
+                                lambda _, a=alias, c_id=char.id: open_alias_explorer_dialog(
+                                    project.id, a, c_id, draw_workspace_layout.refresh
+                                )
+                            ).tooltip("Click to view transcript occurrences")
                             
-                            save_project_characters_to_json(project.id)
-                            draw_workspace_layout.refresh()
-                            ui.notify("Alias removed.", type="info")
-
-                        ui.chip(
-                            alias.alias, 
-                            removable=True, 
-                            on_value_change=lambda e, a_id=alias.id: delete_alias(a_id) if not e.value else None
-                        ).classes('text-xs bg-white border border-slate-200 text-slate-800')
+                            # Clean click action to trigger deletion/spin-off
+                            ui.icon('cancel', size='14px', color='slate-400').classes(
+                                'cursor-pointer hover:text-red-500 transition-colors'
+                            ).on('click', make_delete_handler(alias, char.id))
 
                 other_chars = [c for c in all_characters if c.id != char.id]
                 if other_chars:
@@ -651,7 +1052,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             await asyncio.to_thread(merge_character_aliases, project.id, c_id, alias_ids)
                             with client:
                                 ui.notify("Merged successfully!", type="positive")
-                            draw_workspace_layout.refresh()
+                            await refresh_workspace_with_scroll()
 
                         ui.button(
                             'Merge',
@@ -758,7 +1159,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             ui.notify(f"Discovered and indexed {len(tags)} character tags!", type="positive")
                         else:
                             ui.notify("No new bracketed character tags found in prompts.csv.", type="info")
-                    draw_workspace_layout.refresh()
+                    await refresh_workspace_with_scroll()
 
                 ui.button(
                     'Scan for Bracketed Prompt Tags', 

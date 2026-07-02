@@ -24,6 +24,7 @@ def compile_character_visual_prompt(char: Character) -> str:
     """
     Assembles a descriptive, natural language physical prompt from simplified structured traits.
     Optimized for single-stream text encoders like Qwen (Z-Image Turbo).
+    Deduplicates overlapping traits to prevent prompt weight bloat.
     """
     pieces = []
     
@@ -36,7 +37,14 @@ def compile_character_visual_prompt(char: Character) -> str:
     if char.distinguishing_marks and str(char.distinguishing_marks).strip():
         pieces.append(char.distinguishing_marks.strip())
 
-    cleaned_pieces = [p.strip() for p in pieces if p and str(p).strip()]
+    cleaned_pieces = []
+    seen = set()
+    for p in pieces:
+        p_clean = p.strip()
+        if p_clean and p_clean.lower() not in seen:
+            cleaned_pieces.append(p_clean)
+            seen.add(p_clean.lower())
+
     if not cleaned_pieces:
         return f"a person named {char.name}"
         
@@ -278,12 +286,13 @@ def get_character_mention_chunks(
     project_id: int,
     character_id: int,
     book_id: Optional[int] = None,
-    chunk_size_words: int = 800
+    chunk_size_words: int = 150
 ) -> List[Dict[str, Any]]:
     """
-    Retrieves chunks of transcript.txt containing character aliases.
-    If book_id is provided, limits scan to that book.
-    If book_id is None, scans all books in the project, returning them in chronological order.
+    Retrieves consecutive, chronological snippet windows of transcript.txt centered on character aliases.
+    Maintains strictly sequential order (earliest first) to capture introductions and development in order.
+    Supports multi-word aliases (e.g., "Sir Winston") flawlessly via regex-to-word-index mapping.
+    Safeguards against cross-book character bleeding by filtering book scans to only those with active prompt hits.
     """
     base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
     
@@ -293,17 +302,25 @@ def get_character_mention_chunks(
             return []
             
         aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == character_id)).all()
-        alias_texts = {a.alias.lower() for a in aliases}
+        alias_texts = {a.alias.lower().strip() for a in aliases}
         if not alias_texts:
             return []
 
         if book_id:
             books = [session.get(Book, book_id)]
         else:
-            # Query all books inside the project, ordered chronologically
-            books = session.exec(
+            # Optimize and safeguard: Only scan books where this character actually has prompt tags in prompts.csv.
+            # This prevents character profile bleeding across separate books for common names (e.g. "Marvin", "Joe").
+            book_mentions = get_character_book_mentions(project_id, character_id)
+            all_books = session.exec(
                 select(Book).where(Book.project_id == project_id).order_by(Book.id)
             ).all()
+            
+            if book_mentions:
+                books = [b for b in all_books if b.name in book_mentions]
+            else:
+                # Fallback: If no tags are active anywhere yet, scan all books so discovery is still possible.
+                books = all_books
 
     mention_chunks = []
     
@@ -321,20 +338,52 @@ def get_character_mention_chunks(
             print(f"[Profiler] Error reading transcript for {book.name}: {str(e)}")
             continue
 
-        cleaned_text = content.replace("==CHAPTER==", " ").strip()
-        all_chunks = smart_chunk_text(cleaned_text, chunk_size_words)
+        # Inject visible chapter break barriers to prevent LLM attention bleeding across scene transitions
+        cleaned_text = content.replace("==CHAPTER==", "\n\n--- CHAPTER BREAK ---\n\n").strip()
         
-        for idx, chunk in enumerate(all_chunks):
-            lower_chunk = chunk.lower()
-            mentions_count = sum(len(re.findall(re.escape(alias), lower_chunk)) for alias in alias_texts)
-            if mentions_count > 0:
-                mention_chunks.append({
-                    "book_id": book.id,
-                    "book_name": book.name,
-                    "chunk_index": idx,
-                    "text": chunk,
-                    "mentions_count": mentions_count
-                })
+        # Scan raw transcript text using regex to find all matches of any alias.
+        # This completely resolves the multi-word alias bug.
+        match_positions = []
+        for alias in alias_texts:
+            pattern = re.compile(rf"\b{re.escape(alias)}\b", re.IGNORECASE)
+            for m in pattern.finditer(cleaned_text):
+                match_positions.append(m.start())
+                
+        if not match_positions:
+            continue
+
+        # Earliest Consecutive Chronological Selection:
+        # Take consecutive hits sequentially starting from her first introduction.
+        # We cap the chronological index list at 50 to keep memory lightweight.
+        sampled_char_offsets = sorted(list(set(match_positions)))[:50]
+
+        # Split entire transcript into raw words
+        words = re.findall(r'\S+', cleaned_text)
+        if not words:
+            continue
+
+        half_window = chunk_size_words // 2
+        for start_pos in sampled_char_offsets:
+            # Map character start offset to exact word index
+            words_before_count = len(re.findall(r'\S+', cleaned_text[:start_pos]))
+            
+            start_idx = max(0, words_before_count - half_window)
+            end_idx = min(len(words), words_before_count + half_window)
+            
+            snippet_words = words[start_idx:end_idx]
+            snippet_text = " ".join(snippet_words)
+            
+            # Count the alias mentions inside this focus window
+            snippet_lower = snippet_text.lower()
+            mentions_count = sum(len(re.findall(re.escape(alias), snippet_lower)) for alias in alias_texts)
+
+            mention_chunks.append({
+                "book_id": book.id,
+                "book_name": book.name,
+                "chunk_index": start_idx,
+                "text": snippet_text,
+                "mentions_count": mentions_count
+            })
 
     return mention_chunks
 
@@ -402,9 +451,44 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
 
     return {}
 
+def get_speculative_character_template() -> str:
+    """Returns a creative system prompt instructing the LLM to act as a casting director when physical details are missing."""
+    return (
+        "You are an expert creative casting director and character concept designer. The target character, "
+        "{character_name} (aka: {aliases}), lacks complete physical descriptions in the text.\n\n"
+        "### YOUR TASK ###\n"
+        "Analyze the provided passage's context—their name, honorifics, dialog tone, and social role—to "
+        "deduce their gender and approximate age. Then, cast them with a distinct, physical appearance. "
+        "Every character must look highly distinct from one another. Avoid generic, repetitive visual archetypes.\n\n"
+        "### TARGET SENTENCE SCHEMA ###\n"
+        "We inject your output into this exact template:\n"
+        "\"{character_name} (a {{demographics}}, {{hair_and_face}}, who is {{physical_build}}, and {{distinguishing_marks}})\"\n\n"
+        "Your JSON values must be short, lowercase grammatical fragments:\n"
+        "- 'demographics': Noun phrase defining their age and gender (do NOT use articles, do NOT list occupations, and do NOT use abstract personality words like 'reliable', 'composed', 'authoritative', or 'distinguished'). E.g., 'elderly woman', 'young man'.\n"
+        "- 'hair_and_face': Physical descriptors of hair style, hair color, or facial structure starting with 'with' (do NOT use transient expressions like 'smiling' or 'worried').\n"
+        "- 'physical_build': Physical height and body build.\n"
+        "- 'distinguishing_marks': Set to null. Do NOT invent accessories, jewelry, scars, or glasses; leave this field as null.\n\n"
+        "### CRITICAL RESTRICTIONS ###\n"
+        "1. NO CLOTHING: Do not specify suits, jackets, raincoats, uniform details, or hats. Focus strictly on their body, face, and permanent physical features.\n"
+        "2. NO GAZE/LOOK/EXPRESSION: Do not use abstract behavioral terms like 'piercing gaze', 'cynical look', 'investigative eyes', or 'weathered brow' in distinguishing marks. Focus on concrete physical objects or permanent markings.\n"
+        "3. TRANSCRIPTION RESILIENCE (COMMON SENSE GENDER): Audiobook transcriptions contain frequent phonetic errors (e.g., transcribing 'ma'am' or 'Ames' as 'a man', or 'Mrs.' as 'misses'). Use overwhelming pronoun consistency (she, her, woman, Mrs., wife, husband) and name associations (e.g., Alison is a female name) to determine correct gender. If a character is called 'Mrs. Manning', 'the woman', or referred to as 'she/her' multiple times, they are female. Do NOT let a single transcription typo trick you into flipping their gender.\n"
+        "4. Output MUST be a single, valid JSON block. No commentary.\n\n"
+        "### CURRENT PROFILE STATE ###\n"
+        "Currently recorded:\n"
+        "{known_traits}\n"
+        "Unknown (needs data):\n"
+        "{unknown_traits}\n\n"
+        "### JSON TARGET SCHEMA ###\n"
+        "{{\n"
+        "  \"demographics\": \"string\",\n"
+        "  \"hair_and_face\": \"string\",\n"
+        "  \"physical_build\": \"string\",\n"
+        "  \"distinguishing_marks\": \"string\" | null\n"
+        "}}\n"
+    )
+
 
 def get_default_character_template() -> str:
-    """Returns default visual profiling instructions emphasizing paintable concrete details and banning narrative plots."""
     return (
         "You are a strict, objective AI character profiler. Extract physical features for {character_name} "
         "(aka: {aliases}) from the provided book passage.\n\n"
@@ -412,24 +496,28 @@ def get_default_character_template() -> str:
         "We inject your output into this exact template:\n"
         "\"{character_name} (a {{demographics}}, {{hair_and_face}}, who is {{physical_build}}, and {{distinguishing_marks}})\"\n\n"
         "Your JSON values must be short, lowercase grammatical fragments:\n"
-        "- 'demographics': Noun phrase of age, race, gender (NO articles). E.g., 'middle-aged Caucasian man', 'young Italian woman'.\n"
+        "- 'demographics': Noun phrase of age, race, gender (NO articles). E.g., 'middle-aged Caucasian man', 'young Italian woman', 'elderly woman'.\n"
         "- 'hair_and_face': Prepositional phrase starting with 'with'. E.g., 'with thinning brown hair', 'with sharp blue eyes'.\n"
-        "- 'physical_build': Height, posture, and build. E.g., 'tall and athletic', 'short and stocky'.\n"
-        "- 'distinguishing_marks': Permanent details only (tattoos, scars, glasses). E.g., 'with a scar on his cheek'.\n\n"
+        "- 'physical_build': Height, posture, and build. E.g., 'tall and athletic', 'short and stocky', 'petite and slender'.\n"
+        "- 'distinguishing_marks': Permanent details only (tattoos, scars, glasses). E.g., 'with a scar on his cheek'. Otherwise leave null.\n\n"
         "### CRITICAL RESTRICTIONS (STRICTLY ENFORCED) ###\n"
         "1. NO CLOTHING: Do not extract suits, jackets, raincoats, hats, or attire. The profile must be entirely clothing-free.\n"
         "2. NO TRANSIENT GESTURES/EXPRESSIONS: Ignore voice, sounds, smiles, frowns, raised eyebrows, jaw drops, parted lips, glances, or momentary physical movements. Focus on stable, lifelong features only.\n"
-        "3. ENTITY SHIELD: Often the text describes a perp, suspect, bystander, or corpse (e.g., 'a male Caucasian 5'6\"' or 'the doctor at the bar') while {character_name} reacts or speaks. Do NOT extract these! Only extract traits if they explicitly describe {character_name}.\n"
-        "4. ONLY PAINTABLE VISUAL DETAILS: Your extractions must describe direct, concrete physical colors, textures, shapes, and tangible sizes (e.g., 'blonde hair', 'sharp green eyes'). Do NOT extract narrative, abstract, plot-heavy, or relational facts (e.g., 'hair color matching a Jane Doe', 'looked like her mother', 'with a face known to police'). If an artist cannot physically paint it, it is strictly forbidden.\n"
-        "5. Output MUST be a single, valid JSON block. No commentary.\n\n"
+        "3. ENTITY SHIELD: Often the text describes other individuals while {character_name} reacts or speaks. Do NOT extract these! Only extract traits if they explicitly describe {character_name}. If the passage transitions to a new scene or introduces a different character of the same gender (e.g., after a --- CHAPTER BREAK ---), do NOT attribute that new character's physical details (like pimples, scars, hair, or clothing) to {character_name}.\n"
+        "4. ONLY PAINTABLE VISUAL DETAILS: Your extractions must describe direct, concrete physical colors, textures, shapes, and tangible sizes (e.g., 'blonde hair', 'sharp green eyes'). Do NOT extract narrative, abstract, plot-heavy, or relational facts. If an artist cannot physically paint it, it is strictly forbidden.\n"
+        "5. PRONOUN & HONORIFIC TRACING: Pay close attention to gendered pronouns (she, her, hers, he, him, his) and titles (Mr., Mrs., Ms., Miss, Dr.) linked directly to {character_name} or their aliases. Only attribute a pronoun if it explicitly and directly refers to them. Do NOT guess or associate a nearby pronoun if another character of that gender is the active subject of the sentence.\n"
+        "6. TRANSCRIPTION RESILIENCE (COMMON SENSE GENDER): Audiobook/OCR transcriptions contain frequent phonetic errors (e.g., transcribing 'ma'am' or 'Ames' as 'a man', or 'Mrs.' as 'misses'). Use overwhelming pronoun consistency (she, her, woman, Mrs., wife, husband) and name associations (Alison is a female name) to determine correct gender. If a character is called 'Mrs. Manning', 'the woman', or referred to as 'she/her' multiple times, they are female. Do NOT let a single transcription typo trick you into flipping their gender.\n"
+        "7. STRICTLY FACTUAL DISTINGUISHING MARKS: Only extract distinguishing marks if explicitly and clearly stated in the passage. Never assume, infer, or invent accessories, jewelry, scars, or glasses.\n"
+        "8. Output MUST be a single, valid JSON block. No commentary.\n\n"
         "### CURRENT PROFILE STATE ###\n"
         "Currently recorded:\n"
         "{known_traits}\n"
         "Unknown (needs data):\n"
         "{unknown_traits}\n\n"
         "### INSTRUCTIONS ###\n"
-        "Fill missing data or correct old provisional traits ONLY if this text passage clearly and explicitly contradicts them with authoritative evidence. "
-        "Do not output unchanged fields.\n\n"
+        "1. Fill missing data, or ENRICH and EXPAND upon existing traits if the passage provides more specific, detailed physical observations (e.g., expanding 'tall' to 'tall, trim, and athletic', or appending eye details to hair description).\n"
+        "2. Correct or overwrite traits ONLY if the text explicitly and authoritatively contradicts them.\n"
+        "3. Do not output unchanged fields if the passage contains no new or more descriptive details.\n\n"
         "### JSON TARGET SCHEMA ###\n"
         "{{\n"
         "  \"demographics\": \"string\" | null,\n"
@@ -483,25 +571,57 @@ def is_valid_permanent_trait(key: str, new_val: str, old_val: Optional[str] = No
     return True
 
 
+def score_chunk_visual_relevance(text: str) -> int:
+    """Computes a heuristic score for how likely a text chunk is to contain physical descriptions."""
+    text_lower = text.lower()
+    
+    # Highly diagnostic visual description keywords
+    visual_keywords = [
+        "hair", "eyes", "tall", "short", "build", "face", "handsome", "pretty", "slender", 
+        "stocky", "athletic", "physique", "glasses", "beard", "mustache", "scar", "tattoo", 
+        "height", "weight", "slim", "skin", "complexion", "features", "jaw", "shoulders", 
+        "looking", "looked", "blond", "blonde", "brunette", "brown", "black", "blue", "green", 
+        "gray", "grey", "bald", "shaven", "he was a", "she was a", "years old",
+        # Expanded keywords focusing on high-density descriptive scenes
+        "trim", "slender", "beautiful", "gorgeous", "shapely", "naked", "shower", "back", 
+        "buttocks", "chest", "waist", "figure", "attractive", "stature"
+    ]
+    
+    score = 0
+    for kw in visual_keywords:
+        if kw in text_lower:
+            score += 1
+            
+    return score
+
+
 async def run_stateful_character_profiling(
     project_id: int, 
     character_id: int, 
     book_id: Optional[int] = None, 
     max_chunks_to_scan: int = 5,
-    progress_callback: Optional[Any] = None
+    clear_existing: bool = True,
+    early_stopping_traits: Optional[List[str]] = None,
+    is_cancelled_fn: Optional[Any] = None,
+    progress_callback: Optional[Any] = None,
+    speculate: bool = False
 ) -> Dict[str, Any]:
     """
     Executes the Code-Led Stateful Extraction Loop for a single character.
-    Chronologically scans chunks mentioning the character's aliases from book transcripts.
+    Uses target context chunks to resolve pronouns and high-impact prompts.
+    Supports speculate=True to deduce and invent plausible details if none are written.
     """
     llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
     model_name = get_setting("llm_model", "local-model")
     
-    custom_template = get_setting("character_profiler_template", None)
-    if not custom_template or str(custom_template).strip() == "":
-        system_instructions_raw = get_default_character_template()
+    if speculate:
+        system_instructions_raw = get_speculative_character_template()
     else:
-        system_instructions_raw = str(custom_template)
+        custom_template = get_setting("character_profiler_template", None)
+        if not custom_template or str(custom_template).strip() == "":
+            system_instructions_raw = get_default_character_template()
+        else:
+            system_instructions_raw = str(custom_template)
 
     with Session(engine) as session:
         project = session.get(Project, project_id)
@@ -514,40 +634,79 @@ async def run_stateful_character_profiling(
             print(f"[Profiler] Character {char.name} is locked. Skipping.")
             return {}
 
-        # WIPE OLD AUTO-GENERATED TRAITS FOR A CLEAN SLATE PASS
-        char.demographics = None
-        char.physical_build = None
-        char.hair_and_face = None
-        char.distinguishing_marks = None
-        char.visual_description = None
-        session.add(char)
-        session.commit()
+    # Handle existing traits based on clear_existing choice
+    with Session(engine) as session:
+        char = session.get(Character, character_id)
+        if clear_existing:
+            char.demographics = None
+            char.physical_build = None
+            char.hair_and_face = None
+            char.distinguishing_marks = None
+            char.visual_description = None
+            session.add(char)
+            session.commit()
+            
+            state_checklist = {
+                "demographics": None,
+                "physical_build": None,
+                "hair_and_face": None,
+                "distinguishing_marks": None
+            }
+        else:
+            state_checklist = {
+                "demographics": char.demographics,
+                "physical_build": char.physical_build,
+                "hair_and_face": char.hair_and_face,
+                "distinguishing_marks": char.distinguishing_marks
+            }
 
         aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
         alias_list = [a.alias for a in aliases]
 
-    # Initialize running state with a clean slate
-    state_checklist = {
-        "demographics": None,
-        "physical_build": None,
-        "hair_and_face": None,
-        "distinguishing_marks": None
-    }
-
-    chunks = get_character_mention_chunks(project_id, character_id, book_id, chunk_size_words=800)
-    if not chunks:
+    # Target chunk size of 220 words (sweet spot for high density and context containment)
+    all_chunks = get_character_mention_chunks(project_id, character_id, book_id, chunk_size_words=220)
+    if not all_chunks:
         print(f"[Profiler] No mention chunks found for character: {char.name}")
         return state_checklist
 
+    # Score each candidate chunk for logging and diagnostics, but do not re-sort
+    for chunk in all_chunks:
+        chunk["visual_score"] = score_chunk_visual_relevance(chunk["text"])
+
+    # Earliest Consecutive Chronological Selection
+    # Taking the chronological mentions preserves original introductory descriptions
+    sampled_chunks = all_chunks[:max_chunks_to_scan]
+
     scanned_count = 0
 
-    for chunk_data in chunks:
-        if scanned_count >= max_chunks_to_scan:
+    for chunk_data in sampled_chunks:
+        # Instant cancellation hook
+        if is_cancelled_fn and is_cancelled_fn():
+            print("[Profiler] Cancellation requested. Aborting character run.")
             break
+
+        # Check early stopping conditions before scanning next chunk
+        if early_stopping_traits:
+            has_all_required = True
+            for trait in early_stopping_traits:
+                val = state_checklist.get(trait)
+                if not val or str(val).strip() == "" or str(val).lower() == "null":
+                    has_all_required = False
+                    break
+            if has_all_required:
+                print(f"[Profiler] Early stopping triggered. Specified traits populated: {early_stopping_traits}")
+                break
 
         unknown_fields = [k for k, v in state_checklist.items() if v is None or str(v).strip() == ""]
         scanned_count += 1
         chunk_text = chunk_data["text"]
+
+        # Raw chunk debugger output directed straight to python terminal console
+        print("\n" + "=" * 80)
+        print(f"[DEBUG PROFILER CHUNK] Character: {char.name} | Book: {chunk_data['book_name']} | Visual Score: {chunk_data.get('visual_score', 0)} | Offset: {chunk_data['chunk_index']} ({scanned_count}/{len(sampled_chunks)})")
+        print("-" * 80)
+        print(chunk_text)
+        print("=" * 80 + "\n", flush=True)
 
         known_display = "\n".join([f"- {k}: {v}" for k, v in state_checklist.items() if v]) or "None"
         unknown_display = "\n".join([f"- {k}" for k in unknown_fields]) or "None"
@@ -568,16 +727,15 @@ async def run_stateful_character_profiling(
                 .replace("{unknown_traits}", unknown_display)
 
         user_prompt = (
-            f"### CURRENT TEXT PASSAGE (from {chunk_data['book_name']}) ###\n"
+            f"### PASSAGE ###\n"
             f"\"\"\"\n{chunk_text}\n\"\"\"\n\n"
-            f"Task: Review the passage. Extract facts for the unknown traits or self-correct "
-            f"any contradicted provisional details. Respond with a single JSON block."
+            f"Task: Extract the physical characteristics for {char.name}. Output a single JSON block."
         )
 
         full_prompt = f"{system_instructions}\n\n{user_prompt}"
 
         try:
-            print(f"[Profiler] Scanning {chunk_data['book_name']} Chunk {chunk_data['chunk_index']} for {char.name} ({scanned_count}/{max_chunks_to_scan})...")
+            print(f"[Profiler] Scanning {chunk_data['book_name']} Chunk {chunk_data['chunk_index']} for {char.name} ({scanned_count}/{len(sampled_chunks)})...")
             raw_response = await get_llm_response(full_prompt, llm_url, model_name)
             extracted_json = extract_json_from_text(raw_response)
 
@@ -590,7 +748,7 @@ async def run_stateful_character_profiling(
                             state_checklist[key] = str(new_val).strip()
 
             if progress_callback:
-                progress_callback(char.id, scanned_count, max_chunks_to_scan, state_checklist)
+                progress_callback(char.id, scanned_count, len(sampled_chunks), state_checklist)
 
         except Exception as e:
             print(f"[Profiler] Error during chunk scan loop: {str(e)}")
@@ -805,6 +963,7 @@ def compile_character_description(char: Character, enabled_fields: Dict[str, boo
     """
     Assembles selected character traits into either a comma-separated list 
     or a parenthetical relative clause to bound traits and prevent bleeding.
+    Deduplicates traits programmatically to prevent redundant features.
     If no traits are populated, returns the character's name directly.
     """
     demo = char.demographics if enabled_fields.get("demographics", True) else None
@@ -827,7 +986,14 @@ def compile_character_description(char: Character, enabled_fields: Dict[str, boo
         if build: pieces.append(build.strip())
         if marks: pieces.append(marks.strip())
 
-        cleaned_pieces = [p.strip() for p in pieces if p and str(p).strip()]
+        cleaned_pieces = []
+        seen = set()
+        for p in pieces:
+            p_clean = p.strip()
+            if p_clean and p_clean.lower() not in seen:
+                cleaned_pieces.append(p_clean)
+                seen.add(p_clean.lower())
+
         if not cleaned_pieces:
             return char.name
             
@@ -842,19 +1008,26 @@ def compile_character_description(char: Character, enabled_fields: Dict[str, boo
         article = "an" if first_char in "aeiou" else "a"
         
         clauses = []
-        if hair_face:
-            clauses.append(hair_face.strip())
+        seen_clauses = set()
+        
+        # Deduplicate incoming clauses to prevent repeating redundant attributes
+        for raw_val, name in [(hair_face, "hair_face"), (build, "build"), (marks, "marks")]:
+            if not raw_val:
+                continue
+            val_clean = raw_val.strip()
+            val_lower = val_clean.lower()
+            if val_lower in seen_clauses:
+                continue
+            seen_clauses.add(val_lower)
             
-        if build:
-            b_clean = build.strip()
-            # Handle if LLM extracted starting with 'who is' or 'is'
-            if not b_clean.lower().startswith("who is ") and not b_clean.lower().startswith("is "):
-                clauses.append(f"who is {b_clean}")
+            if name == "build":
+                # Handle if LLM extracted starting with 'who is' or 'is'
+                if not val_clean.lower().startswith("who is ") and not val_clean.lower().startswith("is "):
+                    clauses.append(f"who is {val_clean}")
+                else:
+                    clauses.append(val_clean)
             else:
-                clauses.append(b_clean)
-            
-        if marks:
-            clauses.append(marks.strip())
+                clauses.append(val_clean)
             
         if clauses:
             # Construct cohesive natural relative clauses
@@ -930,3 +1103,69 @@ def replace_character_tags_in_prompt(
                 # Fallback: Strip brackets for characters/pronouns not in the database
                 modified_prompt = modified_prompt.replace(f"[{tag}]", tag, 1)
     return modified_prompt
+
+
+def get_alias_occurrences(project_id: int, alias_text: str) -> List[Dict[str, Any]]:
+    """
+    Searches all transcript.txt files in the project for occurrences of alias_text (case-insensitive).
+    Returns a list of matches containing context windows with HTML highlighting applied.
+    """
+    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    occurrences = []
+
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if not project:
+            return []
+        books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+
+    for book in books:
+        transcript_path = base_output_dir / project.name / book.name / "transcript.txt"
+        if not transcript_path.exists():
+            continue
+
+        try:
+            with open(transcript_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            print(f"[Profiler] Error reading transcript for context search in {book.name}: {str(e)}")
+            continue
+
+        # Strip chapter division markers to maintain clean reading flow
+        cleaned_text = content.replace("==CHAPTER==", " ")
+        
+        # Search case-insensitively. Since name contractions or possessives can occur (e.g. Stone's),
+        # we target the alias word base.
+        pattern = re.compile(rf"(\b{re.escape(alias_text)}\w*\b)", re.IGNORECASE)
+        
+        for match in pattern.finditer(cleaned_text):
+            start, end = match.span()
+            
+            # Increased context window (500 characters on either side, ~150-180 words total context block)
+            window_start = max(0, start - 500)
+            window_end = min(len(cleaned_text), end + 500)
+            
+            fragment = cleaned_text[window_start:window_end]
+            
+            # Slice fragment precisely to inject safe HTML highlighting
+            match_start_in_frag = start - window_start
+            match_end_in_frag = end - window_start
+            
+            prefix = fragment[:match_start_in_frag]
+            match_word = fragment[match_start_in_frag:match_end_in_frag]
+            suffix = fragment[match_end_in_frag:]
+            
+            # Standardize spacing/newlines for dialog compatibility
+            highlighted_html = (
+                f"... {prefix}<mark class='bg-yellow-200 text-slate-900 px-1 rounded font-bold'>{match_word}</mark>{suffix} ..."
+            ).replace("\n", " ")
+
+            occurrences.append({
+                "book_id": book.id,
+                "book_name": book.name,
+                "raw_context": fragment,
+                "html_context": highlighted_html,
+                "match_word": match_word
+            })
+
+    return occurrences
