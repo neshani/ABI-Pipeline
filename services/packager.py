@@ -563,6 +563,9 @@ def build_illumination_pack(
         scene_duration = max(1.0, end_sec - start_sec)
 
         raw_quote = scene.get("quote", "").strip()
+        # Strip bracket characters to clean up character tagging artifacts
+        if raw_quote:
+            raw_quote = raw_quote.replace("[", "").replace("]", "")
         quote_text = raw_quote if raw_quote else None
 
         # A. Compile PORTRAIT / MOBILE timeline variations

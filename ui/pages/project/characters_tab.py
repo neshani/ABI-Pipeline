@@ -26,6 +26,7 @@ cancel_profiling_all: bool = False
 currently_profiling_char_id: Optional[int] = None
 profiling_progress: str = ""
 profiler_scan_depth: int = 5  # Scan depth (how many text chunks LLM reads)
+workspace_was_empty: bool = True  # Track transition from empty state to grid layout
 
 # Dynamic Filter and Interactive Selection states
 search_query: str = ""
@@ -507,9 +508,21 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
 
     async def refresh_workspace_with_scroll():
         """Refreshes individual active components in-place and aligns the active selection."""
-        draw_stats_bar.refresh()
-        draw_character_list.refresh()
-        draw_details_panel.refresh()
+        global workspace_was_empty
+        with Session(engine) as session:
+            any_characters = session.exec(
+                select(Character).where(Character.project_id == project.id)
+            ).first()
+
+        current_empty = (any_characters is None)
+        if current_empty != workspace_was_empty:
+            # Transition between empty state and populated grid state requires full redraw
+            draw_workspace_layout.refresh()
+        else:
+            # Maintain existing layout to preserve active scroll context
+            draw_stats_bar.refresh()
+            draw_character_list.refresh()
+            draw_details_panel.refresh()
         
         await restore_scroll_position()
 
@@ -1148,12 +1161,14 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
 
     @ui.refreshable
     def draw_workspace_layout():
+        global workspace_was_empty
         with Session(engine) as session:
             any_characters = session.exec(
                 select(Character).where(Character.project_id == project.id)
             ).first()
 
         if not any_characters:
+            workspace_was_empty = True
             with ui.column().classes('w-full items-center justify-center p-12 text-slate-400 border border-dashed rounded-xl bg-slate-50 gap-4'):
                 ui.icon('face', size='xl', color='slate-300')
                 ui.label('No characters detected or generated in this project yet.').classes('text-sm font-semibold text-slate-500')
@@ -1178,6 +1193,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs px-5 py-2.5 rounded-lg shadow-sm')
             return
 
+        workspace_was_empty = False
         draw_stats_bar()
 
         with ui.grid().classes('w-full grid-cols-1 lg:grid-cols-12 gap-4 items-start'):
