@@ -655,8 +655,8 @@ async def run_stateful_character_profiling(
         aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
         alias_list = [a.alias for a in aliases]
 
-    # Retrieve mention chunks (~220 words window)
-    all_chunks = get_character_mention_chunks(project_id, character_id, book_id, chunk_size_words=220)
+    # Retrieve tighter mention chunks (~120 words window to prevent multi-character description bleeding)
+    all_chunks = get_character_mention_chunks(project_id, character_id, book_id, chunk_size_words=120)
     if not all_chunks:
         print(f"[Profiler] No mention chunks found for character: {char.name}")
         return state_checklist
@@ -664,6 +664,8 @@ async def run_stateful_character_profiling(
     for chunk in all_chunks:
         chunk["visual_score"] = score_chunk_visual_relevance(chunk["text"])
 
+    # Sort chunks so those with high density of visual descriptions are processed first
+    all_chunks.sort(key=lambda x: x.get("visual_score", 0), reverse=True)
     sampled_chunks = all_chunks[:max_chunks_to_scan]
 
     # --- PHASE 1: OBJECTIVE FACTUAL EXTRACTION PASS ---
@@ -1171,6 +1173,8 @@ def get_alias_occurrences(project_id: int, alias_text: str) -> List[Dict[str, An
         try:
             with open(transcript_path, "r", encoding="utf-8") as f:
                 content = f.read()
+            # Clean up the text input to normalize spacing for the search window
+            content = content.replace("\r\n", "\n").replace("\r", "\n")
         except Exception as e:
             print(f"[Profiler] Error reading transcript for context search in {book.name}: {str(e)}")
             continue
@@ -1178,14 +1182,13 @@ def get_alias_occurrences(project_id: int, alias_text: str) -> List[Dict[str, An
         # Strip chapter division markers to maintain clean reading flow
         cleaned_text = content.replace("==CHAPTER==", " ")
         
-        # Search case-insensitively. Since name contractions or possessives can occur (e.g. Stone's),
-        # we target the alias word base.
-        pattern = re.compile(rf"(\b{re.escape(alias_text)}\w*\b)", re.IGNORECASE)
+        # Search case-insensitively using strict word boundaries and an optional possessive suffix
+        pattern = re.compile(rf"(\b{re.escape(alias_text)}(?:'s|’s)?\b)", re.IGNORECASE)
         
         for match in pattern.finditer(cleaned_text):
             start, end = match.span()
             
-            # Increased context window (500 characters on either side, ~150-180 words total context block)
+            # Context window (500 characters on either side, ~150-180 words total context block)
             window_start = max(0, start - 500)
             window_end = min(len(cleaned_text), end + 500)
             

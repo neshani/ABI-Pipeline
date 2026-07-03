@@ -1559,6 +1559,29 @@ async def free_all_memory():
 
     ui.notify("VRAM and RAM clearance commands successfully sent!", type="positive")
 
+async def trigger_output_folder_scan():
+    """Triggers an asynchronous scan and reconciliation of the output folder with the database."""
+    ui.notify("Scanning output directory for project and book folders...", type="info")
+    
+    from services.sync_engine import reconcile_database_with_output_folder
+    
+    def run_scan():
+        with Session(engine) as session:
+            return reconcile_database_with_output_folder(session)
+            
+    try:
+        stats = await asyncio.to_thread(run_scan)
+        ui.notify(
+            f"Scan complete! Discovered {stats['projects_discovered']} projects & {stats['books_discovered']} books. "
+            f"Created {stats['new_projects_created']} new projects & {stats['new_books_created']} books.", 
+            type="positive",
+            close_button=True,
+            timeout=8.0
+        )
+        refresh_dashboard()
+    except Exception as e:
+        ui.notify(f"Scan failed: {str(e)}", type="negative")
+
 
 async def quit_app():
     """Performs a clean shutdown sequence, automatically closing the browser-initiated process console."""
@@ -1735,6 +1758,7 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
         with ui.button(icon='construction', color='slate-600') as tools_btn:
             tools_btn.classes('text-white text-sm capitalize rounded-lg')
             with ui.menu() as menu:
+                ui.menu_item('Scan Output Folder', on_click=trigger_output_folder_scan)
                 ui.menu_item('LoRA Contact Sheets', on_click=lambda: open_tool('lora_contact_sheet'))
                 ui.menu_item('Rerun Setup Wizard', on_click=onboarding_wizard.open)
                 ui.menu_item('Clear Comfy Outputs (abi_*)', on_click=clear_comfy_dialog.open) \

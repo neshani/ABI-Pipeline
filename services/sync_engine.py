@@ -3,9 +3,11 @@ import os
 import json
 import csv
 from pathlib import Path
+from typing import Optional
 from sqlmodel import Session, select, delete
 from database.connection import engine, get_setting
 from database.models import Project, Book, Chapter, ScenePrompt
+
 
 def sync_project_status(project_id: int, session: Session) -> None:
     """
@@ -111,7 +113,6 @@ def sync_prompts_csv_to_db_cache(book_id: int, session: Session) -> None:
             session.flush()
     except Exception as e:
         print(f"[Sync-Engine] Error caching prompts.csv to SQLite: {e}")
-
 
 
 def sync_book_from_disk(book_id: int, session: Session) -> None:
@@ -315,15 +316,117 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
         sync_project_status(book.project_id, session)
 
 
+def prune_stale_database_records(session: Session) -> None:
+    """
+    Cleans up the database by removing Projects and Books that have been physically
+    deleted from the output folder, keeping the index completely aligned with disk.
+    """
+    output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
+    if not output_dir.exists() or not output_dir.is_dir():
+        return
+
+    # 1. Fetch all projects in database
+    db_projects = session.exec(select(Project)).all()
+    for proj in db_projects:
+        # Ignore special namespaces
+        if proj.name.startswith('_') or proj.name.startswith('.'):
+            continue
+
+        proj_output_dir = output_dir / proj.name
+        
+        # If the project output directory does not exist on disk, prune it from DB
+        if not proj_output_dir.exists():
+            print(f"[Sync-Engine] Pruning stale project from database (deleted on disk): '{proj.name}'")
+            
+            # Delete child books, chapters, and prompts
+            books = session.exec(select(Book).where(Book.project_id == proj.id)).all()
+            for b in books:
+                session.exec(delete(Chapter).where(Chapter.book_id == b.id))
+                session.exec(delete(ScenePrompt).where(ScenePrompt.book_id == b.id))
+                session.delete(b)
+                
+            session.delete(proj)
+            session.flush()
+
+
+def ensure_book_chapters_populated(book: Book, book_dir: Path, source_path_str: Optional[str], session: Session) -> None:
+    """
+    Ensures that Chapter records for a given Book are fully populated in the database.
+    Prioritizes probing original source audiobook files for precise boundaries and stems,
+    falling back to splitting paragraphs from compiled transcript.txt files if audio is missing.
+    """
+    existing_ch_count = len(session.exec(select(Chapter).where(Chapter.book_id == book.id)).all())
+    if existing_ch_count > 0:
+        return  # Chapters already indexed
+
+    from services.scanner import find_audio_sources, create_chapter_plan_for_book
+
+    audio_type = 'none'
+    audio_files = []
+
+    # 1. Attempt scanning original source directory first (most accurate timestamps)
+    if source_path_str:
+        src_path = Path(source_path_str)
+        if src_path.exists():
+            audio_type, audio_files = find_audio_sources(src_path)
+
+    # 2. Fallback to scanning compiled output folder directly
+    if audio_type == 'none' and book_dir.exists():
+        audio_type, audio_files = find_audio_sources(book_dir)
+
+    if audio_type != 'none' and audio_files:
+        try:
+            create_chapter_plan_for_book(
+                book_id=book.id,
+                audio_type=audio_type,
+                files=[str(f) for f in audio_files],
+                session=session
+            )
+            session.flush()
+            print(f"[Sync-Engine] Successfully parsed chapters from audio files for '{book.name}'")
+            return
+        except Exception as e:
+            print(f"[Sync-Engine] Error probing audio tracks during recovery: {e}")
+
+    # 3. Last fallback: Split raw transcript.txt if present (e.g. text or EPUB books)
+    transcript_file = book_dir / "transcript.txt"
+    if transcript_file.exists():
+        try:
+            with open(transcript_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            sections = content.split("==CHAPTER==")
+            cleaned_sections = [s.strip() for s in sections if s.strip()]
+
+            for idx in range(len(cleaned_sections)):
+                ch_num = idx + 1
+                new_ch = Chapter(
+                    book_id=book.id,
+                    chapter_num=ch_num,
+                    title=f"Chapter {ch_num}",
+                    status="Completed",
+                    word_count=len(cleaned_sections[idx].split()),
+                    total_images=0,
+                    completed_images=0
+                )
+                session.add(new_ch)
+            session.flush()
+            print(f"[Sync-Engine] Reconstructed chapters for '{book.name}' by splitting transcript.txt")
+        except Exception as e:
+            print(f"[Sync-Engine] Error reconstructing chapters from transcript: {e}")
+
+
 def recover_from_temp_workspaces(session: Session) -> None:
     """
     Scans both workspace_temp/ and output/ folders for transcription tracking metadata.
-    Reconstructs the complete database index on database wipe.
+    Reconstructs the complete database index on database wipe. Includes self-healing 
+    cleanup for deleted projects and automatic metadata.json healing to align with disk split.
     """
-    detected_projects = {}  # project_path -> project_name
+    # Run a safe database cleanup first to synchronize DB records with disk deletions
+    prune_stale_database_records(session)
+
     meta_items = []
 
-    # 1. Gather any incomplete/active workspace recovery configurations
+    # 1. Gather any incomplete/active workspace recovery configurations from workspace_temp
     temp_dir = Path("./workspace_temp")
     if temp_dir.exists() and temp_dir.is_dir():
         for working_dir in temp_dir.iterdir():
@@ -333,22 +436,68 @@ def recover_from_temp_workspaces(session: Session) -> None:
                     try:
                         with open(state_file, "r", encoding="utf-8") as f:
                             data = json.load(f)
-                            data["source_type"] = "temp"
-                            data["working_dir"] = str(working_dir)
-                            meta_items.append(data)
+                            
+                        proj_name = data.get("project_name")
+                        if proj_name:
+                            # Skip and delete immediately if the project name points to an internal/special folder
+                            if proj_name.startswith('_') or proj_name.startswith('.'):
+                                import shutil
+                                shutil.rmtree(working_dir, ignore_errors=True)
+                                print(f"[Sync-Engine] Cleaned up internal/invalid temp workspace: {working_dir.name}")
+                                continue
+
+                            db_proj = session.exec(
+                                select(Project).where(Project.name == proj_name)
+                            ).first()
+                            
+                            output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
+                            proj_output_dir = output_dir / proj_name
+                            
+                            if not db_proj and not proj_output_dir.exists():
+                                import shutil
+                                shutil.rmtree(working_dir, ignore_errors=True)
+                                print(f"[Sync-Engine] Cleaned up stale temp workspace for deleted project '{proj_name}': {working_dir.name}")
+                                continue
+
+                        data["source_type"] = "temp"
+                        data["working_dir"] = str(working_dir)
+                        meta_items.append(data)
                     except Exception as e:
                         print(f"Error reading temp state file {state_file}: {e}")
 
-    # 2. Gather any fully completed output configurations
+    # 2. Gather any fully completed output configurations from output/ and heal metadata.json
     output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
     if output_dir.exists() and output_dir.is_dir():
         for meta_file in output_dir.glob("*/*/metadata.json"):
+            # Skip if any parent folder starts with '_' or '.' (like _lora_library)
+            parts = meta_file.relative_to(output_dir).parts
+            if any(p.startswith('_') or p.startswith('.') for p in parts):
+                continue
+
             try:
                 with open(meta_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    data["source_type"] = "output"
-                    data["book_output_dir"] = str(meta_file.parent)
-                    meta_items.append(data)
+                    
+                # --- METADATA FILE HEALER ---
+                # Detect if the project was split or renamed on disk (parent folder name differs from metadata)
+                physical_proj_name = meta_file.parent.parent.name
+                metadata_proj_name = data.get("project_name", "")
+                
+                if metadata_proj_name != physical_proj_name:
+                    data["project_name"] = physical_proj_name
+                    # Save the healed metadata.json back to disk
+                    with open(meta_file, "w", encoding="utf-8") as out_f:
+                        json.dump(data, out_f, indent=4)
+                    print(f"[Sync-Engine] Healed stale project_name in '{meta_file.parent.name}' metadata: '{metadata_proj_name}' -> '{physical_proj_name}'")
+                
+                # Double-check namespace check on the healed project name
+                proj_name = data.get("project_name")
+                if proj_name and (proj_name.startswith('_') or proj_name.startswith('.')):
+                    continue
+
+                data["source_type"] = "output"
+                data["book_output_dir"] = str(meta_file.parent)
+                meta_items.append(data)
             except Exception as e:
                 print(f"Error reading output metadata file {meta_file}: {e}")
 
@@ -357,50 +506,90 @@ def recover_from_temp_workspaces(session: Session) -> None:
 
     print(f"[Sync-Engine] Found {len(meta_items)} project tracking records to synchronize.")
 
-    # 3. Reconstruct parent Projects
+    # 3. Direct Reconstruction of parent Projects and Books (No deep source folder re-scanning)
     for item in meta_items:
-        project_name = item.get("project_name")
-        project_path = item.get("project_path")
-        if project_name and project_path:
-            detected_projects[project_path] = project_name
-
-    # Ensure parent projects are scanned and ingested in full
-    for proj_path, proj_name in detected_projects.items():
-        project_exists = session.exec(
-            select(Project).where(Project.name == proj_name).where(Project.path == proj_path)
-        ).first()
-
-        if not project_exists:
-            print(f"[Sync-Engine] Re-scanning parent project path: {proj_path}")
-            try:
-                from services.scanner import scan_directory, ingest_project
-                scan_res = scan_directory(proj_path)
-                if scan_res["type"] != "none":
-                    # Pass the active transaction session directly down to parent scanner ingest
-                    ingest_project(scan_res, proj_name, session)
-            except Exception as e:
-                print(f"[Sync-Engine] Could not re-ingest parent project '{proj_name}': {e}")
-
-    session.commit()
-
-    # 4. Map and restore status indicators for each book
-    for item in meta_items:
+        proj_name = item.get("project_name")
+        proj_path = item.get("project_path")
         book_name = item.get("book_name")
         book_path = item.get("book_path")
         source_type = item.get("source_type")
 
-        if not book_name or not book_path:
+        if not proj_name or not book_name:
+            continue
+
+        # Find or create Project directly in database
+        project = session.exec(
+            select(Project).where(Project.name == proj_name)
+        ).first()
+
+        if not project:
+            p_path = proj_path if proj_path else str(output_dir / proj_name)
+            project = Project(
+                name=proj_name,
+                path=p_path,
+                is_batch=True,
+                status="Imported"
+            )
+            session.add(project)
+            session.flush()
+            print(f"[Sync-Engine] Reconstructed database Project record: '{proj_name}'")
+
+        # Find or create Book directly in database
+        book = session.exec(
+            select(Book).where(Book.name == book_name).where(Book.project_id == project.id)
+        ).first()
+
+        if not book:
+            # Detect cover image dynamically using scanner find_cover_art fallback pipeline
+            from services.scanner import find_cover_art
+            book_output_dir = Path(item["book_output_dir"]) if source_type == "output" else Path(item["working_dir"])
+            cover_path = None
+            if book_path:
+                cover_path = find_cover_art(Path(book_path))
+            if not cover_path:
+                cover_path = find_cover_art(book_output_dir)
+
+            b_path = book_path if book_path else str(book_output_dir)
+            book = Book(
+                project_id=project.id,
+                name=book_name,
+                path=b_path,
+                status="Imported",
+                progress=0.0
+            )
+            if cover_path:
+                book.cover_path = cover_path
+            session.add(book)
+            session.flush()
+            print(f"[Sync-Engine] Reconstructed database Book record: '{book_name}'")
+
+    session.commit()
+
+    # 4. Map and restore status indicators and chapters for each book
+    for item in meta_items:
+        proj_name = item.get("project_name")
+        book_name = item.get("book_name")
+        source_type = item.get("source_type")
+
+        if not proj_name or not book_name:
             continue
 
         # Fetch the restored book database record
+        project = session.exec(select(Project).where(Project.name == proj_name)).first()
+        if not project:
+            continue
+            
         book = session.exec(
-            select(Book).where(Book.name == book_name).where(Book.path == book_path)
+            select(Book).where(Book.name == book_name).where(Book.project_id == project.id)
         ).first()
 
         if not book:
             continue
 
         if source_type == "output":
+            # Ensure Chapter records are fully populated (probes audio or parses transcript)
+            ensure_book_chapters_populated(book, Path(item["book_output_dir"]), item.get("book_path"), session)
+
             # Book has a completed transcript on disk, perform audit to resolve correct step
             sync_book_from_disk(book.id, session)
 
@@ -425,11 +614,8 @@ def recover_from_temp_workspaces(session: Session) -> None:
             if total_chapters > 0:
                 book.progress = completed_count / total_chapters
                 
-                # --- CORRECTION: Verify the merged transcript.txt actually exists on disk before declaring "Transcribed" ---
-                project = session.get(Project, book.project_id) if book.project_id else None
-                project_name = project.name if project else "Default_Project"
-                base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
-                transcript_file = base_output_dir / project_name / book.name / "transcript.txt"
+                # Verify the merged transcript.txt actually exists on disk before declaring "Transcribed"
+                transcript_file = output_dir / proj_name / book.name / "transcript.txt"
 
                 if completed_count == total_chapters and transcript_file.exists():
                     book.status = "Transcribed"
@@ -444,6 +630,127 @@ def recover_from_temp_workspaces(session: Session) -> None:
                 sync_project_status(book.project_id, session)
 
     print("[Sync-Engine] Database state recovery sequence complete.")
+
+
+def reconcile_database_with_output_folder(session: Session) -> dict:
+    """
+    Scans the local output directory to discover projects, books, and chapters 
+    reorganized or split on disk. Reconstructs missing database records 
+    and resynchronizes existing ones with the disk state. Ignores internal 
+    and library directories starting with '.' or '_'.
+    """
+    stats = {
+        "projects_discovered": 0,
+        "books_discovered": 0,
+        "new_projects_created": 0,
+        "new_books_created": 0,
+        "synced_books_count": 0
+    }
+
+    base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
+    if not base_output_dir.exists() or not base_output_dir.is_dir():
+        return stats
+
+    from services.scanner import find_cover_art
+
+    # Iterate through project subdirectories in the output folder
+    for proj_dir in base_output_dir.iterdir():
+        # Exclude directories starting with '_' (like _lora_library) or '.'
+        if not proj_dir.is_dir() or proj_dir.name.startswith('.') or proj_dir.name.startswith('_'):
+            continue
+
+        stats["projects_discovered"] += 1
+
+        # Check if the project already exists in the database
+        project = session.exec(
+            select(Project).where(Project.name == proj_dir.name)
+        ).first()
+
+        if not project:
+            project = Project(
+                name=proj_dir.name,
+                path=str(proj_dir.resolve()),
+                is_batch=True,
+                status="Imported"
+            )
+            session.add(project)
+            session.flush()
+            stats["new_projects_created"] += 1
+
+        # Iterate through book subdirectories within the project folder
+        for book_dir in proj_dir.iterdir():
+            if not book_dir.is_dir() or book_dir.name.startswith('.') or book_dir.name.startswith('_'):
+                continue
+
+            # Skip the 'images' folder if it is in the project root instead of inside a book
+            if book_dir.name.lower() == "images":
+                continue
+
+            stats["books_discovered"] += 1
+
+            # Resolve cover path and original book source path
+            metadata_file = book_dir / "metadata.json"
+            book_path_src = None
+            
+            if metadata_file.exists():
+                try:
+                    with open(metadata_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    
+                    # Heal metadata project name on the fly if needed
+                    if data.get("project_name") != proj_dir.name:
+                        data["project_name"] = proj_dir.name
+                        with open(metadata_file, "w", encoding="utf-8") as out_f:
+                            json.dump(data, out_f, indent=4)
+                        print(f"[Sync-Engine] Healed stale project_name in '{book_dir.name}' metadata.")
+                    
+                    book_path_src = data.get("book_path")
+                except Exception as e:
+                    print(f"Error reading metadata.json in {book_dir.name}: {e}")
+
+            # Check if this book is registered in the database for the active project
+            book = session.exec(
+                select(Book).where(Book.name == book_dir.name).where(Book.project_id == project.id)
+            ).first()
+
+            # Dynamic Cover Resolve
+            cover_path = None
+            if book_path_src:
+                cover_path = find_cover_art(Path(book_path_src))
+            if not cover_path:
+                cover_path = find_cover_art(book_dir)
+
+            if not book:
+                book = Book(
+                    project_id=project.id,
+                    name=book_dir.name,
+                    path=book_path_src if book_path_src else str(book_dir.resolve()),
+                    status="Imported",
+                    progress=0.0
+                )
+                if cover_path:
+                    book.cover_path = cover_path
+                session.add(book)
+                session.flush()
+                stats["new_books_created"] += 1
+            else:
+                # Update missing details on existing books safely
+                if cover_path and not book.cover_path:
+                    book.cover_path = cover_path
+                    session.add(book)
+
+            # Ensure Chapter records are fully populated (probes audio or parses transcript)
+            ensure_book_chapters_populated(book, book_dir, book_path_src, session)
+
+            # Re-index all properties, word counts, and rendering counts from files on disk
+            try:
+                sync_book_from_disk(book.id, session)
+                stats["synced_books_count"] += 1
+            except Exception as e:
+                print(f"[Sync-Engine] Error syncing book '{book.name}' from disk: {e}")
+
+    session.commit()
+    return stats
 
 
 def get_book_stats(project_name: str, book_name: str) -> dict:

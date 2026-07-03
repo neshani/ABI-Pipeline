@@ -263,10 +263,78 @@ def open_lora_chooser_modal(node_id: str):
         render_lora_chooser_content.refresh()
 
 
+# Tracker dict for LoRA sidebar rows to preserve scroll positioning
+lora_row_elements: Dict[str, ui.row] = {}
+
+@ui.refreshable
+def render_lora_preview_panel():
+    """Visual selection preview showcasing trigger words and 2x2 grids of completed sample images."""
+    global chooser_selected_lora_id, chooser_active_node_id
+    
+    selected_lora = next((l for l in associated_loras_list if l["id"] == chooser_selected_lora_id), None)
+    
+    with ui.column().classes('h-full flex flex-col gap-3 justify-between'):
+        if selected_lora:
+            with ui.column().classes('w-full gap-2 flex-1 min-h-0'):
+                ui.label(Path(selected_lora["lora_path"]).name).classes('text-base font-bold text-slate-800')
+                
+                triggers = selected_lora.get("triggers", "").strip()
+                if triggers and triggers != ".":
+                    with ui.row().classes('w-full p-2 bg-blue-50 rounded border border-blue-100 text-xs items-center gap-1'):
+                        ui.icon('bolt', color='blue', size='xs')
+                        ui.label("Triggers:").classes('font-bold text-blue-800')
+                        ui.label(triggers).classes('font-mono font-semibold text-blue-700')
+                else:
+                    ui.label("(No trigger words configured for this LoRA)").classes('text-xs text-slate-400 italic')
+                    
+                # Retrieve first 4 samples for styling demonstration
+                lora_dir = Path("./output/_lora_library") / selected_lora["id"]
+                sample_images = []
+                if lora_dir.exists():
+                    sample_images = sorted(list(lora_dir.glob("*.png")))[:4]
+                    
+                if sample_images:
+                    with ui.grid(columns=2).classes('w-full gap-3 mt-1 overflow-y-auto flex-1 p-1'):
+                        for img_path in sample_images:
+                            ui.image(str(img_path)).props('fit=contain').classes('w-full rounded border shadow-sm')
+                else:
+                    with ui.column().classes('w-full flex-1 items-center justify-center border border-dashed rounded bg-slate-50 text-slate-400'):
+                        ui.icon('photo_library', size='lg')
+                        ui.label("No benchmark images rendered yet for this LoRA.").classes('text-xs text-center')
+
+            # Dialog action panel
+            with ui.row().classes('w-full justify-end gap-3 border-t pt-2 flex-shrink-0'):
+                ui.button('Cancel', on_click=lambda: lora_chooser_dialog_ref.close() if lora_chooser_dialog_ref else None).props('flat color=slate')
+                
+                def apply_selection():
+                    if selected_lora and chooser_active_node_id:
+                        update_override_state(chooser_active_node_id, "lora_name", selected_lora["lora_path"])
+                        update_override_state(chooser_active_node_id, "strength_model", float(selected_lora["strength"]))
+                        
+                        triggers_to_add = selected_lora.get("triggers", "").strip()
+                        if triggers_to_add and triggers_to_add != ".":
+                            if triggers_to_add not in state.style_prompt_prefix:
+                                cleaned_prefix = state.style_prompt_prefix.strip()
+                                if cleaned_prefix and not cleaned_prefix.endswith(","):
+                                    cleaned_prefix += ","
+                                state.style_prompt_prefix = f"{cleaned_prefix} {triggers_to_add}, ".strip().replace("  ", " ")
+                                ui.notify(f"Selected LoRA and appended trigger words: '{triggers_to_add}'", type="positive")
+                            else:
+                                ui.notify("Selected LoRA successfully!", type="positive")
+                        else:
+                            ui.notify("Selected LoRA successfully!", type="positive")
+                            
+                        lora_chooser_dialog_ref.close()
+                        render_workflow_overrides_ui.refresh()
+                        
+                ui.button('Accept & Apply', on_click=apply_selection).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs h-9')
+
+
 @ui.refreshable
 def render_lora_chooser_content():
     """Visual selection matrix showcasing trigger words and 2x2 grids of completed sample images."""
     global chooser_selected_lora_id, chooser_active_node_id
+    lora_row_elements.clear()  # Clear row reference cache on rebuild
     
     if not associated_loras_list:
         with ui.column().classes('w-full items-center justify-center p-12 text-slate-400'):
@@ -278,8 +346,6 @@ def render_lora_chooser_content():
     if not chooser_selected_lora_id and associated_loras_list:
         chooser_selected_lora_id = associated_loras_list[0]["id"]
 
-    selected_lora = next((l for l in associated_loras_list if l["id"] == chooser_selected_lora_id), None)
-
     with ui.grid(columns='240px 1fr').classes('w-full h-[500px] gap-4'):
         # LEFT SIDEBAR: Benchmarked LoRA list
         with ui.column().classes('border-r pr-2 gap-1 overflow-y-auto h-full'):
@@ -287,13 +353,37 @@ def render_lora_chooser_content():
                 is_selected = lora["id"] == chooser_selected_lora_id
                 bg_color = "bg-blue-50 border-blue-200 text-blue-700 font-bold" if is_selected else "hover:bg-slate-50 border-transparent text-slate-700"
                 
+                row_el = ui.row().classes(f'w-full p-2 rounded-lg border cursor-pointer transition-colors items-center justify-between {bg_color}')
+                lora_row_elements[lora["id"]] = row_el
+                
                 def select_lora_item(lid=lora["id"]):
                     global chooser_selected_lora_id
+                    old_id = chooser_selected_lora_id
                     chooser_selected_lora_id = lid
-                    render_lora_chooser_content.refresh()
                     
-                with ui.row().classes(f'w-full p-2 rounded-lg border cursor-pointer transition-colors items-center justify-between {bg_color}') \
-                        .on('click', select_lora_item):
+                    # Transition class styles in-place to avoid rebuilding elements and losing scroll state
+                    if old_id in lora_row_elements and lora_row_elements[old_id]:
+                        try:
+                            lora_row_elements[old_id].classes(
+                                add='hover:bg-slate-50 border-transparent text-slate-700',
+                                remove='bg-blue-50 border-blue-200 text-blue-700 font-bold'
+                            )
+                        except Exception:
+                            pass
+                            
+                    if lid in lora_row_elements and lora_row_elements[lid]:
+                        try:
+                            lora_row_elements[lid].classes(
+                                add='bg-blue-50 border-blue-200 text-blue-700 font-bold',
+                                remove='hover:bg-slate-50 border-transparent text-slate-700'
+                            )
+                        except Exception:
+                            pass
+                    
+                    # Refresh only the right-hand preview column
+                    render_lora_preview_panel.refresh()
+                    
+                with row_el.on('click', select_lora_item):
                     with ui.row().classes('items-center gap-1 truncate flex-1'):
                         if lora.get("favorite") == "True":
                             ui.icon('star', color='amber-500', size='14px').classes('flex-shrink-0')
@@ -301,62 +391,7 @@ def render_lora_chooser_content():
                     ui.label(f"str: {float(lora['strength']):.1f}").classes('text-[9px] text-slate-400 flex-shrink-0')
 
         # RIGHT PREVIEW PANEL: Sample Grid & Selection Metadata
-        with ui.column().classes('h-full flex flex-col gap-3 justify-between'):
-            if selected_lora:
-                with ui.column().classes('w-full gap-2 flex-1 min-h-0'):
-                    ui.label(Path(selected_lora["lora_path"]).name).classes('text-base font-bold text-slate-800')
-                    
-                    triggers = selected_lora.get("triggers", "").strip()
-                    if triggers and triggers != ".":
-                        with ui.row().classes('w-full p-2 bg-blue-50 rounded border border-blue-100 text-xs items-center gap-1'):
-                            ui.icon('bolt', color='blue', size='xs')
-                            ui.label("Triggers:").classes('font-bold text-blue-800')
-                            ui.label(triggers).classes('font-mono font-semibold text-blue-700')
-                    else:
-                        ui.label("(No trigger words configured for this LoRA)").classes('text-xs text-slate-400 italic')
-                        
-                    # Retrieve first 4 samples for styling demonstration
-                    lora_dir = Path("./output/_lora_library") / selected_lora["id"]
-                    sample_images = []
-                    if lora_dir.exists():
-                        sample_images = sorted(list(lora_dir.glob("*.png")))[:4]
-                        
-                    if sample_images:
-                        with ui.grid(columns=2).classes('w-full gap-3 mt-1 overflow-y-auto flex-1 p-1'):
-                            for img_path in sample_images:
-                                ui.image(str(img_path)).props('fit=contain').classes('w-full rounded border shadow-sm')
-                    else:
-                        with ui.column().classes('w-full flex-1 items-center justify-center border border-dashed rounded bg-slate-50 text-slate-400'):
-                            ui.icon('photo_library', size='lg')
-                            ui.label("No benchmark images rendered yet for this LoRA.").classes('text-xs text-center')
-
-                # Dialog action panel
-                with ui.row().classes('w-full justify-end gap-3 border-t pt-2 flex-shrink-0'):
-                    ui.button('Cancel', on_click=lambda: lora_chooser_dialog_ref.close() if lora_chooser_dialog_ref else None).props('flat color=slate')
-                    
-                    def apply_selection():
-                        if selected_lora and chooser_active_node_id:
-                            update_override_state(chooser_active_node_id, "lora_name", selected_lora["lora_path"])
-                            update_override_state(chooser_active_node_id, "strength_model", float(selected_lora["strength"]))
-                            
-                            triggers_to_add = selected_lora.get("triggers", "").strip()
-                            if triggers_to_add and triggers_to_add != ".":
-                                if triggers_to_add not in state.style_prompt_prefix:
-                                    cleaned_prefix = state.style_prompt_prefix.strip()
-                                    if cleaned_prefix and not cleaned_prefix.endswith(","):
-                                        cleaned_prefix += ","
-                                    state.style_prompt_prefix = f"{cleaned_prefix} {triggers_to_add}, ".strip().replace("  ", " ")
-                                    ui.notify(f"Selected LoRA and appended trigger words: '{triggers_to_add}'", type="positive")
-                                else:
-                                    ui.notify("Selected LoRA successfully!", type="positive")
-                            else:
-                                ui.notify("Selected LoRA successfully!", type="positive")
-                                
-                            lora_chooser_dialog_ref.close()
-                            render_workflow_overrides_ui.refresh()
-                            
-                    ui.button('Accept & Apply', on_click=apply_selection).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs h-9')
-
+        render_lora_preview_panel()
                     
 
 def create_contact_sheet(base64_list: list, overlay_text: str = "") -> Optional[bytes]:
