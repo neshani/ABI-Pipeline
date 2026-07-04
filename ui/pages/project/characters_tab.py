@@ -575,6 +575,183 @@ def open_alias_explorer_dialog(project_id: int, alias: CharacterAlias, parent_ch
 
     dialog.open()
 
+def get_character_prompt_occurrences(project_name: str, book_name: str, alias_texts: Set[str]) -> List[Dict[str, Any]]:
+    """Reads prompts.csv and extracts all rows where this character or their aliases are mentioned in brackets."""
+    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    csv_path = base_output_dir / project_name / book_name / "prompts.csv"
+    if not csv_path.exists():
+        return []
+    
+    bracket_regex = re.compile(r"\[(.*?)\]")
+    occurrences = []
+    
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="|")
+            rows = list(reader)
+    except Exception as e:
+        print(f"[Map] Error reading prompts.csv: {e}")
+        return []
+
+    for idx, row in enumerate(rows):
+        prompt_text = row.get("prompt", "")
+        matched = False
+        
+        # Check bracketed tags explicitly
+        for match in bracket_regex.findall(prompt_text):
+            if match.strip().lower() in alias_texts:
+                matched = True
+                break
+        
+        if matched:
+            occurrences.append({
+                "global_row_index": idx,
+                "chapter": row.get("chapter") or row.get("chapter_num") or row.get("Chapter") or "N/A",
+                "scene": row.get("scene") or row.get("scene_num") or row.get("Scene") or "N/A",
+                "quote": row.get("quote") or row.get("Quote") or "",
+                "prompt": prompt_text
+            })
+            
+    return occurrences
+
+
+def save_prompt_occurrence(project_name: str, book_name: str, global_row_index: int, new_quote: str, new_prompt: str) -> bool:
+    """Saves edited quote and prompt values back to prompts.csv at the correct row index."""
+    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    csv_path = base_output_dir / project_name / book_name / "prompts.csv"
+    if not csv_path.exists():
+        return False
+        
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="|")
+            fieldnames = reader.fieldnames or []
+            rows = list(reader)
+            
+        if 0 <= global_row_index < len(rows):
+            # Normalize column headers
+            quote_key = next((k for k in ["quote", "Quote"] if k in rows[global_row_index]), None) or "quote"
+            prompt_key = next((k for k in ["prompt", "Prompt"] if k in rows[global_row_index]), None) or "prompt"
+            
+            rows[global_row_index][quote_key] = new_quote
+            rows[global_row_index][prompt_key] = new_prompt
+            
+            with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="|")
+                writer.writeheader()
+                writer.writerows(rows)
+            return True
+    except Exception as e:
+        print(f"[Map] Error saving to prompts.csv: {e}")
+    return False
+
+
+def open_appearance_prompt_modal(project: Project, character: Character, book_name: str):
+    """Spawns an interactive sliding/clicking dialog to view and edit book prompts where this character is tagged."""
+    with Session(engine) as session:
+        aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == character.id)).all()
+        alias_texts = {a.alias.lower().strip() for a in aliases}
+        if not alias_texts:
+            alias_texts = {character.name.lower().strip()}
+
+    occurrences = get_character_prompt_occurrences(project.name, book_name, alias_texts)
+    current_index = 0
+
+    with ui.dialog() as dialog, ui.card().classes('w-[700px] max-w-[95vw] p-6 rounded-xl flex flex-col gap-4 overflow-hidden'):
+        
+        with ui.row().classes('w-full justify-between items-center border-b pb-3 shrink-0'):
+            with ui.column().classes('gap-0.5'):
+                ui.label(f'Prompt Map: {character.name} in "{book_name}"').classes('text-base font-bold text-slate-800')
+                status_label = ui.label('Loading prompts...').classes('text-xs text-slate-500')
+            ui.button(icon='close', on_click=dialog.close).props('flat dense').classes('text-slate-400')
+
+        if not occurrences:
+            with ui.column().classes('w-full flex-1 justify-center items-center py-12 bg-slate-50 border rounded-lg px-4'):
+                ui.icon('search_off', size='lg', color='slate-300')
+                ui.label("No bracketed occurrences found in this book's prompts.csv.").classes('text-sm text-slate-500 mt-2 text-center')
+                ui.button('Close', on_click=dialog.close).classes('mt-4 text-xs font-bold bg-slate-100 text-slate-700 border')
+            dialog.open()
+            return
+
+        with ui.column().classes('w-full flex-1 gap-3 overflow-y-auto pr-1 min-h-[300px]'):
+            with ui.row().classes('w-full bg-blue-50/40 p-3 rounded-lg border border-blue-100 items-center justify-between'):
+                coordinate_label = ui.label('').classes('text-xs font-extrabold text-blue-700')
+                counter_label = ui.label('').classes('text-xs font-bold text-blue-700 bg-blue-100/50 px-2 py-0.5 rounded-full')
+            
+            quote_input = ui.textarea(
+                label="Scene Quote (Context Material)",
+                placeholder="The spoken context..."
+            ).classes('w-full bg-white').props('outlined dense autogrow')
+
+            prompt_input = ui.textarea(
+                label="Image Generation Prompt",
+                placeholder="Descriptive text..."
+            ).classes('w-full bg-white font-mono text-xs').props('outlined dense autogrow')
+
+        with ui.row().classes('w-full justify-between items-center border-t pt-3 shrink-0 mt-2'):
+            async def save_active_changes():
+                occ = occurrences[current_index]
+                new_q = quote_input.value.strip()
+                new_p = prompt_input.value.strip()
+                
+                success = await asyncio.to_thread(
+                    save_prompt_occurrence, 
+                    project.name, 
+                    book_name, 
+                    occ["global_row_index"], 
+                    new_q, 
+                    new_p
+                )
+                if success:
+                    occurrences[current_index]["quote"] = new_q
+                    occurrences[current_index]["prompt"] = new_p
+                    ui.notify("Prompt and Quote changes saved to disk!", type="positive")
+                else:
+                    ui.notify("Failed to save changes.", type="negative")
+
+            ui.button(
+                'Save Changes', 
+                icon='save', 
+                on_click=save_active_changes
+            ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs px-4 py-2 rounded-lg shadow-sm')
+
+            with ui.row().classes('gap-2 items-center'):
+                prev_btn = ui.button(icon='chevron_left', on_click=lambda: navigate(-1)).props('flat dense').classes('bg-slate-100 p-1 rounded-lg')
+                counter_label_nav = ui.label('').classes('text-xs font-bold text-slate-600 px-2')
+                next_btn = ui.button(icon='chevron_right', on_click=lambda: navigate(1)).props('flat dense').classes('bg-slate-100 p-1 rounded-lg')
+
+        def navigate(direction: int):
+            nonlocal current_index
+            new_idx = current_index + direction
+            if 0 <= new_idx < len(occurrences):
+                current_index = new_idx
+                update_display()
+
+        def update_display():
+            occ = occurrences[current_index]
+            coordinate_label.text = f"Coordinates: Chapter {occ['chapter']}, Scene {occ['scene']}"
+            counter_label.text = f"{current_index + 1} of {len(occurrences)}"
+            counter_label_nav.text = f"{current_index + 1} / {len(occurrences)}"
+            status_label.text = f"Showing mentions in: {book_name}"
+            
+            quote_input.value = occ["quote"]
+            prompt_input.value = occ["prompt"]
+            
+            if current_index > 0:
+                prev_btn.enable()
+            else:
+                prev_btn.disable()
+                
+            if current_index < len(occurrences) - 1:
+                next_btn.enable()
+            else:
+                next_btn.disable()
+
+        update_display()
+
+    dialog.open()
+
+
 def render_characters_tab(project: Project, books: List[Book], refresh_parent: Optional[Any] = None):
     # Enforce chronological self-healing index alignment on draw
     ensure_book_orders(project.id)
@@ -1021,88 +1198,106 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 
                 ui.badge(f'{mentions} total mentions', color='blue-50').classes('text-blue-700 text-xs font-bold px-2.5 py-1 rounded-full')
                 
-            with ui.row().classes('items-center gap-2'):
-                async def scan_single_char():
-                    global currently_profiling_char_id, profiler_scan_depth, selected_event_id
-                    client = ui.context.client
-                    currently_profiling_char_id = char.id
-                    draw_details_panel.refresh()
-                    
-                    try:
-                        with client:
-                            ui.notify(f"Running LLM research pipeline for {char.name}...", type="info")
-                        await run_stateful_character_profiling(
-                            project.id, char.id, selected_book_id, 
-                            max_chunks_to_scan=profiler_scan_depth, event_id=selected_event_id
-                        )
-                        with client:
-                            ui.notify("Profiling completed successfully!", type="positive")
-                    except Exception as ex:
-                        with client:
-                            ui.notify(f"Profiling failed: {str(ex)}", type="negative")
-                    
-                    currently_profiling_char_id = None
-                    await refresh_workspace_with_scroll()
+            # Flex-grow right-side container to stretch and support absolute right-aligned items
+            with ui.row().classes('items-center gap-2 flex-grow justify-end'):
+                # Sub-group to keep standard actions clustered together
+                with ui.row().classes('items-center gap-2'):
+                    async def scan_single_char():
+                        global currently_profiling_char_id, profiler_scan_depth, selected_event_id
+                        client = ui.context.client
+                        
+                        if char.locked:
+                            with client:
+                                ui.notify("Character is locked from being profiled, unlock and try again.", type="warning")
+                            return
 
-                async def speculate_single_char():
-                    global currently_profiling_char_id, profiler_scan_depth, selected_event_id
-                    client = ui.context.client
-                    currently_profiling_char_id = char.id
-                    draw_details_panel.refresh()
-                    
-                    try:
-                        with client:
-                            ui.notify(f"Speculating character casting vibe for {char.name}...", type="info")
-                        await run_stateful_character_profiling(
-                            project.id, char.id, selected_book_id, 
-                            max_chunks_to_scan=profiler_scan_depth, speculate=True, event_id=selected_event_id
-                        )
-                        with client:
-                            ui.notify("Casting speculation completed!", type="positive")
-                    except Exception as ex:
-                        with client:
-                            ui.notify(f"Speculation failed: {str(ex)}", type="negative")
-                    
-                    currently_profiling_char_id = None
-                    await refresh_workspace_with_scroll()
+                        currently_profiling_char_id = char.id
+                        draw_details_panel.refresh()
+                        
+                        try:
+                            with client:
+                                ui.notify(f"Running LLM research pipeline for {char.name}...", type="info")
+                            await run_stateful_character_profiling(
+                                project.id, char.id, selected_book_id, 
+                                max_chunks_to_scan=profiler_scan_depth, event_id=selected_event_id
+                            )
+                            with client:
+                                ui.notify("Profiling completed successfully!", type="positive")
+                        except Exception as ex:
+                            with client:
+                                ui.notify(f"Profiling failed: {str(ex)}", type="negative")
+                        
+                        currently_profiling_char_id = None
+                        await refresh_workspace_with_scroll()
 
-                is_card_profiling = currently_profiling_char_id == char.id
-                if is_card_profiling:
-                    with ui.row().classes('items-center gap-1.5 bg-purple-50 px-3 py-1.5 rounded-lg border border-purple-200'):
-                        ui.spinner(size='xs', color='purple')
-                        ui.label('LLM Active...').classes('text-xs text-purple-700 font-bold')
-                else:
+                    async def speculate_single_char():
+                        global currently_profiling_char_id, profiler_scan_depth, selected_event_id
+                        client = ui.context.client
+                        
+                        if char.locked:
+                            with client:
+                                ui.notify("Character is locked from being profiled, unlock and try again.", type="warning")
+                            return
+
+                        currently_profiling_char_id = char.id
+                        draw_details_panel.refresh()
+                        
+                        try:
+                            with client:
+                                ui.notify(f"Speculating character casting vibe for {char.name}...", type="info")
+                            await run_stateful_character_profiling(
+                                project.id, char.id, selected_book_id, 
+                                max_chunks_to_scan=profiler_scan_depth, speculate=True, event_id=selected_event_id
+                            )
+                            with client:
+                                ui.notify("Casting speculation completed!", type="positive")
+                        except Exception as ex:
+                            with client:
+                                ui.notify(f"Speculation failed: {str(ex)}", type="negative")
+                        
+                        currently_profiling_char_id = None
+                        await refresh_workspace_with_scroll()
+
+                    is_card_profiling = currently_profiling_char_id == char.id
+                    if is_card_profiling:
+                        with ui.row().classes('items-center gap-1.5 bg-purple-50 px-3 py-1.5 rounded-lg border border-purple-200'):
+                            ui.spinner(size='xs', color='purple')
+                            ui.label('LLM Active...').classes('text-xs text-purple-700 font-bold')
+                    else:
+                        ui.button(
+                            'Research (LLM)', 
+                            icon='science', 
+                            on_click=scan_single_char
+                        ).classes('text-white font-bold text-xs bg-purple-600 hover:bg-purple-700').tooltip("Scan actual, written physical descriptions.")
+                        
+                        ui.button(
+                            'Deduce Vibe', 
+                            icon='theater_comedy', 
+                            on_click=speculate_single_char
+                        ).classes('text-white font-bold text-xs bg-indigo-600 hover:bg-indigo-700').tooltip("Deduce characteristics when details are unwritten.")
+
+                    def toggle_locked(c_id=char.id, val=not char.locked):
+                        with Session(engine) as session:
+                            db_char = session.get(Character, c_id)
+                            if db_char:
+                                db_char.locked = val
+                                session.add(db_char)
+                                session.commit()
+                        save_project_characters_to_json(project.id)
+                        draw_character_list.refresh()
+                        draw_details_panel.refresh()
+                        draw_stats_bar.refresh()
+                        ui.notify(f"Profile {'Locked' if val else 'Unlocked'}!", type="info")
+
+                    lock_icon = "lock" if char.locked else "lock_open"
+                    lock_color = "bg-rose-50 text-rose-600 hover:bg-rose-100" if char.locked else "bg-slate-100 text-slate-600 hover:bg-slate-200"
                     ui.button(
-                        'Research (LLM)', 
-                        icon='science', 
-                        on_click=scan_single_char
-                    ).classes('text-white font-bold text-xs bg-purple-600 hover:bg-purple-700').tooltip("Scan actual, written physical descriptions.")
-                    
-                    ui.button(
-                        'Deduce Vibe', 
-                        icon='theater_comedy', 
-                        on_click=speculate_single_char
-                    ).classes('text-white font-bold text-xs bg-indigo-600 hover:bg-indigo-700').tooltip("Deduce characteristics when details are unwritten.")
+                        icon=lock_icon, 
+                        on_click=lambda c_id=char.id: toggle_locked(c_id)
+                    ).props('flat dense').classes(f'p-1.5 rounded-lg {lock_color}').tooltip('Toggle manual editing lock')
 
-                def toggle_locked(c_id=char.id, val=not char.locked):
-                    with Session(engine) as session:
-                        db_char = session.get(Character, c_id)
-                        if db_char:
-                            db_char.locked = val
-                            session.add(db_char)
-                            session.commit()
-                    save_project_characters_to_json(project.id)
-                    draw_character_list.refresh()
-                    draw_details_panel.refresh()
-                    draw_stats_bar.refresh()
-                    ui.notify(f"Profile {'Locked' if val else 'Unlocked'}!", type="info")
-
-                lock_icon = "lock" if char.locked else "lock_open"
-                lock_color = "bg-rose-50 text-rose-600 hover:bg-rose-100" if char.locked else "bg-slate-100 text-slate-600 hover:bg-slate-200"
-                ui.button(
-                    icon=lock_icon, 
-                    on_click=lambda c_id=char.id: toggle_locked(c_id)
-                ).props('flat dense').classes(f'p-1.5 rounded-lg {lock_color}').tooltip('Toggle manual editing lock')
+                # Fills the middle space, pushing the delete action to the absolute right
+                ui.space()
 
                 async def delete_profile(c_id=char.id):
                     global selected_character_id
@@ -1128,10 +1323,12 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     await refresh_workspace_with_scroll()
                     ui.notify("Character profile deleted.", type="warning")
 
+                # Standout red button to prevent accidental misclicks
                 ui.button(
                     icon='delete', 
-                    on_click=delete_profile
-                ).props('flat dense').classes('bg-red-50 text-red-500 hover:bg-red-100 p-1.5 rounded-lg').tooltip('Delete Character Profile')
+                    on_click=delete_profile,
+                    color='red'
+                ).props('unelevated dense').classes('p-2 rounded-lg text-white').tooltip('Delete Character Profile')
 
         with ui.column().classes('w-full flex-1 overflow-y-auto gap-4 pr-1'):
             
@@ -1369,14 +1566,19 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             on_click=handle_merge_click
                         ).classes('bg-blue-600 text-white font-bold text-xs px-3 py-2 rounded-lg')
 
-            # --- Row 5.0: Appearance Map across Series (Moved to the bottom!) ---
+            # --- Row 5.0: Appearance Map across Series ---
             book_mentions = get_character_book_mentions(project.id, char.id)
             if book_mentions:
                 with ui.column().classes('w-full bg-slate-50 p-4 rounded-xl border gap-2 mt-1'):
-                    ui.label('Appearance Map across Series').classes('text-[11px] font-bold text-slate-500 uppercase tracking-wider')
+                    ui.label('Appearance Map across Series (Click a book to edit prompts)').classes('text-[11px] font-bold text-slate-500 uppercase tracking-wider')
                     with ui.row().classes('w-full gap-2 flex-wrap'):
                         for b_name, m_count in book_mentions.items():
-                            ui.badge(f"{b_name} ({m_count} hits)", color='purple-50').classes('text-purple-700 text-xs font-semibold px-2 py-1 rounded')
+                            ui.badge(
+                                f"{b_name} ({m_count} hits)", 
+                                color='purple-50'
+                            ).classes('text-purple-700 text-xs font-semibold px-2 py-1.5 rounded cursor-pointer hover:bg-purple-100 transition-colors')\
+                             .on('click', lambda _, b=b_name: open_appearance_prompt_modal(project, char, b))\
+                             .tooltip(f"Click to audit and edit {m_count} matching prompts in {b_name}")
 
 
     @ui.refreshable
