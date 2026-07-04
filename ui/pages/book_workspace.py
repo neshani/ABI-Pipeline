@@ -11,9 +11,9 @@ from database.connection import engine, get_setting
 from database.models import Book, Project, Character, CharacterAlias, CharacterTimelineEvent
 from services.character_manager import compile_character_visual_prompt, save_project_characters_to_json, ensure_book_orders
 from ui.pages.project.characters_tab import get_character_frequency_map
+from ui.components.prompt_editor_view import render_prompt_editor_view
 from ui import state
 
-# Ensure standard FastAPI static file serving is mounted once
 try:
     app.add_static_files('/output_media', './output')
 except Exception:
@@ -86,7 +86,6 @@ def save_prompts_csv(project_name: str, book_name: str, rows: List[Dict[str, Any
                 cleaned_row = {h: r.get(h, "") for h in headers}
                 writer.writerow(cleaned_row)
 
-        # Sync update directly into SQLite database cache to maintain consistency
         from services.sync_engine import sync_prompts_csv_to_db_cache
         with Session(engine) as session:
             book = session.exec(select(Book).where(Book.name == book_name)).first()
@@ -107,7 +106,6 @@ def get_book_images_cache(project_name: str, book_name: str) -> Dict[tuple, str]
         (Path(f"./output/{project_name}/{book_name}"), f"/output_media/{project_name}/{book_name}")
     ]
     
-    # Establish load-time static timestamp if none exists in state
     load_time = getattr(state, 'workspace_load_time', 0)
     if not load_time:
         load_time = int(time.time())
@@ -127,7 +125,6 @@ def get_book_images_cache(project_name: str, book_name: str) -> Dict[tuple, str]
                         try:
                             ch = int(parts[0])
                             sc = int(parts[1])
-                            # Use custom targeted coordinate timestamp if present, otherwise fallback to book load time
                             t_val = custom_versions.get((ch, sc), load_time)
                             cache[(ch, sc)] = f"{url_prefix}/{filename}?t={t_val}"
                         except ValueError:
@@ -163,7 +160,6 @@ def delete_scene_image_file(project_name: str, book_name: str, chapter_str: str,
             except Exception as e:
                 print(f"[Proofreader] Error deleting file {m.name}: {e}")
                 
-    # Register dynamic version bump timestamp for this coordinate to cache-bust it on generation
     if not hasattr(state, 'custom_image_timestamps'):
         state.custom_image_timestamps = {}
     state.custom_image_timestamps[(chapter, scene)] = int(time.time() * 1000)
@@ -173,50 +169,50 @@ def delete_scene_image_file(project_name: str, book_name: str, chapter_str: str,
 
 # --- Lazy Context Finder ---
 
-def find_quote_context(project_name: str, book_name: str, quote: str) -> str:
+def find_quote_context(project_name: str, book_name: str, quote: str, char_window: int = 400) -> str:
     """Lazy parses transcript.txt, extracting surrounding paragraphs to highlight narration context."""
     transcript_path = Path(f"./output/{project_name}/{book_name}/transcript.txt")
     if not transcript_path.exists():
         return "Transcript file not found on disk. Run Transcription to load context narration."
-        
+            
     try:
         text = transcript_path.read_text(encoding='utf-8')
     except Exception as e:
         return f"Error reading transcript: {str(e)}"
-        
+            
     if not quote:
         return "Narrative quote is empty."
-        
+            
     text_lower = text.lower()
     quote_lower = quote.lower()
-    
+        
     idx = text_lower.find(quote_lower)
     match_len = len(quote)
-    
+        
     if idx == -1 and len(quote_lower) > 25:
         idx = text_lower.find(quote_lower[:25])
         match_len = 25
-        
+            
     if idx == -1:
         return "Narrative segment context match could not be found inside transcript.txt."
-        
-    start_idx = max(0, idx - 400)
-    end_idx = min(len(text), idx + match_len + 400)
+            
+    start_idx = max(0, idx - char_window)
+    end_idx = min(len(text), idx + match_len + char_window)
     snippet = text[start_idx:end_idx]
-    
+        
     snippet_lower = snippet.lower()
     snippet_idx = snippet_lower.find(quote_lower[:match_len])
-    
+        
     if snippet_idx != -1:
         highlighted = (
             snippet[:snippet_idx] +
-            '<mark class="bg-yellow-200 text-slate-900 font-semibold px-1 rounded">' +
+            '<mark id="quote-target" class="bg-yellow-200 text-slate-900 font-bold px-1 rounded shadow-2xs">' +
             snippet[snippet_idx:snippet_idx + match_len] +
             '</mark>' +
             snippet[snippet_idx + match_len:]
         )
         return f"... {highlighted} ..."
-        
+            
     return f"... {snippet} ..."
 
 
@@ -238,13 +234,11 @@ def render_book_tabs(book_id: int):
             ui.label("Project workspace details not available.").classes('text-slate-400 text-sm')
             return
 
-    # Self-heal book sorting index chronological offsets
     ensure_book_orders(project.id)
 
     project_name = project.name
     book_name = book.name
     
-    # Coordinate cache to prevent resetting the user's active typing/prompt edit input
     loaded_scene_coords = [-1, -1]
 
     def extract_prompt_character_tags(prompt_text: str) -> List[str]:
@@ -262,20 +256,18 @@ def render_book_tabs(book_id: int):
                 ui.notify("Character not found.", type="negative")
                 return
             
-            # Resolve the targeted scene coordinate parameters
             books_list = session.exec(select(Book).where(Book.project_id == project.id)).all()
             book_order_map = {b.id: (b.book_order or 0) for b in books_list}
             target_book_order = book_order_map.get(book_id, 0)
-            target_ch = int(float(state.book_active_chapter))
-            target_sc = int(float(state.book_active_scene))
+            
+            target_ch = int(float(getattr(state, 'book_active_chapter', 1)))
+            target_sc = int(float(getattr(state, 'book_active_scene', 1)))
 
-            # Query all timeline override events for this character
             events = session.exec(
                 select(CharacterTimelineEvent)
                 .where(CharacterTimelineEvent.character_id == char.id)
             ).all()
             
-            # Separate baseline from chronological override events
             matched_evs = []
             base_ev = None
             for ev in events:
@@ -311,18 +303,14 @@ def render_book_tabs(book_id: int):
             active_ev_id = active_ev.id
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
             
-            # Count character mentions in this book's prompts.csv
             frequencies = get_character_frequency_map(project_name, [book])
             total_hits = sum(frequencies.get(a.alias.lower(), 0) for a in aliases)
             if not aliases:
                 total_hits = frequencies.get(char.name.lower(), 0)
 
-        # Force mounting the dialog to the page's root client context to prevent 
-        # it from being destroyed when its triggering container clears during background refreshes.
         with ui.context.client:
-            with ui.dialog() as char_dialog, ui.card().classes('w-[520px] max-w-[95vw] p-5 rounded-xl flex flex-col gap-3 overflow-hidden'):
+            with ui.dialog() as char_dialog, ui.card().classes('w-[520px] max-w-[95vw] p-5 rounded-xl flex flex-col gap-3 overflow-hidden outline-none focus:outline-none'):
                 
-                # Header
                 with ui.row().classes('w-full justify-between items-center border-b pb-2 flex-shrink-0'):
                     with ui.column().classes('gap-0'):
                         ui.label(f"Edit Profile: {char.name}").classes('text-sm font-bold text-slate-800')
@@ -342,16 +330,13 @@ def render_book_tabs(book_id: int):
                         lock_switch = ui.switch(value=char.locked, on_change=toggle_modal_lock).props('dense')
                         ui.label('Locked').classes('text-xs font-semibold text-slate-500 mr-2')
 
-                # Scrollable Body Panel
                 with ui.column().classes('w-full flex-1 overflow-y-auto pr-1 gap-3 max-h-[55vh] min-h-0'):
                     
-                    # Coordinate State Indicator & Fork Trigger Button
                     with ui.row().classes('w-full items-center justify-between bg-blue-50/50 border border-blue-100 p-2.5 rounded-lg flex-shrink-0'):
                         with ui.column().classes('gap-0'):
                             ui.label('Active State:').classes('text-[9px] font-black text-blue-600 uppercase tracking-wider')
                             ui.label(f"'{active_ev.label or 'Base State'}'").classes('text-xs font-bold text-slate-700')
                         
-                        # Fork coordinate changes directly on the fly
                         if active_ev.book_id != book_id or active_ev.chapter_num != target_ch or active_ev.scene_num != target_sc:
                             async def create_timeline_change_here():
                                 with Session(engine) as session:
@@ -397,7 +382,6 @@ def render_book_tabs(book_id: int):
                         )
                         return compile_character_visual_prompt(mock_ev)
 
-                    # Compiled Description Textarea
                     ui.label('Compiled Visual Prompt').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide mt-1')
                     
                     desc_textarea = ui.textarea(
@@ -411,7 +395,6 @@ def render_book_tabs(book_id: int):
                     for field_el in [demo_input, hair_input, build_input, marks_input]:
                         field_el.on('blur', on_trait_change)
 
-                    # Aliases chip manager
                     ui.label('Mapped Alias Tags').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide mt-1')
                     
                     @ui.refreshable
@@ -419,7 +402,7 @@ def render_book_tabs(book_id: int):
                         with Session(engine) as session:
                             curr_aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char_id)).all()
                         
-                        with ui.row().classes('w-full gap-1.5 flex-wrap items-center bg-slate-50 p-2 rounded-lg border border-dashed'):
+                        with ui.row().classes('w-full gap-1.5 flex-wrap items-center bg-slate-50 p-2 rounded-lg border border-dashed outline-none focus:outline-none'):
                             if not curr_aliases:
                                 ui.label('No aliases mapped.').classes('text-[11px] text-slate-400 italic')
                             for a in curr_aliases:
@@ -456,7 +439,6 @@ def render_book_tabs(book_id: int):
 
                     render_modal_aliases()
 
-                # Footer
                 with ui.row().classes('w-full justify-end gap-2 border-t pt-2 mt-2 flex-shrink-0'):
                     def cancel():
                         char_dialog.close()
@@ -467,9 +449,9 @@ def render_book_tabs(book_id: int):
                             db_char = session.get(Character, char_id)
                             if db_ev:
                                 db_ev.demographics = demo_input.value.strip() if demo_input.value.strip() else None
-                                db_ev.physical_build = build_input.value.strip() if build_input.value.strip() else None
-                                db_ev.hair_and_face = hair_input.value.strip() if hair_input.value.strip() else None
-                                db_ev.distinguishing_marks = marks_input.value.strip() if marks_input.value.strip() else None
+                                db_ev.physical_build = build_input.value.strip() if db_ev.physical_build is None or db_ev.physical_build == "" else db_ev.physical_build
+                                db_ev.hair_and_face = hair_input.value.strip() if db_ev.hair_and_face is None or db_ev.hair_and_face == "" else db_ev.hair_and_face
+                                db_ev.distinguishing_marks = marks_input.value.strip() if db_ev.distinguishing_marks is None or db_ev.distinguishing_marks == "" else db_ev.distinguishing_marks
                                 db_ev.visual_description = desc_textarea.value.strip() if desc_textarea.value.strip() else None
                                 session.add(db_ev)
                                 session.commit()
@@ -488,9 +470,8 @@ def render_book_tabs(book_id: int):
 
             char_dialog.open()
 
-    # Dynamic Scene Chips Container clear and draw handler (Robust, context-safe)
     def render_scene_character_chips(prompt_text: str):
-        """Safely clears and populates matched character tags on the scene."""
+        """Safely clears and populates matched character tags on the scene with descriptive hover tooltips."""
         scene_chips_container.clear()
         tags = extract_prompt_character_tags(prompt_text)
         if not tags:
@@ -498,7 +479,14 @@ def render_book_tabs(book_id: int):
         
         with Session(engine) as session:
             chars = session.exec(select(Character).where(Character.project_id == project.id)).all()
+            books_list = session.exec(select(Book).where(Book.project_id == project.id)).all()
+            book_order_map = {b.id: (b.book_order or 0) for b in books_list}
+            target_book_order = book_order_map.get(book_id, 0)
             
+            # Fetch active theater scene coordinates
+            target_ch = int(float(getattr(state, 'book_active_chapter', 1)))
+            target_sc = int(float(getattr(state, 'book_active_scene', 1)))
+
             matched_chars = []
             for char in chars:
                 aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
@@ -506,20 +494,57 @@ def render_book_tabs(book_id: int):
                 alias_texts.add(char.name.lower())
                 
                 if any(t.lower() in alias_texts for t in tags):
-                    matched_chars.append((char, aliases))
+                    # Query timeline events for this character
+                    events = session.exec(
+                        select(CharacterTimelineEvent)
+                        .where(CharacterTimelineEvent.character_id == char.id)
+                    ).all()
+                    
+                    matched_evs = []
+                    base_ev = None
+                    for ev in events:
+                        if ev.book_id is None:
+                            base_ev = ev
+                            continue
+                        ev_order = book_order_map.get(ev.book_id, 0)
+                        if ev_order < target_book_order:
+                            matched_evs.append((ev, ev_order))
+                        elif ev_order == target_book_order:
+                            if ev.chapter_num < target_ch:
+                                matched_evs.append((ev, ev_order))
+                            elif ev.chapter_num == target_ch and ev.scene_num <= target_sc:
+                                matched_evs.append((ev, ev_order))
+                                
+                    active_ev = base_ev
+                    if matched_evs:
+                        matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
+                        active_ev = matched_evs[-1][0]
+                        
+                    if not active_ev:
+                        active_ev = base_ev
+                        
+                    matched_chars.append((char, active_ev))
 
         if matched_chars:
             with scene_chips_container:
-                with ui.row().classes('w-full items-center gap-1 bg-slate-50 p-2 rounded-lg border border-dashed mt-1 flex-wrap'):
+                with ui.row().classes('w-full items-center gap-1 bg-slate-50 p-2 rounded-lg border border-dashed mt-1 flex-wrap outline-none focus:outline-none'):
                     ui.label('Scene Characters:').classes('text-[9px] font-black text-slate-400 uppercase tracking-wider')
-                    for char, _ in matched_chars:
-                        ui.chip(
+                    for char, active_ev in matched_chars:
+                        # Build description hover text
+                        demo_text = active_ev.demographics if active_ev else None
+                        build_text = active_ev.physical_build if active_ev else None
+                        
+                        demo_disp = demo_text or "unspecified demographics"
+                        build_disp = build_text or "unspecified build"
+                        tooltip_desc = f"👤 {char.name} ({demo_disp}, {build_disp})"
+                        
+                        chip = ui.chip(
                             f"👤 {char.name}",
                             on_click=lambda _, c_id=char.id: open_character_edit_dialog(c_id)
-                        ).classes('text-[11px] bg-white hover:bg-blue-50 hover:text-blue-700 cursor-pointer border py-0.5 px-2.5 rounded-md')
-
-    # Aggressively deallocate and clear any stale workspace timers & keyboards
-    # to prevent background execution leakage and active binding propagation bloat.
+                        ).classes('text-[11px] bg-white hover:bg-blue-50 hover:text-blue-700 cursor-pointer border py-0.5 px-2.5 rounded-md outline-none focus:outline-none')
+                        with chip:
+                            ui.tooltip(tooltip_desc).classes('bg-slate-800 text-white text-[10px] p-2.5 rounded-md')
+                            
     if getattr(state, 'book_scroll_timer', None):
         try:
             state.book_scroll_timer.cancel()
@@ -558,7 +583,6 @@ def render_book_tabs(book_id: int):
     project_name = project.name
     book_name = book.name
 
-    # Initialize shortcuts, infinite scroll parameters, and key tracking in state
     if not hasattr(state, 'key_approve'):
         state.key_approve = 'a'
     if not hasattr(state, 'key_delete'):
@@ -571,16 +595,15 @@ def render_book_tabs(book_id: int):
         state.book_active_chapter = 1
     if not hasattr(state, 'book_active_scene'):
         state.book_active_scene = 1
+    if not hasattr(state, 'book_view_mode'):
+        state.book_view_mode = 'Gallery'
     
-    # Establish dynamic load times and clear coordinate timestamps
     import time
     state.workspace_load_time = int(time.time())
     state.custom_image_timestamps = {}
     
-    # Infinite gallery paging limit
     state.book_gallery_limit = 24
 
-    # Synchronize scenes to the SQLite DB cache
     from services.sync_engine import sync_prompts_csv_to_db_cache
     with Session(engine) as session:
         sync_prompts_csv_to_db_cache(book_id, session)
@@ -593,7 +616,6 @@ def render_book_tabs(book_id: int):
             query = select(ScenePrompt).where(ScenePrompt.book_id == book_id).order_by(ScenePrompt.chapter_num, ScenePrompt.scene_num)
             results = session.exec(query).all()
         
-        # Convert each ScenePrompt database instance into standard lower-case dicts
         return [
             {
                 "chapter": str(r.chapter_num),
@@ -606,7 +628,6 @@ def render_book_tabs(book_id: int):
             for r in results
         ]
 
-    # Populate active prompts from SQLite Cache instantly
     prompts = get_all_prompts_as_dicts()
     images_cache = get_book_images_cache(project_name, book_name)
 
@@ -689,7 +710,6 @@ def render_book_tabs(book_id: int):
                 current_scene = p
                 break
                 
-        # Fallback if the active item was filtered out
         if not current_scene:
             current_scene = filtered[0]
             try:
@@ -710,7 +730,6 @@ def render_book_tabs(book_id: int):
         img_url = images_cache.get((ch, sc))
         is_approved = current_scene.get("approved", "False").strip().lower() == "true"
         
-        # Update Modal Content In-place
         if modal_img_el:
             if img_url:
                 if modal_img_el.source != img_url:
@@ -728,7 +747,6 @@ def render_book_tabs(book_id: int):
         if modal_subtitle_el:
             modal_subtitle_el.set_text(f"Review Scene: {current_idx + 1} of {len(filtered)}")
             
-        # Modal Badge updates
         if modal_badge_missing:
             modal_badge_missing.visible = not img_url
         if modal_badge_approved:
@@ -736,7 +754,6 @@ def render_book_tabs(book_id: int):
         if modal_badge_review:
             modal_badge_review.visible = bool(img_url and not is_approved)
 
-        # Highlight background Grid Card
         for (grid_ch, grid_sc), ref in grid_card_references.items():
             ref["card"].classes(remove="ring-4 ring-blue-500 ring-offset-2")
             
@@ -744,7 +761,6 @@ def render_book_tabs(book_id: int):
             target_ref = grid_card_references[(ch, sc)]
             target_ref["card"].classes(add="ring-4 ring-blue-500 ring-offset-2")
 
-        # Only overwrite inputs and text if coordinates changed (prevent resetting cursor / active edits)
         if loaded_scene_coords[0] != ch or loaded_scene_coords[1] != sc:
             loaded_scene_coords[0] = ch
             loaded_scene_coords[1] = sc
@@ -758,7 +774,6 @@ def render_book_tabs(book_id: int):
             if modal_context_html:
                 modal_context_html.set_content(find_quote_context(project_name, book_name, current_scene.get("quote", "")))
 
-        # Update character chips beneath prompt input
         if modal_prompt_input:
             render_scene_character_chips(modal_prompt_input.value)
 
@@ -866,9 +881,6 @@ def render_book_tabs(book_id: int):
         
         next_scene()
 
-    def handle_modal_close():
-        pass
-
     async def trigger_batch_restart():
         start_fn = getattr(state, 'start_image_generation_cb', None)
         if not start_fn:
@@ -901,7 +913,6 @@ def render_book_tabs(book_id: int):
             is_approved = ref["item"].get("approved", "False").strip().lower() == "true"
             has_image = bool(img_url)
             
-            # Determine if this card matches the active filter criteria
             should_be_visible = True
             if filter_mode.value == "Unapproved Only":
                 should_be_visible = bool(has_image and not is_approved)
@@ -923,12 +934,10 @@ def render_book_tabs(book_id: int):
                 border_style = "border-amber-300 bg-amber-50/10"
                 dot_color = "bg-amber-500"
                 
-            ref["card"].classes(replace=f"border rounded-lg shadow-sm p-2 cursor-pointer hover:shadow-md transition-all {border_style}")
+            ref["card"].classes(replace=f"border rounded-lg shadow-sm p-2 cursor-pointer hover:shadow-md transition-all {border_style} outline-none focus:outline-none")
             ref["dot"].classes(replace=f"w-2 h-2 rounded-full {dot_color}")
             
             if img_url:
-                # Only tell the client to set the image source if the URL string has actually changed.
-                # This prevents unchanged images on the grid from flashing and reloading.
                 if ref["image"].source != img_url:
                     ref["image"].set_source(img_url)
                 ref["image"].visible = True
@@ -937,32 +946,14 @@ def render_book_tabs(book_id: int):
                 ref["image"].visible = False
                 ref["placeholder"].visible = True
 
-    def check_for_image_updates():
-        if state.active_book_id is None:
-            return
-            
-        img_dir = Path(f"./output/{project_name}/{book_name}/images")
-        parent_dir = Path(f"./output/{project_name}/{book_name}")
-        
-        count = 0
-        if img_dir.exists():
-            count += len(os.listdir(img_dir))
-        if parent_dir.exists():
-            count += len(os.listdir(parent_dir))
-            
-        if count != last_file_count[0]:
-            last_file_count[0] = count
-            
-            nonlocal images_cache
-            images_cache = get_book_images_cache(project_name, book_name)
-            
-            update_grid_views_in_place()
-            if theater_dialog.value:
-                update_active_scene_ui()
+    def launch_theater_from_coordinate(ch_val: int, sc_val: int):
+        state.book_active_chapter = ch_val
+        state.book_active_scene = sc_val
+        theater_dialog.open()
+        update_active_scene_ui()
 
     # --- 2. LAYOUT RENDERING COMPONENT DECLARATIONS ---
 
-    # Awaiting Generation Panel / Transcript Editor Portal
     if not prompts:
         transcript_path = Path(f"./output/{project_name}/{book_name}/transcript.txt")
         has_transcript = transcript_path.exists()
@@ -981,7 +972,7 @@ def render_book_tabs(book_id: int):
                 char_count = len(text_content)
                 word_count = len(text_content.split())
                 
-                with ui.card().classes('w-full border p-6 shadow-sm bg-white gap-4'):
+                with ui.card().classes('w-full border p-6 shadow-sm bg-white gap-4 outline-none focus:outline-none'):
                     with ui.row().classes('items-center justify-between border-b pb-3 w-full'):
                         with ui.row().classes('items-center gap-2'):
                             ui.icon('description', size='md', color='blue-500')
@@ -994,7 +985,6 @@ def render_book_tabs(book_id: int):
                         else:
                             ui.badge('Awaiting Review', color='amber').classes('px-3 py-1 text-xs font-semibold rounded-full')
                     
-                    # Volume Stats Bar
                     with ui.row().classes('w-full justify-start gap-6 bg-slate-50 p-3 rounded-lg border border-dashed text-xs'):
                         with ui.column().classes('gap-0'):
                             ui.label('Character Count').classes('text-slate-400 font-medium')
@@ -1034,7 +1024,6 @@ def render_book_tabs(book_id: int):
 
                     def toggle_approval():
                         try:
-                            # Auto-save changes on approval toggle so users do not lose typed edits
                             transcript_path.write_text(editor.value, encoding="utf-8")
                         except Exception as e:
                             state.add_console_log(f"[Workspace] Failed to auto-save transcript on approval: {str(e)}")
@@ -1048,11 +1037,9 @@ def render_book_tabs(book_id: int):
                         
                         render_transcript_editor.refresh()
                         
-                        # Trigger main project dashboard stats check
                         if state.stats_refresh_callback:
                             asyncio.create_task(state.stats_refresh_callback())
                     
-                    # Action Buttons (Positioned above the text area)
                     with ui.row().classes('w-full justify-between items-center border-b pb-3 mb-1'):
                         with ui.row().classes('gap-2'):
                             ui.button('Save Changes', icon='save', on_click=save_transcript).classes('bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4')
@@ -1064,7 +1051,6 @@ def render_book_tabs(book_id: int):
                         else:
                             ui.button('Approve Transcript', icon='check_circle', on_click=toggle_approval).classes('bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-5')
 
-                    # Text Editor Component
                     editor = ui.textarea(
                         label="Editable transcript.txt", 
                         value=text_content
@@ -1076,10 +1062,7 @@ def render_book_tabs(book_id: int):
             return
 
         else:
-            # Original Awaiting Generation Panel (No transcript available yet)
-            char_count = 0
-            word_count = 0
-            with ui.card().classes('w-full border p-6 shadow-sm bg-white gap-4'):
+            with ui.card().classes('w-full border p-6 shadow-sm bg-white gap-4 outline-none focus:outline-none'):
                 with ui.row().classes('items-center gap-2 border-b pb-3 w-full'):
                     ui.icon('pending_actions', size='md', color='amber-500')
                     with ui.column().classes('gap-0'):
@@ -1125,34 +1108,32 @@ def render_book_tabs(book_id: int):
                     ui.label("Switch to the 'Dashboard' tab on the project workspace to run these steps.").classes('text-[11px] text-slate-500 italic')
             return
 
-    # Hidden filter reference
     filter_mode = ui.select(
         options=["All", "Unapproved Only", "Missing Only"], 
         value="All"
     ).classes('hidden')
 
-    # --- Top Interface Toolbar ---
-    with ui.row().classes('w-full justify-between items-center bg-white p-3 border rounded-xl shadow-xs mb-4'):
-        with ui.row().classes('items-center gap-4'):
-            # Icon-based Filter Selector Segment
-            with ui.row().classes('items-center gap-1 bg-slate-100 p-1 rounded-lg border'):
-                btn_all = ui.button(icon='grid_view').props('flat dense').classes('px-3 py-1.5 rounded-md')
-                btn_unapproved = ui.button(icon='rate_review').props('flat dense').classes('px-3 py-1.5 rounded-md')
-                btn_missing = ui.button(icon='image_not_supported').props('flat dense').classes('px-3 py-1.5 rounded-md')
+    # --- Optimized Dense One-Line Toolbar Header ---
+    with ui.row().classes('w-full justify-between items-center bg-white py-1.5 px-3 border rounded-xl shadow-2xs mb-3 flex-nowrap gap-2 outline-none focus:outline-none'):
+        with ui.row().classes('items-center gap-2 flex-nowrap'):
+            with ui.row().classes('items-center gap-0.5 bg-slate-100 p-0.5 rounded-lg border flex-nowrap'):
+                btn_all = ui.button(icon='grid_view').props('flat dense').classes('px-2 py-1 rounded-md text-xs')
+                btn_unapproved = ui.button(icon='rate_review').props('flat dense').classes('px-2 py-1 rounded-md text-xs')
+                btn_missing = ui.button(icon='image_not_supported').props('flat dense').classes('px-2 py-1 rounded-md text-xs')
                 
                 with btn_all:
-                    ui.tooltip('Show All Scenes')
+                    ui.tooltip('Show All')
                 with btn_unapproved:
-                    ui.tooltip('Show Unapproved Scenes Only')
+                    ui.tooltip('Unapproved Only')
                 with btn_missing:
-                    ui.tooltip('Show Missing Scenes Only')
+                    ui.tooltip('Missing Only')
                     
                 def update_button_styles(mode: str):
                     for m, btn in [('All', btn_all), ('Unapproved Only', btn_unapproved), ('Missing Only', btn_missing)]:
                         if mode == m:
-                            btn.classes(replace='px-3 py-1.5 rounded-md bg-white text-blue-600 shadow-sm font-bold')
+                            btn.classes(replace='px-2 py-1 rounded-md bg-white text-blue-600 shadow-sm font-bold')
                         else:
-                            btn.classes(replace='px-3 py-1.5 rounded-md text-slate-500 hover:text-slate-700 hover:bg-slate-200/50')
+                            btn.classes(replace='px-2 py-1 rounded-md text-slate-500 hover:text-slate-700 hover:bg-slate-200/50')
                             
                 def set_filter(mode: str):
                     filter_mode.value = mode
@@ -1163,35 +1144,50 @@ def render_book_tabs(book_id: int):
                 btn_unapproved.on('click', lambda: set_filter('Unapproved Only'))
                 btn_missing.on('click', lambda: set_filter('Missing Only'))
                 
-                # Apply styles without evaluating render_content.refresh() too early
                 update_button_styles(filter_mode.value)
             
-            # Direct batch reboot action
+            with ui.row().classes('items-center gap-0.5 bg-slate-100 p-0.5 rounded-lg border flex-nowrap'):
+                btn_view_gallery = ui.button('Gallery', icon='photo_library').props('flat dense').classes('px-2.5 py-1 rounded-md text-xs font-semibold')
+                btn_view_editor = ui.button('Prompt', icon='edit_note').props('flat dense').classes('px-2.5 py-1 rounded-md text-xs font-semibold')
+                
+                def update_view_mode_styles(mode: str):
+                    if mode == 'Gallery':
+                        btn_view_gallery.classes(replace='px-2.5 py-1 rounded-md text-xs bg-white text-blue-600 shadow-sm font-black')
+                        btn_view_editor.classes(replace='px-2.5 py-1 rounded-md text-xs text-slate-500 hover:text-slate-700 hover:bg-slate-200/50 font-medium')
+                    else:
+                        btn_view_editor.classes(replace='px-2.5 py-1 rounded-md text-xs bg-white text-blue-600 shadow-sm font-black')
+                        btn_view_gallery.classes(replace='px-2.5 py-1 rounded-md text-xs text-slate-500 hover:text-slate-700 hover:bg-slate-200/50 font-medium')
+
+                def swap_view_mode(mode: str):
+                    state.book_view_mode = mode
+                    update_view_mode_styles(mode)
+                    
+                btn_view_gallery.on('click', lambda: swap_view_mode('Gallery'))
+                btn_view_editor.on('click', lambda: swap_view_mode('Editor'))
+                update_view_mode_styles(state.book_view_mode)
+
             ui.button(
-                'Restart Batch / Regen', 
+                'Regen', 
                 icon='refresh', 
                 on_click=trigger_batch_restart
-            ).classes('bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 h-10')
+            ).classes('bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1 h-8 rounded-lg')
 
-            # Stop image generation button
             ui.button(
-                'Stop Rendering',
+                'Stop',
                 icon='stop',
                 on_click=trigger_stop_rendering
-            ).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 h-10') \
+            ).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-3 py-1 h-8 rounded-lg') \
              .bind_visibility_from(state, 'image_gen_active')
             
-        # Shortcuts Reminder Label
-        with ui.row().classes('items-center gap-2 bg-slate-50 px-3 py-1.5 rounded-lg border text-[11px] font-semibold text-slate-500'):
+        with ui.row().classes('items-center gap-1.5 bg-slate-50 px-2.5 py-1 rounded-lg border text-[10px] font-semibold text-slate-500 flex-nowrap'):
             ui.icon('keyboard', size='xs')
             ui.label(
-                f"Shortcuts: [{state.key_approve.upper()}] Approve  |  "
-                f"[{state.key_delete.upper()}] Delete  |  "
-                f"[{state.key_next.upper()}] Next  |  "
+                f"Keys: [{state.key_approve.upper()}] Approve | "
+                f"[{state.key_delete.upper()}] Del | "
+                f"[{state.key_next.upper()}] Next | "
                 f"[{state.key_prev.upper()}] Prev"
             )
 
-    # --- Persistent References for Modal In-place Updates ---
     modal_img_el = None
     modal_placeholder = None
     modal_quote_el = None
@@ -1209,10 +1205,10 @@ def render_book_tabs(book_id: int):
 
     # --- High Performance Theater Modal ---
     with ui.dialog() as theater_dialog:
-        with ui.card().classes('w-full max-w-[95vw] lg:max-w-7xl h-[90vh] p-4 rounded-xl bg-white flex flex-col items-stretch overflow-hidden gap-0'):
+        with ui.card().classes('w-full max-w-[95vw] lg:max-w-7xl h-[90vh] p-4 rounded-xl bg-white flex flex-col items-stretch overflow-hidden gap-0 outline-none focus:outline-none'):
             with ui.grid(columns='1fr 380px').classes('w-full h-full gap-4 items-stretch overflow-hidden min-h-0'):
                 with ui.column().classes('w-full h-full justify-center min-h-0 relative'):
-                    with ui.card().classes('w-full h-full border rounded-xl overflow-hidden shadow-sm flex items-center justify-center bg-slate-900 relative p-0 m-0'):
+                    with ui.card().classes('w-full h-full border rounded-xl overflow-hidden shadow-sm flex items-center justify-center bg-slate-900 relative p-0 m-0 outline-none focus:outline-none'):
                         modal_placeholder = ui.column().classes('items-center justify-center text-slate-400 w-full h-full')
                         with modal_placeholder:
                             ui.icon('photo_library', size='lg').classes('mb-2 text-slate-500 animate-pulse')
@@ -1241,13 +1237,12 @@ def render_book_tabs(book_id: int):
                     
                     with ui.column().classes('w-full gap-2 bg-slate-100 p-3 rounded-lg border border-dashed flex-shrink-0'):
                         with ui.row().classes('w-full gap-2 items-center justify-between'):
-                            ui.button('Prev', icon='chevron_left', on_click=prev_scene).props('flat dense').classes('text-xs font-bold text-slate-600 flex-1 py-1.5 bg-white border rounded')
-                            ui.button('Next', icon='chevron_right', on_click=next_scene).props('flat dense').classes('text-xs font-bold text-slate-600 flex-1 py-1.5 bg-white border rounded')
+                            ui.button('Prev', icon='chevron_left', on_click=prev_scene).props('flat dense').classes('text-xs font-bold text-slate-600 flex-1 py-1.5 bg-white border rounded outline-none focus:outline-none')
+                            ui.button('Next', icon='chevron_right', on_click=next_scene).props('flat dense').classes('text-xs font-bold text-slate-600 flex-1 py-1.5 bg-white border rounded outline-none focus:outline-none')
                         with ui.row().classes('w-full gap-2'):
-                            ui.button('Delete Image', icon='delete', on_click=delete_current).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold flex-1 py-2')
-                            ui.button('Approve', icon='check', on_click=approve_current).classes('bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex-1 py-2')
+                            ui.button('Delete Image', icon='delete', on_click=delete_current).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold flex-1 py-2 outline-none focus:outline-none')
+                            ui.button('Approve', icon='check', on_click=approve_current).classes('bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex-1 py-2 outline-none focus:outline-none')
 
-                    # Dynamic scene chips row (fixed below the buttons block)
                     scene_chips_container = ui.row().classes('w-full flex-shrink-0')
 
                     with ui.column().classes('w-full gap-2 bg-slate-50 p-3 rounded border border-dashed flex-shrink-0'):
@@ -1259,15 +1254,10 @@ def render_book_tabs(book_id: int):
                     ).classes('w-full h-32 text-xs leading-relaxed flex-shrink-0').props('outlined')
                     
                     modal_prompt_input.on('blur', lambda: update_prompt_text(modal_prompt_input.value, active_row_ref[0]))
-                    
-                    # Bind chip updates to live keystrokes / value adjustments
                     modal_prompt_input.on('update:value', lambda e: render_scene_character_chips(e.sender.value))
                     
-                    # Narrative Context drawer (restored)
                     with ui.expansion('Narrative Context (transcript.txt)').classes('w-full border rounded bg-slate-50 text-xs flex-shrink-0'):
                         modal_context_html = ui.html("").classes('p-3 leading-relaxed text-slate-700 bg-white font-serif')
-
-    theater_dialog.on('close', handle_modal_close)
 
     # Keyboard shortcut listener
     def handle_key(e):
@@ -1288,19 +1278,12 @@ def render_book_tabs(book_id: int):
 
     # --- Gallery Grid View Rendering (Dynamic In-Place Appending) ---
     
-    # Reference boxes to track pagination and active containers across callbacks safely
     grid_el_ref = [None]
     load_more_spinner_ref = [None]
     rendered_count_ref = [0]
 
     def render_batch(batch_list: list):
         """Builds and mounts card elements dynamically into the active grid context container."""
-        def launch_theater(ch_val: int, sc_val: int):
-            state.book_active_chapter = ch_val
-            state.book_active_scene = sc_val
-            theater_dialog.open()
-            update_active_scene_ui()
-            
         for item in batch_list:
             is_approved = item.get("approved", "False").strip().lower() == "true"
             
@@ -1322,8 +1305,8 @@ def render_book_tabs(book_id: int):
                 border_style = "border-amber-300 bg-amber-50/10"
                 status_color = "bg-amber-500"
                 
-            with ui.card().classes(f'border rounded-lg shadow-sm p-2 cursor-pointer hover:shadow-md transition-all {border_style}') \
-                    .on('click', lambda _, ch_val=ch, sc_val=sc: launch_theater(ch_val, sc_val)) as card_el:
+            with ui.card().classes(f'border rounded-lg shadow-sm p-2 cursor-pointer hover:shadow-md transition-all {border_style} outline-none focus:outline-none') \
+                    .on('click', lambda _, ch_val=ch, sc_val=sc: launch_theater_from_coordinate(ch_val, sc_val)) as card_el:
                 
                 img_el = ui.image(img_url or "").classes('w-full aspect-square rounded object-cover border')
                 img_el.visible = bool(img_url)
@@ -1346,45 +1329,58 @@ def render_book_tabs(book_id: int):
                 "item": item
             }
 
-    # --- Parent Workspace Loader ---
+    # --- Parent Permanent Workspace Containers ---
+    editor_view_container = ui.column().classes('w-full')
+    editor_view_container.bind_visibility_from(state, 'book_view_mode', value='Editor')
+
+    # Re-evaluating Scope Inside the Refreshable Function solves layout bugs [2.2.9]
     @ui.refreshable
     def render_content():
         filtered = get_filtered_prompts()
-        if not filtered:
-            with ui.column().classes('w-full items-center justify-center p-12 text-slate-400 border border-dashed rounded-xl bg-slate-50'):
-                ui.icon('info', size='lg', color='slate-300')
-                ui.label("No scenes match your active filter.").classes('text-sm text-center font-semibold')
-            return
+        
+        # Permanent gallery container now correctly managed internally!
+        with ui.column().classes('w-full').bind_visibility_from(state, 'book_view_mode', value='Gallery'):
+            if not filtered:
+                with ui.column().classes('w-full items-center justify-center p-12 text-slate-400 border border-dashed rounded-xl bg-slate-50 outline-none focus:outline-none'):
+                    ui.icon('info', size='lg', color='slate-300')
+                    ui.label("No scenes match your active filter.").classes('text-sm text-center font-semibold')
+                return
+                
+            grid_card_references.clear()
+            rendered_count_ref[0] = min(24, len(filtered))
             
-        # Reset counters and references on fresh renders (like changing filters)
-        grid_card_references.clear()
-        rendered_count_ref[0] = min(24, len(filtered))
-        
-        # Instantiate active grid container and capture reference
-        grid_el = ui.grid(columns='repeat(auto-fill, minmax(180px, 1fr))').classes('w-full gap-4')
-        grid_el_ref[0] = grid_el
-        
-        with grid_el:
-            render_batch(filtered[:rendered_count_ref[0]])
+            grid_el = ui.grid(columns='repeat(auto-fill, minmax(180px, 1fr))').classes('w-full gap-4')
+            grid_el_ref[0] = grid_el
             
-        # Instantiate spinner element below the grid
-        load_more_spinner_ref[0] = ui.row().classes('w-full justify-center p-4')
-        with load_more_spinner_ref[0]:
-            ui.spinner(size='md', color='blue')
-            ui.label('Scrolling to load more scenes...').classes('text-xs text-slate-400 font-medium')
-        
-        load_more_spinner_ref[0].visible = len(filtered) > rendered_count_ref[0]
+            with grid_el:
+                render_batch(filtered[:rendered_count_ref[0]])
+                
+            load_more_spinner_ref[0] = ui.row().classes('w-full justify-center p-4')
+            with load_more_spinner_ref[0]:
+                ui.spinner(size='md', color='blue')
+                ui.label('Scrolling to load more scenes...').classes('text-xs text-slate-400 font-medium')
+            
+            load_more_spinner_ref[0].visible = len(filtered) > rendered_count_ref[0]
 
-    # Initial render of the workspace view
+    # Initial paint call
     render_content()
 
-    # --- Viewport-Aware Scroll Listener (In-place append lazy loading) ---
+    with editor_view_container:
+        render_prompt_editor_view(
+            project_id=project.id,
+            book_id=book_id,
+            images_cache=images_cache,
+            prompts_list=prompts,
+            on_refresh_grid=lambda: [render_content.refresh()],
+            open_character_edit_dialog_fn=open_character_edit_dialog,
+            open_theater_modal_fn=launch_theater_from_coordinate
+        )
+
+    # --- Viewport-Aware Scroll Listener ---
     async def check_scroll():
-        # Exit scroll checking if active details modal is open
-        if theater_dialog.value:
+        if theater_dialog.value or state.book_view_mode != 'Gallery':
             return
         try:
-            # Check browser scroll heights on the client side
             is_near_bottom = await ui.run_javascript(
                 'window.pageYOffset >= document.body.offsetHeight - 1.5 * window.innerHeight'
             )
@@ -1392,7 +1388,6 @@ def render_book_tabs(book_id: int):
                 filtered = get_filtered_prompts()
                 current_count = rendered_count_ref[0]
                 
-                # Append next batch of cards dynamically if more exist
                 if current_count < len(filtered):
                     next_count = min(current_count + 24, len(filtered))
                     next_batch = filtered[current_count:next_count]
@@ -1402,16 +1397,14 @@ def render_book_tabs(book_id: int):
                         with grid_el_ref[0]:
                             render_batch(next_batch)
                             
-                        # Toggle loader state
                         if load_more_spinner_ref[0]:
                             load_more_spinner_ref[0].visible = len(filtered) > rendered_count_ref[0]
         except Exception:
             pass
 
-    # Non-blocking scroll checking timer
     state.book_scroll_timer = ui.timer(0.3, check_scroll)
 
- # --- Real-Time Background Image Pop-in Timer (Offloaded!) ---
+    # --- Real-Time Background Image Pop-in Timer ---
     last_file_count = [len(images_cache)]
     
     async def check_for_image_updates():
@@ -1421,7 +1414,6 @@ def render_book_tabs(book_id: int):
         img_dir = Path(f"./output/{project_name}/{book_name}/images")
         parent_dir = Path(f"./output/{project_name}/{book_name}")
         
-        # Offload file-system counting checks to a background thread
         def count_files():
             count = 0
             if img_dir.exists():
@@ -1442,10 +1434,8 @@ def render_book_tabs(book_id: int):
             last_file_count[0] = count
             
             nonlocal images_cache
-            # Offload heavy folder parsing cache building to a background thread
             images_cache = await asyncio.to_thread(get_book_images_cache, project_name, book_name)
             
-            # Use smooth swap on "All" view; refresh grid container for filter changes
             if filter_mode.value == "All":
                 update_grid_views_in_place()
             else:
@@ -1454,5 +1444,4 @@ def render_book_tabs(book_id: int):
             if theater_dialog.value:
                 update_active_scene_ui()
 
-    # Check for newly generated images every 3 seconds
     state.book_update_timer = ui.timer(3.0, check_for_image_updates)
