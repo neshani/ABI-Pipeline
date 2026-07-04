@@ -415,6 +415,28 @@ def ensure_book_chapters_populated(book: Book, book_dir: Path, source_path_str: 
             print(f"[Sync-Engine] Error reconstructing chapters from transcript: {e}")
 
 
+def heal_project_book_orders(project_id: int, session: Session) -> None:
+    """
+    Ensures all books within a project have a non-None, unique, sequential book_order.
+    Preserves any existing orders, filling in missing or duplicate values alphabetically.
+    """
+    books = session.exec(
+        select(Book).where(Book.project_id == project_id)
+    ).all()
+    
+    # Sort first by whether they have an order, then by their order, then alphabetically by name.
+    # This preserves existing custom orders and appends unordered ones to the end alphabetically.
+    sorted_books = sorted(
+        books, 
+        key=lambda b: (b.book_order is None, b.book_order if b.book_order is not None else 0, b.name.lower())
+    )
+    
+    for idx, b in enumerate(sorted_books):
+        b.book_order = idx
+        session.add(b)
+    session.flush()
+
+
 def recover_from_temp_workspaces(session: Session) -> None:
     """
     Scans both workspace_temp/ and output/ folders for transcription tracking metadata.
@@ -632,7 +654,7 @@ def recover_from_temp_workspaces(session: Session) -> None:
     # 1. Commit all recovered projects, books, and audio scans to disk safely first
     session.commit()
 
-    # 2. Re-scan and synchronize characters.json for each active project in a separate isolated transaction
+    # 2. Run self-healing pass to clean and re-index project book ordering sequence gaps/duplicates
     recovered_project_ids = set()
     for item in meta_items:
         proj_name = item.get("project_name")
@@ -641,6 +663,18 @@ def recover_from_temp_workspaces(session: Session) -> None:
             if proj:
                 recovered_project_ids.add(proj.id)
 
+    for p_id in recovered_project_ids:
+        try:
+            heal_project_book_orders(p_id, session)
+        except Exception as oe:
+            # Cleanly un-poison the outer session transaction if a specific project fails
+            session.rollback()
+            print(f"[Sync-Engine] Error healing book orders during recovery for project ID {p_id}: {oe}")
+
+    # Commit all successfully healed book orders and release the SQLite write lock!
+    session.commit()
+
+    # 3. Re-scan and synchronize characters.json for each active project in a separate isolated transaction
     for p_id in recovered_project_ids:
         try:
             from services.character_manager import sync_project_characters_from_json
@@ -701,15 +735,12 @@ def reconcile_database_with_output_folder(session: Session) -> dict:
 
         reconciled_project_ids.append(project.id)
 
-        # Iterate through book subdirectories within the project folder
-        for book_dir in proj_dir.iterdir():
-            if not book_dir.is_dir() or book_dir.name.startswith('.') or book_dir.name.startswith('_'):
-                continue
+        # Collect, filter, and sort book subdirectories alphabetically to guarantee consistent order indexing
+        subdirs = [d for d in proj_dir.iterdir() if d.is_dir() and not d.name.startswith('.') and not d.name.startswith('_')]
+        book_subdirs = [d for d in subdirs if d.name.lower() != "images"]
+        book_subdirs.sort(key=lambda d: d.name.lower())
 
-            # Skip the 'images' folder if it is in the project root instead of inside a book
-            if book_dir.name.lower() == "images":
-                continue
-
+        for idx, book_dir in enumerate(book_subdirs):
             stats["books_discovered"] += 1
 
             # Resolve cover path and original book source path
@@ -761,7 +792,7 @@ def reconcile_database_with_output_folder(session: Session) -> dict:
                 # Update missing details on existing books safely
                 if cover_path and not book.cover_path:
                     book.cover_path = cover_path
-                    session.add(book)
+                session.add(book)
 
             # Ensure Chapter records are fully populated (probes audio or parses transcript)
             ensure_book_chapters_populated(book, book_dir, book_path_src, session)
@@ -776,7 +807,19 @@ def reconcile_database_with_output_folder(session: Session) -> dict:
     # 1. Commit all reconciled projects, books, and audio scans to disk safely first
     session.commit()
 
-    # 2. Run character syncing in fresh, isolated, non-overlapping transactions
+    # 2. Run self-healing pass on all reconciled projects to clean up sequential book orders
+    for p_id in reconciled_project_ids:
+        try:
+            heal_project_book_orders(p_id, session)
+        except Exception as oe:
+            # Cleanly un-poison the outer session transaction if a specific project fails
+            session.rollback()
+            print(f"[Sync-Engine] Error healing book orders during reconciliation for project ID {p_id}: {oe}")
+
+    # Commit all successfully healed book orders and release the SQLite write lock!
+    session.commit()
+
+    # 3. Run character syncing in fresh, isolated, non-overlapping transactions
     for p_id in reconciled_project_ids:
         try:
             from services.character_manager import sync_project_characters_from_json

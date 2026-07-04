@@ -194,7 +194,7 @@ def import_text_transcripts(project_name: str, txt_filepaths: list[str]) -> int:
             session.add(project)
             session.flush()
             
-        for path_str in sorted_paths:
+        for idx, path_str in enumerate(sorted_paths):
             path = Path(path_str)
             book_name = path.stem
             book_dir = project_dir / book_name
@@ -223,24 +223,29 @@ def import_text_transcripts(project_name: str, txt_filepaths: list[str]) -> int:
                     name=book_name,
                     path=str(book_dir),
                     status="Transcribed",
-                    progress=0.0
+                    progress=0.0,
+                    book_order=idx
                 )
                 session.add(book)
                 session.flush()
+            else:
+                if book.book_order is None:
+                    book.book_order = idx
+                    session.add(book)
                 
             from sqlmodel import delete
             session.exec(delete(Chapter).where(Chapter.book_id == book.id))
             session.flush()
             
-            for idx, text_block in enumerate(cleaned_sections):
+            for s_idx, text_block in enumerate(cleaned_sections):
                 lines = [l.strip() for l in text_block.split("\n") if l.strip()]
-                title = lines[0] if lines else f"Chapter {idx + 1}"
+                title = lines[0] if lines else f"Chapter {s_idx + 1}"
                 if len(title) > 60:
                     title = title[:57] + "..."
                     
                 ch = Chapter(
                     book_id=book.id,
-                    chapter_num=idx + 1,
+                    chapter_num=s_idx + 1,
                     title=title,
                     input_file=str(path),
                     type='text_only',
@@ -281,7 +286,7 @@ def import_epub_novels(project_name: str, epub_filepaths: list[str]) -> int:
             session.add(project)
             session.flush()
             
-        for path_str in sorted_paths:
+        for idx, path_str in enumerate(sorted_paths):
             path = Path(path_str)
             book_name = path.stem
             book_dir = project_dir / book_name
@@ -291,8 +296,8 @@ def import_epub_novels(project_name: str, epub_filepaths: list[str]) -> int:
             
             # Compile master transcript.txt with ==CHAPTER== boundaries
             full_transcript_content = ""
-            for idx, (title, text) in enumerate(chapters_data):
-                if idx > 0:
+            for s_idx, (title, text) in enumerate(chapters_data):
+                if s_idx > 0:
                     full_transcript_content += "\n\n==CHAPTER==\n\n"
                     
                 # Double-Heading Guard: Prevent duplicating the title on disk
@@ -323,19 +328,24 @@ def import_epub_novels(project_name: str, epub_filepaths: list[str]) -> int:
                     name=book_name,
                     path=str(book_dir),
                     status="Transcribed",
-                    progress=0.0
+                    progress=0.0,
+                    book_order=idx
                 )
                 session.add(book)
                 session.flush()
+            else:
+                if book.book_order is None:
+                    book.book_order = idx
+                    session.add(book)
                 
             from sqlmodel import delete
             session.exec(delete(Chapter).where(Chapter.book_id == book.id))
             session.flush()
             
-            for idx, (title, text) in enumerate(chapters_data):
+            for s_idx, (title, text) in enumerate(chapters_data):
                 ch = Chapter(
                     book_id=book.id,
-                    chapter_num=idx + 1,
+                    chapter_num=s_idx + 1,
                     title=title,
                     input_file=str(path),
                     type='text_only',
