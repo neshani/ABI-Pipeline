@@ -1007,17 +1007,27 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
 
 def compile_character_description(char: Character, enabled_fields: Dict[str, bool], use_sentence_structure: bool) -> str:
     """
-    Assembles selected character traits into either a comma-separated list 
-    or a parenthetical relative clause to bound traits and prevent bleeding.
-    Deduplicates traits programmatically to prevent redundant features.
-    If no traits are populated, returns the character's name directly.
+    Returns the character's compiled description (visual_description) as the primary source of truth.
+    If visual_description is empty, it falls back to compiling from the 4 individual fields on the fly.
+    If no traits or descriptions are populated, it returns the character's name directly.
     """
+    # 1. Primary Source of Truth: Check if the compiled visual description is populated
+    if char.visual_description and str(char.visual_description).strip():
+        desc = char.visual_description.strip()
+        if use_sentence_structure:
+            # Prevent double-wrapping if the name or parenthetical structure is already present
+            if desc.startswith(char.name) or "(" in desc:
+                return desc
+            return f"{char.name} ({desc})"
+        return desc
+
+    # 2. Fallback: Compile from individual fields on the fly only if visual_description is missing
     demo = char.demographics if enabled_fields.get("demographics", True) else None
     build = char.physical_build if enabled_fields.get("physical_build", True) else None
     hair_face = char.hair_and_face if enabled_fields.get("hair_and_face", True) else None
     marks = char.distinguishing_marks if enabled_fields.get("distinguishing_marks", True) else None
 
-    # Check if there are any active, populated visual details at all
+    # Check if there are any active, populated visual details
     has_any_details = any(
         f is not None and str(f).strip() != ""
         for f in [demo, build, hair_face, marks]
@@ -1118,9 +1128,12 @@ def replace_character_tags_in_prompt(
     expanded_character_ids = set()  # Track which characters have already been described in this prompt
     
     with Session(engine) as session:
+        # Expire any existing identity map entries to force subsequent queries to load from disk
+        session.expire_all()
+        
         for match in matches:
             tag = match.strip()
-            # Fixed: Match Alias scoped strictly to the current project_id
+            # Match Alias scoped strictly to the current project_id
             alias = session.exec(
                 select(CharacterAlias)
                 .join(Character)
@@ -1130,12 +1143,20 @@ def replace_character_tags_in_prompt(
             
             if not alias:
                 char = session.exec(
-                    select(Character).where(Character.project_id == project_id).where(Character.name == tag)
+                    select(Character)
+                    .where(Character.project_id == project_id)
+                    .where(Character.name == tag)
                 ).first()
             else:
                 char = session.get(Character, alias.character_id)
 
             if char:
+                # Force-reload character column attributes from SQLite to catch manual edits on the fly
+                try:
+                    session.refresh(char)
+                except Exception:
+                    pass
+
                 # If we've already described this specific character ID in this prompt, just use their name!
                 if char.id in expanded_character_ids:
                     replacement = char.name
