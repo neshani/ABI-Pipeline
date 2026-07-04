@@ -629,6 +629,26 @@ def recover_from_temp_workspaces(session: Session) -> None:
             if book.project_id:
                 sync_project_status(book.project_id, session)
 
+    # 1. Commit all recovered projects, books, and audio scans to disk safely first
+    session.commit()
+
+    # 2. Re-scan and synchronize characters.json for each active project in a separate isolated transaction
+    recovered_project_ids = set()
+    for item in meta_items:
+        proj_name = item.get("project_name")
+        if proj_name:
+            proj = session.exec(select(Project).where(Project.name == proj_name)).first()
+            if proj:
+                recovered_project_ids.add(proj.id)
+
+    for p_id in recovered_project_ids:
+        try:
+            from services.character_manager import sync_project_characters_from_json
+            # Calling with session=None allows the function to handle its own clean, non-deadlocking transaction
+            sync_project_characters_from_json(p_id)
+        except Exception as ce:
+            print(f"[Sync-Engine] Error syncing characters during recovery for project ID {p_id}: {ce}")
+
     print("[Sync-Engine] Database state recovery sequence complete.")
 
 
@@ -653,6 +673,8 @@ def reconcile_database_with_output_folder(session: Session) -> dict:
 
     from services.scanner import find_cover_art
 
+    reconciled_project_ids = []
+
     # Iterate through project subdirectories in the output folder
     for proj_dir in base_output_dir.iterdir():
         # Exclude directories starting with '_' (like _lora_library) or '.'
@@ -676,6 +698,8 @@ def reconcile_database_with_output_folder(session: Session) -> dict:
             session.add(project)
             session.flush()
             stats["new_projects_created"] += 1
+
+        reconciled_project_ids.append(project.id)
 
         # Iterate through book subdirectories within the project folder
         for book_dir in proj_dir.iterdir():
@@ -749,7 +773,18 @@ def reconcile_database_with_output_folder(session: Session) -> dict:
             except Exception as e:
                 print(f"[Sync-Engine] Error syncing book '{book.name}' from disk: {e}")
 
+    # 1. Commit all reconciled projects, books, and audio scans to disk safely first
     session.commit()
+
+    # 2. Run character syncing in fresh, isolated, non-overlapping transactions
+    for p_id in reconciled_project_ids:
+        try:
+            from services.character_manager import sync_project_characters_from_json
+            # Calling with session=None allows the function to handle its own clean, non-deadlocking transaction
+            sync_project_characters_from_json(p_id)
+        except Exception as ce:
+            print(f"[Sync-Engine] Error syncing characters for project ID {p_id}: {ce}")
+
     return stats
 
 

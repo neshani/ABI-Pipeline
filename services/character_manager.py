@@ -7,35 +7,62 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 from sqlmodel import Session, select
 from database.connection import engine, get_setting
-from database.models import Project, Book, Character, CharacterAlias, CharacterStateModifier
+from database.models import Project, Book, Character, CharacterAlias, CharacterStateModifier, CharacterTimelineEvent
 from services.prompt_engine import smart_chunk_text, get_llm_response
 
-def get_characters_json_path(project_id: int) -> Optional[Path]:
+def get_characters_json_path(project_id: int, session: Optional[Session] = None) -> Optional[Path]:
     """Retrieves the file-as-source-of-truth characters.json target path."""
-    with Session(engine) as session:
+    should_close = False
+    if session is None:
+        session = Session(engine)
+        should_close = True
+    try:
         project = session.get(Project, project_id)
         if not project:
             return None
-        base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+        # Crucial: Passed the active session into get_setting to prevent secondary connection deadlocks
+        base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
         return base_output_dir / project.name / "characters.json"
+    finally:
+        if should_close:
+            session.close()
 
 
-def compile_character_visual_prompt(char: Character) -> str:
+def ensure_book_orders(project_id: int):
     """
-    Assembles a descriptive, natural language physical prompt from simplified structured traits.
-    Optimized for single-stream text encoders like Qwen (Z-Image Turbo).
-    Deduplicates overlapping traits to prevent prompt weight bloat.
+    Self-heals book_order fields for books within a project,
+    sorting alphabetically by name as the natural default order.
+    """
+    with Session(engine) as session:
+        books = session.exec(
+            select(Book).where(Book.project_id == project_id).order_by(Book.name)
+        ).all()
+        
+        changed = False
+        for idx, book in enumerate(books):
+            if book.book_order is None or book.book_order != idx:
+                book.book_order = idx
+                session.add(book)
+                changed = True
+        if changed:
+            session.commit()
+
+
+def compile_character_visual_prompt(obj) -> str:
+    """
+    Assembles a descriptive, natural language physical prompt from structured traits.
+    Optimized for single-stream text encoders. Accepts either CharacterTimelineEvent or a legacy Character object.
     """
     pieces = []
     
-    if char.demographics and str(char.demographics).strip():
-        pieces.append(char.demographics.strip())
-    if char.hair_and_face and str(char.hair_and_face).strip():
-        pieces.append(char.hair_and_face.strip())
-    if char.physical_build and str(char.physical_build).strip():
-        pieces.append(char.physical_build.strip())
-    if char.distinguishing_marks and str(char.distinguishing_marks).strip():
-        pieces.append(char.distinguishing_marks.strip())
+    if getattr(obj, "demographics", None) and str(obj.demographics).strip():
+        pieces.append(obj.demographics.strip())
+    if getattr(obj, "hair_and_face", None) and str(obj.hair_and_face).strip():
+        pieces.append(obj.hair_and_face.strip())
+    if getattr(obj, "physical_build", None) and str(obj.physical_build).strip():
+        pieces.append(obj.physical_build.strip())
+    if getattr(obj, "distinguishing_marks", None) and str(obj.distinguishing_marks).strip():
+        pieces.append(obj.distinguishing_marks.strip())
 
     cleaned_pieces = []
     seen = set()
@@ -46,14 +73,15 @@ def compile_character_visual_prompt(char: Character) -> str:
             seen.add(p_clean.lower())
 
     if not cleaned_pieces:
-        return f"a person named {char.name}"
+        name = getattr(obj, "name", "person")
+        return f"a person named {name}"
         
     return ", ".join(cleaned_pieces)
 
 
 def save_project_characters_to_json(project_id: int):
     """
-    Serializes all project characters, aliases, and modifiers to characters.json.
+    Serializes all project characters, aliases, and timeline override events to characters.json.
     Ensures that manual edits and LLM descriptions are always safely preserved on disk.
     """
     json_path = get_characters_json_path(project_id)
@@ -67,32 +95,39 @@ def save_project_characters_to_json(project_id: int):
         serialized_data = []
         for char in characters:
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-            modifiers = session.exec(select(CharacterStateModifier).where(CharacterStateModifier.character_id == char.id)).all()
+            timeline_events = session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == char.id)
+                .order_by(CharacterTimelineEvent.id)
+            ).all()
             
+            timeline_serialized = []
+            for ev in timeline_events:
+                book_name = None
+                if ev.book_id is not None:
+                    b = session.get(Book, ev.book_id)
+                    if b:
+                        book_name = b.name
+                
+                timeline_serialized.append({
+                    "book_name": book_name,
+                    "chapter_num": ev.chapter_num,
+                    "scene_num": ev.scene_num,
+                    "label": ev.label,
+                    "visual_description": ev.visual_description,
+                    "profile": {
+                        "demographics": ev.demographics,
+                        "physical_build": ev.physical_build,
+                        "hair_and_face": ev.hair_and_face,
+                        "distinguishing_marks": ev.distinguishing_marks
+                    }
+                })
+
             char_entry = {
                 "name": char.name,
-                "is_dynamic": char.is_dynamic,
                 "locked": char.locked,
-                "book_id": char.book_id,
-                "visual_description": char.visual_description,
-                "profile": {
-                    "demographics": char.demographics,
-                    "physical_build": char.physical_build,
-                    "hair_and_face": char.hair_and_face,
-                    "distinguishing_marks": char.distinguishing_marks
-                },
                 "aliases": [alias.alias for alias in aliases],
-                "modifiers": [
-                    {
-                        "name": mod.name,
-                        "modifier_text": mod.modifier_text,
-                        "book_id": mod.book_id,
-                        "start_chapter": mod.start_chapter,
-                        "end_chapter": mod.end_chapter,
-                        "is_permanent": mod.is_permanent
-                    }
-                    for mod in modifiers
-                ]
+                "timeline": timeline_serialized
             }
             serialized_data.append(char_entry)
 
@@ -101,24 +136,81 @@ def save_project_characters_to_json(project_id: int):
         json.dump(serialized_data, f, indent=2, ensure_ascii=False)
 
 
-
-def sync_project_characters_from_json(project_id: int):
+def robust_json_load(json_str: str) -> Any:
     """
-    Rebuilds the SQLModel character entries from characters.json if the database was wiped.
+    Attempts to parse JSON, with fallbacks to repair trailing commas and unclosed brackets/braces.
+    Useful for handling legacy files or copy-paste truncated outputs cleanly.
+    """
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        pass
+
+    cleaned = json_str.strip()
+    
+    # Remove trailing commas before closing brackets or braces
+    cleaned = re.sub(r',\s*([\]}])', r'\1', cleaned)
+    
+    if cleaned.endswith(','):
+        cleaned = cleaned[:-1].strip()
+        
+    open_brackets = cleaned.count('[') - cleaned.count(']')
+    open_braces = cleaned.count('{') - cleaned.count('}')
+    
+    if open_braces > 0:
+        cleaned += '}' * open_braces
+    if open_brackets > 0:
+        cleaned += ']' * open_brackets
+        
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Last-ditch: Scan and extract any complete flat JSON objects {...} in sequence
+        objects = []
+        brace_level = 0
+        start_idx = -1
+        for i, char in enumerate(cleaned):
+            if char == '{':
+                if brace_level == 0:
+                    start_idx = i
+                brace_level += 1
+            elif char == '}':
+                brace_level -= 1
+                if brace_level == 0 and start_idx != -1:
+                    obj_str = cleaned[start_idx:i+1]
+                    try:
+                        objects.append(json.loads(obj_str))
+                    except Exception:
+                        pass
+        if objects:
+            return objects
+        raise
+
+
+def sync_project_characters_from_json(project_id: int, session: Optional[Session] = None):
+    """
+    Rebuilds the SQLModel character entries and timeline overrides from characters.json if the database was wiped.
     Maintains our strict File-as-Source-of-Truth database indexing principles.
     """
-    json_path = get_characters_json_path(project_id)
+    # Resolve the path using the shared session
+    json_path = get_characters_json_path(project_id, session)
     if not json_path or not json_path.exists():
         return
 
     try:
         with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            raw_content = f.read()
+        data = robust_json_load(raw_content)
     except Exception as e:
         print(f"[Characters] Failed to parse {json_path}: {str(e)}")
         return
 
-    with Session(engine) as session:
+    should_close = False
+    if session is None:
+        session = Session(engine)
+        should_close = True
+
+    try:
         # Clear out existing SQLModel character caches for this project to perform a clean sync
         old_chars = session.exec(select(Character).where(Character.project_id == project_id)).all()
         for oc in old_chars:
@@ -128,52 +220,81 @@ def sync_project_characters_from_json(project_id: int):
             for a in aliases_to_del:
                 session.delete(a)
             
-            mods_to_del = session.exec(
-                select(CharacterStateModifier).where(CharacterStateModifier.character_id == oc.id)
+            evs_to_del = session.exec(
+                select(CharacterTimelineEvent).where(CharacterTimelineEvent.character_id == oc.id)
             ).all()
-            for m in mods_to_del:
-                session.delete(m)
+            for ev in evs_to_del:
+                session.delete(ev)
 
             session.delete(oc)
-        session.commit()
+        session.flush()
 
         # Reconstruct tables from file mapping
         for char_data in data:
-            profile = char_data.get("profile", {})
             new_char = Character(
                 project_id=project_id,
-                book_id=char_data.get("book_id"),
                 name=char_data["name"],
-                demographics=profile.get("demographics"),
-                physical_build=profile.get("physical_build"),
-                hair_and_face=profile.get("hair_and_face"),
-                distinguishing_marks=profile.get("distinguishing_marks"),
-                visual_description=char_data.get("visual_description"),
-                is_dynamic=char_data.get("is_dynamic", False),
                 locked=char_data.get("locked", False)
             )
             session.add(new_char)
-            session.commit()  # commit to acquire character ID for relational attachments
+            session.flush()  # flush to acquire character ID for relational attachments
 
             # Attach extracted aliases
             for alias_text in char_data.get("aliases", []):
                 new_alias = CharacterAlias(character_id=new_char.id, alias=alias_text)
                 session.add(new_alias)
 
-            # Attach state modifiers
-            for mod_data in char_data.get("modifiers", []):
-                new_mod = CharacterStateModifier(
+            # Rebuild Timeline Events
+            timeline_list = char_data.get("timeline", [])
+            if not timeline_list:
+                # Backward compatibility fallback
+                legacy_profile = char_data.get("profile") or {}
+                base_ev = CharacterTimelineEvent(
                     character_id=new_char.id,
-                    book_id=mod_data["book_id"],
-                    name=mod_data["name"],
-                    modifier_text=mod_data["modifier_text"],
-                    start_chapter=mod_data["start_chapter"],
-                    end_chapter=mod_data["end_chapter"],
-                    is_permanent=mod_data.get("is_permanent", False)
+                    book_id=None,
+                    chapter_num=0,
+                    scene_num=0,
+                    label="Base State",
+                    demographics=legacy_profile.get("demographics"),
+                    physical_build=legacy_profile.get("physical_build"),
+                    hair_and_face=legacy_profile.get("hair_and_face"),
+                    distinguishing_marks=legacy_profile.get("distinguishing_marks"),
+                    visual_description=char_data.get("visual_description")
                 )
-                session.add(new_mod)
-                
-        session.commit()
+                session.add(base_ev)
+            else:
+                for ev_data in timeline_list:
+                    book_name = ev_data.get("book_name")
+                    b_id = None
+                    if book_name:
+                        b = session.exec(
+                            select(Book)
+                            .where(Book.project_id == project_id)
+                            .where(Book.name == book_name)
+                        ).first()
+                        if b:
+                            b_id = b.id
+                    
+                    prof = ev_data.get("profile", {})
+                    new_ev = CharacterTimelineEvent(
+                        character_id=new_char.id,
+                        book_id=b_id,
+                        chapter_num=ev_data.get("chapter_num", 0),
+                        scene_num=ev_data.get("scene_num", 0),
+                        label=ev_data.get("label", "Base State" if b_id is None else "Override State"),
+                        demographics=prof.get("demographics"),
+                        physical_build=prof.get("physical_build"),
+                        hair_and_face=prof.get("hair_and_face"),
+                        distinguishing_marks=prof.get("distinguishing_marks"),
+                        visual_description=ev_data.get("visual_description")
+                    )
+                    session.add(new_ev)
+                    
+        session.flush()
+    finally:
+        if should_close:
+            session.commit()
+            session.close()
 
 
 def extract_characters_from_prompts(project_id: int) -> Set[str]:
@@ -213,7 +334,6 @@ def extract_characters_from_prompts(project_id: int) -> Set[str]:
             return discovered_tags
 
         for tag in discovered_tags:
-            # Fixed: Join with Character table to check if the alias exists in the current project scope
             existing_alias = session.exec(
                 select(CharacterAlias)
                 .join(Character)
@@ -235,6 +355,17 @@ def extract_characters_from_prompts(project_id: int) -> Set[str]:
             session.add(new_char)
             session.commit()
 
+            # Ensure Base State timeline event is created automatically!
+            base_ev = CharacterTimelineEvent(
+                character_id=new_char.id,
+                book_id=None,
+                chapter_num=0,
+                scene_num=0,
+                label="Base State"
+            )
+            session.add(base_ev)
+            session.commit()
+
             new_alias = CharacterAlias(character_id=new_char.id, alias=tag)
             session.add(new_alias)
             session.commit()
@@ -246,7 +377,7 @@ def extract_characters_from_prompts(project_id: int) -> Set[str]:
 def merge_character_aliases(project_id: int, target_character_id: int, source_alias_ids: List[int]):
     """
     Merges multiple aliases into a single canonical target Character.
-    Cleans up the now empty source characters to keep our database indexed and neat.
+    Moves chronological timeline events to target character, cleans up empty source characters.
     """
     with Session(engine) as session:
         target_char = session.get(Character, target_character_id)
@@ -270,14 +401,43 @@ def merge_character_aliases(project_id: int, target_character_id: int, source_al
             if not remaining_aliases:
                 old_char = session.get(Character, old_char_id)
                 if old_char and old_char.id != target_character_id:
+                    # Merge timeline override events
+                    cand_evs = session.exec(
+                        select(CharacterTimelineEvent).where(CharacterTimelineEvent.character_id == old_char_id)
+                    ).all()
+                    for ev in cand_evs:
+                        if ev.book_id is None:
+                            # Recombine legacy traits into target's Base State if blank, then discard
+                            target_base = session.exec(
+                                select(CharacterTimelineEvent)
+                                .where(CharacterTimelineEvent.character_id == target_character_id)
+                                .where(CharacterTimelineEvent.book_id == None)
+                            ).first()
+                            if target_base:
+                                if not target_base.demographics: target_base.demographics = ev.demographics
+                                if not target_base.physical_build: target_base.physical_build = ev.physical_build
+                                if not target_base.hair_and_face: target_base.hair_and_face = ev.hair_and_face
+                                if not target_base.distinguishing_marks: target_base.distinguishing_marks = ev.distinguishing_marks
+                                session.add(target_base)
+                            session.delete(ev)
+                        else:
+                            ev.character_id = target_character_id
+                            session.add(ev)
+                    
                     session.delete(old_char)
                     session.commit()
 
-        # Update target's visual description if unlocked
+        # Update target base's visual description if unlocked
         if target_char and not target_char.locked:
-            target_char.visual_description = compile_character_visual_prompt(target_char)
-            session.add(target_char)
-            session.commit()
+            base_ev = session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == target_character_id)
+                .where(CharacterTimelineEvent.book_id == None)
+            ).first()
+            if base_ev:
+                base_ev.visual_description = compile_character_visual_prompt(base_ev)
+                session.add(base_ev)
+                session.commit()
 
     save_project_characters_to_json(project_id)
 
@@ -291,8 +451,6 @@ def get_character_mention_chunks(
     """
     Retrieves consecutive, chronological snippet windows of transcript.txt centered on character aliases.
     Maintains strictly sequential order (earliest first) to capture introductions and development in order.
-    Supports multi-word aliases (e.g., "Sir Winston") flawlessly via regex-to-word-index mapping.
-    Safeguards against cross-book character bleeding by filtering book scans to only those with active prompt hits.
     """
     base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
     
@@ -309,8 +467,6 @@ def get_character_mention_chunks(
         if book_id:
             books = [session.get(Book, book_id)]
         else:
-            # Optimize and safeguard: Only scan books where this character actually has prompt tags in prompts.csv.
-            # This prevents character profile bleeding across separate books for common names (e.g. "Marvin", "Joe").
             book_mentions = get_character_book_mentions(project_id, character_id)
             all_books = session.exec(
                 select(Book).where(Book.project_id == project_id).order_by(Book.id)
@@ -319,7 +475,6 @@ def get_character_mention_chunks(
             if book_mentions:
                 books = [b for b in all_books if b.name in book_mentions]
             else:
-                # Fallback: If no tags are active anywhere yet, scan all books so discovery is still possible.
                 books = all_books
 
     mention_chunks = []
@@ -338,11 +493,8 @@ def get_character_mention_chunks(
             print(f"[Profiler] Error reading transcript for {book.name}: {str(e)}")
             continue
 
-        # Inject visible chapter break barriers to prevent LLM attention bleeding across scene transitions
         cleaned_text = content.replace("==CHAPTER==", "\n\n--- CHAPTER BREAK ---\n\n").strip()
         
-        # Scan raw transcript text using regex to find all matches of any alias.
-        # This completely resolves the multi-word alias bug.
         match_positions = []
         for alias in alias_texts:
             pattern = re.compile(rf"\b{re.escape(alias)}\b", re.IGNORECASE)
@@ -352,19 +504,14 @@ def get_character_mention_chunks(
         if not match_positions:
             continue
 
-        # Earliest Consecutive Chronological Selection:
-        # Take consecutive hits sequentially starting from her first introduction.
-        # We cap the chronological index list at 50 to keep memory lightweight.
         sampled_char_offsets = sorted(list(set(match_positions)))[:50]
 
-        # Split entire transcript into raw words
         words = re.findall(r'\S+', cleaned_text)
         if not words:
             continue
 
         half_window = chunk_size_words // 2
         for start_pos in sampled_char_offsets:
-            # Map character start offset to exact word index
             words_before_count = len(re.findall(r'\S+', cleaned_text[:start_pos]))
             
             start_idx = max(0, words_before_count - half_window)
@@ -373,7 +520,6 @@ def get_character_mention_chunks(
             snippet_words = words[start_idx:end_idx]
             snippet_text = " ".join(snippet_words)
             
-            # Count the alias mentions inside this focus window
             snippet_lower = snippet_text.lower()
             mentions_count = sum(len(re.findall(re.escape(alias), snippet_lower)) for alias in alias_texts)
 
@@ -459,17 +605,14 @@ def get_speculative_character_template() -> str:
         "### YOUR TASK ###\n"
         "Analyze the provided passage's context—their name, honorifics (Mr., Mrs., Miss, Dr., Sir), dialog tone, age cues, "
         "and social role—to deduce their gender, approximate age, and stylistic vibe. Then, cast them with a "
-        "highly cohesive, fitting, and visually distinct physical appearance appropriate for their character role "
-        "(e.g., an elegant female love interest, a rugged middle-aged detective, a distinguished elder, a tough bodyguard).\n\n"
-        "Every character in this series must look highly distinct from one another. Do NOT use lazy filler clichés. "
-        "Be extremely creative, "
-        "varying face structures, hair textures, colors, skin tones, heights, and builds to build a unique cast.\n\n"
+        "highly cohesive, fitting, and visually distinct physical appearance appropriate for their character role.\n\n"
+        "Every character in this series must look highly distinct from one another. Do NOT use lazy filler clichés.\n\n"
         "### TARGET SENTENCE SCHEMA ###\n"
         "We inject your output into this exact template:\n"
         "\"{character_name} (a {{demographics}}, {{hair_and_face}}, who is {{physical_build}}, and {{distinguishing_marks}})\"\n\n"
         "Your JSON values must be short, lowercase grammatical fragments:\n"
-        "- 'demographics': Noun phrase defining their age and gender (do NOT use articles, do NOT list occupations, and do NOT use abstract personality words like 'reliable', 'composed', or 'distinguished'). E.g., 'elderly woman', 'young man'.\n"
-        "- 'hair_and_face': Physical descriptors of hair style, hair color, or facial structure starting with 'with' (do NOT use transient expressions like 'smiling' or 'worried'). Make it highly cohesive and appropriate for their age, gender, and narrative role.\n"
+        "- 'demographics': Noun phrase defining their age and gender (do NOT use articles, do NOT list occupations, and do NOT use abstract personality words like 'reliable'). E.g., 'elderly woman', 'young man'.\n"
+        "- 'hair_and_face': Physical descriptors of hair style, hair color, or facial structure starting with 'with'. Make it highly cohesive.\n"
         "- 'physical_build': Physical height, stature, and body build.\n"
         "- 'distinguishing_marks': Set to null. Do NOT invent accessories, jewelry, scars, or glasses; leave this field as null.\n\n"
         "### CRITICAL RESTRICTIONS ###\n"
@@ -505,11 +648,11 @@ def get_default_character_template() -> str:
         "- 'physical_build': Height, posture, and build.\n"
         "- 'distinguishing_marks': Permanent details only (tattoos, scars, glasses). Otherwise leave null.\n\n"
         "### CRITICAL RESTRICTIONS (STRICTLY ENFORCED) ###\n"
-        "1. NO CLOTHING: Do not extract suits, jackets, raincoats, hats, or attire. The profile must be entirely clothing-free.\n"
-        "2. NO TRANSIENT GESTURES/EXPRESSIONS: Ignore voice, sounds, smiles, frowns, raised eyebrows, jaw drops, parted lips, glances, or momentary physical movements. Focus on stable, lifelong features only.\n"
-        "3. ENTITY SHIELD: Often the text describes other individuals while {character_name} reacts or speaks. Do NOT extract these! Only extract traits if they explicitly describe {character_name}.\n"
-        "4. ONLY PAINTABLE VISUAL DETAILS: Your extractions must describe direct, concrete physical colors, textures, shapes, and tangible sizes (e.g., skin color, hair color, eye shape). Do NOT extract narrative, abstract, or relational facts. If an artist cannot physically paint it, it is strictly forbidden.\n"
-        "5. NO BLUEPRINT CLICHÉS: Do NOT invent, assume, or default to generic descriptors. If a detail is not explicitly written in the passage, leave it as null.\n"
+        "1. NO CLOTHING: Do not extract suits, jackets, raincoats, hats, or attire.\n"
+        "2. NO TRANSIENT GESTURES/EXPRESSIONS: Ignore voice, sounds, smiles, frowns, glances, or momentary physical movements.\n"
+        "3. ENTITY SHIELD: Only extract traits if they explicitly describe {character_name}.\n"
+        "4. ONLY PAINTABLE VISUAL DETAILS: Your extractions must describe direct, concrete physical colors, textures, shapes, and tangible sizes. If an artist cannot physically paint it, it is strictly forbidden.\n"
+        "5. NO BLUEPRINT CLICHÉS: Do NOT invent, assume, or default to generic descriptors.\n"
         "6. Output MUST be a single, valid JSON block. No commentary.\n\n"
         "### CURRENT PROFILE STATE ###\n"
         "Currently recorded:\n"
@@ -528,30 +671,20 @@ def get_default_character_template() -> str:
 
 def is_valid_permanent_trait(key: str, new_val: str, old_val: Optional[str] = None) -> bool:
     """
-    Determines if a newly extracted trait value is a valid permanent visual descriptor,
-    preventing transient expressions, auditory traits, actions, or overly generic single words.
+    Determines if a newly extracted trait value is a valid permanent visual descriptor.
     """
     val = new_val.lower().strip()
     if not val or val == "null" or val == "none":
         return False
         
-    # 1. Surgical ban list targeting ONLY non-visual traits or highly transient action-modifiers
     banned_terms = [
-        # Auditory/Vocal (Strictly non-visual)
         "voice", "sound", "accent", "tone", "shout", "whisper", "screamed", "spoken", "spoke", "screaming",
-        
-        # Pure momentary facial expressions
         "smile", "grin", "frown", "scowl", "pout", "smirk", "laugh", "giggle", "chuckle",
         "twitching", "winking", "blinking", "crying", "tears", "shivering", "shivered", "recoiled",
-        
-        # Transient states of permanent features (allows 'eyebrows', 'lips', 'jaw', 'teeth' to be permanent)
         "raised eyebrow", "raised eyebrows", "furrowed", "dropped jaw", "parted lip", "parted lips",
         "gritting teeth", "gnashing", "biting lip", "chewing lip",
-        
-        # Transitive physical action verbs (prevents literal plot interactions from becoming traits)
         "clap", "clapped", "clapping", "slap", "slapped", "slapping", "grab", "grabbed", "grabbing", 
         "hold", "held", "holding", "press", "pressed", "pressing", "touch", "touched", "touching",
-
         "unknown", "not specified", "unspecified", "unmentioned", "not mentioned", "not described"
     ]
     
@@ -560,7 +693,6 @@ def is_valid_permanent_trait(key: str, new_val: str, old_val: Optional[str] = No
             print(f"[Profiler Filter] Discarding transient/action/auditory term '{term}' in: '{new_val}'")
             return False
             
-    # 2. Block ultra-generic single-word filler overwrites (e.g. overwriting 'six-foot-two and athletic' with just 'tall')
     generic_words = ["tall", "short", "thin", "fat", "man", "woman", "boy", "girl", "hair", "face"]
     if val in generic_words and old_val and len(old_val.strip()) > 15:
         print(f"[Profiler Filter] Discarding generic single-word update '{new_val}' over descriptive: '{old_val}'")
@@ -573,14 +705,12 @@ def score_chunk_visual_relevance(text: str) -> int:
     """Computes a heuristic score for how likely a text chunk is to contain physical descriptions."""
     text_lower = text.lower()
     
-    # Highly diagnostic visual description keywords
     visual_keywords = [
         "hair", "eyes", "tall", "short", "build", "face", "handsome", "pretty", "slender", 
         "stocky", "athletic", "physique", "glasses", "beard", "mustache", "scar", "tattoo", 
         "height", "weight", "slim", "skin", "complexion", "features", "jaw", "shoulders", 
         "looking", "looked", "blond", "blonde", "brunette", "brown", "black", "blue", "green", 
         "gray", "grey", "bald", "shaven", "he was a", "she was a", "years old",
-        # Expanded keywords focusing on high-density descriptive scenes
         "trim", "slender", "beautiful", "gorgeous", "shapely", "naked", "shower", "back", 
         "buttocks", "chest", "waist", "figure", "attractive", "stature"
     ]
@@ -602,13 +732,12 @@ async def run_stateful_character_profiling(
     early_stopping_traits: Optional[List[str]] = None,
     is_cancelled_fn: Optional[Any] = None,
     progress_callback: Optional[Any] = None,
-    speculate: bool = False
+    speculate: bool = False,
+    event_id: Optional[int] = None
 ) -> Dict[str, Any]:
     """
-    Executes a two-stage profiling pipeline:
-    1. ALWAYS runs an objective factual scan across the text chunks to capture real visual hints.
-    2. If speculate is True, runs a single speculative casting call ONLY for fields that remain blank,
-       letting the LLM use its contextual intelligence to deduce gender/age/role-appropriate traits.
+    Executes profiling directly on a target CharacterTimelineEvent (representing a chronological state).
+    Defaults to the nullable 'Base State' event if no event_id is supplied.
     """
     llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
     model_name = get_setting("llm_model", "local-model")
@@ -626,16 +755,34 @@ async def run_stateful_character_profiling(
             print(f"[Profiler] Character {char.name} is locked. Skipping.")
             return {}
 
-    # Reset or retrieve starting checklist state
-    with Session(engine) as session:
-        char = session.get(Character, character_id)
+        # Resolve targeted event
+        if event_id:
+            db_event = session.get(CharacterTimelineEvent, event_id)
+        else:
+            db_event = session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == character_id)
+                .where(CharacterTimelineEvent.book_id == None)
+            ).first()
+            if not db_event:
+                db_event = CharacterTimelineEvent(
+                    character_id=character_id,
+                    book_id=None,
+                    chapter_num=0,
+                    scene_num=0,
+                    label="Base State"
+                )
+                session.add(db_event)
+                session.commit()
+                session.refresh(db_event)
+
         if clear_existing:
-            char.demographics = None
-            char.physical_build = None
-            char.hair_and_face = None
-            char.distinguishing_marks = None
-            char.visual_description = None
-            session.add(char)
+            db_event.demographics = None
+            db_event.physical_build = None
+            db_event.hair_and_face = None
+            db_event.distinguishing_marks = None
+            db_event.visual_description = None
+            session.add(db_event)
             session.commit()
             
             state_checklist = {
@@ -646,16 +793,15 @@ async def run_stateful_character_profiling(
             }
         else:
             state_checklist = {
-                "demographics": char.demographics,
-                "physical_build": char.physical_build,
-                "hair_and_face": char.hair_and_face,
-                "distinguishing_marks": char.distinguishing_marks
+                "demographics": db_event.demographics,
+                "physical_build": db_event.physical_build,
+                "hair_and_face": db_event.hair_and_face,
+                "distinguishing_marks": db_event.distinguishing_marks
             }
 
         aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
         alias_list = [a.alias for a in aliases]
 
-    # Retrieve tighter mention chunks (~120 words window to prevent multi-character description bleeding)
     all_chunks = get_character_mention_chunks(project_id, character_id, book_id, chunk_size_words=120)
     if not all_chunks:
         print(f"[Profiler] No mention chunks found for character: {char.name}")
@@ -664,7 +810,6 @@ async def run_stateful_character_profiling(
     for chunk in all_chunks:
         chunk["visual_score"] = score_chunk_visual_relevance(chunk["text"])
 
-    # Sort chunks so those with high density of visual descriptions are processed first
     all_chunks.sort(key=lambda x: x.get("visual_score", 0), reverse=True)
     sampled_chunks = all_chunks[:max_chunks_to_scan]
 
@@ -672,7 +817,6 @@ async def run_stateful_character_profiling(
     scanned_count = 0
     for chunk_data in sampled_chunks:
         if is_cancelled_fn and is_cancelled_fn():
-            print("[Profiler] Cancellation requested. Aborting factual pass.")
             break
 
         if early_stopping_traits:
@@ -683,19 +827,13 @@ async def run_stateful_character_profiling(
                     has_all_required = False
                     break
             if has_all_required:
-                print(f"[Profiler] Early stopping triggered during factual pass: {early_stopping_traits}")
                 break
 
         unknown_fields = [k for k, v in state_checklist.items() if v is None or str(v).strip() == ""]
         scanned_count += 1
         chunk_text = chunk_data["text"]
 
-        # Log chunk target context purely for debugging
-        print("\n" + "=" * 80)
-        print(f"[DEBUG PROFILER CHUNK - FACTUAL PASS] Character: {char.name} | Book: {chunk_data['book_name']} | Visual Score: {chunk_data.get('visual_score', 0)} | Offset: {chunk_data['chunk_index']} ({scanned_count}/{len(sampled_chunks)})")
-        print("-" * 80)
-        print(chunk_text)
-        print("=" * 80 + "\n", flush=True)
+        print(f"[Profiler] Scanning {chunk_data['book_name']} Chunk {chunk_data['chunk_index']} factually...")
 
         known_display = "\n".join([f"- {k}: {v}" for k, v in state_checklist.items() if v]) or "None"
         unknown_display = "\n".join([f"- {k}" for k in unknown_fields]) or "None"
@@ -707,7 +845,7 @@ async def run_stateful_character_profiling(
                 known_traits=known_display,
                 unknown_traits=unknown_display
             )
-        except Exception as e:
+        except Exception:
             system_instructions = factual_template_raw\
                 .replace("{character_name}", char.name)\
                 .replace("{aliases}", ", ".join(alias_list))\
@@ -723,12 +861,10 @@ async def run_stateful_character_profiling(
         full_prompt = f"{system_instructions}\n\n{user_prompt}"
 
         try:
-            print(f"[Profiler] Scanning {chunk_data['book_name']} Chunk {chunk_data['chunk_index']} factually ({scanned_count}/{len(sampled_chunks)})...")
             raw_response = await get_llm_response(full_prompt, llm_url, model_name)
             extracted_json = extract_json_from_text(raw_response)
 
             if extracted_json:
-                print(f"[Profiler] Received factual profiling data: {extracted_json}")
                 for key in state_checklist.keys():
                     new_val = extracted_json.get(key)
                     if new_val and str(new_val).strip() != "" and str(new_val).lower() != "null":
@@ -744,14 +880,11 @@ async def run_stateful_character_profiling(
         await asyncio.sleep(0.5)
 
     # --- PHASE 2: CREATIVE SPECULATIVE CASTING PASS ---
-    # Only executes if 'speculate=True' AND we still have core physical traits missing after scanning.
     if speculate and not (is_cancelled_fn and is_cancelled_fn()):
         core_fields = ["demographics", "physical_build", "hair_and_face"]
         missing_fields = [f for f in core_fields if not state_checklist.get(f) or str(state_checklist.get(f)).strip() == ""]
         
         if missing_fields:
-            print(f"[Profiler] Entering Speculative Casting Pass for {char.name} to fill missing fields: {missing_fields}")
-            
             speculative_template_raw = get_speculative_character_template()
             
             known_display = "\n".join([f"- {k}: {v}" for k, v in state_checklist.items() if v]) or "None"
@@ -764,31 +897,28 @@ async def run_stateful_character_profiling(
                     known_traits=known_display,
                     unknown_traits=unknown_display
                 )
-            except Exception as e:
+            except Exception:
                 system_instructions = speculative_template_raw\
                     .replace("{character_name}", char.name)\
                     .replace("{aliases}", ", ".join(alias_list))\
                     .replace("{known_traits}", known_display)\
                     .replace("{unknown_traits}", unknown_display)
 
-            # Use the first chunk (representative introduction) to anchor the tone
             representative_chunk = sampled_chunks[0]["text"] if sampled_chunks else "No passage context available."
             
             user_prompt = (
                 f"### PASSAGE CONTEXT ###\n"
                 f"\"\"\"\n{representative_chunk}\n\"\"\"\n\n"
-                f"Task: Fill in only the missing traits {missing_fields} for {char.name} using your contextual understanding of their gender, age, tone, and role. Output a single JSON block."
+                f"Task: Fill in only the missing traits {missing_fields} for {char.name}. Output a single JSON block."
             )
 
             full_prompt = f"{system_instructions}\n\n{user_prompt}"
 
             try:
-                print(f"[Profiler] Executing casting speculation for {char.name}...")
                 raw_response = await get_llm_response(full_prompt, llm_url, model_name)
                 extracted_json = extract_json_from_text(raw_response)
 
                 if extracted_json:
-                    print(f"[Profiler] Received speculative casting data: {extracted_json}")
                     for key in missing_fields:
                         new_val = extracted_json.get(key)
                         if new_val and str(new_val).strip() != "" and str(new_val).lower() != "null":
@@ -801,19 +931,29 @@ async def run_stateful_character_profiling(
             except Exception as e:
                 print(f"[Profiler] Error during speculative casting call: {str(e)}")
 
-    # Save finalized profiling results to database
+    # Save finalized profiling results to timeline event record
     with Session(engine) as session:
-        db_char = session.get(Character, character_id)
-        if db_char:
-            db_char.demographics = state_checklist["demographics"]
-            db_char.physical_build = state_checklist["physical_build"]
-            db_char.hair_and_face = state_checklist["hair_and_face"]
-            db_char.distinguishing_marks = state_checklist["distinguishing_marks"]
+        if event_id:
+            db_event = session.get(CharacterTimelineEvent, event_id)
+        else:
+            db_event = session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == character_id)
+                .where(CharacterTimelineEvent.book_id == None)
+            ).first()
             
-            if not db_char.locked:
-                db_char.visual_description = compile_character_visual_prompt(db_char)
+        char = session.get(Character, character_id)
+
+        if db_event:
+            db_event.demographics = state_checklist["demographics"]
+            db_event.physical_build = state_checklist["physical_build"]
+            db_event.hair_and_face = state_checklist["hair_and_face"]
+            db_event.distinguishing_marks = state_checklist["distinguishing_marks"]
+            
+            if char and not char.locked:
+                db_event.visual_description = compile_character_visual_prompt(db_event)
                 
-            session.add(db_char)
+            session.add(db_event)
             session.commit()
 
     save_project_characters_to_json(project_id)
@@ -835,10 +975,8 @@ def save_setting(key: str, value: str):
 
 def auto_merge_project_characters(project_id: int, similarity_threshold: float = 0.8) -> List[Dict[str, Any]]:
     """
-    Scans all characters in a project, computes their bracket-mention frequencies,
-    and automatically merges sub-characters (like 'Detective Stone', 'Stone's') 
-    into their most prominent canonical counterpart (like 'Stone').
-    Utilizes difflib sequence matching, title-stripping, and substring rules.
+    Scans all characters in a project, and automatically merges sub-characters
+    into their most prominent canonical counterpart based on titles and possessives.
     """
     with Session(engine) as session:
         project = session.get(Project, project_id)
@@ -890,14 +1028,10 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
         
         def normalize(name_str: str) -> str:
             val = name_str.lower().strip()
-            if val.endswith("'s"):
-                val = val[:-2].strip()
-            if val.endswith("’s"):
+            if val.endswith("'s") or val.endswith("’s"):
                 val = val[:-2].strip()
             for t in titles:
-                if val.startswith(t + " "):
-                    val = val[len(t) + 1:].strip()
-                elif val.startswith(t + "."):
+                if val.startswith(t + " ") or val.startswith(t + "."):
                     val = val[len(t) + 1:].strip()
             return val
 
@@ -930,13 +1064,13 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
 
                         if target_norm == cand_norm:
                             is_match = True
-                            match_reason = f"Title/Possessive Normalization"
+                            match_reason = "Title/Possessive Normalization"
                             break
 
                         if len(target_norm) >= 4 and len(cand_norm) >= 4:
                             if target_norm in cand_norm or cand_norm in target_norm:
                                 is_match = True
-                                match_reason = f"Substring Containment"
+                                match_reason = "Substring Containment"
                                 break
 
                         if len(target_norm) >= 4 and len(cand_norm) >= 4:
@@ -960,7 +1094,6 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
                         "aliases_added": [a.alias for a in cand_aliases_db]
                     })
 
-                    # Fixed: Collect all candidate names/aliases and verify uniquely against target
                     existing_aliases_on_target = {a.lower() for a in target_aliases}
                     candidates_to_add = {candidate_char.name.lower()}
                     for alias in cand_aliases_db:
@@ -968,11 +1101,9 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
 
                     new_aliases_to_create = candidates_to_add - existing_aliases_on_target
 
-                    # Delete candidate aliases entirely to prevent duplicated target aliases
                     for alias in cand_aliases_db:
                         session.delete(alias)
 
-                    # Create fresh non-duplicate aliases assigned directly to the target
                     for new_alias_text in new_aliases_to_create:
                         original_case = candidate_char.name
                         if candidate_char.name.lower() != new_alias_text:
@@ -985,49 +1116,71 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
                         session.add(new_alias_obj)
                         target_aliases.append(original_case)
 
-                    cand_mods = session.exec(
-                        select(CharacterStateModifier).where(CharacterStateModifier.character_id == candidate_char.id)
+                    # Reparent custom override events
+                    cand_evs = session.exec(
+                        select(CharacterTimelineEvent).where(CharacterTimelineEvent.character_id == candidate_char.id)
                     ).all()
-                    for mod in cand_mods:
-                        mod.character_id = target_char.id
-                        session.add(mod)
+                    for ev in cand_evs:
+                        if ev.book_id is None:
+                            # Merge legacy profiles into target baseline
+                            target_base = session.exec(
+                                select(CharacterTimelineEvent)
+                                .where(CharacterTimelineEvent.character_id == target_char.id)
+                                .where(CharacterTimelineEvent.book_id == None)
+                            ).first()
+                            if target_base:
+                                if not target_base.demographics: target_base.demographics = ev.demographics
+                                if not target_base.physical_build: target_base.physical_build = ev.physical_build
+                                if not target_base.hair_and_face: target_base.hair_and_face = ev.hair_and_face
+                                if not target_base.distinguishing_marks: target_base.distinguishing_marks = ev.distinguishing_marks
+                                session.add(target_base)
+                            session.delete(ev)
+                        else:
+                            ev.character_id = target_char.id
+                            session.add(ev)
 
                     session.delete(candidate_char)
                     session.commit()
                     merged_ids.add(candidate_char.id)
 
-            # Re-compile target visual description after all merges if unlocked
+            # Re-compile target visual description of baseline state if unlocked
             if target_char.id not in merged_ids and not target_char.locked:
-                target_char.visual_description = compile_character_visual_prompt(target_char)
-                session.add(target_char)
-                session.commit()
+                base_ev = session.exec(
+                    select(CharacterTimelineEvent)
+                    .where(CharacterTimelineEvent.character_id == target_char.id)
+                    .where(CharacterTimelineEvent.book_id == None)
+                ).first()
+                if base_ev:
+                    base_ev.visual_description = compile_character_visual_prompt(base_ev)
+                    session.add(base_ev)
+                    session.commit()
 
     save_project_characters_to_json(project_id)
     return merged_log
 
-def compile_character_description(char: Character, enabled_fields: Dict[str, bool], use_sentence_structure: bool) -> str:
+
+def compile_character_description_from_event(
+    char: Character,
+    event: CharacterTimelineEvent,
+    enabled_fields: Dict[str, bool],
+    use_sentence_structure: bool
+) -> str:
     """
-    Returns the character's compiled description (visual_description) as the primary source of truth.
-    If visual_description is empty, it falls back to compiling from the 4 individual fields on the fly.
-    If no traits or descriptions are populated, it returns the character's name directly.
+    Returns the compiled character description (visual_description) for a specific timeline event state.
     """
-    # 1. Primary Source of Truth: Check if the compiled visual description is populated
-    if char.visual_description and str(char.visual_description).strip():
-        desc = char.visual_description.strip()
+    if event.visual_description and str(event.visual_description).strip():
+        desc = event.visual_description.strip()
         if use_sentence_structure:
-            # Prevent double-wrapping if the name or parenthetical structure is already present
             if desc.startswith(char.name) or "(" in desc:
                 return desc
             return f"{char.name} ({desc})"
         return desc
 
-    # 2. Fallback: Compile from individual fields on the fly only if visual_description is missing
-    demo = char.demographics if enabled_fields.get("demographics", True) else None
-    build = char.physical_build if enabled_fields.get("physical_build", True) else None
-    hair_face = char.hair_and_face if enabled_fields.get("hair_and_face", True) else None
-    marks = char.distinguishing_marks if enabled_fields.get("distinguishing_marks", True) else None
+    demo = event.demographics if enabled_fields.get("demographics", True) else None
+    build = event.physical_build if enabled_fields.get("physical_build", True) else None
+    hair_face = event.hair_and_face if enabled_fields.get("hair_and_face", True) else None
+    marks = event.distinguishing_marks if enabled_fields.get("distinguishing_marks", True) else None
 
-    # Check if there are any active, populated visual details
     has_any_details = any(
         f is not None and str(f).strip() != ""
         for f in [demo, build, hair_face, marks]
@@ -1054,19 +1207,14 @@ def compile_character_description(char: Character, enabled_fields: Dict[str, boo
             return char.name
             
         return ", ".join(cleaned_pieces)
-    
     else:
-        # Prevent blending/cross-contamination via descriptive containment
         base_noun = demo.strip() if demo else "person"
-        
-        # Determine phonetic a/an
         first_char = base_noun[0].lower() if base_noun else 'p'
         article = "an" if first_char in "aeiou" else "a"
         
         clauses = []
         seen_clauses = set()
         
-        # Deduplicate incoming clauses to prevent repeating redundant attributes
         for raw_val, name in [(hair_face, "hair_face"), (build, "build"), (marks, "marks")]:
             if not raw_val:
                 continue
@@ -1077,7 +1225,6 @@ def compile_character_description(char: Character, enabled_fields: Dict[str, boo
             seen_clauses.add(val_lower)
             
             if name == "build":
-                # Handle if LLM extracted starting with 'who is' or 'is'
                 if not val_clean.lower().startswith("who is ") and not val_clean.lower().startswith("is "):
                     clauses.append(f"who is {val_clean}")
                 else:
@@ -1086,7 +1233,6 @@ def compile_character_description(char: Character, enabled_fields: Dict[str, boo
                 clauses.append(val_clean)
             
         if clauses:
-            # Construct cohesive natural relative clauses
             if len(clauses) > 1:
                 main_clauses = ", ".join(clauses[:-1])
                 final_clause = clauses[-1]
@@ -1096,7 +1242,6 @@ def compile_character_description(char: Character, enabled_fields: Dict[str, boo
             else:
                 parenthetical = f"{article} {base_noun}, {clauses[0]}"
             
-            # Defensive post-processing cleanup (fix double spaces, duplicate commas, double connectives)
             parenthetical = re.sub(r'\s*,\s*,', ',', parenthetical)
             parenthetical = re.sub(r'\band\s+and\b', 'and', parenthetical)
             parenthetical = re.sub(r'\bwith\s+with\b', 'with', parenthetical)
@@ -1107,17 +1252,40 @@ def compile_character_description(char: Character, enabled_fields: Dict[str, boo
             return f"{char.name} ({article} {base_noun})"
 
 
+def compile_character_description(char: Character, enabled_fields: Dict[str, bool], use_sentence_structure: bool) -> str:
+    """Fallback legacy helper compiling base description from nullable base event."""
+    with Session(engine) as session:
+        base_ev = session.exec(
+            select(CharacterTimelineEvent)
+            .where(CharacterTimelineEvent.character_id == char.id)
+            .where(CharacterTimelineEvent.book_id == None)
+        ).first()
+        if not base_ev:
+            base_ev = CharacterTimelineEvent(
+                character_id=char.id,
+                book_id=None,
+                chapter_num=0,
+                scene_num=0,
+                label="Base State"
+            )
+            session.add(base_ev)
+            session.commit()
+            session.refresh(base_ev)
+    return compile_character_description_from_event(char, base_ev, enabled_fields, use_sentence_structure)
+
+
 def replace_character_tags_in_prompt(
     prompt: str, 
     project_id: int, 
     enabled_fields: Dict[str, bool], 
-    use_sentence_structure: bool
+    use_sentence_structure: bool,
+    book_id: Optional[int] = None,
+    chapter_num: Optional[int] = None,
+    scene_num: Optional[int] = None
 ) -> str:
     """
-    Scans a prompt string for bracketed tags, matches aliases to project characters, 
-    and returns a modified prompt string containing compiled descriptions.
-    If the character occurs multiple times, only the first mention gets expanded 
-    to prevent redundancy, prompt bloat, and attribute bleeding.
+    Scans a prompt string for bracketed tags, resolves timeline event descriptions chronologically
+    based on coordinates, and returns a modified prompt string containing compiled descriptions.
     """
     bracket_regex = re.compile(r"\[(.*?)\]")
     matches = bracket_regex.findall(prompt)
@@ -1125,15 +1293,17 @@ def replace_character_tags_in_prompt(
         return prompt
 
     modified_prompt = prompt
-    expanded_character_ids = set()  # Track which characters have already been described in this prompt
+    expanded_character_ids = set()
     
     with Session(engine) as session:
-        # Expire any existing identity map entries to force subsequent queries to load from disk
         session.expire_all()
         
+        books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+        book_order_map = {b.id: (b.book_order or 0) for b in books}
+        target_book_order = book_order_map.get(book_id, 0) if book_id else 0
+
         for match in matches:
             tag = match.strip()
-            # Match Alias scoped strictly to the current project_id
             alias = session.exec(
                 select(CharacterAlias)
                 .join(Character)
@@ -1151,31 +1321,70 @@ def replace_character_tags_in_prompt(
                 char = session.get(Character, alias.character_id)
 
             if char:
-                # Force-reload character column attributes from SQLite to catch manual edits on the fly
                 try:
                     session.refresh(char)
                 except Exception:
                     pass
 
-                # If we've already described this specific character ID in this prompt, just use their name!
                 if char.id in expanded_character_ids:
                     replacement = char.name
                 else:
-                    replacement = compile_character_description(char, enabled_fields, use_sentence_structure)
+                    # Resolve active timeline event!
+                    events = session.exec(
+                        select(CharacterTimelineEvent)
+                        .where(CharacterTimelineEvent.character_id == char.id)
+                    ).all()
+                    
+                    base_ev = None
+                    matched_evs = []
+                    for ev in events:
+                        if ev.book_id is None:
+                            base_ev = ev
+                            continue
+                        
+                        ev_order = book_order_map.get(ev.book_id, 0)
+                        
+                        if ev_order < target_book_order:
+                            matched_evs.append((ev, ev_order))
+                        elif ev_order == target_book_order:
+                            if chapter_num is not None and ev.chapter_num < chapter_num:
+                                matched_evs.append((ev, ev_order))
+                            elif chapter_num is not None and ev.chapter_num == chapter_num:
+                                if scene_num is not None and ev.scene_num <= scene_num:
+                                    matched_evs.append((ev, ev_order))
+                    
+                    resolved_ev = base_ev
+                    if matched_evs:
+                        matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
+                        resolved_ev = matched_evs[-1][0]
+                    
+                    if not resolved_ev:
+                        resolved_ev = CharacterTimelineEvent(
+                            character_id=char.id,
+                            book_id=None,
+                            chapter_num=0,
+                            scene_num=0,
+                            label="Base State"
+                        )
+                        session.add(resolved_ev)
+                        session.commit()
+                        session.refresh(resolved_ev)
+                        
+                    replacement = compile_character_description_from_event(
+                        char, resolved_ev, enabled_fields, use_sentence_structure
+                    )
                     expanded_character_ids.add(char.id)
                 
-                # Replace ONLY the first single occurrence of this bracketed tag in the string
                 modified_prompt = modified_prompt.replace(f"[{tag}]", replacement, 1)
             else:
-                # Fallback: Strip brackets for characters/pronouns not in the database
                 modified_prompt = modified_prompt.replace(f"[{tag}]", tag, 1)
+                
     return modified_prompt
 
 
 def get_alias_occurrences(project_id: int, alias_text: str) -> List[Dict[str, Any]]:
     """
-    Searches all transcript.txt files in the project for occurrences of alias_text (case-insensitive).
-    Returns a list of matches containing context windows with HTML highlighting applied.
+    Searches all transcript.txt files in the project for occurrences of alias_text.
     """
     base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
     occurrences = []
@@ -1194,28 +1403,20 @@ def get_alias_occurrences(project_id: int, alias_text: str) -> List[Dict[str, An
         try:
             with open(transcript_path, "r", encoding="utf-8") as f:
                 content = f.read()
-            # Clean up the text input to normalize spacing for the search window
             content = content.replace("\r\n", "\n").replace("\r", "\n")
         except Exception as e:
-            print(f"[Profiler] Error reading transcript for context search in {book.name}: {str(e)}")
+            print(f"[Profiler] Error reading transcript for context search: {str(e)}")
             continue
 
-        # Strip chapter division markers to maintain clean reading flow
         cleaned_text = content.replace("==CHAPTER==", " ")
-        
-        # Search case-insensitively using strict word boundaries and an optional possessive suffix
         pattern = re.compile(rf"(\b{re.escape(alias_text)}(?:'s|’s)?\b)", re.IGNORECASE)
         
         for match in pattern.finditer(cleaned_text):
             start, end = match.span()
-            
-            # Context window (500 characters on either side, ~150-180 words total context block)
             window_start = max(0, start - 500)
             window_end = min(len(cleaned_text), end + 500)
             
             fragment = cleaned_text[window_start:window_end]
-            
-            # Slice fragment precisely to inject safe HTML highlighting
             match_start_in_frag = start - window_start
             match_end_in_frag = end - window_start
             
@@ -1223,7 +1424,6 @@ def get_alias_occurrences(project_id: int, alias_text: str) -> List[Dict[str, An
             match_word = fragment[match_start_in_frag:match_end_in_frag]
             suffix = fragment[match_end_in_frag:]
             
-            # Standardize spacing/newlines for dialog compatibility
             highlighted_html = (
                 f"... {prefix}<mark class='bg-yellow-200 text-slate-900 px-1 rounded font-bold'>{match_word}</mark>{suffix} ..."
             ).replace("\n", " ")

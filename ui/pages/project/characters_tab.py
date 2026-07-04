@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Optional, Set
 from nicegui import ui
 from sqlmodel import Session, select
 from database.connection import engine, get_setting
-from database.models import Project, Book, Character, CharacterAlias, CharacterStateModifier
+from database.models import Project, Book, Character, CharacterAlias, CharacterStateModifier, CharacterTimelineEvent
 from services.character_manager import (
     extract_characters_from_prompts,
     save_project_characters_to_json,
@@ -16,25 +16,27 @@ from services.character_manager import (
     get_character_book_mentions,
     save_setting,
     auto_merge_project_characters,
-    compile_character_visual_prompt
+    compile_character_visual_prompt,
+    ensure_book_orders
 )
 
 # Active local state trackers
-selected_book_id: Optional[int] = None  # None translates cleanly to "All Books"
+selected_book_id: Optional[int] = None
 is_profiling_all: bool = False
 cancel_profiling_all: bool = False
 currently_profiling_char_id: Optional[int] = None
 profiling_progress: str = ""
-profiler_scan_depth: int = 5  # Scan depth (how many text chunks LLM reads)
-workspace_was_empty: bool = True  # Track transition from empty state to grid layout
+profiler_scan_depth: int = 5
+workspace_was_empty: bool = True
 
 # Dynamic Filter and Interactive Selection states
 search_query: str = ""
 sort_by: str = "mentions_desc"
 filter_status: str = "all"
 selected_character_id: Optional[int] = None
+selected_event_id: Optional[int] = None
 
-# High-density caching tracker to prevent list scroll position resets
+# High-density caching tracker
 row_elements: Dict[int, ui.row] = {}
 
 
@@ -60,6 +62,123 @@ def get_character_frequency_map(project_name: str, books: List[Book]) -> Dict[st
     return frequencies
 
 
+def open_add_event_dialog(project_id: int, character_id: int, books: List[Book], refresh_callback: Any):
+    """Spawns modal asking coordinate parameters to add a timeline transition event."""
+    with ui.dialog() as dialog, ui.card().classes('w-[450px] p-5 rounded-xl flex flex-col gap-3'):
+        ui.label('Add Timeline Override Event').classes('text-sm font-bold text-slate-800')
+        
+        book_opts = {b.id: b.name for b in books}
+        if not book_opts:
+            ui.label('No books imported in this project yet.').classes('text-xs text-red-500')
+            ui.button('Close', on_click=dialog.close).props('flat')
+            dialog.open()
+            return
+            
+        book_select = ui.select(options=book_opts, value=books[0].id if books else None, label="Target Book").classes('w-full bg-white')
+        chapter_input = ui.number(label="Chapter Number", value=1, min=1, step=1).classes('w-full').props('outlined dense')
+        scene_input = ui.number(label="Scene Number", value=1, min=1, step=1).classes('w-full').props('outlined dense')
+        label_input = ui.input(label="Event Label", placeholder="e.g. Gandalf the White").classes('w-full').props('outlined dense')
+        
+        copied_status = ui.label("").classes('text-[11px] text-green-600 font-semibold')
+        copied_traits = {}
+        
+        def copy_previous():
+            """Queries chronological state machine up to current coordinate to clone values."""
+            with Session(engine) as session:
+                events = session.exec(
+                    select(CharacterTimelineEvent)
+                    .where(CharacterTimelineEvent.character_id == character_id)
+                ).all()
+                
+                tgt_book = session.get(Book, book_select.value)
+                tgt_order = tgt_book.book_order if tgt_book else 0
+                tgt_ch = int(chapter_input.value or 1)
+                tgt_sc = int(scene_input.value or 1)
+                
+                all_books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+                book_order_map = {b.id: (b.book_order or 0) for b in all_books}
+                
+                matched = []
+                base_ev = None
+                for ev in events:
+                    if ev.book_id is None:
+                        base_ev = ev
+                        continue
+                    ev_order = book_order_map.get(ev.book_id, 0)
+                    if ev_order < tgt_order:
+                        matched.append((ev, ev_order))
+                    elif ev_order == tgt_order:
+                        if ev.chapter_num < tgt_ch:
+                            matched.append((ev, ev_order))
+                        elif ev.chapter_num == tgt_ch and ev.scene_num <= tgt_sc:
+                            matched.append((ev, ev_order))
+                            
+                resolved = base_ev
+                if matched:
+                    matched.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
+                    resolved = matched[-1][0]
+                
+                if resolved:
+                    copied_traits["demographics"] = resolved.demographics
+                    copied_traits["physical_build"] = resolved.physical_build
+                    copied_traits["hair_and_face"] = resolved.hair_and_face
+                    copied_traits["distinguishing_marks"] = resolved.distinguishing_marks
+                    copied_traits["visual_description"] = resolved.visual_description
+                    copied_status.text = f"Copied description from: '{resolved.label or 'Base State'}'!"
+                else:
+                    copied_status.text = "No previous states found to copy."
+
+        ui.button('Copy Previous Description', icon='content_copy', on_click=copy_previous).classes('text-xs text-slate-700 bg-slate-100 hover:bg-slate-200 border w-full')
+        
+        def save_new_event():
+            b_id = book_select.value
+            ch = int(chapter_input.value or 1)
+            sc = int(scene_input.value or 1)
+            lbl = label_input.value.strip() or "Override State"
+            
+            with Session(engine) as session:
+                dup = session.exec(
+                    select(CharacterTimelineEvent)
+                    .where(CharacterTimelineEvent.character_id == character_id)
+                    .where(CharacterTimelineEvent.book_id == b_id)
+                    .where(CharacterTimelineEvent.chapter_num == ch)
+                    .where(CharacterTimelineEvent.scene_num == sc)
+                ).first()
+                
+                if dup:
+                    ui.notify("An override event already exists at this scene coordinate.", type="warning")
+                    return
+                
+                new_ev = CharacterTimelineEvent(
+                    character_id=character_id,
+                    book_id=b_id,
+                    chapter_num=ch,
+                    scene_num=sc,
+                    label=lbl,
+                    demographics=copied_traits.get("demographics"),
+                    physical_build=copied_traits.get("physical_build"),
+                    hair_and_face=copied_traits.get("hair_and_face"),
+                    distinguishing_marks=copied_traits.get("distinguishing_marks"),
+                    visual_description=copied_traits.get("visual_description")
+                )
+                session.add(new_ev)
+                session.commit()
+                
+                global selected_event_id
+                selected_event_id = new_ev.id
+                
+            save_project_characters_to_json(project_id)
+            ui.notify("Timeline override event added!", type="positive")
+            dialog.close()
+            refresh_callback()
+
+        with ui.row().classes('w-full justify-end gap-2 border-t pt-3 mt-2'):
+            ui.button('Cancel', on_click=dialog.close).props('flat')
+            ui.button('Create Event', on_click=save_new_event).classes('bg-blue-600 text-white font-bold text-xs px-3 py-1.5 rounded-lg')
+
+    dialog.open()
+
+
 def open_batch_profiler_dialog(
     project: Project, 
     books: List[Book], 
@@ -70,7 +189,6 @@ def open_batch_profiler_dialog(
     """Opens options settings before launching character batch profiling runs."""
     global is_profiling_all, currently_profiling_char_id, profiling_progress, cancel_profiling_all, profiler_scan_depth
 
-    # Safe refresh helper to bypass stale slot stack warnings during async tasks
     async def safe_refresh(callback_fn):
         try:
             if asyncio.iscoroutinefunction(callback_fn):
@@ -79,41 +197,36 @@ def open_batch_profiler_dialog(
                 callback_fn()
         except RuntimeError as e:
             if "The parent element this slot belongs to" in str(e):
-                pass  # Discard stale slot lookup errors from closed modal tasks
+                pass
             else:
                 raise
 
     with ui.dialog() as dialog, ui.card().classes('w-[520px] max-w-[95vw] p-6 rounded-xl flex flex-col gap-4 overflow-hidden'):
         
-        # Header Row
         with ui.row().classes('w-full justify-between items-center border-b pb-3 shrink-0'):
             with ui.column().classes('gap-0.5'):
                 ui.label('Batch Profiler Options').classes('text-base font-bold text-slate-800')
                 ui.label('Configure rules for the automated batch sequence.').classes('text-xs text-slate-500')
             ui.button(icon='close', on_click=dialog.close).props('flat dense').classes('text-slate-400')
 
-        # Shared Global Settings (Mentions limit)
         with ui.row().classes('w-full items-center justify-between gap-3 bg-slate-50 p-3 rounded-lg border shrink-0'):
             with ui.column().classes('gap-0.5'):
                 ui.label('Minimum Mentions Limit').classes('text-xs font-semibold text-slate-700')
                 ui.label('Skips low-frequency background characters.').classes('text-[10px] text-slate-400')
             min_mentions_input = ui.number(value=5, min=1, step=1).classes('w-16 bg-white').props('outlined dense')
 
-        # Tab Navigation
         with ui.tabs().classes('w-full border-b shrink-0') as tabs:
             factual_tab = ui.tab('Factual').classes('text-xs font-bold')
             creative_tab = ui.tab('Creative').classes('text-xs font-bold')
 
-        # Trigger batch execution
         async def run_configured_batch(start_mode: str):
             global is_profiling_all, currently_profiling_char_id, profiling_progress, cancel_profiling_all, profiler_scan_depth
             
             clear_existing = clear_existing_cb.value
             min_mentions = int(min_mentions_input.value or 1)
             run_creative_after = run_creative_after_cb.value if start_mode == "factual" else False
-            creative_target = speculate_criteria.value  # "0", "1", "all"
+            creative_target = speculate_criteria.value
 
-            # Map selected stopping conditions
             stopping_traits = []
             if stop_demo.value: stopping_traits.append("demographics")
             if stop_build.value: stopping_traits.append("physical_build")
@@ -128,7 +241,6 @@ def open_batch_profiler_dialog(
 
             client = ui.context.client
 
-            # Helper to gather base unlocked queue matching minimum mentions limit
             def get_base_queue():
                 frequencies = get_character_frequency_map(project.name, books)
                 with Session(engine) as session:
@@ -163,7 +275,7 @@ def open_batch_profiler_dialog(
             if start_mode == "factual":
                 factual_queue = get_base_queue()
                 with client:
-                    ui.notify(f"Starting factual batch for {len(factual_queue)} characters (Min. {min_mentions} mentions)...", type="info")
+                    ui.notify(f"Starting factual batch for {len(factual_queue)} characters...", type="info")
 
                 for idx, char in enumerate(factual_queue):
                     if cancel_profiling_all:
@@ -187,7 +299,6 @@ def open_batch_profiler_dialog(
                             else:
                                 profiling_progress = f"[Factual] {char_obj.name} ({char_idx + 1}/{total_chars}) [{scanned}/{total}]..."
                             
-                            # Using run_coroutine to cleanly run safe_refresh asynchronously from inner sync callbacks
                             asyncio.run_coroutine_threadsafe(safe_refresh(refresh_toolbar_callback), asyncio.get_event_loop())
                             if char_obj.id == selected_character_id:
                                 asyncio.run_coroutine_threadsafe(safe_refresh(refresh_details_callback), asyncio.get_event_loop())
@@ -212,22 +323,26 @@ def open_batch_profiler_dialog(
             if (start_mode == "creative" or (start_mode == "factual" and run_creative_after)) and not cancel_profiling_all:
                 base_queue = get_base_queue()
                 
-                # Helper to count non-null and non-empty traits
-                def get_trait_count(char_obj) -> int:
+                def get_trait_count(ev_obj) -> int:
                     fields = [
-                        char_obj.demographics, char_obj.physical_build, 
-                        char_obj.hair_and_face, char_obj.distinguishing_marks
+                        ev_obj.demographics, ev_obj.physical_build, 
+                        ev_obj.hair_and_face, ev_obj.distinguishing_marks
                     ]
                     return sum(1 for f in fields if f and str(f).strip() and str(f).lower() != "null")
 
                 creative_queue = []
                 for char in base_queue:
-                    # Re-verify character record from DB to get the newly generated Factual traits
                     with Session(engine) as session:
                         db_char = session.get(Character, char.id)
                         if not db_char or db_char.locked:
                             continue
-                        traits_count = get_trait_count(db_char)
+                        # Query Base State event to check completion
+                        base_ev = session.exec(
+                            select(CharacterTimelineEvent)
+                            .where(CharacterTimelineEvent.character_id == char.id)
+                            .where(CharacterTimelineEvent.book_id == None)
+                        ).first()
+                        traits_count = get_trait_count(base_ev) if base_ev else 0
                     
                     if creative_target == "0" and traits_count == 0:
                         creative_queue.append(char)
@@ -268,13 +383,12 @@ def open_batch_profiler_dialog(
                             return progress_callback
 
                         try:
-                            # Run profiling with speculation enabled
                             await run_stateful_character_profiling(
                                 project_id=project.id, 
                                 character_id=char.id, 
                                 book_id=selected_book_id, 
                                 max_chunks_to_scan=profiler_scan_depth,
-                                clear_existing=False,  # Preserve existing traits and only fill the missing ones
+                                clear_existing=False,
                                 early_stopping_traits=None,
                                 is_cancelled_fn=lambda: cancel_profiling_all,
                                 progress_callback=make_progress_callback(char, idx, len(creative_queue)),
@@ -297,7 +411,6 @@ def open_batch_profiler_dialog(
             await safe_refresh(refresh_toolbar_callback)
             await safe_refresh(refresh_ui_callback)
 
-        # Tab Content Panels
         with ui.tab_panels(tabs, value=factual_tab).classes('w-full flex-1 min-h-0 bg-transparent'):
             
             # FACTUAL PANEL
@@ -306,9 +419,8 @@ def open_batch_profiler_dialog(
                     clear_existing_cb = ui.checkbox(
                         'Wipe existing profile traits before profiling', 
                         value=False
-                    ).tooltip("If checked, completely clears demographics, build, etc. before researching. If unchecked, preserves completed fields and searches only for missing traits.")
+                    ).tooltip("If checked, completely clears active event traits before researching.")
 
-                    # Early Stopping Rules
                     with ui.column().classes('w-full gap-1.5 bg-slate-50 p-3 rounded-lg border'):
                         ui.label('Early Stopping Criteria').classes('text-xs font-semibold text-slate-700')
                         ui.label('Stop scanning a character as soon as selected traits are found:').classes('text-[10px] text-slate-400 mb-1')
@@ -322,7 +434,7 @@ def open_batch_profiler_dialog(
                     run_creative_after_cb = ui.checkbox(
                         'Run Creative Casting after Factual pass?', 
                         value=False
-                    ).tooltip("If checked, characters meeting Creative Tab criteria will immediately undergo speculation following the Factual pass.")
+                    ).tooltip("If checked, characters will undergo speculation following factual passes.")
 
                 with ui.row().classes('w-full justify-end gap-2 border-t pt-3 shrink-0 mt-auto'):
                     ui.button('Cancel', on_click=dialog.close).props('flat').classes('text-xs text-slate-500 font-semibold')
@@ -336,9 +448,7 @@ def open_batch_profiler_dialog(
             with ui.tab_panel(creative_tab).classes('p-0 flex flex-col gap-4 h-full justify-between'):
                 with ui.column().classes('w-full gap-4'):
                     ui.markdown(
-                        "Creative Casting uses local LLM **speculation** to fill in sparse descriptions. "
-                        "It deduces age, demographic profiles, hair, build, or permanent accessories "
-                        "even if they are never explicitly written in the transcript."
+                        "Creative Casting uses local LLM **speculation** to fill in sparse descriptions."
                     ).classes('text-xs text-slate-500 leading-relaxed bg-slate-50 p-3 rounded-lg border w-full')
 
                     speculate_criteria = ui.select(
@@ -369,7 +479,6 @@ def open_prompt_editor_dialog():
         from services.character_manager import get_default_character_template
         current_template = get_default_character_template()
 
-    # Added a stable height 'h-[650px]' to prevent flex-1 height collapse
     with ui.dialog() as dialog, ui.card().classes('w-[750px] max-w-[95vw] h-[650px] max-h-[90vh] p-6 rounded-xl flex flex-col overflow-hidden'):
         
         def reset():
@@ -382,7 +491,6 @@ def open_prompt_editor_dialog():
             ui.notify("Custom profiler prompt template saved!", type="positive")
             dialog.close()
 
-        # Fixed Header row with Actions on Top (no floating overlap, non-shrinkable)
         with ui.row().classes('w-full justify-between items-center border-b pb-3 mb-3 shrink-0'):
             with ui.column().classes('gap-0.5'):
                 ui.label('Customize Character Profiler Prompt').classes('text-base font-bold text-slate-800')
@@ -393,15 +501,10 @@ def open_prompt_editor_dialog():
                 ui.button('Cancel', on_click=dialog.close, color='slate').props('flat').classes('text-xs font-semibold')
                 ui.button('Save Template', on_click=save).classes('bg-blue-600 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')
 
-        # Scrollable column with a robust minimum height context
         with ui.column().classes('w-full flex-1 overflow-y-auto overflow-x-hidden gap-4 pr-1 min-w-0'):
             ui.markdown(
-                "Configure the instructions sent to the LLM during character research. "
-                "You can use these dynamic placeholder tags:\n"
-                "- `{character_name}`: Canonical name of the character\n"
-                "- `{aliases}`: Comma-separated list of known aliases\n"
-                "- `{known_traits}`: Attributes already discovered\n"
-                "- `{unknown_traits}`: Attributes still needing discovery"
+                "Configure the instructions sent to the LLM during character research. Placeholders:\n"
+                "- `{character_name}`, `{aliases}`, `{known_traits}`, `{unknown_traits}`"
             ).classes('text-xs text-slate-500 leading-relaxed bg-slate-50 p-3 rounded-lg border w-full')
 
             editor = ui.textarea(
@@ -412,7 +515,7 @@ def open_prompt_editor_dialog():
     dialog.open()
 
 def open_alias_explorer_dialog(project_id: int, alias: CharacterAlias, parent_char_id: int, refresh_callback: Any):
-    """Opens a modal displaying where the selected alias occurs within project audiobook transcripts."""
+    """Opens a modal displaying where the selected alias occurs within transcripts."""
     from services.character_manager import get_alias_occurrences
     
     occurrences = get_alias_occurrences(project_id, alias.alias)
@@ -426,16 +529,12 @@ def open_alias_explorer_dialog(project_id: int, alias: CharacterAlias, parent_ch
                 book_label = ui.label('Loading context...').classes('text-xs text-slate-500')
             ui.button(icon='close', on_click=dialog.close).props('flat dense').classes('text-slate-400')
 
-        # Highlighted context container
         with ui.column().classes('w-full flex-1 justify-center items-center py-6 min-h-[160px] bg-slate-50 border rounded-lg px-4 overflow-y-auto'):
             context_html = ui.html('').classes('text-sm text-slate-700 leading-relaxed text-center')
 
-        # Footer Actions & Pagination Row (Simplified: delete button removed)
         with ui.row().classes('w-full justify-between items-center pt-2 shrink-0'):
-            # Empty element keeps pagination elements pushed to the right
             ui.label('').classes('flex-grow')
 
-            # Navigators
             with ui.row().classes('gap-3 items-center'):
                 prev_btn = ui.button(icon='chevron_left', on_click=lambda: navigate(-1)).props('flat dense').classes('bg-slate-100 p-1 rounded-lg')
                 counter_label = ui.label('0 of 0').classes('text-xs font-bold text-slate-600')
@@ -462,7 +561,6 @@ def open_alias_explorer_dialog(project_id: int, alias: CharacterAlias, parent_ch
             counter_label.text = f"{current_index + 1} of {len(occurrences)}"
             book_label.text = f"Source: {occ['book_name']}"
             
-            # Disable buttons at boundaries
             if current_index > 0:
                 prev_btn.enable()
             else:
@@ -473,15 +571,14 @@ def open_alias_explorer_dialog(project_id: int, alias: CharacterAlias, parent_ch
             else:
                 next_btn.disable()
 
-        # Load first occurrence
         update_display()
 
     dialog.open()
 
 def render_characters_tab(project: Project, books: List[Book], refresh_parent: Optional[Any] = None):
-    # Keep selected_book_id as None to default to Project-wide All Books scans
+    # Enforce chronological self-healing index alignment on draw
+    ensure_book_orders(project.id)
 
-    # --- SCROLL PRESERVATION UTILITIES ---
     async def restore_scroll_position():
         """Scrolls the currently active/selected character row into view within the container."""
         js_code = """
@@ -490,7 +587,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             let timer = setInterval(() => {
                 let active = document.querySelector('.char-scroll-list .bg-blue-50');
                 if (active) {
-                    // Scrolls the list to expose the element with minimal jarring shifts
                     active.scrollIntoView({ block: 'nearest', behavior: 'auto' });
                     clearInterval(timer);
                 }
@@ -516,10 +612,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
 
         current_empty = (any_characters is None)
         if current_empty != workspace_was_empty:
-            # Transition between empty state and populated grid state requires full redraw
             draw_workspace_layout.refresh()
         else:
-            # Maintain existing layout to preserve active scroll context
             draw_stats_bar.refresh()
             draw_character_list.refresh()
             draw_details_panel.refresh()
@@ -529,16 +623,26 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
     async def refresh_list_with_scroll():
         """Refreshes only the list view and aligns the active selection."""
         draw_character_list.refresh()
-        
         await restore_scroll_position()
 
     def select_char(c_id):
         """Changes focus and toggles selection styles without rebuilding the scrolling list element."""
-        global selected_character_id
+        global selected_character_id, selected_event_id
         old_id = selected_character_id
         selected_character_id = c_id
         
-        # Style transition (pure Python element class mutation without full pane rebuilds)
+        # Reset the selected event state to the baseline event of the newly focused character
+        with Session(engine) as session:
+            base_ev = session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == c_id)
+                .where(CharacterTimelineEvent.book_id == None)
+            ).first()
+            if base_ev:
+                selected_event_id = base_ev.id
+            else:
+                selected_event_id = None
+        
         if old_id in row_elements and row_elements[old_id]:
             try:
                 row_elements[old_id].classes(
@@ -566,12 +670,11 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
         with ui.row().classes('w-full items-center justify-between bg-slate-50 border p-4 rounded-xl mb-4 gap-4'):
             with ui.column().classes('gap-0'):
                 ui.label('Character Visual Profiles').classes('text-base font-bold text-slate-800')
-                ui.label('Tag aliases, generate physical characteristics using local LLMs, and track character changes.').classes('text-xs text-slate-500')
+                ui.label('Tag aliases and generate physical overrides across chronological timeline states.').classes('text-xs text-slate-500')
             
             with ui.row().classes('items-center gap-3'):
                 ui.label('Source:').classes('text-xs font-semibold text-slate-500')
                 
-                # Default to dynamic Project-wide mapping
                 book_options = {None: "All Books (Project-wide)"}
                 for b in books:
                     book_options[b.id] = b.name
@@ -586,7 +689,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     on_change=lambda e: handle_book_change(e.value)
                 ).classes('w-56 bg-white').props('outlined dense')
 
-                ui.label('Depth (Chunks):').classes('text-xs font-semibold text-slate-500 ml-1')
+                ui.label('Depth:').classes('text-xs font-semibold text-slate-500 ml-1')
                 def handle_depth_change(e):
                     global profiler_scan_depth
                     profiler_scan_depth = int(e.value)
@@ -625,8 +728,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     with client:
                         if merged_log:
                             ui.notify(f"Auto-merged {len(merged_log)} duplicate tags!", type="positive")
-                            for log in merged_log[:5]:
-                                ui.notify(f"Merged {log['merged_name']} -> {log['target_name']}", type="info")
                         else:
                             ui.notify("No matching alias tags to merge found.", type="info")
                     await refresh_workspace_with_scroll()
@@ -685,26 +786,33 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
         fully_profiled = 0
         locked_count = 0
         
-        for char in all_characters:
-            if char.locked:
-                locked_count += 1
-            fields = [
-                char.demographics, char.physical_build, 
-                char.hair_and_face, char.distinguishing_marks
-            ]
-            if sum(1 for f in fields if f and str(f).strip()) == 4:
-                fully_profiled += 1
+        with Session(engine) as session:
+            for char in all_characters:
+                if char.locked:
+                    locked_count += 1
+                base_ev = session.exec(
+                    select(CharacterTimelineEvent)
+                    .where(CharacterTimelineEvent.character_id == char.id)
+                    .where(CharacterTimelineEvent.book_id == None)
+                ).first()
+                if base_ev:
+                    fields = [
+                        base_ev.demographics, base_ev.physical_build, 
+                        base_ev.hair_and_face, base_ev.distinguishing_marks
+                    ]
+                    if sum(1 for f in fields if f and str(f).strip()) == 4:
+                        fully_profiled += 1
 
         with ui.row().classes('w-full items-center gap-4 bg-blue-50/50 border border-blue-100 p-3 rounded-xl mb-4 text-xs font-semibold text-blue-700'):
             ui.icon('info', size='xs')
             ui.label(f"Database Stats: {total_chars} total characters discovered.")
-            ui.label(f"|  {fully_profiled} fully profiled (4/4 traits)")
+            ui.label(f"|  {fully_profiled} fully profiled baseline (4/4 traits)")
             ui.label(f"|  {locked_count} locked/manually curated")
 
     @ui.refreshable
     def draw_character_list():
         global selected_character_id, search_query, sort_by, filter_status
-        row_elements.clear()  # Purge pointer maps to rebuild lists
+        row_elements.clear()
         frequencies = get_character_frequency_map(project.name, books)
 
         with Session(engine) as session:
@@ -728,19 +836,36 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             return total
 
         char_data_list = []
-        for char in all_characters:
-            aliases_list = char_aliases.get(char.id, [])
-            mentions = get_char_mentions(char, aliases_list)
-            fields = [
-                char.demographics, char.physical_build,
-                char.hair_and_face, char.distinguishing_marks
-            ]
-            completion_count = sum(1 for f in fields if f and str(f).strip())
-            char_data_list.append((char, aliases_list, mentions, completion_count))
+        with Session(engine) as session:
+            for char in all_characters:
+                aliases_list = char_aliases.get(char.id, [])
+                mentions = get_char_mentions(char, aliases_list)
+                
+                base_ev = session.exec(
+                    select(CharacterTimelineEvent)
+                    .where(CharacterTimelineEvent.character_id == char.id)
+                    .where(CharacterTimelineEvent.book_id == None)
+                ).first()
+                
+                if base_ev:
+                    fields = [
+                        base_ev.demographics, base_ev.physical_build,
+                        base_ev.hair_and_face, base_ev.distinguishing_marks
+                    ]
+                    completion_count = sum(1 for f in fields if f and str(f).strip())
+                    summary_pieces = []
+                    if base_ev.demographics: summary_pieces.append(base_ev.demographics)
+                    if base_ev.hair_and_face: summary_pieces.append(base_ev.hair_and_face)
+                    if base_ev.physical_build: summary_pieces.append(base_ev.physical_build)
+                else:
+                    completion_count = 0
+                    summary_pieces = []
+                    
+                char_data_list.append((char, aliases_list, mentions, completion_count, summary_pieces))
 
         filtered_list = []
         q = search_query.lower().strip()
-        for char, aliases_list, mentions, completion_count in char_data_list:
+        for char, aliases_list, mentions, completion_count, summary_pieces in char_data_list:
             if q:
                 alias_texts = [a.alias.lower() for a in aliases_list]
                 name_match = q in char.name.lower()
@@ -755,7 +880,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             elif filter_status == "unlocked" and char.locked:
                 continue
                 
-            filtered_list.append((char, aliases_list, mentions, completion_count))
+            filtered_list.append((char, aliases_list, mentions, completion_count, summary_pieces))
 
         if sort_by == "mentions_desc":
             filtered_list.sort(key=lambda x: x[2], reverse=True)
@@ -774,7 +899,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
         if not filtered_list:
             ui.label('No characters match filters.').classes('text-xs text-slate-400 text-center py-8 w-full')
         else:
-            for char, aliases_list, mentions, completion_count in filtered_list:
+            for char, aliases_list, mentions, completion_count, summary_pieces in filtered_list:
                 is_selected = char.id == selected_character_id
                 bg_class = "bg-blue-50 border-l-4 border-blue-600 font-semibold text-blue-900" if is_selected else "hover:bg-slate-50 text-slate-700"
                 border_class = "" if is_selected else "border-l border-slate-100"
@@ -791,11 +916,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                 ui.icon('face', size='14px', color='slate-400')
                             ui.label(char.name).classes('text-xs truncate font-semibold')
                         
-                        summary_pieces = []
-                        if char.demographics: summary_pieces.append(char.demographics)
-                        if char.hair_and_face: summary_pieces.append(char.hair_and_face)
-                        if char.physical_build: summary_pieces.append(char.physical_build)
-                        
                         summary_text = " • ".join(summary_pieces) if summary_pieces else "No traits profiled yet"
                         ui.label(summary_text).classes('text-[10px] text-slate-400 truncate w-full')
                     
@@ -806,13 +926,13 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
 
     @ui.refreshable
     def draw_details_panel():
-        global selected_character_id, selected_book_id, profiler_scan_depth, currently_profiling_char_id
+        global selected_character_id, selected_event_id, selected_book_id, profiler_scan_depth, currently_profiling_char_id
         
         if selected_character_id is None:
             with ui.column().classes('w-full h-full items-center justify-center text-slate-400 gap-4'):
                 ui.icon('person_search', size='xl', color='slate-300')
                 ui.label('No Character Selected').classes('text-sm font-bold text-slate-500')
-                ui.label('Choose a character from the left panel list to view and edit their details.').classes('text-xs text-slate-400 max-w-xs text-center')
+                ui.label('Choose a character from the left panel list to view and edit details.').classes('text-xs text-slate-400 max-w-xs text-center')
             return
 
         with Session(engine) as session:
@@ -820,6 +940,37 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             if not char:
                 ui.label('Character not found.').classes('text-xs text-slate-400 text-center py-8 w-full')
                 return
+
+            # Resolve/Safeguard Active Selected Event State
+            if selected_event_id is None:
+                base_ev = session.exec(
+                    select(CharacterTimelineEvent)
+                    .where(CharacterTimelineEvent.character_id == char.id)
+                    .where(CharacterTimelineEvent.book_id == None)
+                ).first()
+                if base_ev:
+                    selected_event_id = base_ev.id
+                else:
+                    base_ev = CharacterTimelineEvent(
+                        character_id=char.id,
+                        book_id=None,
+                        chapter_num=0,
+                        scene_num=0,
+                        label="Base State"
+                    )
+                    session.add(base_ev)
+                    session.commit()
+                    selected_event_id = base_ev.id
+
+            active_event = session.get(CharacterTimelineEvent, selected_event_id)
+            if not active_event or active_event.character_id != char.id:
+                base_ev = session.exec(
+                    select(CharacterTimelineEvent)
+                    .where(CharacterTimelineEvent.character_id == char.id)
+                    .where(CharacterTimelineEvent.book_id == None)
+                ).first()
+                selected_event_id = base_ev.id if base_ev else None
+                active_event = base_ev
 
             aliases = session.exec(
                 select(CharacterAlias).where(CharacterAlias.character_id == char.id)
@@ -836,8 +987,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             mentions = get_char_mentions(char, aliases)
 
             fields_list = [
-                char.demographics, char.physical_build,
-                char.hair_and_face, char.distinguishing_marks
+                active_event.demographics, active_event.physical_build,
+                active_event.hair_and_face, active_event.distinguishing_marks
             ]
             completion_count = sum(1 for f in fields_list if f and str(f).strip())
 
@@ -872,7 +1023,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 
             with ui.row().classes('items-center gap-2'):
                 async def scan_single_char():
-                    global currently_profiling_char_id, profiler_scan_depth
+                    global currently_profiling_char_id, profiler_scan_depth, selected_event_id
                     client = ui.context.client
                     currently_profiling_char_id = char.id
                     draw_details_panel.refresh()
@@ -880,7 +1031,10 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     try:
                         with client:
                             ui.notify(f"Running LLM research pipeline for {char.name}...", type="info")
-                        await run_stateful_character_profiling(project.id, char.id, selected_book_id, max_chunks_to_scan=profiler_scan_depth)
+                        await run_stateful_character_profiling(
+                            project.id, char.id, selected_book_id, 
+                            max_chunks_to_scan=profiler_scan_depth, event_id=selected_event_id
+                        )
                         with client:
                             ui.notify("Profiling completed successfully!", type="positive")
                     except Exception as ex:
@@ -891,7 +1045,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     await refresh_workspace_with_scroll()
 
                 async def speculate_single_char():
-                    global currently_profiling_char_id, profiler_scan_depth
+                    global currently_profiling_char_id, profiler_scan_depth, selected_event_id
                     client = ui.context.client
                     currently_profiling_char_id = char.id
                     draw_details_panel.refresh()
@@ -900,11 +1054,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         with client:
                             ui.notify(f"Speculating character casting vibe for {char.name}...", type="info")
                         await run_stateful_character_profiling(
-                            project.id, 
-                            char.id, 
-                            selected_book_id, 
-                            max_chunks_to_scan=profiler_scan_depth,
-                            speculate=True
+                            project.id, char.id, selected_book_id, 
+                            max_chunks_to_scan=profiler_scan_depth, speculate=True, event_id=selected_event_id
                         )
                         with client:
                             ui.notify("Casting speculation completed!", type="positive")
@@ -925,13 +1076,13 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         'Research (LLM)', 
                         icon='science', 
                         on_click=scan_single_char
-                    ).classes('text-white font-bold text-xs bg-purple-600 hover:bg-purple-700').tooltip("Scan the text for actual, written physical descriptions of this character.")
+                    ).classes('text-white font-bold text-xs bg-purple-600 hover:bg-purple-700').tooltip("Scan actual, written physical descriptions.")
                     
                     ui.button(
                         'Deduce Vibe', 
                         icon='theater_comedy', 
                         on_click=speculate_single_char
-                    ).classes('text-white font-bold text-xs bg-indigo-600 hover:bg-indigo-700').tooltip("Deduce gender, age, job, and cast a plausible visual description when no physical descriptions are written in the text.")
+                    ).classes('text-white font-bold text-xs bg-indigo-600 hover:bg-indigo-700').tooltip("Deduce characteristics when details are unwritten.")
 
                 def toggle_locked(c_id=char.id, val=not char.locked):
                     with Session(engine) as session:
@@ -964,11 +1115,11 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             for a in aliases_to_del:
                                 session.delete(a)
 
-                            mods_to_del = session.exec(
-                                select(CharacterStateModifier).where(CharacterStateModifier.character_id == c_id)
+                            evs_to_del = session.exec(
+                                select(CharacterTimelineEvent).where(CharacterTimelineEvent.character_id == c_id)
                             ).all()
-                            for m in mods_to_del:
-                                session.delete(m)
+                            for ev in evs_to_del:
+                                session.delete(ev)
 
                             session.delete(db_char)
                             session.commit()
@@ -983,10 +1134,136 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 ).props('flat dense').classes('bg-red-50 text-red-500 hover:bg-red-100 p-1.5 rounded-lg').tooltip('Delete Character Profile')
 
         with ui.column().classes('w-full flex-1 overflow-y-auto gap-4 pr-1'):
-            with ui.column().classes('w-full bg-slate-50 p-4 rounded-xl border gap-3'):
+            
+            # --- Row 1.5: Timeline State Switcher Row (New) ---
+            with ui.row().classes('w-full items-center justify-between bg-slate-50 border p-3 rounded-xl gap-3'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.label('Timeline State:').classes('text-xs font-bold text-slate-500')
+                    
+                    with Session(engine) as session:
+                        all_evs = session.exec(
+                            select(CharacterTimelineEvent)
+                            .where(CharacterTimelineEvent.character_id == char.id)
+                        ).all()
+                    
+                    dropdown_options = {}
+                    for ev in all_evs:
+                        if ev.book_id is None:
+                            dropdown_options[ev.id] = "Base State (Initial)"
+                        else:
+                            with Session(engine) as session:
+                                b = session.get(Book, ev.book_id)
+                                b_name = b.name if b else f"Book {ev.book_id}"
+                            dropdown_options[ev.id] = f"{b_name} - Ch {ev.chapter_num}, Sc {ev.scene_num} ('{ev.label or 'Override'}')"
+                    
+                    def handle_event_change(e):
+                        global selected_event_id
+                        selected_event_id = e.value
+                        draw_details_panel.refresh()
+                        
+                    ui.select(
+                        options=dropdown_options,
+                        value=selected_event_id,
+                        on_change=handle_event_change
+                    ).classes('w-72 bg-white').props('outlined dense')
+                    
+                with ui.row().classes('items-center gap-1.5'):
+                    ui.button(
+                        icon='add_circle', 
+                        on_click=lambda: open_add_event_dialog(project.id, char.id, books, draw_details_panel.refresh)
+                    ).props('flat dense').classes('p-1 text-blue-600 hover:bg-blue-50').tooltip('Add custom timeline override event')
+                    
+                    if active_event and active_event.book_id is not None:
+                        async def delete_timeline_event():
+                            global selected_event_id
+                            with Session(engine) as session:
+                                db_ev = session.get(CharacterTimelineEvent, active_event.id)
+                                if db_ev:
+                                    session.delete(db_ev)
+                                    session.commit()
+                            save_project_characters_to_json(project.id)
+                            ui.notify("Timeline override event deleted.", type="warning")
+                            selected_event_id = None
+                            draw_details_panel.refresh()
+                            
+                        ui.button(
+                            icon='remove_circle',
+                            on_click=delete_timeline_event
+                        ).props('flat dense').classes('p-1 text-red-500 hover:bg-red-50').tooltip('Delete selected timeline event')
+
+            # --- Row 2.0: Compiled Visual Description Prompt (Brought to the top!) ---
+            with ui.column().classes('w-full bg-blue-50/20 p-4 rounded-xl border border-blue-100 gap-2'):
+                ui.label('Compiled Visual Description Prompt').classes('text-[11px] font-bold text-blue-600 uppercase tracking-wider')
+                
+                if not active_event.visual_description:
+                    active_event.visual_description = compile_character_visual_prompt(active_event)
+                    with Session(engine) as session:
+                        db_ev = session.get(CharacterTimelineEvent, active_event.id)
+                        if db_ev:
+                            db_ev.visual_description = active_event.visual_description
+                            session.add(db_ev)
+                            session.commit()
+                    save_project_characters_to_json(project.id)
+
+                def handle_desc_blur(e, ev_id=active_event.id):
+                    new_val = e.sender.value.strip()
+                    with Session(engine) as session:
+                        db_ev = session.get(CharacterTimelineEvent, ev_id)
+                        if db_ev:
+                            db_ev.visual_description = new_val if new_val else None
+                            session.add(db_ev)
+                            session.commit()
+                    save_project_characters_to_json(project.id)
+                    ui.notify("Visual Prompt overridden!", type="info")
+
+                compiled_desc_input = ui.textarea(
+                    value=active_event.visual_description
+                ).classes('w-full bg-white font-mono text-xs').props('outlined dense autogrow')\
+                 .on('blur', handle_desc_blur)\
+                 .tooltip("Injected into your prompt template")
+
+            # --- Row 3.0: Physical parameters grid (Brought to the top!) ---
+            ui.label('Physical Description Parameters').classes('text-[11px] font-bold text-slate-500 uppercase tracking-wider mt-1')
+            with ui.grid().classes('w-full grid-cols-1 md:grid-cols-2 gap-3'):
+                fields = [
+                    ("demographics", "Demographics (Age, Race, Gender)"),
+                    ("hair_and_face", "Hair & Face Details"),
+                    ("physical_build", "Physical Build (Height/Weight/Posture)"),
+                    ("distinguishing_marks", "Distinguishing Marks & Key Accessories")
+                ]
+                
+                def make_update_handler(ev_id, key, text_area_el):
+                    def handler(e):
+                        val = e.sender.value.strip()
+                        with Session(engine) as session:
+                            db_ev = session.get(CharacterTimelineEvent, ev_id)
+                            if db_ev:
+                                setattr(db_ev, key, val if val != "" else None)
+                                
+                                char_obj = session.get(Character, db_ev.character_id)
+                                if char_obj and not char_obj.locked:
+                                    new_prompt = compile_character_visual_prompt(db_ev)
+                                    db_ev.visual_description = new_prompt
+                                    text_area_el.set_value(new_prompt)
+                                    
+                                session.add(db_ev)
+                                session.commit()
+                        save_project_characters_to_json(project.id)
+                        ui.notify("Trait saved.", type="positive", position="bottom-right", timeout=1000)
+                    return handler
+
+                for key, label in fields:
+                    val = getattr(active_event, key) or ""
+                    ui.input(
+                        label=label, 
+                        value=val
+                    ).classes('w-full bg-white').props('outlined dense').on('blur', make_update_handler(active_event.id, key, compiled_desc_input))
+
+            # --- Row 4.0: Mapped Aliases ---
+            with ui.column().classes('w-full bg-slate-50 p-4 rounded-xl border gap-3 mt-1'):
                 with ui.row().classes('w-full justify-between items-center'):
                     ui.label('Assigned Aliases & Target Tags').classes('text-[11px] font-bold text-slate-500 uppercase tracking-wider')
-                    ui.label(f'{completion_count}/4 attributes populated').classes('text-[10px] font-bold text-purple-700 bg-purple-50 px-2 py-0.5 rounded-full')
+                    ui.label(f'{completion_count}/4 traits populated').classes('text-[10px] font-bold text-purple-700 bg-purple-50 px-2 py-0.5 rounded-full')
                 
                 with ui.row().classes('w-full gap-2 flex-wrap items-center'):
                     for alias in aliases:
@@ -1000,27 +1277,39 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                         session.delete(db_alias)
                                         session.commit()
                                         
-                                        # Spin off a standalone character if it was not the primary self-alias
                                         if alias_name.lower() != char.name.lower():
                                             new_char = Character(project_id=project.id, name=alias_name)
                                             session.add(new_char)
+                                            session.commit()
+                                            
+                                            base_ev = CharacterTimelineEvent(
+                                                character_id=new_char.id,
+                                                book_id=None,
+                                                chapter_num=0,
+                                                scene_num=0,
+                                                label="Base State"
+                                            )
+                                            session.add(base_ev)
                                             session.commit()
                                             
                                             new_alias = CharacterAlias(character_id=new_char.id, alias=alias_name)
                                             session.add(new_alias)
                                             session.commit()
                                             
-                                            new_char.visual_description = compile_character_visual_prompt(new_char)
-                                            session.add(new_char)
+                                            base_ev.visual_description = compile_character_visual_prompt(base_ev)
+                                            session.add(base_ev)
                                             session.commit()
                                             
                                             ui.notify(f"Spun off '{alias_name}' into standalone profile!", type="positive")
 
-                                    # Clear out parent character if empty of aliases
                                     rem = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char_id)).all()
                                     if not rem:
                                         db_char = session.get(Character, char_id)
                                         if db_char:
+                                            # Clean timeline events
+                                            evs_to_del = session.exec(select(CharacterTimelineEvent).where(CharacterTimelineEvent.character_id == char_id)).all()
+                                            for ev in evs_to_del:
+                                                session.delete(ev)
                                             session.delete(db_char)
                                             session.commit()
                                             selected_character_id = None
@@ -1030,11 +1319,9 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                 ui.notify("Alias removed.", type="info")
                             return handle
 
-                        # Interactive Custom Chip: click text for Context Modal, click cancel icon to delete
                         with ui.row().classes(
                             'items-center gap-1.5 bg-white border border-slate-200 px-2.5 py-1 rounded-full text-xs text-slate-800 hover:bg-slate-50 transition-colors shadow-sm'
                         ):
-                            # Clickable Text to trigger Dialog Context Explorer
                             ui.label(alias.alias).classes('cursor-pointer font-medium').on(
                                 'click', 
                                 lambda _, a=alias, c_id=char.id: open_alias_explorer_dialog(
@@ -1042,7 +1329,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                 )
                             ).tooltip("Click to view transcript occurrences")
                             
-                            # Clean click action to trigger deletion/spin-off
                             ui.icon('cancel', size='14px', color='slate-400').classes(
                                 'cursor-pointer hover:text-red-500 transition-colors'
                             ).on('click', make_delete_handler(alias, char.id))
@@ -1083,7 +1369,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             on_click=handle_merge_click
                         ).classes('bg-blue-600 text-white font-bold text-xs px-3 py-2 rounded-lg')
 
-            # Dynamic Appearance Map across series
+            # --- Row 5.0: Appearance Map across Series (Moved to the bottom!) ---
             book_mentions = get_character_book_mentions(project.id, char.id)
             if book_mentions:
                 with ui.column().classes('w-full bg-slate-50 p-4 rounded-xl border gap-2 mt-1'):
@@ -1092,72 +1378,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         for b_name, m_count in book_mentions.items():
                             ui.badge(f"{b_name} ({m_count} hits)", color='purple-50').classes('text-purple-700 text-xs font-semibold px-2 py-1 rounded')
 
-            # Row 2.5: Composite prompt editor card
-            with ui.column().classes('w-full bg-blue-50/20 p-4 rounded-xl border border-blue-100 gap-2'):
-                ui.label('Compiled Visual Description Prompt').classes('text-[11px] font-bold text-blue-600 uppercase tracking-wider')
-                
-                if not char.visual_description:
-                    char.visual_description = compile_character_visual_prompt(char)
-                    with Session(engine) as session:
-                        db_char = session.get(Character, char.id)
-                        if db_char:
-                            db_char.visual_description = char.visual_description
-                            session.add(db_char)
-                            session.commit()
-                    save_project_characters_to_json(project.id)
-
-                def handle_desc_blur(e, char_id=char.id):
-                    new_val = e.sender.value.strip()
-                    with Session(engine) as session:
-                        db_char = session.get(Character, char_id)
-                        if db_char:
-                            db_char.visual_description = new_val if new_val else None
-                            session.add(db_char)
-                            session.commit()
-                    save_project_characters_to_json(project.id)
-                    ui.notify("Visual Prompt overridden!", type="info")
-
-                compiled_desc_input = ui.textarea(
-                    value=char.visual_description
-                ).classes('w-full bg-white font-mono text-xs').props('outlined dense autogrow')\
-                 .on('blur', handle_desc_blur)\
-                 .tooltip("This string is what actually replaces the [bracketed] tags inside your ComfyUI prompting pipeline")
-
-            ui.label('Physical Description Parameters').classes('text-[11px] font-bold text-slate-500 uppercase tracking-wider mt-1')
-            with ui.grid().classes('w-full grid-cols-1 md:grid-cols-2 gap-3'):
-                fields = [
-                    ("demographics", "Demographics (Age, Race, Gender)"),
-                    ("hair_and_face", "Hair & Face Details"),
-                    ("physical_build", "Physical Build (Height/Weight/Posture)"),
-                    ("distinguishing_marks", "Distinguishing Marks & Key Accessories")
-                ]
-                
-                # Upgraded: Directly update the visual prompt textarea's value on-the-fly to stop layout redraw lag
-                def make_update_handler(char_id, key, text_area_el):
-                    def handler(e):
-                        val = e.sender.value.strip()
-                        with Session(engine) as session:
-                            db_char = session.get(Character, char_id)
-                            if db_char:
-                                setattr(db_char, key, val if val != "" else None)
-                                
-                                if not db_char.locked:
-                                    new_prompt = compile_character_visual_prompt(db_char)
-                                    db_char.visual_description = new_prompt
-                                    text_area_el.set_value(new_prompt)
-                                    
-                                session.add(db_char)
-                                session.commit()
-                        save_project_characters_to_json(project.id)
-                        ui.notify("Trait saved.", type="positive", position="bottom-right", timeout=1000)
-                    return handler
-
-                for key, label in fields:
-                    val = getattr(char, key) or ""
-                    ui.input(
-                        label=label, 
-                        value=val
-                    ).classes('w-full bg-white').props('outlined dense').on('blur', make_update_handler(char.id, key, compiled_desc_input))
 
     @ui.refreshable
     def draw_workspace_layout():
@@ -1172,7 +1392,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             with ui.column().classes('w-full items-center justify-center p-12 text-slate-400 border border-dashed rounded-xl bg-slate-50 gap-4'):
                 ui.icon('face', size='xl', color='slate-300')
                 ui.label('No characters detected or generated in this project yet.').classes('text-sm font-semibold text-slate-500')
-                ui.label('The system needs bracketed names like [Dino] to exist in your prompts.csv files first.').classes('text-xs text-slate-400 max-w-sm text-center leading-normal')
+                ui.label('The system needs bracketed names like [Dino] to exist in prompts.csv first.').classes('text-xs text-slate-400 max-w-sm text-center leading-normal')
                 
                 async def run_prompt_scan_empty():
                     client = ui.context.client
@@ -1197,7 +1417,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
         draw_stats_bar()
 
         with ui.grid().classes('w-full grid-cols-1 lg:grid-cols-12 gap-4 items-start'):
-            # --- LEFT PANEL: High Density Searchable List (col-span-4) ---
+            # --- LEFT PANEL: Searchable List (col-span-4) ---
             with ui.card().classes('col-span-4 p-4 border rounded-xl bg-white h-[650px] flex flex-col gap-3'):
                 ui.label('Characters List').classes('text-sm font-bold text-slate-800 border-b pb-1.5')
                 
@@ -1246,7 +1466,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         on_change=on_filter_change
                     ).props('dense outlined').classes('w-32 text-xs')
                 
-                # Scrollable container wrapping the refreshable list
                 with ui.column().classes('w-full flex-1 overflow-y-auto gap-1 pr-1 char-scroll-list'):
                     draw_character_list()
 
@@ -1254,6 +1473,5 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             with ui.card().classes('col-span-8 p-6 border rounded-xl bg-white h-[650px] flex flex-col gap-4'):
                 draw_details_panel()
 
-    # Layout container hierarchy
     draw_header_toolbar()
     draw_workspace_layout()

@@ -27,6 +27,7 @@ class Book(SQLModel, table=True):
     completed_images: Optional[int] = Field(default=None)
     prompts_mtime: Optional[float] = Field(default=None)  # Dynamic cache syncing timestamp
     duration: Optional[float] = Field(default=None)       # Cached audiobook total duration in seconds
+    book_order: Optional[int] = Field(default=None, description="Chronological sorting index of the book within its project.")
 
 class Chapter(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -55,20 +56,28 @@ class ScenePrompt(SQLModel, table=True):
 class Character(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     project_id: int = Field(foreign_key="project.id", index=True)
-    book_id: Optional[int] = Field(default=None, foreign_key="book.id", index=True) # Null if global/static, Book ID if book-specific/dynamic
     name: str = Field(index=True)
-    
-    # Simplified 4-Field Physical Descriptor Schema (Cohesive buckets)
-    demographics: Optional[str] = Field(default=None)         # e.g., "middle-aged Caucasian man" or "young Italian woman"
-    physical_build: Optional[str] = Field(default=None)       # e.g., "six-foot-two and athletic" or "petite and slender"
-    hair_and_face: Optional[str] = Field(default=None)        # e.g., "with thinning brown hair and a clean-shaven face"
-    distinguishing_marks: Optional[str] = Field(default=None) # e.g., "wearing wire-rimmed glasses" or "with a scar on his cheek"
-
-    # The compiled natural-language text-to-image replacement string
-    visual_description: Optional[str] = Field(default=None)
-    
-    is_dynamic: bool = Field(default=False) # True if scoped to a book, False if static/project-global
     locked: bool = Field(default=False)     # True if manual curation should protect this profile from LLM extraction or compile overwrites
+
+class CharacterTimelineEvent(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    character_id: int = Field(foreign_key="character.id", index=True)
+    
+    # Null represents the absolute Base State (Initial Appearance)
+    book_id: Optional[int] = Field(default=None, foreign_key="book.id", index=True)
+    chapter_num: int = Field(default=0, index=True)
+    scene_num: int = Field(default=0, index=True)
+    
+    label: Optional[str] = Field(default="Base State")
+    
+    # Concrete physical traits (Only stored here now!)
+    demographics: Optional[str] = Field(default=None)
+    physical_build: Optional[str] = Field(default=None)
+    hair_and_face: Optional[str] = Field(default=None)
+    distinguishing_marks: Optional[str] = Field(default=None)
+    
+    # Compiled prompt text used during image rendering
+    visual_description: Optional[str] = Field(default=None)
 
 class CharacterAlias(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)

@@ -8,8 +8,8 @@ import asyncio
 from nicegui import ui, app
 from sqlmodel import Session, select
 from database.connection import engine, get_setting
-from database.models import Book, Project, Character, CharacterAlias
-from services.character_manager import compile_character_visual_prompt, save_project_characters_to_json
+from database.models import Book, Project, Character, CharacterAlias, CharacterTimelineEvent
+from services.character_manager import compile_character_visual_prompt, save_project_characters_to_json, ensure_book_orders
 from ui.pages.project.characters_tab import get_character_frequency_map
 from ui import state
 
@@ -226,6 +226,24 @@ def render_book_tabs(book_id: int):
     import platform
     import subprocess
     
+    with Session(engine) as session:
+        book = session.get(Book, book_id)
+        if not book:
+            ui.label("Book details not available.").classes('text-slate-400 text-sm')
+            return
+            
+        from database.models import Project
+        project = session.get(Project, book.project_id)
+        if not project:
+            ui.label("Project workspace details not available.").classes('text-slate-400 text-sm')
+            return
+
+    # Self-heal book sorting index chronological offsets
+    ensure_book_orders(project.id)
+
+    project_name = project.name
+    book_name = book.name
+    
     # Coordinate cache to prevent resetting the user's active typing/prompt edit input
     loaded_scene_coords = [-1, -1]
 
@@ -237,13 +255,60 @@ def render_book_tabs(book_id: int):
         return [t.strip() for t in bracket_regex.findall(prompt_text) if t.strip()]
 
     def open_character_edit_dialog(char_id: int):
-        """Spawns an independent edit dialog that remains open and functional during image rendering updates."""
+        """Spawns an independent edit dialog that loads the chronologically active timeline state."""
         with Session(engine) as session:
             char = session.get(Character, char_id)
             if not char:
                 ui.notify("Character not found.", type="negative")
                 return
             
+            # Resolve the targeted scene coordinate parameters
+            books_list = session.exec(select(Book).where(Book.project_id == project.id)).all()
+            book_order_map = {b.id: (b.book_order or 0) for b in books_list}
+            target_book_order = book_order_map.get(book_id, 0)
+            target_ch = int(float(state.book_active_chapter))
+            target_sc = int(float(state.book_active_scene))
+
+            # Query all timeline override events for this character
+            events = session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == char.id)
+            ).all()
+            
+            # Separate baseline from chronological override events
+            matched_evs = []
+            base_ev = None
+            for ev in events:
+                if ev.book_id is None:
+                    base_ev = ev
+                    continue
+                ev_order = book_order_map.get(ev.book_id, 0)
+                if ev_order < target_book_order:
+                    matched_evs.append((ev, ev_order))
+                elif ev_order == target_book_order:
+                    if ev.chapter_num < target_ch:
+                        matched_evs.append((ev, ev_order))
+                    elif ev.chapter_num == target_ch and ev.scene_num <= target_sc:
+                        matched_evs.append((ev, ev_order))
+                        
+            active_ev = base_ev
+            if matched_evs:
+                matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
+                active_ev = matched_evs[-1][0]
+                
+            if not active_ev:
+                active_ev = CharacterTimelineEvent(
+                    character_id=char.id,
+                    book_id=None,
+                    chapter_num=0,
+                    scene_num=0,
+                    label="Base State"
+                )
+                session.add(active_ev)
+                session.commit()
+                session.refresh(active_ev)
+                
+            active_ev_id = active_ev.id
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
             
             # Count character mentions in this book's prompts.csv
@@ -279,28 +344,64 @@ def render_book_tabs(book_id: int):
 
                 # Scrollable Body Panel
                 with ui.column().classes('w-full flex-1 overflow-y-auto pr-1 gap-3 max-h-[55vh] min-h-0'):
+                    
+                    # Coordinate State Indicator & Fork Trigger Button
+                    with ui.row().classes('w-full items-center justify-between bg-blue-50/50 border border-blue-100 p-2.5 rounded-lg flex-shrink-0'):
+                        with ui.column().classes('gap-0'):
+                            ui.label('Active State:').classes('text-[9px] font-black text-blue-600 uppercase tracking-wider')
+                            ui.label(f"'{active_ev.label or 'Base State'}'").classes('text-xs font-bold text-slate-700')
+                        
+                        # Fork coordinate changes directly on the fly
+                        if active_ev.book_id != book_id or active_ev.chapter_num != target_ch or active_ev.scene_num != target_sc:
+                            async def create_timeline_change_here():
+                                with Session(engine) as session:
+                                    new_ev = CharacterTimelineEvent(
+                                        character_id=char_id,
+                                        book_id=book_id,
+                                        chapter_num=target_ch,
+                                        scene_num=target_sc,
+                                        label=f"Ch {target_ch}, Sc {target_sc} Change",
+                                        demographics=active_ev.demographics,
+                                        physical_build=active_ev.physical_build,
+                                        hair_and_face=active_ev.hair_and_face,
+                                        distinguishing_marks=active_ev.distinguishing_marks,
+                                        visual_description=active_ev.visual_description
+                                    )
+                                    session.add(new_ev)
+                                    session.commit()
+                                save_project_characters_to_json(project.id)
+                                ui.notify("Created a new timeline override event starting at this scene!", type="positive")
+                                char_dialog.close()
+                                open_character_edit_dialog(char_id)
+                                
+                            ui.button(
+                                'Add Timeline Change', 
+                                icon='add_circle', 
+                                on_click=create_timeline_change_here
+                            ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-[10px] px-2.5 py-1.5 rounded-md')
+
                     ui.label('Physical Traits').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide')
                     
-                    demo_input = ui.input(label="Demographics", value=char.demographics or "").classes('w-full bg-white').props('outlined dense')
-                    hair_input = ui.input(label="Hair & Face", value=char.hair_and_face or "").classes('w-full bg-white').props('outlined dense')
-                    build_input = ui.input(label="Physical Build", value=char.physical_build or "").classes('w-full bg-white').props('outlined dense')
-                    marks_input = ui.input(label="Distinguishing Marks", value=char.distinguishing_marks or "").classes('w-full bg-white').props('outlined dense')
+                    demo_input = ui.input(label="Demographics", value=active_ev.demographics or "").classes('w-full bg-white').props('outlined dense')
+                    hair_input = ui.input(label="Hair & Face", value=active_ev.hair_and_face or "").classes('w-full bg-white').props('outlined dense')
+                    build_input = ui.input(label="Physical Build", value=active_ev.physical_build or "").classes('w-full bg-white').props('outlined dense')
+                    marks_input = ui.input(label="Distinguishing Marks", value=active_ev.distinguishing_marks or "").classes('w-full bg-white').props('outlined dense')
 
                     def get_compiled_preview() -> str:
-                        mock_char = Character(
-                            name=char.name,
+                        mock_ev = CharacterTimelineEvent(
+                            character_id=char_id,
                             demographics=demo_input.value,
                             physical_build=build_input.value,
                             hair_and_face=hair_input.value,
                             distinguishing_marks=marks_input.value
                         )
-                        return compile_character_visual_prompt(mock_char)
+                        return compile_character_visual_prompt(mock_ev)
 
                     # Compiled Description Textarea
-                    ui.label('Compiled Visual Prompt Override').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide mt-1')
+                    ui.label('Compiled Visual Prompt').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide mt-1')
                     
                     desc_textarea = ui.textarea(
-                        value=char.visual_description or get_compiled_preview()
+                        value=active_ev.visual_description or get_compiled_preview()
                     ).classes('w-full font-mono text-xs').props('outlined dense autogrow')
 
                     def on_trait_change():
@@ -362,24 +463,28 @@ def render_book_tabs(book_id: int):
 
                     def save():
                         with Session(engine) as session:
+                            db_ev = session.get(CharacterTimelineEvent, active_ev_id)
                             db_char = session.get(Character, char_id)
+                            if db_ev:
+                                db_ev.demographics = demo_input.value.strip() if demo_input.value.strip() else None
+                                db_ev.physical_build = build_input.value.strip() if build_input.value.strip() else None
+                                db_ev.hair_and_face = hair_input.value.strip() if hair_input.value.strip() else None
+                                db_ev.distinguishing_marks = marks_input.value.strip() if marks_input.value.strip() else None
+                                db_ev.visual_description = desc_textarea.value.strip() if desc_textarea.value.strip() else None
+                                session.add(db_ev)
+                                session.commit()
                             if db_char:
-                                db_char.demographics = demo_input.value.strip() if demo_input.value.strip() else None
-                                db_char.physical_build = build_input.value.strip() if build_input.value.strip() else None
-                                db_char.hair_and_face = hair_input.value.strip() if hair_input.value.strip() else None
-                                db_char.distinguishing_marks = marks_input.value.strip() if marks_input.value.strip() else None
-                                db_char.visual_description = desc_textarea.value.strip() if desc_textarea.value.strip() else None
                                 db_char.locked = lock_switch.value
                                 session.add(db_char)
                                 session.commit()
                         save_project_characters_to_json(project.id)
-                        ui.notify("Character profile updated successfully!", type="positive")
+                        ui.notify("Character profile state updated successfully!", type="positive")
                         char_dialog.close()
                         if modal_prompt_input:
                             render_scene_character_chips(modal_prompt_input.value)
 
                     ui.button('Cancel', on_click=cancel, color='slate').props('flat').classes('text-xs font-semibold')
-                    ui.button('Save Profile', on_click=save).classes('bg-blue-600 text-white font-bold text-xs px-4 py-2 rounded-lg shadow-sm')
+                    ui.button('Save Profile State', on_click=save).classes('bg-blue-600 text-white font-bold text-xs px-4 py-2 rounded-lg shadow-sm')
 
             char_dialog.open()
 
