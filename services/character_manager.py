@@ -1437,3 +1437,351 @@ def get_alias_occurrences(project_id: int, alias_text: str) -> List[Dict[str, An
             })
 
     return occurrences
+
+def get_character_frequency_map_db(project_name: str, session: Session) -> Dict[str, int]:
+    """Scans prompts.csv files to build a map of bracket tag occurrences for a project."""
+    frequencies = {}
+    bracket_regex = re.compile(r"\[(.*?)\]")
+    base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
+    
+    proj = session.exec(select(Project).where(Project.name == project_name)).first()
+    if not proj:
+        return frequencies
+        
+    books = session.exec(select(Book).where(Book.project_id == proj.id)).all()
+    for b in books:
+        csv_path = base_output_dir / project_name / b.name / "prompts.csv"
+        if not csv_path.exists():
+            continue
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter="|")
+                for row in reader:
+                    prompt_text = row.get("prompt", "")
+                    for match in bracket_regex.findall(prompt_text):
+                        clean_tag = match.strip().lower()
+                        frequencies[clean_tag] = frequencies.get(clean_tag, 0) + 1
+        except Exception:
+            pass
+    return frequencies
+
+
+def get_character_import_matches(tgt_project_id: int, src_project_id: int) -> List[Dict[str, Any]]:
+    """
+    Finds pairings between target project unlocked characters and source project characters.
+    Matches if canonical name matches or if aliases intersect.
+    Filters out source characters with empty descriptions or fallback "a person named X" descriptions.
+    Ensures each source character is matched with at most one target character (best fit).
+    Sorts matches descending by target mentions count so important characters are at the top.
+    """
+    with Session(engine) as session:
+        tgt_project = session.get(Project, tgt_project_id)
+        if not tgt_project:
+            return []
+            
+        frequencies = get_character_frequency_map_db(tgt_project.name, session)
+        
+        def get_mentions(char_obj, alias_texts):
+            total = sum(frequencies.get(a.lower(), 0) for a in alias_texts)
+            if not total:
+                total = frequencies.get(char_obj.name.lower(), 0)
+            return total
+
+        # Grab unlocked target characters
+        tgt_chars = session.exec(
+            select(Character).where(Character.project_id == tgt_project_id).where(Character.locked == False)
+        ).all()
+        
+        # Grab all source characters
+        src_chars = session.exec(
+            select(Character).where(Character.project_id == src_project_id)
+        ).all()
+        
+        # Fetch details for Target Project characters
+        tgt_data = []
+        for tc in tgt_chars:
+            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == tc.id)).all()
+            alias_list = [a.alias for a in aliases]
+            alias_texts = {a.alias.lower().strip() for a in aliases}
+            alias_texts.add(tc.name.lower().strip())
+            
+            base_ev = session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == tc.id)
+                .where(CharacterTimelineEvent.book_id == None)
+            ).first()
+            
+            mentions = get_mentions(tc, alias_texts)
+            
+            tgt_data.append({
+                "char": tc,
+                "aliases": alias_list,
+                "all_terms_lower": alias_texts,
+                "desc": base_ev.visual_description if base_ev else "",
+                "mentions": mentions
+            })
+            
+        # Fetch details for Source Project characters
+        src_data = []
+        for sc in src_chars:
+            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == sc.id)).all()
+            alias_texts = {a.alias.lower().strip() for a in aliases}
+            alias_texts.add(sc.name.lower().strip())
+            
+            base_ev = session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == sc.id)
+                .where(CharacterTimelineEvent.book_id == None)
+            ).first()
+            
+            if not base_ev:
+                continue
+                
+            # Verify if there is actual physical descriptive data
+            has_physical_data = any(
+                f and str(f).strip() and str(f).lower() != "none"
+                for f in [base_ev.demographics, base_ev.physical_build, base_ev.hair_and_face, base_ev.distinguishing_marks]
+            )
+            
+            # Check if there is a custom visual description that is not just the default compiled fallback
+            has_custom_desc = False
+            if base_ev.visual_description and base_ev.visual_description.strip():
+                fallback_str = f"a person named {sc.name.lower().strip()}"
+                if base_ev.visual_description.lower().strip() != fallback_str:
+                    has_custom_desc = True
+                    
+            if not (has_physical_data or has_custom_desc):
+                continue
+            
+            src_data.append({
+                "char": sc,
+                "aliases": [a.alias for a in aliases],
+                "all_terms_lower": alias_texts,
+                "desc": base_ev.visual_description or "",
+                "base_ev": base_ev
+            })
+            
+        # Collect all candidates matching the criteria
+        candidates = []
+        for td in tgt_data:
+            tc = td["char"]
+            for sd in src_data:
+                sc = sd["char"]
+                score = 0
+                if sc.name.lower().strip() == tc.name.lower().strip():
+                    score = 3
+                elif sc.name.lower().strip() in td["all_terms_lower"] or tc.name.lower().strip() in sd["all_terms_lower"]:
+                    score = 2
+                elif td["all_terms_lower"].intersection(sd["all_terms_lower"]):
+                    score = 1
+                    
+                if score > 0:
+                    candidates.append({
+                        "score": score,
+                        "tgt_mentions": td["mentions"],
+                        "sd": sd,
+                        "td": td
+                    })
+                    
+        # Sort candidates: high match score first, then target mentions descending
+        candidates.sort(key=lambda x: (x["score"], x["tgt_mentions"]), reverse=True)
+        
+        assigned_sources = set()
+        assigned_targets = set()
+        final_matches = []
+        
+        for cand in candidates:
+            src_id = cand["sd"]["char"].id
+            tgt_id = cand["td"]["char"].id
+            
+            if src_id in assigned_sources or tgt_id in assigned_targets:
+                continue
+                
+            assigned_sources.add(src_id)
+            assigned_targets.add(tgt_id)
+            
+            final_matches.append({
+                "source_char_id": src_id,
+                "source_name": cand["sd"]["char"].name,
+                "source_aliases": cand["sd"]["aliases"],
+                "source_desc": cand["sd"]["desc"] or "No traits profiled.",
+                "target_char_id": tgt_id,
+                "target_name": cand["td"]["char"].name,
+                "target_aliases": cand["td"]["aliases"],
+                "target_desc": cand["td"]["desc"] or "No traits profiled.",
+                "target_mentions": cand["tgt_mentions"]
+            })
+            
+        # Final sort: major characters (highest target hit counts) appear at the top
+        final_matches.sort(key=lambda x: x["target_mentions"], reverse=True)
+        return final_matches
+
+
+def get_matching_source_projects(project_id: int) -> List[Dict[str, Any]]:
+    """
+    Returns list of source projects that have valid character matches with matching descriptions.
+    """
+    matching_projects = []
+    with Session(engine) as session:
+        other_projects = session.exec(
+            select(Project).where(Project.id != project_id)
+        ).all()
+        
+        for proj in other_projects:
+            matches = get_character_import_matches(project_id, proj.id)
+            if matches:
+                matching_projects.append({
+                    "id": proj.id,
+                    "name": proj.name
+                })
+    return matching_projects
+
+
+def execute_character_import(
+    tgt_project_id: int,
+    pairings: List[Dict[str, Any]],
+    lock_after_import: bool,
+    import_merge_aliases: bool
+):
+    """
+    Executes core profiling copies for selected pairing items.
+    Applies overrides, merges alias maps, and handles structural name updates.
+    Consolidates and deletes duplicate target characters with overlapping aliases.
+    """
+    def safe_add_alias(char_id: int, alias_text: str, db_session: Session):
+        alias_clean = alias_text.strip()
+        if not alias_clean:
+            return
+        dup = db_session.exec(
+            select(CharacterAlias)
+            .where(CharacterAlias.character_id == char_id)
+            .where(CharacterAlias.alias == alias_clean)
+        ).first()
+        if not dup:
+            new_alias = CharacterAlias(character_id=char_id, alias=alias_clean)
+            db_session.add(new_alias)
+
+    with Session(engine) as session:
+        for pair in pairings:
+            src_char_id = pair["source_char_id"]
+            tgt_char_id = pair["target_char_id"]
+            
+            src_char = session.get(Character, src_char_id)
+            tgt_char = session.get(Character, tgt_char_id)
+            
+            if not src_char or not tgt_char:
+                continue
+                
+            # 1. Sync baseline profile traits
+            src_base_ev = session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == src_char_id)
+                .where(CharacterTimelineEvent.book_id == None)
+            ).first()
+            
+            tgt_base_ev = session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == tgt_char_id)
+                .where(CharacterTimelineEvent.book_id == None)
+            ).first()
+            
+            if not tgt_base_ev:
+                tgt_base_ev = CharacterTimelineEvent(
+                    character_id=tgt_char_id,
+                    book_id=None,
+                    chapter_num=0,
+                    scene_num=0,
+                    label="Base State"
+                )
+                session.add(tgt_base_ev)
+                session.flush()
+                
+            if src_base_ev:
+                tgt_base_ev.demographics = src_base_ev.demographics
+                tgt_base_ev.physical_build = src_base_ev.physical_build
+                tgt_base_ev.hair_and_face = src_base_ev.hair_and_face
+                tgt_base_ev.distinguishing_marks = src_base_ev.distinguishing_marks
+                tgt_base_ev.visual_description = src_base_ev.visual_description
+                session.add(tgt_base_ev)
+            
+            # 2. Rename Target, Merge/Consolidate Duplicates, and Import Aliases
+            if import_merge_aliases:
+                old_tgt_name = tgt_char.name
+                tgt_char.name = src_char.name
+                session.add(tgt_char)
+                
+                # Retrieve source character aliases
+                src_aliases = session.exec(
+                    select(CharacterAlias).where(CharacterAlias.character_id == src_char_id)
+                ).all()
+                
+                # Compile target names and aliases to watch out for
+                conflict_names = {src_char.name.lower().strip()}
+                for sa in src_aliases:
+                    conflict_names.add(sa.alias.lower().strip())
+                conflict_names.add(old_tgt_name.lower().strip())
+                
+                # Preserve the old target name as an alias of the renamed canonical target character
+                if old_tgt_name.lower().strip() != src_char.name.lower().strip():
+                    safe_add_alias(tgt_char_id, old_tgt_name, session)
+                
+                # Scan and merge other characters in the target project that share any of these names/aliases
+                other_chars = session.exec(
+                    select(Character)
+                    .where(Character.project_id == tgt_project_id)
+                    .where(Character.id != tgt_char_id)
+                ).all()
+                
+                for other_char in other_chars:
+                    is_conflict = other_char.name.lower().strip() in conflict_names
+                    
+                    other_aliases = session.exec(
+                        select(CharacterAlias).where(CharacterAlias.character_id == other_char.id)
+                    ).all()
+                    
+                    if not is_conflict:
+                        for oa in other_aliases:
+                            if oa.alias.lower().strip() in conflict_names:
+                                is_conflict = True
+                                break
+                                
+                    if is_conflict:
+                        # Merge the duplicate character's name and aliases into our main target character
+                        safe_add_alias(tgt_char_id, other_char.name, session)
+                        for oa in other_aliases:
+                            safe_add_alias(tgt_char_id, oa.alias, session)
+                            session.delete(oa)
+                            
+                        # Reparent custom timeline overrides (e.g. from specific book coordinates)
+                        other_evs = session.exec(
+                            select(CharacterTimelineEvent).where(CharacterTimelineEvent.character_id == other_char.id)
+                        ).all()
+                        for ev in other_evs:
+                            if ev.book_id is None:
+                                session.delete(ev)  # Baseline state is redundant
+                            else:
+                                ev.character_id = tgt_char_id  # Reparent chronological override event
+                                session.add(ev)
+                                
+                        session.delete(other_char)
+                
+                # Finally, import remaining source aliases to our main target character
+                for sa in src_aliases:
+                    safe_add_alias(tgt_char_id, sa.alias, session)
+            else:
+                # Standard traits import without renaming or merging other characters
+                src_aliases = session.exec(
+                    select(CharacterAlias).where(CharacterAlias.character_id == src_char_id)
+                ).all()
+                for sa in src_aliases:
+                    safe_add_alias(tgt_char_id, sa.alias, session)
+                    
+            # 3. Lock target character from automatic LLM profiling overrides
+            if lock_after_import:
+                tgt_char.locked = True
+                session.add(tgt_char)
+                
+        session.commit()
+    
+    # Keep flat file characters.json as the ultimate source of truth on disk
+    save_project_characters_to_json(tgt_project_id) 
