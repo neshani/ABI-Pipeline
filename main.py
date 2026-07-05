@@ -1515,7 +1515,7 @@ async def free_all_memory():
     except Exception:
         base_host_url = llm_url
 
-    state.add_console_log(f"[Memory-Engine] Dispatching asynchronous target VRAM clear requests for configured model '{model_name}' to: {base_host_url}")
+    state.add_console_log(f"[Memory-Engine] Dispatching asynchronous target VRAM clear requests. Configured default model is '{model_name}'. Host: {base_host_url}")
 
     import httpx
     async with httpx.AsyncClient() as client:
@@ -1545,17 +1545,56 @@ async def free_all_memory():
         except Exception:
             pass
 
-        # --- TARGET 3: Target-Specific llama-server Unload ---
+        # --- TARGET 3: Dynamic llama-server Unload ---
         try:
-            # Send targeted unload specifically for the model name saved in settings
-            await client.post(
-                f"{base_host_url}/models/unload", 
-                json={"model": model_name}, 
-                timeout=1.5
-            )
-            state.add_console_log(f"[Memory-Engine] Sent llama-server targeted unload command for: {model_name}")
-        except Exception:
-            pass
+            # 1. Fetch current model status list from the server
+            models_resp = await client.get(f"{base_host_url}/models", timeout=2.0)
+            if models_resp.status_code == 200:
+                models_data = models_resp.json()
+                
+                # Normalize the structure (handles raw array list or wrapped {"data": [...]})
+                if isinstance(models_data, dict):
+                    models_list = models_data.get("data", models_data.get("models", []))
+                    if not models_list and "id" in models_data:
+                        models_list = [models_data]
+                elif isinstance(models_data, list):
+                    models_list = models_data
+                else:
+                    models_list = []
+
+                # 2. Collect IDs of all currently loaded models
+                loaded_model_ids = []
+                for item in models_list:
+                    if isinstance(item, dict):
+                        status = item.get("status", {})
+                        status_val = status.get("value") if isinstance(status, dict) else None
+                        
+                        if status_val == "loaded":
+                            m_id = item.get("id")
+                            if m_id:
+                                loaded_model_ids.append(m_id)
+
+                # 3. Request unloads for any models that are actually resident in memory
+                if loaded_model_ids:
+                    for m_id in loaded_model_ids:
+                        try:
+                            unload_resp = await client.post(
+                                f"{base_host_url}/models/unload", 
+                                json={"model": m_id}, 
+                                timeout=2.0
+                            )
+                            if unload_resp.status_code == 200:
+                                state.add_console_log(f"[Memory-Engine] Sent llama-server targeted unload command for loaded model: {m_id}")
+                            else:
+                                state.add_console_log(f"[Memory-Engine] llama-server unload returned status {unload_resp.status_code} for: {m_id}")
+                        except Exception as unload_err:
+                            state.add_console_log(f"[Memory-Engine] Error unloading model '{m_id}' from llama-server: {str(unload_err)}")
+                else:
+                    state.add_console_log("[Memory-Engine] llama-server reports no models are currently loaded.")
+            else:
+                state.add_console_log(f"[Memory-Engine] Query to llama-server /models returned status code: {models_resp.status_code}")
+        except Exception as e:
+            state.add_console_log(f"[Memory-Engine] Skipped dynamic llama-server unload or host offline: {str(e)}")
 
     ui.notify("VRAM and RAM clearance commands successfully sent!", type="positive")
 
