@@ -611,10 +611,10 @@ def get_speculative_character_template() -> str:
         "We inject your output into this exact template:\n"
         "\"{character_name} (a {{demographics}}, {{hair_and_face}}, who is {{physical_build}}, and {{distinguishing_marks}})\"\n\n"
         "Your JSON values must be short, lowercase grammatical fragments:\n"
-        "- 'demographics': Noun phrase defining their age and gender (do NOT use articles, do NOT list occupations, and do NOT use abstract personality words like 'reliable'). E.g., 'elderly woman', 'young man'.\n"
+        "- 'demographics': Noun phrase defining their age and gender (do NOT use articles). E.g., 'elderly woman', 'young man'.\n"
         "- 'hair_and_face': Physical descriptors of hair style, hair color, or facial structure starting with 'with'. Make it highly cohesive.\n"
         "- 'physical_build': Physical height, stature, and body build.\n"
-        "- 'distinguishing_marks': Set to null. Do NOT invent accessories, jewelry, scars, or glasses; leave this field as null.\n\n"
+        "- 'distinguishing_marks': Do NOT invent accessories, or jewelry.\n\n"
         "### CRITICAL RESTRICTIONS ###\n"
         "1. NO CLOTHING: Do not specify suits, jackets, raincoats, uniform details, or hats. Focus strictly on their body, face, and permanent physical features.\n"
         "2. NO GAZE/LOOK/EXPRESSION: Focus on concrete, paintable physical features only.\n"
@@ -1035,6 +1035,11 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
                     val = val[len(t) + 1:].strip()
             return val
 
+        def is_word_contained(short_name: str, long_name: str) -> bool:
+            # Word-boundary check prevents substring matches inside whole words (e.g. "arrington" in "barrington")
+            pattern = rf"\b{re.escape(short_name)}\b"
+            return bool(re.search(pattern, long_name))
+
         for i, target_char in enumerate(sorted_chars):
             if target_char.id in merged_ids:
                 continue
@@ -1062,18 +1067,33 @@ def auto_merge_project_characters(project_id: int, similarity_threshold: float =
                         if not cand_norm:
                             continue
 
+                        # 1. Exact match after normalization
                         if target_norm == cand_norm:
                             is_match = True
                             match_reason = "Title/Possessive Normalization"
                             break
 
-                        if len(target_norm) >= 4 and len(cand_norm) >= 4:
-                            if target_norm in cand_norm or cand_norm in target_norm:
+                        # Determine smaller and larger profiles
+                        short_n, long_n = (target_norm, cand_norm) if len(target_norm) < len(cand_norm) else (cand_norm, target_norm)
+
+                        # 2. Smart Word/Token Containment (requires length >= 3)
+                        if len(short_n) >= 3:
+                            if is_word_contained(short_n, long_n):
                                 is_match = True
-                                match_reason = "Substring Containment"
+                                match_reason = f"Word containment ('{short_n}' in '{long_n}')"
                                 break
 
+                        # 3. Fuzzy Similarity Check
                         if len(target_norm) >= 4 and len(cand_norm) >= 4:
+                            target_words = target_norm.split()
+                            cand_words = cand_norm.split()
+                            
+                            # Filter out short single-word differences that start with different letters (Molly/Polly, Lance/Vance)
+                            if len(target_words) == 1 and len(cand_words) == 1:
+                                if len(target_norm) <= 6 and len(cand_norm) <= 6:
+                                    if target_norm[0] != cand_norm[0]:
+                                        continue
+                                        
                             ratio = difflib.SequenceMatcher(None, target_norm, cand_norm).ratio()
                             if ratio >= similarity_threshold:
                                 is_match = True

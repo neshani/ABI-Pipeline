@@ -519,7 +519,7 @@ def open_prompt_editor_dialog():
 
 def open_alias_explorer_dialog(project_id: int, alias: CharacterAlias, parent_char_id: int, refresh_callback: Any):
     """Opens a modal displaying where the selected alias occurs within transcripts."""
-    from services.character_manager import get_alias_occurrences
+    from services.character_manager import get_alias_occurrences, save_project_characters_to_json
     
     occurrences = get_alias_occurrences(project_id, alias.alias)
     current_index = 0
@@ -535,8 +535,55 @@ def open_alias_explorer_dialog(project_id: int, alias: CharacterAlias, parent_ch
         with ui.column().classes('w-full flex-1 justify-center items-center py-6 min-h-[160px] bg-slate-50 border rounded-lg px-4 overflow-y-auto'):
             context_html = ui.html('').classes('text-sm text-slate-700 leading-relaxed text-center')
 
-        with ui.row().classes('w-full justify-between items-center pt-2 shrink-0'):
-            ui.label('').classes('flex-grow')
+        # Bottom Controls & Actions Row
+        with ui.row().classes('w-full justify-between items-center pt-2 shrink-0 border-t mt-2'):
+            with Session(engine) as session:
+                char = session.get(Character, parent_char_id)
+                char_name = char.name if char else ""
+            
+            show_promote = char_name.lower() != alias.alias.lower()
+            
+            if show_promote:
+                def handle_promote():
+                    with Session(engine) as session:
+                        db_char = session.get(Character, parent_char_id)
+                        db_alias = session.get(CharacterAlias, alias.id)
+                        if db_char and db_alias:
+                            old_name = db_char.name
+                            new_name = db_alias.alias
+                            
+                            # 1. Update the character's canonical name
+                            db_char.name = new_name
+                            session.add(db_char)
+                            
+                            # 2. Check if the old name is already registered as an alias
+                            exists = session.exec(
+                                select(CharacterAlias)
+                                .where(CharacterAlias.character_id == parent_char_id)
+                                .where(CharacterAlias.alias == old_name)
+                            ).first()
+                            
+                            # Swap old name into this alias record, or discard it if old_name is already a redundant alias
+                            if not exists:
+                                db_alias.alias = old_name
+                                session.add(db_alias)
+                            else:
+                                session.delete(db_alias)
+                                
+                            session.commit()
+                    
+                    save_project_characters_to_json(project_id)
+                    ui.notify(f"Promoted '{new_name}' to canonical character name!", type="positive")
+                    dialog.close()
+                    refresh_callback()
+
+                ui.button(
+                    'Promote to Character Name', 
+                    icon='upgrade', 
+                    on_click=handle_promote
+                ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg')
+            else:
+                ui.label('Canonical Character Name').classes('text-xs text-slate-400 italic font-semibold')
 
             with ui.row().classes('gap-3 items-center'):
                 prev_btn = ui.button(icon='chevron_left', on_click=lambda: navigate(-1)).props('flat dense').classes('bg-slate-100 p-1 rounded-lg')
@@ -1013,37 +1060,39 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         on_change=handle_depth_change
                     ).classes('w-14 bg-white').props('outlined dense')
 
-                # Profile All Batch Action Trigger
-                with ui.row().classes('items-center gap-2'):
-                    if is_profiling_all:
-                        with ui.row().classes('items-center gap-2 bg-purple-50 border border-purple-200 px-3 py-1 rounded-lg shrink-0'):
-                            ui.spinner(size='xs', color='purple')
-                            ui.label(profiling_progress).classes('text-xs font-bold text-purple-700 animate-pulse')
-                            
-                            def stop_profiling():
-                                global cancel_profiling_all, profiling_progress
-                                cancel_profiling_all = True
-                                profiling_progress = "Stopping..."
-                                draw_header_toolbar.refresh()
-                                ui.notify("Stop requested...", type="warning")
+                # Render "Profile All" button only if NOT actively profiling to keep controls neat
+                if not is_profiling_all:
+                    ui.button(
+                        'Profile All', 
+                        icon='bolt', 
+                        on_click=lambda: open_batch_profiler_dialog(
+                            project, 
+                            books, 
+                            refresh_workspace_with_scroll, 
+                            draw_header_toolbar.refresh,
+                            draw_details_panel.refresh
+                        )
+                    ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-4 py-2 rounded-lg shadow-sm')
 
-                            ui.button(
-                                'Stop', 
-                                icon='stop', 
-                                on_click=stop_profiling
-                            ).classes('bg-red-600 hover:bg-red-700 text-white font-bold text-xs px-2.5 py-1 rounded-lg')
-                    else:
-                        ui.button(
-                            'Profile All', 
-                            icon='bolt', 
-                            on_click=lambda: open_batch_profiler_dialog(
-                                project, 
-                                books, 
-                                refresh_workspace_with_scroll, 
-                                draw_header_toolbar.refresh,
-                                draw_details_panel.refresh
-                            )
-                        ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-4 py-2 rounded-lg shadow-sm')
+            # Line 1.5: Dedicated Active Profiling Row (Visible only during execution)
+            if is_profiling_all:
+                with ui.row().classes('w-full items-center gap-3 bg-purple-50/40 border border-purple-200 p-3 rounded-lg mb-1 shrink-0'):
+                    def stop_profiling():
+                        global cancel_profiling_all, profiling_progress
+                        cancel_profiling_all = True
+                        profiling_progress = "Stopping..."
+                        draw_header_toolbar.refresh()
+                        ui.notify("Stop requested...", type="warning")
+
+                    # The Stop button is anchored completely to the left, keeping its position absolute and immutable
+                    ui.button(
+                        'Stop Batch', 
+                        icon='stop', 
+                        on_click=stop_profiling
+                    ).classes('bg-red-600 hover:bg-red-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm shrink-0')
+
+                    ui.spinner(size='xs', color='purple').classes('shrink-0')
+                    ui.label(profiling_progress).classes('text-xs font-bold text-purple-700 animate-pulse truncate flex-1')
 
             # Line 2: Manual Curation Controls
             with ui.row().classes('w-full items-center justify-between border-t pt-3 border-slate-200 flex-wrap gap-2'):
@@ -1067,7 +1116,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         icon='tag', 
                         on_click=run_prompt_scan
                     ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
-                     .tooltip("Scan prompts.csv for bracketed character tags")
+                    .tooltip("Scan prompts.csv for bracketed character tags")
 
                     async def run_auto_merge():
                         client = ui.context.client
@@ -1086,17 +1135,22 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         icon='merge_type',
                         on_click=run_auto_merge
                     ).classes('bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
-                     .tooltip("Fuzzy-merge common names, titles, and possessives")
+                    .tooltip("Fuzzy-merge common names, titles, and possessives")
 
-                    # Dynamic Import Profiles tool button
-                    matching_projects = get_matching_source_projects(project.id)
-                    if matching_projects:
-                        ui.button(
-                            'Import Profiles',
-                            icon='cloud_download',
-                            on_click=lambda: open_import_profiles_dialog(project, matching_projects, refresh_workspace_with_scroll)
-                        ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
-                         .tooltip(f"Import curated profiles from {len(matching_projects)} overlapping project(s)")
+                    # "Import Profiles" tool button is permanently visible to prevent layout shift
+                    def try_open_import():
+                        matching_projects = get_matching_source_projects(project.id)
+                        if not matching_projects:
+                            ui.notify("No completed projects with matching character tags found.", type="info")
+                        else:
+                            open_import_profiles_dialog(project, matching_projects, refresh_workspace_with_scroll)
+
+                    ui.button(
+                        'Import Profiles',
+                        icon='cloud_download',
+                        on_click=try_open_import
+                    ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
+                    .tooltip("Import curated profiles from overlapping project(s)")
 
                 # Settings/Prompt Button aligned right
                 ui.button(
@@ -1104,7 +1158,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     icon='edit_note',
                     on_click=open_prompt_editor_dialog
                 ).classes('bg-slate-600 hover:bg-slate-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
-                 .tooltip("Customize visual profiler LLM instructions")
+                .tooltip("Customize visual profiler LLM instructions")
 
 
     @ui.refreshable
