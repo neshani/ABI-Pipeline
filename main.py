@@ -723,7 +723,10 @@ async def async_run_project_image_gen_logic(project_id: int):
                     prompt=prompt_text,
                     project_id=project_id,
                     enabled_fields=getattr(state, "style_enabled_character_traits", {}),
-                    use_sentence_structure=getattr(state, "style_use_sentence_structure", True)
+                    use_sentence_structure=getattr(state, "style_use_sentence_structure", True),
+                    book_id=book_id,
+                    chapter_num=chapter,
+                    scene_num=scene
                 )
                 if original_prompt != prompt_text:
                     state.add_console_log(f"[Image-Gen] Character tags replaced: '{original_prompt}' -> '{prompt_text}'")
