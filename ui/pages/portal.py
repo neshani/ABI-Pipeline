@@ -30,6 +30,17 @@ def get_status_badge(status: str):
     return ui.label(display_status).classes(f'px-2.5 py-0.5 text-[10px] rounded-full font-semibold {style}')
 
 
+def select_all_scanned_books(new_project_dialog, refresh_parent):
+    if state.current_scan_result:
+        state.selected_book_paths = {b["path"] for b in state.current_scan_result["books"]}
+        scan_preview_container.refresh(new_project_dialog, refresh_parent)
+
+
+def select_none_scanned_books(new_project_dialog, refresh_parent):
+    state.selected_book_paths.clear()
+    scan_preview_container.refresh(new_project_dialog, refresh_parent)
+
+
 @ui.refreshable
 def scan_preview_container(new_project_dialog, refresh_parent: Callable):
     if state.scan_error:
@@ -59,10 +70,32 @@ def scan_preview_container(new_project_dialog, refresh_parent: Callable):
                 ui.icon('folder', color='amber-500', size='sm')
                 ui.label(f'Structure: Batch ({len(state.current_scan_result["books"])} audiobooks found)').classes('text-sm font-semibold text-slate-700')
         
+        # Select All / Select None Controls Row
+        total_books = len(state.current_scan_result["books"])
+        with ui.row().classes('w-full justify-between items-center px-1 text-xs'):
+            selection_label = ui.label(f'{len(state.selected_book_paths)} of {total_books} volumes selected').classes('text-slate-500 font-medium')
+            with ui.row().classes('gap-2'):
+                ui.button('Select All', on_click=lambda: select_all_scanned_books(new_project_dialog, refresh_parent)).props('flat dense').classes('text-blue-600 font-semibold text-xs')
+                ui.button('Select None', on_click=lambda: select_none_scanned_books(new_project_dialog, refresh_parent)).props('flat dense').classes('text-slate-500 font-semibold text-xs')
+
         with ui.column().classes('w-full gap-2 max-h-48 overflow-y-auto p-2 bg-slate-50 border rounded-lg'):
             for book in state.current_scan_result["books"]:
+                is_selected = book["path"] in state.selected_book_paths
+                
+                # Direct state modification that updates the label text directly without layout redraws
+                def toggle_selection(val, path):
+                    if val:
+                        state.selected_book_paths.add(path)
+                    else:
+                        state.selected_book_paths.discard(path)
+                    selection_label.set_text(f'{len(state.selected_book_paths)} of {total_books} volumes selected')
+
                 with ui.row().classes('w-full justify-between items-center bg-white p-2 rounded border shadow-xs'):
                     with ui.row().classes('items-center gap-2'):
+                        ui.checkbox(
+                            value=is_selected, 
+                            on_change=lambda e, p=book["path"]: toggle_selection(e.value, p)
+                        ).props('dense')
                         ui.icon('library_books', size='xs', color='slate-400')
                         ui.label(book["name"]).classes('text-xs font-medium text-slate-700 truncate max-w-sm')
                     with ui.row().classes('items-center gap-2'):
@@ -84,6 +117,7 @@ async def run_live_scan(e, new_project_dialog, refresh_parent: Callable):
         state.current_scan_result = None
         state.scan_error = ""
         state.custom_project_name_value = ""
+        state.selected_book_paths.clear()
         scan_preview_container.refresh(new_project_dialog, refresh_parent)
         return
         
@@ -93,14 +127,18 @@ async def run_live_scan(e, new_project_dialog, refresh_parent: Callable):
             state.current_scan_result = None
             state.scan_error = "No supported audiobook files or subdirectories found."
             state.custom_project_name_value = ""
+            state.selected_book_paths.clear()
         else:
             state.current_scan_result = result
             state.scan_error = ""
             state.custom_project_name_value = result["project_name"]
+            # Default to selecting all discovered volumes
+            state.selected_book_paths = {b["path"] for b in result["books"]}
     except Exception as ex:
         state.current_scan_result = None
         state.scan_error = f"Error scanning folder: {str(ex)}"
         state.custom_project_name_value = ""
+        state.selected_book_paths.clear()
         
     scan_preview_container.refresh(new_project_dialog, refresh_parent)
 
@@ -111,7 +149,18 @@ def save_scanned_project(new_project_dialog, refresh_parent: Callable):
         return
         
     try:
-        project_id = ingest_project(state.current_scan_result, state.custom_project_name_value)
+        import copy
+        filtered_result = copy.deepcopy(state.current_scan_result)
+        filtered_result["books"] = [
+            b for b in filtered_result["books"]
+            if b["path"] in state.selected_book_paths
+        ]
+        
+        if not filtered_result["books"]:
+            ui.notify("Please select at least one volume/book to import.", type="warning")
+            return
+
+        project_id = ingest_project(filtered_result, state.custom_project_name_value)
         ui.notify(f"Successfully imported project ID: {project_id}!", type="positive")
         new_project_dialog.close()
         refresh_parent()
@@ -532,5 +581,6 @@ def open_new_project_dialog(dialog, path_input):
     state.selected_txt_files = []
     state.selected_epub_files = []
     state.import_project_name = ""
+    state.selected_book_paths.clear()
     path_input.set_value("")
     dialog.open()

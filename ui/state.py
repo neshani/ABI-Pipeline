@@ -25,6 +25,7 @@ expanded_projects: set[int] = set()
 current_scan_result: Optional[Dict[str, Any]] = None
 scan_error: str = ""
 custom_project_name_value: str = ""
+selected_book_paths: set[str] = set()
 
 # Multi-format import variables
 selected_txt_files: List[str] = []

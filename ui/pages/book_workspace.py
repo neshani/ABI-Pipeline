@@ -449,9 +449,9 @@ def render_book_tabs(book_id: int):
                             db_char = session.get(Character, char_id)
                             if db_ev:
                                 db_ev.demographics = demo_input.value.strip() if demo_input.value.strip() else None
-                                db_ev.physical_build = build_input.value.strip() if db_ev.physical_build is None or db_ev.physical_build == "" else db_ev.physical_build
-                                db_ev.hair_and_face = hair_input.value.strip() if db_ev.hair_and_face is None or db_ev.hair_and_face == "" else db_ev.hair_and_face
-                                db_ev.distinguishing_marks = marks_input.value.strip() if db_ev.distinguishing_marks is None or db_ev.distinguishing_marks == "" else db_ev.distinguishing_marks
+                                db_ev.physical_build = build_input.value.strip() if build_input.value.strip() else None
+                                db_ev.hair_and_face = hair_input.value.strip() if hair_input.value.strip() else None
+                                db_ev.distinguishing_marks = marks_input.value.strip() if marks_input.value.strip() else None
                                 db_ev.visual_description = desc_textarea.value.strip() if desc_textarea.value.strip() else None
                                 session.add(db_ev)
                                 session.commit()
