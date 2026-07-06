@@ -1518,6 +1518,9 @@ def get_character_import_matches(tgt_project_id: int, src_project_id: int) -> Li
         ).all()
         
         # Fetch details for Target Project characters
+        tgt_books = session.exec(select(Book).where(Book.project_id == tgt_project_id)).all()
+        tgt_book_order_map = {b.id: (b.book_order if b.book_order is not None else 0) for b in tgt_books}
+        
         tgt_data = []
         for tc in tgt_chars:
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == tc.id)).all()
@@ -1525,11 +1528,19 @@ def get_character_import_matches(tgt_project_id: int, src_project_id: int) -> Li
             alias_texts = {a.alias.lower().strip() for a in aliases}
             alias_texts.add(tc.name.lower().strip())
             
-            base_ev = session.exec(
+            # Resolve target latest timeline event to show in comparison
+            tgt_evs = session.exec(
                 select(CharacterTimelineEvent)
                 .where(CharacterTimelineEvent.character_id == tc.id)
-                .where(CharacterTimelineEvent.book_id == None)
-            ).first()
+            ).all()
+            
+            tgt_latest_ev = None
+            if tgt_evs:
+                def tgt_sort_key(ev: CharacterTimelineEvent):
+                    if ev.book_id is None:
+                        return (-1, 0, 0, ev.id or 0)
+                    return (tgt_book_order_map.get(ev.book_id, 0), ev.chapter_num, ev.scene_num, ev.id or 0)
+                tgt_latest_ev = sorted(tgt_evs, key=tgt_sort_key)[-1]
             
             mentions = get_mentions(tc, alias_texts)
             
@@ -1537,37 +1548,47 @@ def get_character_import_matches(tgt_project_id: int, src_project_id: int) -> Li
                 "char": tc,
                 "aliases": alias_list,
                 "all_terms_lower": alias_texts,
-                "desc": base_ev.visual_description if base_ev else "",
+                "desc": tgt_latest_ev.visual_description if tgt_latest_ev else "",
                 "mentions": mentions
             })
             
         # Fetch details for Source Project characters
+        src_books = session.exec(select(Book).where(Book.project_id == src_project_id)).all()
+        src_book_order_map = {b.id: (b.book_order if b.book_order is not None else 0) for b in src_books}
+        
         src_data = []
         for sc in src_chars:
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == sc.id)).all()
             alias_texts = {a.alias.lower().strip() for a in aliases}
             alias_texts.add(sc.name.lower().strip())
             
-            base_ev = session.exec(
+            src_evs = session.exec(
                 select(CharacterTimelineEvent)
                 .where(CharacterTimelineEvent.character_id == sc.id)
-                .where(CharacterTimelineEvent.book_id == None)
-            ).first()
+            ).all()
             
-            if not base_ev:
+            if not src_evs:
                 continue
                 
-            # Verify if there is actual physical descriptive data
+            # Chronologically sort timeline events to retrieve the latest state
+            def src_sort_key(ev: CharacterTimelineEvent):
+                if ev.book_id is None:
+                    return (-1, 0, 0, ev.id or 0)
+                return (src_book_order_map.get(ev.book_id, 0), ev.chapter_num, ev.scene_num, ev.id or 0)
+            
+            latest_src_ev = sorted(src_evs, key=src_sort_key)[-1]
+            
+            # Verify if there is actual physical descriptive data in the latest state
             has_physical_data = any(
                 f and str(f).strip() and str(f).lower() != "none"
-                for f in [base_ev.demographics, base_ev.physical_build, base_ev.hair_and_face, base_ev.distinguishing_marks]
+                for f in [latest_src_ev.demographics, latest_src_ev.physical_build, latest_src_ev.hair_and_face, latest_src_ev.distinguishing_marks]
             )
             
             # Check if there is a custom visual description that is not just the default compiled fallback
             has_custom_desc = False
-            if base_ev.visual_description and base_ev.visual_description.strip():
+            if latest_src_ev.visual_description and latest_src_ev.visual_description.strip():
                 fallback_str = f"a person named {sc.name.lower().strip()}"
-                if base_ev.visual_description.lower().strip() != fallback_str:
+                if latest_src_ev.visual_description.lower().strip() != fallback_str:
                     has_custom_desc = True
                     
             if not (has_physical_data or has_custom_desc):
@@ -1577,8 +1598,8 @@ def get_character_import_matches(tgt_project_id: int, src_project_id: int) -> Li
                 "char": sc,
                 "aliases": [a.alias for a in aliases],
                 "all_terms_lower": alias_texts,
-                "desc": base_ev.visual_description or "",
-                "base_ev": base_ev
+                "desc": latest_src_ev.visual_description or "",
+                "latest_ev": latest_src_ev
             })
             
         # Collect all candidates matching the criteria
@@ -1692,12 +1713,22 @@ def execute_character_import(
             if not src_char or not tgt_char:
                 continue
                 
-            # 1. Sync baseline profile traits
-            src_base_ev = session.exec(
+            # 1. Resolve chronological latest source timeline event to sync as the baseline state
+            src_books = session.exec(select(Book).where(Book.project_id == src_char.project_id)).all()
+            src_book_order_map = {b.id: (b.book_order if b.book_order is not None else 0) for b in src_books}
+            
+            src_evs = session.exec(
                 select(CharacterTimelineEvent)
                 .where(CharacterTimelineEvent.character_id == src_char_id)
-                .where(CharacterTimelineEvent.book_id == None)
-            ).first()
+            ).all()
+            
+            src_latest_ev = None
+            if src_evs:
+                def src_sort_key(ev: CharacterTimelineEvent):
+                    if ev.book_id is None:
+                        return (-1, 0, 0, ev.id or 0)
+                    return (src_book_order_map.get(ev.book_id, 0), ev.chapter_num, ev.scene_num, ev.id or 0)
+                src_latest_ev = sorted(src_evs, key=src_sort_key)[-1]
             
             tgt_base_ev = session.exec(
                 select(CharacterTimelineEvent)
@@ -1716,12 +1747,12 @@ def execute_character_import(
                 session.add(tgt_base_ev)
                 session.flush()
                 
-            if src_base_ev:
-                tgt_base_ev.demographics = src_base_ev.demographics
-                tgt_base_ev.physical_build = src_base_ev.physical_build
-                tgt_base_ev.hair_and_face = src_base_ev.hair_and_face
-                tgt_base_ev.distinguishing_marks = src_base_ev.distinguishing_marks
-                tgt_base_ev.visual_description = src_base_ev.visual_description
+            if src_latest_ev:
+                tgt_base_ev.demographics = src_latest_ev.demographics
+                tgt_base_ev.physical_build = src_latest_ev.physical_build
+                tgt_base_ev.hair_and_face = src_latest_ev.hair_and_face
+                tgt_base_ev.distinguishing_marks = src_latest_ev.distinguishing_marks
+                tgt_base_ev.visual_description = src_latest_ev.visual_description
                 session.add(tgt_base_ev)
             
             # 2. Rename Target, Merge/Consolidate Duplicates, and Import Aliases
@@ -1804,4 +1835,41 @@ def execute_character_import(
         session.commit()
     
     # Keep flat file characters.json as the ultimate source of truth on disk
-    save_project_characters_to_json(tgt_project_id) 
+    save_project_characters_to_json(tgt_project_id)
+
+
+def reset_project_characters(project_id: int):
+    """
+    Completely wipes all characters, aliases, and timeline events for a project.
+    Resets the characters.json file to an empty state.
+    """
+    with Session(engine) as session:
+        # 1. Find all characters belonging to this project
+        chars = session.exec(select(Character).where(Character.project_id == project_id)).all()
+        char_ids = [c.id for c in chars]
+
+        if char_ids:
+            # 2. Delete Relational Data first
+            # Aliases
+            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id.in_(char_ids))).all()
+            for a in aliases:
+                session.delete(a)
+
+            # Timeline Events
+            events = session.exec(select(CharacterTimelineEvent).where(CharacterTimelineEvent.character_id.in_(char_ids))).all()
+            for e in events:
+                session.delete(e)
+            
+            # Modifiers (if any)
+            modifiers = session.exec(select(CharacterStateModifier).where(CharacterStateModifier.character_id.in_(char_ids))).all()
+            for m in modifiers:
+                session.delete(m)
+
+            # 3. Delete Characters
+            for c in chars:
+                session.delete(c)
+
+        session.commit()
+
+    # 4. Sync the now-empty state to the characters.json file
+    save_project_characters_to_json(project_id)

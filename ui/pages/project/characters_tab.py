@@ -1084,7 +1084,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         draw_header_toolbar.refresh()
                         ui.notify("Stop requested...", type="warning")
 
-                    # The Stop button is anchored completely to the left, keeping its position absolute and immutable
                     ui.button(
                         'Stop Batch', 
                         icon='stop', 
@@ -1137,7 +1136,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     ).classes('bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
                     .tooltip("Fuzzy-merge common names, titles, and possessives")
 
-                    # "Import Profiles" tool button is permanently visible to prevent layout shift
                     def try_open_import():
                         matching_projects = get_matching_source_projects(project.id)
                         if not matching_projects:
@@ -1151,6 +1149,37 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         on_click=try_open_import
                     ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
                     .tooltip("Import curated profiles from overlapping project(s)")
+
+                    # Character Reset Button
+                    def confirm_reset():
+                        with ui.dialog() as dialog, ui.card().classes('w-[400px] p-6 rounded-xl flex flex-col gap-4'):
+                            ui.label('Reset Character Database?').classes('text-base font-bold text-red-600')
+                            ui.markdown(
+                                "This will **permanently delete** all characters, aliases, and descriptions "
+                                f"for **{project.name}**. This cannot be undone."
+                            ).classes('text-xs text-slate-600')
+                            
+                            with ui.row().classes('w-full justify-end gap-2'):
+                                ui.button('Cancel', on_click=dialog.close).props('flat')
+                                async def handle_reset():
+                                    from services.character_manager import reset_project_characters
+                                    await asyncio.to_thread(reset_project_characters, project.id)
+                                    global selected_character_id
+                                    selected_character_id = None
+                                    dialog.close()
+                                    ui.notify("Character database reset successfully.", type="positive")
+                                    await refresh_workspace_with_scroll()
+                                
+                                ui.button('Reset Everything', on_click=handle_reset).classes('bg-red-600 text-white font-bold text-xs px-3 py-1.5 rounded-lg')
+                        dialog.open()
+
+                    ui.button(
+                        'Reset',
+                        icon='restart_alt',
+                        on_click=confirm_reset,
+                        color='red'
+                    ).classes('text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
+                    .tooltip("Wipe all character data for this project and start over")
 
                 # Settings/Prompt Button aligned right
                 ui.button(
