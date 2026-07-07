@@ -9,6 +9,7 @@ from database.models import Book, Project, Character, CharacterAlias, CharacterT
 from services.character_manager import compile_character_visual_prompt, save_project_characters_to_json
 from ui import state
 
+
 # --- Quote Formatting Clean Helper ---
 def clean_quote_text(text: str) -> str:
     """Removes standard LLM extraction artifacts from quotes."""
@@ -250,40 +251,103 @@ def render_prompt_editor_view(
                 
             ui.button('Clean All Quotes', on_click=apply_bulk_clean).classes('bg-purple-600 text-white text-xs font-bold')
 
+    # Stateful reference values for the Prompt Editor Large Reader Modal
+    context_reader_state = {"window_before": 2500, "window_after": 2500}
+    context_stats_label = [None]
+    prev_chunk_btn = [None]
+    next_chunk_btn = [None]
+    context_reader_html = [None]
+
+    async def update_context_reader_view(scroll_to_quote=True):
+        scene = get_active_scene_dict()
+        if not scene:
+            return
+        
+        # Inline import breaks circular dependencies at module load-time
+        from ui.pages.book_workspace import find_quote_context_paginated
+        
+        with Session(engine) as session:
+            project = session.get(Project, project_id)
+            book = session.get(Book, book_id)
+            if project and book:
+                wb = context_reader_state["window_before"]
+                wa = context_reader_state["window_after"]
+                res = find_quote_context_paginated(
+                    project.name, 
+                    book.name, 
+                    scene.get("quote", ""), 
+                    window_before=wb, 
+                    window_after=wa
+                )
+                
+                formatted_html = format_narrative_context(res["html"])
+                if context_reader_html[0]:
+                    context_reader_html[0].set_content(formatted_html)
+                
+                if context_stats_label[0]:
+                    context_stats_label[0].set_text(f"Showing {wb:,} chars before, {wa:,} chars after target quote")
+                if prev_chunk_btn[0]:
+                    prev_chunk_btn[0].set_visibility(res["has_prev"])
+                if next_chunk_btn[0]:
+                    next_chunk_btn[0].set_visibility(res["has_next"])
+                
+                if scroll_to_quote:
+                    await asyncio.sleep(0.15)
+                    ui.run_javascript('document.getElementById("quote-target")?.scrollIntoView({ block: "center", behavior: "smooth" })')
+
+    def load_adjusted_context(before_delta, after_delta):
+        if before_delta is None and after_delta is None:
+            context_reader_state["window_before"] = 2500
+            context_reader_state["window_after"] = 2500
+        else:
+            if before_delta:
+                context_reader_state["window_before"] = max(500, context_reader_state["window_before"] - before_delta)
+            if after_delta:
+                context_reader_state["window_after"] = max(500, context_reader_state["window_after"] + after_delta)
+        
+        asyncio.create_task(update_context_reader_view(scroll_to_quote=False))
+
     # --- Dynamic Context Book-Style Reader Modal ---
     with ui.dialog() as context_reader_dialog:
-        with ui.card().classes('w-full max-w-2xl p-6 rounded-xl bg-white flex flex-col gap-4 outline-none focus:outline-none'):
+        with ui.card().classes('w-full max-w-3xl p-6 rounded-xl bg-white flex flex-col gap-4 outline-none focus:outline-none'):
             with ui.row().classes('w-full justify-between items-center border-b pb-2 flex-shrink-0'):
-                ui.label('📖 Narrative Passage Context').classes('text-base font-bold text-slate-800')
+                with ui.row().classes('items-center gap-2 flex-nowrap'):
+                    ui.label('📖 Narrative Passage Context').classes('text-base font-bold text-slate-800')
+                    context_stats_label[0] = ui.label("").classes('text-xs text-slate-400 font-semibold')
                 ui.button(icon='close', on_click=context_reader_dialog.close).props('flat round dense').classes('text-slate-400')
                 
+            # Navigation / Paginate actions bar at top
+            with ui.row().classes('w-full justify-between items-center bg-slate-50 p-2 rounded-lg border gap-2 flex-nowrap'):
+                prev_chunk_btn[0] = ui.button(
+                    '← Read Further Back (+2,500 chars)', 
+                    on_click=lambda: load_adjusted_context(-2500, 0)
+                ).props('dense flat').classes('text-xs font-semibold text-blue-600 hover:bg-blue-50 px-2 rounded-md')
+                
+                reset_chunk_btn = ui.button(
+                    'Reset Context Window', 
+                    on_click=lambda: load_adjusted_context(None, None)
+                ).props('dense flat').classes('text-xs font-semibold text-slate-500 hover:bg-slate-100 px-2 rounded-md')
+                
+                next_chunk_btn[0] = ui.button(
+                    'Read Further Ahead (+2,500 chars) →', 
+                    on_click=lambda: load_adjusted_context(0, 2500)
+                ).props('dense flat').classes('text-xs font-semibold text-blue-600 hover:bg-blue-50 px-2 rounded-md')
+
             # Scroll container mapped dynamically to auto-position the quote anchor element
             scroll_wrapper = ui.card().classes('w-full h-96 border bg-white p-4 rounded-lg overflow-y-auto relative outline-none focus:outline-none')
             with scroll_wrapper:
-                context_reader_html = ui.html("").classes('text-sm leading-relaxed font-serif text-slate-800 tracking-wide block')
+                context_reader_html[0] = ui.html("").classes('text-sm leading-relaxed font-serif text-slate-800 tracking-wide block')
                 
             with ui.row().classes('w-full justify-end border-t pt-2 mt-1'):
                 ui.button('Close Reader', on_click=context_reader_dialog.close).classes('bg-slate-600 text-white text-xs font-semibold px-4 py-2')
 
     async def open_context_reader():
-        """Formats 5x large context surrounding quotes and centers scroll into view."""
-        scene = get_active_scene_dict()
-        if not scene:
-            return
-        from ui.pages.book_workspace import find_quote_context
-        with Session(engine) as session:
-            project = session.get(Project, project_id)
-            book = session.get(Book, book_id)
-            if project and book:
-                # Retrieve large context (2500 characters before & after quote)
-                raw_html = find_quote_context(project.name, book.name, scene.get("quote", ""), char_window=2500)
-                formatted_html = format_narrative_context(raw_html)
-                context_reader_html.set_content(formatted_html)
-                context_reader_dialog.open()
-                
-                # yield thread context and execute centered smooth scroll on client DOM
-                await asyncio.sleep(0.15)
-                ui.run_javascript('document.getElementById("quote-target")?.scrollIntoView({ block: "center", behavior: "smooth" })')
+        """Formats large context surrounding quotes, resets view state, and centers scroll into view."""
+        context_reader_state["window_before"] = 2500
+        context_reader_state["window_after"] = 2500
+        context_reader_dialog.open()
+        await update_context_reader_view(scroll_to_quote=True)
+
 
     # --- Autocomplete Tag Insertion & Registration ---
     def register_new_tags_from_text(text: str):

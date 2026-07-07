@@ -167,21 +167,34 @@ def delete_scene_image_file(project_name: str, book_name: str, chapter_str: str,
     return deleted
 
 
-# --- Lazy Context Finder ---
+# --- Stateful Context Finder with Pagination Support ---
 
 def find_quote_context(project_name: str, book_name: str, quote: str, char_window: int = 400) -> str:
     """Lazy parses transcript.txt, extracting surrounding paragraphs to highlight narration context."""
+    res = find_quote_context_paginated(project_name, book_name, quote, window_before=char_window, window_after=char_window)
+    return res["html"]
+
+
+def find_quote_context_paginated(project_name: str, book_name: str, quote: str, window_before: int = 400, window_after: int = 400) -> dict:
+    """
+    Finds the quote context inside transcript.txt using distinct before and after boundaries,
+    returning both the highlighted HTML snippet and pagination capability flags.
+    """
     transcript_path = Path(f"./output/{project_name}/{book_name}/transcript.txt")
     if not transcript_path.exists():
-        return "Transcript file not found on disk. Run Transcription to load context narration."
+        return {
+            "html": "Transcript file not found on disk. Run Transcription to load context narration.", 
+            "has_prev": False, 
+            "has_next": False
+        }
             
     try:
         text = transcript_path.read_text(encoding='utf-8')
     except Exception as e:
-        return f"Error reading transcript: {str(e)}"
+        return {"html": f"Error reading transcript: {str(e)}", "has_prev": False, "has_next": False}
             
     if not quote:
-        return "Narrative quote is empty."
+        return {"html": "Narrative quote is empty.", "has_prev": False, "has_next": False}
             
     text_lower = text.lower()
     quote_lower = quote.lower()
@@ -194,14 +207,17 @@ def find_quote_context(project_name: str, book_name: str, quote: str, char_windo
         match_len = 25
             
     if idx == -1:
-        return "Narrative segment context match could not be found inside transcript.txt."
+        return {"html": "Narrative segment context match could not be found inside transcript.txt.", "has_prev": False, "has_next": False}
             
-    start_idx = max(0, idx - char_window)
-    end_idx = min(len(text), idx + match_len + char_window)
+    start_idx = max(0, idx - window_before)
+    end_idx = min(len(text), idx + match_len + window_after)
     snippet = text[start_idx:end_idx]
         
     snippet_lower = snippet.lower()
     snippet_idx = snippet_lower.find(quote_lower[:match_len])
+    
+    has_prev = start_idx > 0
+    has_next = end_idx < len(text)
         
     if snippet_idx != -1:
         highlighted = (
@@ -211,9 +227,9 @@ def find_quote_context(project_name: str, book_name: str, quote: str, char_windo
             '</mark>' +
             snippet[snippet_idx + match_len:]
         )
-        return f"... {highlighted} ..."
+        return {"html": f"... {highlighted} ...", "has_prev": has_prev, "has_next": has_next}
             
-    return f"... {snippet} ..."
+    return {"html": f"... {snippet} ...", "has_prev": has_prev, "has_next": has_next}
 
 
 # --- Main Proofing UI Component ---
@@ -841,14 +857,18 @@ def render_book_tabs(book_id: int):
             loaded_scene_coords[0] = ch
             loaded_scene_coords[1] = sc
 
+            # Reset contextual limits to default whenever jumping to a brand new scene
+            theater_context_state["window_before"] = 400
+            theater_context_state["window_after"] = 400
+
             if modal_quote_el:
                 modal_quote_el.set_text(f'"{current_scene.get("quote", "")}"')
                 
             if modal_prompt_input:
                 modal_prompt_input.set_value(current_scene.get("prompt", ""))
                 
-            if modal_context_html:
-                modal_context_html.set_content(find_quote_context(project_name, book_name, current_scene.get("quote", "")))
+            if modal_context_html[0]:
+                update_theater_context_view()
 
         if modal_prompt_input:
             render_scene_character_chips(modal_prompt_input.value)
@@ -1271,7 +1291,52 @@ def render_book_tabs(book_id: int):
     modal_placeholder = None
     modal_quote_el = None
     modal_prompt_input = None
-    modal_context_html = None
+    
+    # Stateful reference containers to prevent initialization out-of-order NameErrors
+    modal_context_html = [None]
+    theater_prev_btn = [None]
+    theater_next_btn = [None]
+    theater_context_label = [None]
+    
+    theater_context_state = {"window_before": 400, "window_after": 400}
+
+    def load_theater_context_adjusted(before_delta, after_delta):
+        if before_delta is None and after_delta is None:
+            theater_context_state["window_before"] = 400
+            theater_context_state["window_after"] = 400
+        else:
+            if before_delta:
+                theater_context_state["window_before"] = max(200, theater_context_state["window_before"] - before_delta)
+            if after_delta:
+                theater_context_state["window_after"] = max(200, theater_context_state["window_after"] + after_delta)
+        update_theater_context_view()
+
+    def update_theater_context_view():
+        if not modal_context_html[0]:
+            return
+        current_scene = active_row_ref[0]
+        if not current_scene:
+            return
+            
+        wb = theater_context_state["window_before"]
+        wa = theater_context_state["window_after"]
+        
+        res = find_quote_context_paginated(
+            project_name, 
+            book_name, 
+            current_scene.get("quote", ""), 
+            window_before=wb, 
+            window_after=wa
+        )
+        modal_context_html[0].set_content(res["html"])
+        
+        if theater_context_label[0]:
+            theater_context_label[0].set_text(f"Context Span: showing {wb:,} chars before, {wa:,} chars after")
+        if theater_prev_btn[0]:
+            theater_prev_btn[0].set_visibility(res["has_prev"])
+        if theater_next_btn[0]:
+            theater_next_btn[0].set_visibility(res["has_next"])
+
     modal_title_el = None
     modal_subtitle_el = None
     
@@ -1464,8 +1529,27 @@ def render_book_tabs(book_id: int):
                         )
                         modal_prompt_input.on('keydown.tab.prevent', handle_modal_autocomplete_tab_completion)
                     
-                    with ui.expansion('Narrative Context (transcript.txt)').classes('w-full border rounded bg-slate-50 text-xs flex-shrink-0'):
-                        modal_context_html = ui.html("").classes('p-3 leading-relaxed text-slate-700 bg-white font-serif')
+                    with ui.expansion('Narrative Context (transcript.txt)').classes('w-full border rounded bg-slate-50 text-xs flex-shrink-0') as context_expansion:
+                        with ui.column().classes('w-full gap-1.5 p-2 bg-slate-100 border-b flex-nowrap'):
+                            with ui.row().classes('w-full justify-between items-center gap-1 flex-nowrap'):
+                                theater_prev_btn[0] = ui.button(
+                                    '← Load Back (+1,000)',
+                                    on_click=lambda: load_theater_context_adjusted(-1000, 0)
+                                ).props('dense flat').classes('text-[10px] font-bold text-blue-600')
+                                
+                                theater_reset_btn = ui.button(
+                                    'Reset',
+                                    on_click=lambda: load_theater_context_adjusted(None, None)
+                                ).props('dense flat').classes('text-[10px] text-slate-500 font-bold')
+                                
+                                theater_next_btn[0] = ui.button(
+                                    'Load Ahead (+1,000) →',
+                                    on_click=lambda: load_theater_context_adjusted(0, 1000)
+                                ).props('dense flat').classes('text-[10px] font-bold text-blue-600')
+                                
+                            theater_context_label[0] = ui.label("").classes('text-[9px] text-slate-400 self-center font-semibold')
+                            
+                        modal_context_html[0] = ui.html("").classes('p-3 leading-relaxed text-slate-700 bg-white font-serif')
 
     # Keyboard shortcut listener
     def handle_key(e):
