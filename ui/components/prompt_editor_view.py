@@ -65,13 +65,23 @@ def render_prompt_editor_view(
 
     # Compile character vocabulary for this book's autocomplete matching
     book_characters: List[Character] = []
+    character_alias_map: Dict[int, List[str]] = {}
+    
     with Session(engine) as session:
         book_characters = session.exec(
             select(Character).where(Character.project_id == project_id)
         ).all()
+        
+        # Pre-cache all aliases to prevent database queries freezing the UI on keystrokes
+        for char in book_characters:
+            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
+            character_alias_map[char.id] = [a.alias.lower() for a in aliases] + [char.name.lower()]
 
     # Active matched characters for Intellisense autocomplete
     active_matches_list: List[Character] = []
+
+    # Tracks autocomplete context for mid-string substitutions
+    autocomplete_context = {"last_bracket": -1, "cursor_pos": -1}
 
     # --- Interactive Element References ---
     sidebar_container_ref = [None]
@@ -336,11 +346,39 @@ def render_prompt_editor_view(
     def handle_autocomplete_selection(char_name: str):
         """Replaces typed bracket query with completed bracket character tag."""
         prompt_val = prompt_textarea[0].value
-        last_bracket_idx = prompt_val.rfind('[')
-        if last_bracket_idx != -1:
-            completed_text = prompt_val[:last_bracket_idx] + f"[{char_name}] "
+        last_bracket = autocomplete_context.get("last_bracket", -1)
+        cursor_pos = autocomplete_context.get("cursor_pos", -1)
+        
+        if last_bracket != -1 and cursor_pos != -1:
+            text_before_bracket = prompt_val[:last_bracket]
+            text_after_cursor = prompt_val[cursor_pos:]
+            
+            # If there is a closing bracket right after the cursor for THIS tag, swallow it
+            close_bracket_idx = text_after_cursor.find(']')
+            next_open = text_after_cursor.find('[')
+            if close_bracket_idx != -1 and (next_open == -1 or close_bracket_idx < next_open):
+                text_after_cursor = text_after_cursor[close_bracket_idx + 1:].lstrip()
+                
+            completed_text = text_before_bracket + f"[{char_name}] " + text_after_cursor
+            
             prompt_textarea[0].set_value(completed_text)
-            prompt_textarea[0].run_method('focus')
+            
+            new_cursor_pos = len(text_before_bracket) + len(char_name) + 3
+            
+            ui.run_javascript(f'''
+                const textarea = document.querySelector(".visual-prompt-editor textarea");
+                if (textarea) {{
+                    textarea.focus();
+                    textarea.setSelectionRange({new_cursor_pos}, {new_cursor_pos});
+                }}
+            ''', respond=False)
+        else:
+            last_bracket_idx = prompt_val.rfind('[')
+            if last_bracket_idx != -1:
+                completed_text = prompt_val[:last_bracket_idx] + f"[{char_name}] "
+                prompt_textarea[0].set_value(completed_text)
+                prompt_textarea[0].run_method('focus')
+                
         autocomplete_card[0].visible = False
 
     def handle_autocomplete_tab_completion():
@@ -351,21 +389,38 @@ def render_prompt_editor_view(
 
     def handle_prompt_input_keyup(e):
         """Evaluates live input queries inside visual prompt to trigger Intellisense."""
-        val = e.sender.value
-        last_bracket = val.rfind('[')
-        last_close = val.rfind(']')
+        # e.args receives the payload from the original emit() function: [selectionStart, value]
+        if not e.args or len(e.args) < 2:
+            autocomplete_card[0].visible = False
+            return
+            
+        cursor_pos = e.args[0]
+        val = e.args[1]
         
+        if not val or cursor_pos is None:
+            autocomplete_card[0].visible = False
+            return
+            
+        # Check text *before* the cursor to see if we are currently inside an open bracket
+        text_before_cursor = val[:cursor_pos]
+        last_bracket = text_before_cursor.rfind('[')
+        last_close = text_before_cursor.rfind(']')
+        
+        # We are inside a bracket if the last '[' is AFTER the last ']'
         if last_bracket != -1 and last_bracket > last_close:
-            query = val[last_bracket + 1:].strip().lower()
+            query = text_before_cursor[last_bracket + 1:].strip().lower()
+            
+            autocomplete_context["last_bracket"] = last_bracket
+            autocomplete_context["cursor_pos"] = cursor_pos
             
             matches = []
-            with Session(engine) as session:
-                for char in book_characters:
-                    aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-                    alias_texts = [a.alias.lower() for a in aliases] + [char.name.lower()]
-                    
-                    if not query or any(query in a for a in alias_texts):
-                        matches.append(char)
+            
+            # Use the instant in-memory cache
+            for char in book_characters:
+                alias_texts = character_alias_map.get(char.id, [])
+                
+                if not query or any(query in a for a in alias_texts):
+                    matches.append(char)
                         
             active_matches_list.clear()
             active_matches_list.extend(matches[:4])
@@ -664,10 +719,19 @@ def render_prompt_editor_view(
                         ui.label('TAB COMPLETE MATCH:').classes('text-[8px] font-black text-slate-400 tracking-wider mb-0.5 px-1')
                         autocomplete_results_container[0] = ui.column().classes('w-full gap-0.5')
 
-                    prompt_textarea[0] = ui.textarea().classes('w-full text-xs bg-white').props('outlined dense autogrow rows=4')
+                    # Note: Added 'visual-prompt-editor' class so JS can focus it!
+                    prompt_textarea[0] = ui.textarea().classes('w-full text-xs bg-white visual-prompt-editor').props('outlined dense autogrow rows=4')
                     prompt_textarea[0].on('blur', save_active_scene_changes)
-                    prompt_textarea[0].on('keyup', handle_prompt_input_keyup)
-                    prompt_textarea[0].on('keydown.tab', handle_autocomplete_tab_completion)
+                    
+                    # Restored the proven emit() payload
+                    prompt_textarea[0].on(
+                        'keyup', 
+                        handle_prompt_input_keyup, 
+                        js_handler='(e) => emit(e.target.selectionStart, e.target.value)'
+                    )
+                    
+                    # Added .prevent to tab so you don't lose focus to the next UI element
+                    prompt_textarea[0].on('keydown.tab.prevent', handle_autocomplete_tab_completion)
 
     # Initial side-by-side loaders
     render_sidebar_list()
