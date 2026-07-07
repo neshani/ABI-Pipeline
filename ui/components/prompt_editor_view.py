@@ -359,11 +359,11 @@ def render_prompt_editor_view(
             if close_bracket_idx != -1 and (next_open == -1 or close_bracket_idx < next_open):
                 text_after_cursor = text_after_cursor[close_bracket_idx + 1:].lstrip()
                 
-            completed_text = text_before_bracket + f"[{char_name}] " + text_after_cursor
+            completed_text = text_before_bracket + f"[{char_name}]" + text_after_cursor
             
             prompt_textarea[0].set_value(completed_text)
             
-            new_cursor_pos = len(text_before_bracket) + len(char_name) + 3
+            new_cursor_pos = len(text_before_bracket) + len(char_name) + 2
             
             ui.run_javascript(f'''
                 const textarea = document.querySelector(".visual-prompt-editor textarea");
@@ -375,7 +375,7 @@ def render_prompt_editor_view(
         else:
             last_bracket_idx = prompt_val.rfind('[')
             if last_bracket_idx != -1:
-                completed_text = prompt_val[:last_bracket_idx] + f"[{char_name}] "
+                completed_text = prompt_val[:last_bracket_idx] + f"[{char_name}]"
                 prompt_textarea[0].set_value(completed_text)
                 prompt_textarea[0].run_method('focus')
                 

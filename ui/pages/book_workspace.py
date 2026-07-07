@@ -464,6 +464,9 @@ def render_book_tabs(book_id: int):
                         char_dialog.close()
                         if modal_prompt_input:
                             render_scene_character_chips(modal_prompt_input.value)
+                            
+                        if modal_autocomplete_card[0]:
+                            modal_autocomplete_card[0].visible = False
 
                     ui.button('Cancel', on_click=cancel, color='slate').props('flat').classes('text-xs font-semibold')
                     ui.button('Save Profile State', on_click=save).classes('bg-blue-600 text-white font-bold text-xs px-4 py-2 rounded-lg shadow-sm')
@@ -1203,6 +1206,119 @@ def render_book_tabs(book_id: int):
     active_row_ref = [None]
     grid_card_references: Dict[tuple, Dict[str, Any]] = {}
 
+    # Pre-cache character vocabulary for autocomplete inside the book workspace tabs
+    book_characters_modal: List[Character] = []
+    character_alias_map_modal: Dict[int, List[str]] = {}
+    with Session(engine) as session:
+        book_characters_modal = session.exec(
+            select(Character).where(Character.project_id == project.id)
+        ).all()
+        for char in book_characters_modal:
+            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
+            character_alias_map_modal[char.id] = [a.alias.lower() for a in aliases] + [char.name.lower()]
+
+    active_matches_list_modal: List[Character] = []
+    autocomplete_context_modal = {"last_bracket": -1, "cursor_pos": -1}
+    
+    modal_autocomplete_card = [None]
+    modal_autocomplete_results_container = [None]
+
+    def handle_modal_autocomplete_selection(char_name: str):
+        """Replaces typed bracket query in theater modal with completed bracket character tag."""
+        prompt_val = modal_prompt_input.value or ""
+        last_bracket = autocomplete_context_modal.get("last_bracket", -1)
+        cursor_pos = autocomplete_context_modal.get("cursor_pos", -1)
+        
+        if last_bracket != -1 and cursor_pos != -1:
+            text_before_bracket = prompt_val[:last_bracket]
+            text_after_cursor = prompt_val[cursor_pos:]
+            
+            # Swallow previous closing bracket if editing in the middle
+            close_bracket_idx = text_after_cursor.find(']')
+            next_open = text_after_cursor.find('[')
+            if close_bracket_idx != -1 and (next_open == -1 or close_bracket_idx < next_open):
+                text_after_cursor = text_after_cursor[close_bracket_idx + 1:].lstrip()
+                
+            completed_text = text_before_bracket + f"[{char_name}]" + text_after_cursor
+            
+            modal_prompt_input.set_value(completed_text)
+            
+            new_cursor_pos = len(text_before_bracket) + len(char_name) + 2
+            
+            ui.run_javascript(f'''
+                const textarea = document.querySelector(".theater-prompt-editor textarea");
+                if (textarea) {{
+                    textarea.focus();
+                    textarea.setSelectionRange({new_cursor_pos}, {new_cursor_pos});
+                }}
+            ''', respond=False)
+        else:
+            last_bracket_idx = prompt_val.rfind('[')
+            if last_bracket_idx != -1:
+                completed_text = prompt_val[:last_bracket_idx] + f"[{char_name}]"
+                modal_prompt_input.set_value(completed_text)
+                modal_prompt_input.run_method('focus')
+                
+        modal_autocomplete_card[0].visible = False
+        update_prompt_text(modal_prompt_input.value, active_row_ref[0])
+
+    def handle_modal_autocomplete_tab_completion():
+        """Tab handler to auto-insert top match inside absolute container and restore focus in modal."""
+        if modal_autocomplete_card[0].visible and active_matches_list_modal:
+            handle_modal_autocomplete_selection(active_matches_list_modal[0].name)
+            modal_prompt_input.run_method('focus')
+
+    def handle_modal_prompt_input_keyup(e):
+        """Evaluates live input queries inside theater prompt to trigger Intellisense."""
+        if not e.args or len(e.args) < 2:
+            modal_autocomplete_card[0].visible = False
+            return
+            
+        cursor_pos = e.args[0]
+        val = e.args[1]
+        
+        if not val or cursor_pos is None:
+            modal_autocomplete_card[0].visible = False
+            return
+            
+        # Check text *before* the cursor to see if we are currently inside an open bracket
+        text_before_cursor = val[:cursor_pos]
+        last_bracket = text_before_cursor.rfind('[')
+        last_close = text_before_cursor.rfind(']')
+        
+        # We are inside a bracket if the last '[' is AFTER the last ']'
+        if last_bracket != -1 and last_bracket > last_close:
+            query = text_before_cursor[last_bracket + 1:].strip().lower()
+            
+            autocomplete_context_modal["last_bracket"] = last_bracket
+            autocomplete_context_modal["cursor_pos"] = cursor_pos
+            
+            matches = []
+            
+            # Instant memory cache loop
+            for char in book_characters_modal:
+                alias_texts = character_alias_map_modal.get(char.id, [])
+                
+                if not query or any(query in a for a in alias_texts):
+                    matches.append(char)
+                        
+            active_matches_list_modal.clear()
+            active_matches_list_modal.extend(matches[:4])
+            
+            if active_matches_list_modal:
+                modal_autocomplete_results_container[0].clear()
+                with modal_autocomplete_results_container[0]:
+                    for m in active_matches_list_modal:
+                        ui.button(
+                            f"👤 {m.name}", 
+                            on_click=lambda _, name=m.name: handle_modal_autocomplete_selection(name)
+                        ).props('flat dense align=left').classes('text-[11px] w-full text-slate-700 hover:bg-blue-50 py-0.5 px-2 rounded justify-start')
+                modal_autocomplete_card[0].visible = True
+            else:
+                modal_autocomplete_card[0].visible = False
+        else:
+            modal_autocomplete_card[0].visible = False
+
     # --- High Performance Theater Modal ---
     with ui.dialog() as theater_dialog:
         with ui.card().classes('w-full max-w-[95vw] lg:max-w-7xl h-[90vh] p-4 rounded-xl bg-white flex flex-col items-stretch overflow-hidden gap-0 outline-none focus:outline-none'):
@@ -1249,12 +1365,28 @@ def render_book_tabs(book_id: int):
                         ui.label("Target Narration Quote").classes('text-[9px] font-black text-slate-400 uppercase tracking-wider')
                         modal_quote_el = ui.label("").classes('text-xs italic text-slate-700 leading-relaxed font-serif')
                         
-                    modal_prompt_input = ui.textarea(
-                        label="Style-Ready Visual Prompt"
-                    ).classes('w-full h-32 text-xs leading-relaxed flex-shrink-0').props('outlined')
-                    
-                    modal_prompt_input.on('blur', lambda: update_prompt_text(modal_prompt_input.value, active_row_ref[0]))
-                    modal_prompt_input.on('update:value', lambda e: render_scene_character_chips(e.sender.value))
+                    with ui.element('div').classes('relative w-full flex-shrink-0'):
+                        modal_autocomplete_card[0] = ui.card().classes('absolute bottom-full left-0 right-0 z-[100] bg-white border shadow-xl max-h-36 overflow-y-auto p-1.5 rounded-lg mb-1.5 outline-none focus:outline-none')
+                        modal_autocomplete_card[0].visible = False
+                        with modal_autocomplete_card[0]:
+                            ui.label('TAB COMPLETE MATCH:').classes('text-[8px] font-black text-slate-400 tracking-wider mb-0.5 px-1')
+                            modal_autocomplete_results_container[0] = ui.column().classes('w-full gap-0.5')
+
+                        # Note: Added 'theater-prompt-editor' class so autocomplete JS focus can target it!
+                        modal_prompt_input = ui.textarea(
+                            label="Style-Ready Visual Prompt"
+                        ).classes('w-full h-32 text-xs leading-relaxed flex-shrink-0 theater-prompt-editor').props('outlined')
+                        
+                        modal_prompt_input.on('blur', lambda: update_prompt_text(modal_prompt_input.value, active_row_ref[0]))
+                        modal_prompt_input.on('update:value', lambda e: render_scene_character_chips(e.sender.value))
+                        
+                        # Added autocomplete key listeners 
+                        modal_prompt_input.on(
+                            'keyup', 
+                            handle_modal_prompt_input_keyup, 
+                            js_handler='(e) => emit(e.target.selectionStart, e.target.value)'
+                        )
+                        modal_prompt_input.on('keydown.tab.prevent', handle_modal_autocomplete_tab_completion)
                     
                     with ui.expansion('Narrative Context (transcript.txt)').classes('w-full border rounded bg-slate-50 text-xs flex-shrink-0'):
                         modal_context_html = ui.html("").classes('p-3 leading-relaxed text-slate-700 bg-white font-serif')
