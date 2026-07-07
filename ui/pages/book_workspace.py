@@ -631,11 +631,24 @@ def render_book_tabs(book_id: int):
             for r in results
         ]
 
+    # Pre-cache character names and aliases for robust tag search & resolution
+    character_alias_map: Dict[int, List[str]] = {}
+    with Session(engine) as session:
+        book_characters = session.exec(
+            select(Character).where(Character.project_id == project.id)
+        ).all()
+        for char in book_characters:
+            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
+            character_alias_map[char.id] = [a.alias.lower() for a in aliases] + [char.name.lower()]
+
     prompts = get_all_prompts_as_dicts()
     images_cache = get_book_images_cache(project_name, book_name)
 
     if not hasattr(state, 'book_active_scene_idx'):
         state.book_active_scene_idx = 0
+
+    # Fast in-memory search container for keyboard queries
+    search_filter_container = [None]
 
     # --- 1. NESTED HANDLERS DEFINED FIRST ---
 
@@ -654,8 +667,68 @@ def render_book_tabs(book_id: int):
             ui.notify(f"Failed to open directory: {str(e)}", type="negative")
 
     def get_filtered_prompts():
+        query = ""
+        if search_filter_container[0] and search_filter_container[0].value:
+            query = search_filter_container[0].value.strip().lower()
+
         filtered = []
+        
+        # Parse search query into individual terms
+        terms = []
+        if query:
+            brackets = re.findall(r'\[(.*?)\]', query)
+            if brackets:
+                # E.g. "[dino] [stone]" -> ["dino", "stone"]
+                terms = [b.strip().lower() for b in brackets if b.strip()]
+            elif ',' in query:
+                # E.g. "dino, stone" -> ["dino", "stone"]
+                terms = [t.strip().lower() for t in query.split(',') if t.strip()]
+            else:
+                # E.g. "dino stone" -> ["dino", "stone"]
+                terms = [t.strip().lower() for t in query.split(' ') if t.strip()]
+                if len(terms) > 1:
+                    terms = [t for t in terms if t not in ('and', 'or', '&', 'with', 'in')]
+
         for p in prompts:
+            # Evaluate multi-term AND logic search
+            if terms:
+                p_prompt = p.get("prompt", "").lower()
+                p_quote = p.get("quote", "").lower()
+                ch_str = f"ch {p.get('chapter', '')}"
+                sc_str = f"sc {p.get('scene', '')}"
+                
+                # Extract bracketed scene character tags and map them to database IDs
+                tags_in_prompt = re.findall(r"\[(.*?)\]", p_prompt)
+                scene_character_ids = set()
+                for tag in tags_in_prompt:
+                    for char_id, aliases in character_alias_map.items():
+                        if tag in aliases:
+                            scene_character_ids.add(char_id)
+                            break
+                
+                # Check if all typed query terms are satisfied
+                matched_all_terms = True
+                for term in terms:
+                    # Collect characters matching the keyword alias
+                    term_matched_char_ids = set()
+                    for char_id, aliases in character_alias_map.items():
+                        if any(term in alias for alias in aliases):
+                            term_matched_char_ids.add(char_id)
+                            
+                    if term_matched_char_ids:
+                        # Character alias tag constraint check
+                        if not (term_matched_char_ids & scene_character_ids):
+                            matched_all_terms = False
+                            break
+                    else:
+                        # Fallback raw text constraint check
+                        if term not in p_prompt and term not in p_quote and term not in ch_str and term not in sc_str:
+                            matched_all_terms = False
+                            break
+                            
+                if not matched_all_terms:
+                    continue
+
             is_approved = p.get("approved", "False").strip().lower() == "true"
             try:
                 ch = int(float(p.get("chapter", "1")))
@@ -1118,7 +1191,11 @@ def render_book_tabs(book_id: int):
 
     # --- Optimized Dense One-Line Toolbar Header ---
     with ui.row().classes('w-full justify-between items-center bg-white py-1.5 px-3 border rounded-xl shadow-2xs mb-3 flex-nowrap gap-2 outline-none focus:outline-none'):
-        with ui.row().classes('items-center gap-2 flex-nowrap'):
+        
+        # Left-aligned toolbar group (Filter switcher, Search bar, Regen & Stop)
+        with ui.row().classes('items-center gap-2 flex-nowrap flex-1'):
+            
+            # 1. Filter selectors (All, Unapproved, Missing)
             with ui.row().classes('items-center gap-0.5 bg-slate-100 p-0.5 rounded-lg border flex-nowrap'):
                 btn_all = ui.button(icon='grid_view').props('flat dense').classes('px-2 py-1 rounded-md text-xs')
                 btn_unapproved = ui.button(icon='rate_review').props('flat dense').classes('px-2 py-1 rounded-md text-xs')
@@ -1149,26 +1226,13 @@ def render_book_tabs(book_id: int):
                 
                 update_button_styles(filter_mode.value)
             
-            with ui.row().classes('items-center gap-0.5 bg-slate-100 p-0.5 rounded-lg border flex-nowrap'):
-                btn_view_gallery = ui.button('Gallery', icon='photo_library').props('flat dense').classes('px-2.5 py-1 rounded-md text-xs font-semibold')
-                btn_view_editor = ui.button('Prompt', icon='edit_note').props('flat dense').classes('px-2.5 py-1 rounded-md text-xs font-semibold')
-                
-                def update_view_mode_styles(mode: str):
-                    if mode == 'Gallery':
-                        btn_view_gallery.classes(replace='px-2.5 py-1 rounded-md text-xs bg-white text-blue-600 shadow-sm font-black')
-                        btn_view_editor.classes(replace='px-2.5 py-1 rounded-md text-xs text-slate-500 hover:text-slate-700 hover:bg-slate-200/50 font-medium')
-                    else:
-                        btn_view_editor.classes(replace='px-2.5 py-1 rounded-md text-xs bg-white text-blue-600 shadow-sm font-black')
-                        btn_view_gallery.classes(replace='px-2.5 py-1 rounded-md text-xs text-slate-500 hover:text-slate-700 hover:bg-slate-200/50 font-medium')
+            # 2. Expanded text input filter matching the prompt editor search bar
+            search_filter_container[0] = ui.input(
+                placeholder="Search chapters, quotes, prompts...",
+                on_change=lambda e: render_content.refresh()
+            ).classes('flex-1 bg-slate-50 rounded-lg').props('outlined dense clearable')
 
-                def swap_view_mode(mode: str):
-                    state.book_view_mode = mode
-                    update_view_mode_styles(mode)
-                    
-                btn_view_gallery.on('click', lambda: swap_view_mode('Gallery'))
-                btn_view_editor.on('click', lambda: swap_view_mode('Editor'))
-                update_view_mode_styles(state.book_view_mode)
-
+            # 3. Action Buttons (Regen / Stop)
             ui.button(
                 'Regen', 
                 icon='refresh', 
@@ -1181,15 +1245,27 @@ def render_book_tabs(book_id: int):
                 on_click=trigger_stop_rendering
             ).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-3 py-1 h-8 rounded-lg') \
              .bind_visibility_from(state, 'image_gen_active')
+
+        # Right-aligned toolbar group (Gallery/Prompt switcher)
+        with ui.row().classes('items-center gap-0.5 bg-slate-100 p-0.5 rounded-lg border flex-nowrap'):
+            btn_view_gallery = ui.button('Gallery', icon='photo_library').props('flat dense').classes('px-2.5 py-1 rounded-md text-xs font-semibold')
+            btn_view_editor = ui.button('Prompt', icon='edit_note').props('flat dense').classes('px-2.5 py-1 rounded-md text-xs font-semibold')
             
-        with ui.row().classes('items-center gap-1.5 bg-slate-50 px-2.5 py-1 rounded-lg border text-[10px] font-semibold text-slate-500 flex-nowrap'):
-            ui.icon('keyboard', size='xs')
-            ui.label(
-                f"Keys: [{state.key_approve.upper()}] Approve | "
-                f"[{state.key_delete.upper()}] Del | "
-                f"[{state.key_next.upper()}] Next | "
-                f"[{state.key_prev.upper()}] Prev"
-            )
+            def update_view_mode_styles(mode: str):
+                if mode == 'Gallery':
+                    btn_view_gallery.classes(replace='px-2.5 py-1 rounded-md text-xs bg-white text-blue-600 shadow-sm font-black')
+                    btn_view_editor.classes(replace='px-2.5 py-1 rounded-md text-xs text-slate-500 hover:text-slate-700 hover:bg-slate-200/50 font-medium')
+                else:
+                    btn_view_editor.classes(replace='px-2.5 py-1 rounded-md text-xs bg-white text-blue-600 shadow-sm font-black')
+                    btn_view_gallery.classes(replace='px-2.5 py-1 rounded-md text-xs text-slate-500 hover:text-slate-700 hover:bg-slate-200/50 font-medium')
+
+            def swap_view_mode(mode: str):
+                state.book_view_mode = mode
+                update_view_mode_styles(mode)
+                
+            btn_view_gallery.on('click', lambda: swap_view_mode('Gallery'))
+            btn_view_editor.on('click', lambda: swap_view_mode('Editor'))
+            update_view_mode_styles(state.book_view_mode)
 
     modal_img_el = None
     modal_placeholder = None
@@ -1448,6 +1524,27 @@ def render_book_tabs(book_id: int):
                     ui.icon('photo_library', size='sm')
                     ui.label('Missing').classes('text-[9px]')
                 placeholder_el.visible = not img_url
+
+                # Dynamic Character Badges showing up to 4 names with overflow indicators
+                tags = extract_prompt_character_tags(item.get("prompt", ""))
+                seen_tags = set()
+                deduped_tags = []
+                for t in tags:
+                    if t.lower() not in seen_tags:
+                        seen_tags.add(t.lower())
+                        deduped_tags.append(t)
+                        
+                if deduped_tags:
+                    with ui.row().classes('w-full gap-1 items-center mt-1.5 px-1 flex-wrap'):
+                        for t in deduped_tags[:4]:
+                            disp = t
+                            if len(disp) > 8:
+                                disp = disp[:7] + "…"
+                            badge_el = ui.badge(disp, color='slate').classes('text-[8px] font-medium py-0 px-1 rounded-sm flex-shrink-0')
+                            with badge_el:
+                                ui.tooltip(t).classes('bg-slate-800 text-white text-[9px] p-1.5 rounded')
+                        if len(deduped_tags) > 4:
+                            ui.badge(f"+{len(deduped_tags)-4}", color='blue').classes('text-[8px] font-bold py-0 px-1 rounded-sm flex-shrink-0')
                         
                 with ui.row().classes('w-full justify-between items-center mt-1 px-1'):
                     ui.label(f"Ch {item.get('chapter')}, Sc {item.get('scene')}").classes('text-[10px] font-bold text-slate-700')
