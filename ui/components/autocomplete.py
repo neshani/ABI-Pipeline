@@ -37,6 +37,31 @@ class PromptAutocompleteManager:
             with self.popup:
                 self.results_container = ui.column().classes('w-full gap-0.5')
 
+        # Capture-phase native keydown interceptor directly on the native <textarea>
+        # This prevents Quasar's keydown handler from seeing Tab/Enter before we can prevent defaults
+        ui.run_javascript(f'''
+            (() => {{
+                const setupCapture = () => {{
+                    const el = getElement({self.textarea.id});
+                    if (el) {{
+                        const textarea = el.$refs.qRef.getNativeElement();
+                        if (textarea) {{
+                            textarea.addEventListener('keydown', (e) => {{
+                                const popup = document.getElementById("c{self.popup.id}");
+                                const popupVisible = popup && popup.style.display !== "none";
+                                if (popupVisible && ["ArrowUp", "ArrowDown", "Enter", "Tab", "Escape"].includes(e.key)) {{
+                                    e.preventDefault();
+                                }}
+                            }}, true); // true targets the capture phase
+                            return;
+                        }}
+                    }}
+                    setTimeout(setupCapture, 50);
+                }};
+                setupCapture();
+            }})();
+        ''')
+
         # Register keyup/click trackers to detect if the cursor enters brackets
         self.textarea.on(
             'keyup', 
@@ -52,7 +77,7 @@ class PromptAutocompleteManager:
         # Close on blur safely
         self.textarea.on('blur', self._handle_blur)
 
-        # Conditionally intercept keyboard events ONLY when suggestions are visible
+        # Intercept bubbling keyboard events to trigger Python matching logic
         self.textarea.on(
             'keydown', 
             self._handle_keydown, 
@@ -122,12 +147,14 @@ class PromptAutocompleteManager:
                 is_active = idx == self.selected_index
                 bg_class = 'bg-blue-50 text-blue-800 font-bold shadow-2xs' if is_active else 'hover:bg-slate-50 text-slate-600'
                 
-                ui.button(
+                btn = ui.button(
                     f"👤 {match['name']}", 
                     on_click=lambda _, m=match: self.select_match(m)
                 ).props('flat dense align=left').classes(
                     f'text-xs w-full py-1.5 px-2.5 rounded justify-start transition-all {bg_class}'
                 )
+                # Prevent focus theft on mousedown to stop caret from vanishing
+                btn.on('mousedown', js_handler='(e) => e.preventDefault()')
 
     def _handle_keydown(self, e):
         key = e.args[0] if isinstance(e.args, list) and e.args else e.args
@@ -170,31 +197,32 @@ class PromptAutocompleteManager:
         
         self._hide_popup()
         
-        # 1. Update the Python/NiceGUI textarea value natively
+        # 1. Update the Python/NiceGUI textarea value natively (Quasar component updates natively)
         self.textarea.value = completed_text
         
-        # Escape string for JavaScript literal block injection
-        js_text = completed_text.replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n').replace('\r', '\\r')
-        
-        # 2. Focus and align cursor by polling the DOM until Vue completes its render
+        # 2. Cascading cursor position enforcer using NiceGUI's native element retriever
         ui.run_javascript(f'''
             (() => {{
-                const expectedText = '{js_text}';
-                let attempts = 0;
-                
-                const checkAndSetCursor = () => {{
-                    const textarea = document.getElementById("c{self.textarea.id}").querySelector("textarea");
-                    if (textarea) {{
-                        if (textarea.value === expectedText) {{
-                            textarea.focus();
+                const setCursor = () => {{
+                    const el = getElement({self.textarea.id});
+                    if (el) {{
+                        const textarea = el.$refs.qRef.getNativeElement();
+                        if (textarea) {{
+                            if (document.activeElement !== textarea) {{
+                                textarea.focus();
+                            }}
                             textarea.setSelectionRange({new_cursor_pos}, {new_cursor_pos});
-                        }} else if (attempts < 50) {{
-                            attempts++;
-                            setTimeout(checkAndSetCursor, 10);
                         }}
                     }}
                 }};
-                checkAndSetCursor();
+                
+                // Repeatedly enforce position over successive frames to capture Vue microtasks
+                setCursor();
+                setTimeout(setCursor, 10);
+                setTimeout(setCursor, 30);
+                setTimeout(setCursor, 60);
+                setTimeout(setCursor, 120);
+                setTimeout(setCursor, 250);
             }})();
         ''')
         
