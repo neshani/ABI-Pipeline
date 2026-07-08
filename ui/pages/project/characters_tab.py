@@ -931,6 +931,242 @@ def open_import_profiles_dialog(project: Project, matching_projects: List[Dict[s
 
     dialog.open()
 
+def open_add_character_dialog(project_id: int, refresh_callback: Any):
+    """Spawns modal to manually add a new character with a baseline state and default alias."""
+    with ui.dialog() as dialog, ui.card().classes('w-[400px] p-5 rounded-xl flex flex-col gap-3'):
+        ui.label('Add New Character').classes('text-sm font-bold text-slate-800')
+        name_input = ui.input(label="Character Name", placeholder="e.g. Molly").classes('w-full').props('outlined dense')
+        
+        def save_character():
+            name = name_input.value.strip()
+            if not name:
+                ui.notify("Character name cannot be empty.", type="warning")
+                return
+            
+            with Session(engine) as session:
+                # Check for existing duplicate canonical name
+                existing = session.exec(
+                    select(Character)
+                    .where(Character.project_id == project_id)
+                    .where(Character.name == name)
+                ).first()
+                if existing:
+                    ui.notify(f"A character named '{name}' already exists.", type="warning")
+                    return
+                
+                # 1. Create character
+                new_char = Character(project_id=project_id, name=name)
+                session.add(new_char)
+                session.commit()
+                
+                # 2. Create baseline timeline event
+                base_ev = CharacterTimelineEvent(
+                    character_id=new_char.id,
+                    book_id=None,
+                    chapter_num=0,
+                    scene_num=0,
+                    label="Base State"
+                )
+                session.add(base_ev)
+                session.commit()
+                
+                # 3. Create default self-alias
+                new_alias = CharacterAlias(character_id=new_char.id, alias=name)
+                session.add(new_alias)
+                session.commit()
+                
+                # 4. Auto-compile visual description
+                base_ev.visual_description = compile_character_visual_prompt(base_ev)
+                session.add(base_ev)
+                session.commit()
+                
+                # Focus selection onto the new character
+                global selected_character_id, selected_event_id
+                selected_character_id = new_char.id
+                selected_event_id = base_ev.id
+
+            save_project_characters_to_json(project_id)
+            ui.notify(f"Character '{name}' added successfully!", type="positive")
+            dialog.close()
+            refresh_callback()
+
+        with ui.row().classes('w-full justify-end gap-2 border-t pt-3 mt-2'):
+            ui.button('Cancel', on_click=dialog.close).props('flat')
+            ui.button('Add Character', on_click=save_character).classes('bg-blue-600 text-white font-bold text-xs px-3 py-1.5 rounded-lg')
+    dialog.open()
+
+def load_hair_options() -> Dict[str, List[str]]:
+    """Loads hair styles and colors from static/hair_options.json, creating defaults if missing."""
+    import json
+    from pathlib import Path
+    
+    options_path = Path("static/hair_options.json")
+    default_options = {
+        "colors": [
+            "blonde", "platinum blonde", "strawberry blonde", "golden blonde",
+            "dark brown", "chestnut brown", "light brown", "auburn", "ginger", "red",
+            "jet black", "charcoal gray", "silver-gray", "white",
+            "pastel pink", "emerald green", "cobalt blue", "lavender", "neon purple", "teal"
+        ],
+        "female_styles": [
+            "long straight hair", "pixie cut", "bob haircut", "shoulder-length wavy bob",
+            "messy bun", "chignon", "high ponytail", "braided crown", "fishtail braid",
+            "blunt bangs with long straight hair", "layered curls", "undercut pixie",
+            "french braid", "long flowing waves", "twin braided tails", "curled bob"
+        ],
+        "male_styles": [
+            "classic pompadour", "slicked-back undercut", "buzz cut", "shaggy layered cut",
+            "crew cut", "side-part comb-over with high fade", "messy textured crop",
+            "dreadlocks", "curly afro", "man bun with shaved sides", "taper fade",
+            "long middle-parted hair"
+        ],
+        "unisex_styles": [
+            "short messy hair", "curly mop-top", "shoulder-length straight hair",
+            "shaved bald head", "asymmetrical crop", "bowl cut"
+        ]
+    }
+    
+    if not options_path.exists():
+        try:
+            options_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(options_path, "w", encoding="utf-8") as f:
+                json.dump(default_options, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[Hair Helper] Failed to write default options: {e}")
+            return default_options
+            
+    try:
+        with open(options_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[Hair Helper] Failed to load options, using defaults: {e}")
+        return default_options
+
+
+def open_hair_picker_modal(project_id: int, event_id: int, compiled_desc_input: Any, hair_input_el: Any):
+    """Spawns an interactive helper to select, randomize, and apply visual hair formulas to characters."""
+    import random
+    options = load_hair_options()
+    
+    # Pre-declare element references for local function scope access
+    color_select = None
+    style_select = None
+    preview_text_input = None
+    gender_toggle = None
+    
+    def update_preview():
+        if not color_select or not style_select or not preview_text_input:
+            return
+        col = color_select.value
+        sty = style_select.value
+        if not col or not sty:
+            return
+        
+        # Handle bald or hairless styles cleanly
+        if "bald" in sty.lower() or "shaved head" in sty.lower():
+            preview_text_input.set_value("with a shaved bald head")
+        else:
+            preview_text_input.set_value(f"with {col} hair styled in a {sty}")
+            
+    def on_gender_change(e):
+        gender = e.value
+        styles_pool = options[f"{gender}_styles"]
+        style_select.set_options(styles_pool)
+        style_select.set_value(styles_pool[0])
+        update_preview()
+        
+    def randomize():
+        gender = gender_toggle.value
+        styles_pool = options[f"{gender}_styles"]
+        
+        rand_color = random.choice(options["colors"])
+        rand_style = random.choice(styles_pool)
+        
+        color_select.set_value(rand_color)
+        style_select.set_value(rand_style)
+        update_preview()
+
+    with ui.dialog() as dialog, ui.card().classes('w-[460px] p-6 rounded-xl flex flex-col gap-4'):
+        with ui.row().classes('w-full justify-between items-center border-b pb-2'):
+            ui.label('Hairstyle Vibe Helper').classes('text-sm font-bold text-slate-800')
+            ui.button(icon='close', on_click=dialog.close).props('flat dense').classes('text-slate-400')
+            
+        # Controls Group
+        gender_toggle = ui.radio(
+            options={"female": "Female", "male": "Male", "unisex": "Unisex"},
+            value="female",
+            on_change=on_gender_change
+        ).props('inline dense').classes('text-xs mb-1')
+        
+        # Color select
+        color_select = ui.select(
+            options=options["colors"],
+            value=options["colors"][0],
+            label="Hair Color",
+            on_change=update_preview
+        ).classes('w-full bg-white').props('outlined dense')
+        
+        # Style select
+        style_select = ui.select(
+            options=options["female_styles"],
+            value=options["female_styles"][0],
+            label="Hair Style",
+            on_change=update_preview
+        ).classes('w-full bg-white').props('outlined dense')
+        
+        # Live preview element
+        preview_text_input = ui.input(
+            label="Generated Preview Fragment",
+            value=""
+        ).classes('w-full font-mono text-xs bg-white').props('outlined dense')
+        
+        # Initial preview build
+        update_preview()
+        
+        # Quick randomize action row
+        with ui.row().classes('w-full gap-2 items-center bg-slate-50 p-3 rounded-lg border justify-between'):
+            ui.label('Feeling lucky?').classes('text-xs font-semibold text-slate-500')
+            ui.button(
+                'Randomize Combo',
+                icon='casino',
+                on_click=randomize
+            ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')
+
+        with ui.row().classes('w-full justify-end gap-2 border-t pt-3 mt-2'):
+            def copy_clipboard():
+                ui.run_javascript(f"navigator.clipboard.writeText('{preview_text_input.value}');")
+                ui.notify("Copied description fragment to clipboard!", type="info")
+
+            async def apply_to_profile():
+                final_text = preview_text_input.value.strip()
+                if not final_text or not hair_input_el:
+                    return
+                
+                # Direct target injection
+                hair_input_el.set_value(final_text)
+                
+                # Fire update to database, file system and UI
+                with Session(engine) as session:
+                    db_ev = session.get(CharacterTimelineEvent, event_id)
+                    if db_ev:
+                        db_ev.hair_and_face = final_text
+                        char_obj = session.get(Character, db_ev.character_id)
+                        if char_obj and not char_obj.locked:
+                            new_prompt = compile_character_visual_prompt(db_ev)
+                            db_ev.visual_description = new_prompt
+                            compiled_desc_input.set_value(new_prompt)
+                        session.add(db_ev)
+                        session.commit()
+                
+                save_project_characters_to_json(project_id)
+                ui.notify("Applied hair style description!", type="positive")
+                dialog.close()
+
+            ui.button('Copy', icon='content_copy', on_click=copy_clipboard).props('flat').classes('text-xs text-slate-600')
+            ui.button('Cancel', on_click=dialog.close).props('flat')
+            ui.button('Apply to Character', icon='check', on_click=apply_to_profile).classes('bg-blue-600 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')
+            
+    dialog.open()
 
 def render_characters_tab(project: Project, books: List[Book], refresh_parent: Optional[Any] = None):
     # Enforce chronological self-healing index alignment on draw
@@ -1098,6 +1334,13 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 with ui.row().classes('items-center gap-3'):
                     ui.label('Curation Tools').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wider')
                     
+                    ui.button(
+                        'Add Character',
+                        icon='person_add',
+                        on_click=lambda: open_add_character_dialog(project.id, refresh_workspace_with_scroll)
+                    ).classes('bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
+                    .tooltip("Manually add a character profile")
+
                     async def run_prompt_scan():
                         client = ui.context.client
                         with client:
@@ -1187,7 +1430,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     icon='edit_note',
                     on_click=open_prompt_editor_dialog
                 ).classes('bg-slate-600 hover:bg-slate-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
-                .tooltip("Customize visual profiler LLM instructions")
+                    .tooltip("Customize visual profiler LLM instructions")
 
 
     @ui.refreshable
@@ -1570,7 +1813,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
 
         with ui.column().classes('w-full flex-1 overflow-y-auto gap-4 pr-1'):
             
-            # --- Row 1.5: Timeline State Switcher Row (New) ---
+            # --- Row 1.5: Timeline State Switcher Row ---
             with ui.row().classes('w-full items-center justify-between bg-slate-50 border p-3 rounded-xl gap-3'):
                 with ui.row().classes('items-center gap-2'):
                     ui.label('Timeline State:').classes('text-xs font-bold text-slate-500')
@@ -1626,7 +1869,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             on_click=delete_timeline_event
                         ).props('flat dense').classes('p-1 text-red-500 hover:bg-red-50').tooltip('Delete selected timeline event')
 
-            # --- Row 2.0: Compiled Visual Description Prompt (Brought to the top!) ---
+            # --- Row 2.0: Compiled Visual Description Prompt ---
             with ui.column().classes('w-full bg-blue-50/20 p-4 rounded-xl border border-blue-100 gap-2'):
                 ui.label('Compiled Visual Description Prompt').classes('text-[11px] font-bold text-blue-600 uppercase tracking-wider')
                 
@@ -1657,8 +1900,17 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                  .on('blur', handle_desc_blur)\
                  .tooltip("Injected into your prompt template")
 
-            # --- Row 3.0: Physical parameters grid (Brought to the top!) ---
-            ui.label('Physical Description Parameters').classes('text-[11px] font-bold text-slate-500 uppercase tracking-wider mt-1')
+            # --- Row 3.0: Physical parameters grid ---
+            with ui.row().classes('w-full justify-between items-center mt-1'):
+                ui.label('Physical Description Parameters').classes('text-[11px] font-bold text-slate-500 uppercase tracking-wider')
+                
+                # Interactive Hairstyle Assistant popover builder!
+                ui.button(
+                    'Hairstyle Helper',
+                    icon='face',
+                    on_click=lambda: open_hair_picker_modal(project.id, active_event.id, compiled_desc_input, inputs_dict.get("hair_and_face"))
+                ).classes('bg-purple-50 hover:bg-purple-100 text-purple-700 font-bold text-[11px] px-2.5 py-1 rounded-lg border border-purple-200 shadow-sm')
+
             with ui.grid().classes('w-full grid-cols-1 md:grid-cols-2 gap-3'):
                 fields = [
                     ("demographics", "Demographics (Age, Race, Gender)"),
@@ -1687,9 +1939,10 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         ui.notify("Trait saved.", type="positive", position="bottom-right", timeout=1000)
                     return handler
 
+                inputs_dict = {}
                 for key, label in fields:
                     val = getattr(active_event, key) or ""
-                    ui.input(
+                    inputs_dict[key] = ui.input(
                         label=label, 
                         value=val
                     ).classes('w-full bg-white').props('outlined dense').on('blur', make_update_handler(active_event.id, key, compiled_desc_input))
@@ -1857,7 +2110,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
         draw_stats_bar()
 
         with ui.grid().classes('w-full grid-cols-1 lg:grid-cols-12 gap-4 items-start'):
-            # --- LEFT PANEL: Searchable List (col-span-4) ---
+            # --- LEFT PANEL: Searchable List ---
             with ui.card().classes('col-span-4 p-4 border rounded-xl bg-white h-[650px] flex flex-col gap-3'):
                 ui.label('Characters List').classes('text-sm font-bold text-slate-800 border-b pb-1.5')
                 
@@ -1909,7 +2162,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 with ui.column().classes('w-full flex-1 overflow-y-auto gap-1 pr-1 char-scroll-list'):
                     draw_character_list()
 
-            # --- RIGHT PANEL: Selected Curation Workspace Card (col-span-8) ---
+            # --- RIGHT PANEL: Selected Curation Workspace Card ---
             with ui.card().classes('col-span-8 p-6 border rounded-xl bg-white h-[650px] flex flex-col gap-4'):
                 draw_details_panel()
 
