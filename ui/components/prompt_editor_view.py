@@ -7,6 +7,7 @@ from sqlmodel import Session, select
 from database.connection import engine, get_setting
 from database.models import Book, Project, Character, CharacterAlias, CharacterTimelineEvent
 from services.character_manager import compile_character_visual_prompt, save_project_characters_to_json
+from ui.components.autocomplete import PromptAutocompleteManager
 from ui import state
 
 
@@ -64,25 +65,13 @@ def render_prompt_editor_view(
     # Tracks original loaded values to prevent redundant blur saving lag
     original_loaded_values = {"prompt": "", "quote": ""}
 
-    # Compile character vocabulary for this book's autocomplete matching
+    # Compile character vocabulary (needed for Find & Replace filters)
     book_characters: List[Character] = []
-    character_alias_map: Dict[int, List[str]] = {}
     
     with Session(engine) as session:
         book_characters = session.exec(
             select(Character).where(Character.project_id == project_id)
         ).all()
-        
-        # Pre-cache all aliases to prevent database queries freezing the UI on keystrokes
-        for char in book_characters:
-            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-            character_alias_map[char.id] = [a.alias.lower() for a in aliases] + [char.name.lower()]
-
-    # Active matched characters for Intellisense autocomplete
-    active_matches_list: List[Character] = []
-
-    # Tracks autocomplete context for mid-string substitutions
-    autocomplete_context = {"last_bracket": -1, "cursor_pos": -1}
 
     # --- Interactive Element References ---
     sidebar_container_ref = [None]
@@ -94,10 +83,6 @@ def render_prompt_editor_view(
     character_badges_container = [None]
     quote_textarea = [None]
     prompt_textarea = [None]
-    
-    # Autocomplete panel elements
-    autocomplete_card = [None]
-    autocomplete_results_container = [None]
 
     # Dynamic filter binding
     search_filter = ui.input(placeholder="Search scene text...").classes('hidden')
@@ -407,102 +392,6 @@ def render_prompt_editor_view(
                     select(Character).where(Character.project_id == project_id)
                 ).all()
 
-    def handle_autocomplete_selection(char_name: str):
-        """Replaces typed bracket query with completed bracket character tag."""
-        prompt_val = prompt_textarea[0].value
-        last_bracket = autocomplete_context.get("last_bracket", -1)
-        cursor_pos = autocomplete_context.get("cursor_pos", -1)
-        
-        if last_bracket != -1 and cursor_pos != -1:
-            text_before_bracket = prompt_val[:last_bracket]
-            text_after_cursor = prompt_val[cursor_pos:]
-            
-            # If there is a closing bracket right after the cursor for THIS tag, swallow it
-            close_bracket_idx = text_after_cursor.find(']')
-            next_open = text_after_cursor.find('[')
-            if close_bracket_idx != -1 and (next_open == -1 or close_bracket_idx < next_open):
-                text_after_cursor = text_after_cursor[close_bracket_idx + 1:].lstrip()
-                
-            completed_text = text_before_bracket + f"[{char_name}]" + text_after_cursor
-            
-            prompt_textarea[0].set_value(completed_text)
-            
-            new_cursor_pos = len(text_before_bracket) + len(char_name) + 2
-            
-            ui.run_javascript(f'''
-                const textarea = document.querySelector(".visual-prompt-editor textarea");
-                if (textarea) {{
-                    textarea.focus();
-                    textarea.setSelectionRange({new_cursor_pos}, {new_cursor_pos});
-                }}
-            ''', respond=False)
-        else:
-            last_bracket_idx = prompt_val.rfind('[')
-            if last_bracket_idx != -1:
-                completed_text = prompt_val[:last_bracket_idx] + f"[{char_name}]"
-                prompt_textarea[0].set_value(completed_text)
-                prompt_textarea[0].run_method('focus')
-                
-        autocomplete_card[0].visible = False
-
-    def handle_autocomplete_tab_completion():
-        """Tab handler to auto-insert top match inside absolute container and restore focus."""
-        if autocomplete_card[0].visible and active_matches_list:
-            handle_autocomplete_selection(active_matches_list[0].name)
-            prompt_textarea[0].run_method('focus')
-
-    def handle_prompt_input_keyup(e):
-        """Evaluates live input queries inside visual prompt to trigger Intellisense."""
-        # e.args receives the payload from the original emit() function: [selectionStart, value]
-        if not e.args or len(e.args) < 2:
-            autocomplete_card[0].visible = False
-            return
-            
-        cursor_pos = e.args[0]
-        val = e.args[1]
-        
-        if not val or cursor_pos is None:
-            autocomplete_card[0].visible = False
-            return
-            
-        # Check text *before* the cursor to see if we are currently inside an open bracket
-        text_before_cursor = val[:cursor_pos]
-        last_bracket = text_before_cursor.rfind('[')
-        last_close = text_before_cursor.rfind(']')
-        
-        # We are inside a bracket if the last '[' is AFTER the last ']'
-        if last_bracket != -1 and last_bracket > last_close:
-            query = text_before_cursor[last_bracket + 1:].strip().lower()
-            
-            autocomplete_context["last_bracket"] = last_bracket
-            autocomplete_context["cursor_pos"] = cursor_pos
-            
-            matches = []
-            
-            # Use the instant in-memory cache
-            for char in book_characters:
-                alias_texts = character_alias_map.get(char.id, [])
-                
-                if not query or any(query in a for a in alias_texts):
-                    matches.append(char)
-                        
-            active_matches_list.clear()
-            active_matches_list.extend(matches[:4])
-            
-            if active_matches_list:
-                autocomplete_results_container[0].clear()
-                with autocomplete_results_container[0]:
-                    for m in active_matches_list:
-                        ui.button(
-                            f"👤 {m.name}", 
-                            on_click=lambda _, name=m.name: handle_autocomplete_selection(name)
-                        ).props('flat dense align=left').classes('text-[11px] w-full text-slate-700 hover:bg-blue-50 py-0.5 px-2 rounded justify-start')
-                autocomplete_card[0].visible = True
-            else:
-                autocomplete_card[0].visible = False
-        else:
-            autocomplete_card[0].visible = False
-
     # --- Live Detail Panel Renderer ---
     def load_active_scene_details():
         scene = get_active_scene_dict()
@@ -534,8 +423,6 @@ def render_prompt_editor_view(
         
         original_loaded_values["prompt"] = scene.get("prompt", "")
         original_loaded_values["quote"] = scene.get("quote", "")
-        
-        autocomplete_card[0].visible = False
 
         # Clear and rebuild compact character badges (DEDUPLICATED)
         character_badges_container[0].clear()
@@ -777,25 +664,16 @@ def render_prompt_editor_view(
                 ui.label("Visual Rendering Prompt").classes('text-[10px] font-black text-slate-400 uppercase tracking-wider mt-2')
                 
                 with ui.element('div').classes('relative w-full'):
-                    autocomplete_card[0] = ui.card().classes('absolute bottom-full left-0 right-0 z-50 bg-white border shadow-xl max-h-36 overflow-y-auto p-1.5 rounded-lg mb-1.5 outline-none focus:outline-none')
-                    autocomplete_card[0].visible = False
-                    with autocomplete_card[0]:
-                        ui.label('TAB COMPLETE MATCH:').classes('text-[8px] font-black text-slate-400 tracking-wider mb-0.5 px-1')
-                        autocomplete_results_container[0] = ui.column().classes('w-full gap-0.5')
-
                     # Note: Added 'visual-prompt-editor' class so JS can focus it!
                     prompt_textarea[0] = ui.textarea().classes('w-full text-xs bg-white visual-prompt-editor').props('outlined dense autogrow rows=4')
                     prompt_textarea[0].on('blur', save_active_scene_changes)
                     
-                    # Restored the proven emit() payload
-                    prompt_textarea[0].on(
-                        'keyup', 
-                        handle_prompt_input_keyup, 
-                        js_handler='(e) => emit(e.target.selectionStart, e.target.value)'
+                    # Set up our unified autocomplete manager on the target input
+                    PromptAutocompleteManager(
+                        textarea=prompt_textarea[0],
+                        project_id=project_id,
+                        on_change_callback=lambda val: render_scene_character_chips(val) if False else None # Placeholder, we trigger updates on blur/save!
                     )
-                    
-                    # Added .prevent to tab so you don't lose focus to the next UI element
-                    prompt_textarea[0].on('keydown.tab.prevent', handle_autocomplete_tab_completion)
 
     # Initial side-by-side loaders
     render_sidebar_list()
