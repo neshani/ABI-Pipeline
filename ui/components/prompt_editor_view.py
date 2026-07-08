@@ -393,42 +393,12 @@ def render_prompt_editor_view(
                 ).all()
 
     # --- Live Detail Panel Renderer ---
-    def load_active_scene_details():
-        scene = get_active_scene_dict()
-        if not scene:
-            if right_pane_ref[0]:
-                right_pane_ref[0].visible = False
-            return
-            
-        if right_pane_ref[0]:
-            right_pane_ref[0].visible = True
-            
-        try:
-            ch = int(float(scene.get("chapter", "1")))
-            sc = int(float(scene.get("scene", "1")))
-        except ValueError:
-            ch, sc = 1, 1
-            
-        img_url = images_cache.get((ch, sc))
-        if img_url:
-            image_viewer[0].set_source(img_url)
-            image_viewer[0].visible = True
-            image_placeholder[0].visible = False
-        else:
-            image_viewer[0].visible = False
-            image_placeholder[0].visible = True
-
-        quote_textarea[0].set_value(scene.get("quote", ""))
-        prompt_textarea[0].set_value(scene.get("prompt", ""))
-        
-        original_loaded_values["prompt"] = scene.get("prompt", "")
-        original_loaded_values["quote"] = scene.get("quote", "")
-
-        # Clear and rebuild compact character badges (DEDUPLICATED)
+    def render_scene_character_chips(prompt_text: str):
+        """Safely clears and populates matched character tags on the scene with descriptive hover tooltips."""
         character_badges_container[0].clear()
         bracket_regex = re.compile(r"\[(.*?)\]")
         
-        raw_tags = [t.strip() for t in bracket_regex.findall(scene.get("prompt", "")) if t.strip()]
+        raw_tags = [t.strip() for t in bracket_regex.findall(prompt_text or "") if t.strip()]
         scene_tags = []
         seen_tags = set()
         
@@ -437,6 +407,13 @@ def render_prompt_editor_view(
                 seen_tags.add(t.lower())
                 scene_tags.append(t)
         
+        scene = get_active_scene_dict()
+        try:
+            ch = int(float(scene.get("chapter", "1"))) if scene else 1
+            sc = int(float(scene.get("scene", "1"))) if scene else 1
+        except ValueError:
+            ch, sc = 1, 1
+
         with character_badges_container[0]:
             if not scene_tags:
                 ui.label('No characters tagged in this scene.').classes('text-[11px] text-slate-400 italic')
@@ -499,6 +476,39 @@ def render_prompt_editor_view(
                             ).props('dense outline size=sm color=primary').classes('text-[10px] bg-white hover:bg-blue-50/50 normal-case rounded px-2.5 py-0.5 outline-none focus:outline-none')
                             with btn:
                                 ui.tooltip(tooltip_desc).classes('bg-slate-800 text-white text-[10px] p-2.5 rounded-md')
+
+    def load_active_scene_details():
+        scene = get_active_scene_dict()
+        if not scene:
+            if right_pane_ref[0]:
+                right_pane_ref[0].visible = False
+            return
+            
+        if right_pane_ref[0]:
+            right_pane_ref[0].visible = True
+            
+        try:
+            ch = int(float(scene.get("chapter", "1")))
+            sc = int(float(scene.get("scene", "1")))
+        except ValueError:
+            ch, sc = 1, 1
+            
+        img_url = images_cache.get((ch, sc))
+        if img_url:
+            image_viewer[0].set_source(img_url)
+            image_viewer[0].visible = True
+            image_placeholder[0].visible = False
+        else:
+            image_viewer[0].visible = False
+            image_placeholder[0].visible = True
+
+        quote_textarea[0].set_value(scene.get("quote", ""))
+        prompt_textarea[0].set_value(scene.get("prompt", ""))
+        
+        original_loaded_values["prompt"] = scene.get("prompt", "")
+        original_loaded_values["quote"] = scene.get("quote", "")
+
+        render_scene_character_chips(scene.get("prompt", ""))
 
     def save_active_scene_changes():
         scene = get_active_scene_dict()
@@ -672,7 +682,7 @@ def render_prompt_editor_view(
                     PromptAutocompleteManager(
                         textarea=prompt_textarea[0],
                         project_id=project_id,
-                        on_change_callback=lambda val: render_scene_character_chips(val) if False else None # Placeholder, we trigger updates on blur/save!
+                        on_change_callback=lambda val: render_scene_character_chips(val)
                     )
 
     # Initial side-by-side loaders
