@@ -205,33 +205,76 @@ def render_prompt_editor_view(
         ui.label('Bulk clean quotes').classes('text-base font-bold text-slate-800')
         ui.label('Removes quotation envelopes, stripping bad brackets, interior spaces, and carriage returns across all scenes in this book.').classes('text-xs text-slate-500')
         
+        # Checkbox allowing project-wide batch cleanup
+        all_books_checkbox = ui.checkbox('Fix quotes in all books in this project?').classes('text-xs font-semibold text-slate-700 mt-1')
+        
         with ui.row().classes('w-full justify-end gap-2 mt-2'):
             ui.button('Cancel', on_click=bulk_clean_dialog.close).props('flat').classes('text-xs font-semibold text-slate-500')
             
             def apply_bulk_clean():
-                from ui.pages.book_workspace import save_prompts_csv
+                from ui.pages.book_workspace import save_prompts_csv, load_prompts_csv
+                
                 with Session(engine) as session:
                     project = session.get(Project, project_id)
-                    book = session.get(Book, book_id)
-                    if not project or not book:
+                    current_book = session.get(Book, book_id)
+                    if not project or not current_book:
                         return
+                    
+                    # Determine list of books to clean
+                    if all_books_checkbox.value:
+                        books_to_process = session.exec(
+                            select(Book).where(Book.project_id == project_id)
+                        ).all()
+                    else:
+                        books_to_process = [current_book]
                         
                 changed_count = 0
-                for p in prompts_list:
-                    orig = p.get("quote", "")
-                    cleaned = clean_quote_text(orig)
-                    if cleaned != orig:
-                        p["quote"] = cleaned
-                        changed_count += 1
-                        
+                books_affected_count = 0
+                
+                for b in books_to_process:
+                    if b.id == book_id:
+                        # Process current active book from in-memory prompts_list to sync the immediate UI
+                        book_changed = 0
+                        for p in prompts_list:
+                            orig = p.get("quote", "")
+                            cleaned = clean_quote_text(orig)
+                            if cleaned != orig:
+                                p["quote"] = cleaned
+                                book_changed += 1
+                        if book_changed > 0:
+                            save_prompts_csv(project.name, b.name, prompts_list)
+                            changed_count += book_changed
+                            books_affected_count += 1
+                    else:
+                        # Process background books by loading directly from their CSV file
+                        other_prompts = load_prompts_csv(project.name, b.name)
+                        if other_prompts:
+                            book_changed = 0
+                            for p in other_prompts:
+                                orig = p.get("quote", "")
+                                cleaned = clean_quote_text(orig)
+                                if cleaned != orig:
+                                    p["quote"] = cleaned
+                                    book_changed += 1
+                            if book_changed > 0:
+                                save_prompts_csv(project.name, b.name, other_prompts)
+                                changed_count += book_changed
+                                books_affected_count += 1
+                                
                 if changed_count > 0:
-                    save_prompts_csv(project.name, book.name, prompts_list)
-                    ui.notify(f"Successfully cleaned quotes across {changed_count} scenes!", type="positive")
+                    if all_books_checkbox.value:
+                        scope_msg = f"across {changed_count} scenes in {books_affected_count} books"
+                    else:
+                        scope_msg = f"across {changed_count} scenes in this book"
+                    ui.notify(f"Successfully cleaned quotes {scope_msg}!", type="positive")
+                    
+                    # Refresh editor workspace elements for the active book
                     on_refresh_grid()
                     render_sidebar_list()
                     load_active_scene_details()
                 else:
                     ui.notify("No quotes required formatting cleanup.", type="info")
+                    
                 bulk_clean_dialog.close()
                 
             ui.button('Clean All Quotes', on_click=apply_bulk_clean).classes('bg-purple-600 text-white text-xs font-bold')
@@ -266,6 +309,39 @@ def render_prompt_editor_view(
                 )
                 
                 formatted_html = format_narrative_context(res["html"])
+                
+                # Resolve character names and aliases for green context highlights
+                chars = session.exec(
+                    select(Character).where(Character.project_id == project_id)
+                ).all()
+                all_aliases = []
+                for char in chars:
+                    aliases = session.exec(
+                        select(CharacterAlias).where(CharacterAlias.character_id == char.id)
+                    ).all()
+                    all_aliases.extend([a.alias.lower() for a in aliases] + [char.name.lower()])
+                    
+                unique_aliases = sorted(list(set(a.strip() for a in all_aliases if a.strip())), key=len, reverse=True)
+                
+                if unique_aliases and formatted_html:
+                    combined_pattern = r'\b(' + '|'.join(re.escape(alias) for alias in unique_aliases) + r')\b'
+                    combined_regex = re.compile(combined_pattern, flags=re.IGNORECASE)
+                    
+                    tokens = re.split(r'(<[^>]+>)', formatted_html)
+                    highlighted_tokens = []
+                    
+                    for token in tokens:
+                        if token.startswith('<') and token.endswith('>'):
+                            highlighted_tokens.append(token)
+                        else:
+                            text_segment = token
+                            text_segment = combined_regex.sub(
+                                lambda m: f'<mark class="bg-green-100 text-green-800 px-1 rounded font-semibold">{m.group(1)}</mark>',
+                                text_segment
+                            )
+                            highlighted_tokens.append(text_segment)
+                    formatted_html = "".join(highlighted_tokens)
+
                 if context_reader_html[0]:
                     context_reader_html[0].set_content(formatted_html)
                 
@@ -279,6 +355,7 @@ def render_prompt_editor_view(
                 if scroll_to_quote:
                     await asyncio.sleep(0.15)
                     ui.run_javascript('document.getElementById("quote-target")?.scrollIntoView({ block: "center", behavior: "smooth" })')
+
 
     def load_adjusted_context(before_delta, after_delta):
         if before_delta is None and after_delta is None:

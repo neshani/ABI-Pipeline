@@ -1326,7 +1326,42 @@ def render_book_tabs(book_id: int):
             window_before=wb, 
             window_after=wa
         )
-        modal_context_html[0].set_content(res["html"])
+        
+        html_content = res["html"]
+        
+        # Flatten pre-cached dictionary values to extract all lowercase names and aliases
+        all_aliases = []
+        for aliases in character_alias_map_modal.values():
+            all_aliases.extend(aliases)
+            
+        # Deduplicate, prune empty values, and sort by length descending to match multi-word phrases first
+        unique_aliases = sorted(list(set(a.strip() for a in all_aliases if a.strip())), key=len, reverse=True)
+        
+        if unique_aliases and html_content:
+            # Build a single-pass alternation regex to prevent sequential replacement tag corruption (e.g. matching "mark")
+            combined_pattern = r'\b(' + '|'.join(re.escape(alias) for alias in unique_aliases) + r')\b'
+            combined_regex = re.compile(combined_pattern, flags=re.IGNORECASE)
+            
+            # Tokenize by HTML tags to isolate raw text and prevent highlights inside tag structures
+            tokens = re.split(r'(<[^>]+>)', html_content)
+            highlighted_tokens = []
+            
+            for token in tokens:
+                if token.startswith('<') and token.endswith('>'):
+                    # Keep existing HTML tags (such as the yellow quote-target highlight mark) intact
+                    highlighted_tokens.append(token)
+                else:
+                    # Apply single-pass replacement over the plain-text segment
+                    text_segment = token
+                    text_segment = combined_regex.sub(
+                        lambda m: f'<mark class="bg-green-100 text-green-800 px-1 rounded font-semibold">{m.group(1)}</mark>', 
+                        text_segment
+                    )
+                    highlighted_tokens.append(text_segment)
+                    
+            html_content = "".join(highlighted_tokens)
+
+        modal_context_html[0].set_content(html_content)
         
         if theater_context_label[0]:
             theater_context_label[0].set_text(f"Context Span: showing {wb:,} chars before, {wa:,} chars after")
