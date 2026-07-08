@@ -3,7 +3,7 @@ from typing import Optional, Callable, List, Any
 from nicegui import ui
 from sqlmodel import Session, select
 from database.connection import engine
-from database.models import Character, CharacterAlias
+from database.models import Character, CharacterAlias, Project, Book
 
 class PromptAutocompleteManager:
     def __init__(
@@ -126,6 +126,21 @@ class PromptAutocompleteManager:
                 if not query or any(query in a for a in char["aliases"]):
                     matches.append(char)
                     
+            # Smart Priority Sorting Key:
+            # 1. Matches starting with the prefix go first.
+            # 2. Sort descending by project popularity ("hits").
+            # 3. Sort alphabetically as a tie-breaker.
+            def sort_key(char):
+                if not query:
+                    return (-char.get("hits", 0), char["name"].lower())
+                
+                starts_with = any(a.startswith(query) for a in char["aliases"])
+                starts_with_val = -1 if starts_with else 0
+                hits_val = -char.get("hits", 0)
+                return (starts_with_val, hits_val, char["name"].lower())
+
+            matches.sort(key=sort_key)
+                    
             self.active_matches = matches[:5]
             if self.active_matches:
                 if self.selected_index >= len(self.active_matches):
@@ -235,6 +250,20 @@ class PromptAutocompleteManager:
 
     def _load_characters(self) -> List[dict]:
         with Session(engine) as session:
+            project = session.get(Project, self.project_id)
+            if not project:
+                return []
+                
+            # Fetch all books in the project to calculate global frequencies
+            books = session.exec(select(Book).where(Book.project_id == self.project_id)).all()
+            
+            frequencies = {}
+            try:
+                from ui.pages.project.characters_tab import get_character_frequency_map
+                frequencies = get_character_frequency_map(project.name, books)
+            except Exception as e:
+                print(f"[Autocomplete] Could not load character frequency map: {e}")
+                
             chars = session.exec(select(Character).where(Character.project_id == self.project_id)).all()
             data = []
             for c in chars:
@@ -242,9 +271,14 @@ class PromptAutocompleteManager:
                 alias_list = [a.alias.lower() for a in aliases]
                 if c.name.lower() not in alias_list:
                     alias_list.append(c.name.lower())
+                
+                # Sum the total hits for all alias mentions in this project [3.5]
+                total_hits = sum(frequencies.get(alias, 0) for alias in alias_list)
+                
                 data.append({
                     "id": c.id,
                     "name": c.name,
-                    "aliases": alias_list
+                    "aliases": alias_list,
+                    "hits": total_hits
                 })
             return data
