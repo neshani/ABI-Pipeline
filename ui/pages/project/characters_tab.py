@@ -475,29 +475,41 @@ def open_batch_profiler_dialog(
     dialog.open()
 
 
-def open_prompt_editor_dialog():
-    """Renders a modal to customize the LLM profiler template instructions."""
-    current_template = get_setting("character_profiler_template", "")
-    if not current_template:
-        from services.character_manager import get_default_character_template
-        current_template = get_default_character_template()
+def open_prompt_editor_dialog(mode: str = "factual"):
+    """Renders a modal to customize the LLM profiler template instructions (factual or speculative)."""
+    from services.character_manager import load_prompt_template_from_file, save_prompt_template_to_file
+    
+    title = "Factual Profiler Prompt" if mode == "factual" else "Speculative Profiler Prompt"
+    sub_title = (
+        "Configure system instructions sent to the local LLM for factual extraction." 
+        if mode == "factual" else 
+        "Configure system instructions used when speculating character descriptions."
+    )
+    
+    # Read template from flat file structure (will fallback/self-heal automatically)
+    current_template = load_prompt_template_from_file(mode)
 
     with ui.dialog() as dialog, ui.card().classes('w-[750px] max-w-[95vw] h-[650px] max-h-[90vh] p-6 rounded-xl flex flex-col overflow-hidden'):
         
         def reset():
-            from services.character_manager import get_default_character_template
-            editor.value = get_default_character_template()
-            ui.notify("Template reset to system default.", type="info")
+            if mode == "factual":
+                from services.character_manager import get_default_character_template
+                editor.value = get_default_character_template()
+            else:
+                from services.character_manager import get_speculative_character_template
+                editor.value = get_speculative_character_template()
+            ui.notify("Template reset to default.", type="info")
 
         def save():
-            save_setting("character_profiler_template", editor.value)
-            ui.notify("Custom profiler prompt template saved!", type="positive")
+            # Save directly to the flat text file (e.g. prompt_templates/characters/factual_template.txt)
+            save_prompt_template_to_file(mode, editor.value)
+            ui.notify(f"{title} template saved to disk!", type="positive")
             dialog.close()
 
         with ui.row().classes('w-full justify-between items-center border-b pb-3 mb-3 shrink-0'):
             with ui.column().classes('gap-0.5'):
-                ui.label('Customize Character Profiler Prompt').classes('text-base font-bold text-slate-800')
-                ui.label('Configure system instructions sent to the local LLM.').classes('text-xs text-slate-500')
+                ui.label(f'Customize {title}').classes('text-base font-bold text-slate-800')
+                ui.label(sub_title).classes('text-xs text-slate-500')
             
             with ui.row().classes('gap-2 items-center'):
                 ui.button('Reset', on_click=reset, color='amber').props('flat').classes('text-xs font-semibold')
@@ -1262,14 +1274,15 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
     def draw_header_toolbar():
         global selected_book_id, is_profiling_all, currently_profiling_char_id, profiling_progress, profiler_scan_depth, cancel_profiling_all
         
-        with ui.column().classes('w-full bg-slate-50 border p-4 rounded-xl mb-4 gap-3'):
+        with ui.column().classes('w-full bg-slate-50 border p-3.5 rounded-xl mb-4 gap-2.5'):
             # Line 1: Automated LLM Batch Profiling Suite
-            with ui.row().classes('w-full items-center justify-between flex-wrap gap-3'):
-                with ui.row().classes('items-center gap-3'):
-                    ui.label('Batch Profiler Suite').classes('text-xs font-bold text-slate-400 uppercase tracking-wider')
+            with ui.row().classes('w-full items-center justify-between flex-wrap gap-2'):
+                with ui.row().classes('items-center gap-2 flex-wrap'):
+                    ui.icon('bolt', size='18px', color='purple-600')
+                    ui.label('Batch Profiler').classes('text-xs font-extrabold text-slate-500 uppercase tracking-wider mr-2')
                     
-                    ui.label('Source:').classes('text-xs font-semibold text-slate-500 ml-2')
-                    book_options = {None: "All Books (Project-wide)"}
+                    ui.label('Source:').classes('text-xs font-semibold text-slate-500')
+                    book_options = {None: "All Books"}
                     for b in books:
                         book_options[b.id] = b.name
                     
@@ -1281,7 +1294,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         options=book_options,
                         value=selected_book_id,
                         on_change=lambda e: handle_book_change(e.value)
-                    ).classes('w-48 bg-white').props('outlined dense')
+                    ).classes('w-40 bg-white').props('outlined dense')
 
                     ui.label('Depth:').classes('text-xs font-semibold text-slate-500 ml-1')
                     def handle_depth_change(e):
@@ -1294,106 +1307,24 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         max=100,
                         step=1,
                         on_change=handle_depth_change
-                    ).classes('w-14 bg-white').props('outlined dense')
+                    ).classes('w-12 bg-white').props('outlined dense')
 
-                # Render "Profile All" button only if NOT actively profiling to keep controls neat
-                if not is_profiling_all:
-                    ui.button(
-                        'Profile All', 
-                        icon='bolt', 
-                        on_click=lambda: open_batch_profiler_dialog(
-                            project, 
-                            books, 
-                            refresh_workspace_with_scroll, 
-                            draw_header_toolbar.refresh,
-                            draw_details_panel.refresh
-                        )
-                    ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-4 py-2 rounded-lg shadow-sm')
-
-            # Line 1.5: Dedicated Active Profiling Row (Visible only during execution)
-            if is_profiling_all:
-                with ui.row().classes('w-full items-center gap-3 bg-purple-50/40 border border-purple-200 p-3 rounded-lg mb-1 shrink-0'):
-                    def stop_profiling():
-                        global cancel_profiling_all, profiling_progress
-                        cancel_profiling_all = True
-                        profiling_progress = "Stopping..."
-                        draw_header_toolbar.refresh()
-                        ui.notify("Stop requested...", type="warning")
-
-                    ui.button(
-                        'Stop Batch', 
-                        icon='stop', 
-                        on_click=stop_profiling
-                    ).classes('bg-red-600 hover:bg-red-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm shrink-0')
-
-                    ui.spinner(size='xs', color='purple').classes('shrink-0')
-                    ui.label(profiling_progress).classes('text-xs font-bold text-purple-700 animate-pulse truncate flex-1')
-
-            # Line 2: Manual Curation Controls
-            with ui.row().classes('w-full items-center justify-between border-t pt-3 border-slate-200 flex-wrap gap-2'):
-                with ui.row().classes('items-center gap-3'):
-                    ui.label('Curation Tools').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wider')
+                with ui.row().classes('items-center gap-2'):
+                    # Render "Profile All" button only if NOT actively profiling
+                    if not is_profiling_all:
+                        ui.button(
+                            'Profile All', 
+                            icon='bolt', 
+                            on_click=lambda: open_batch_profiler_dialog(
+                                project, 
+                                books, 
+                                refresh_workspace_with_scroll, 
+                                draw_header_toolbar.refresh,
+                                draw_details_panel.refresh
+                            )
+                        ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')
                     
-                    ui.button(
-                        'Add Character',
-                        icon='person_add',
-                        on_click=lambda: open_add_character_dialog(project.id, refresh_workspace_with_scroll)
-                    ).classes('bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
-                    .tooltip("Manually add a character profile")
-
-                    async def run_prompt_scan():
-                        client = ui.context.client
-                        with client:
-                            ui.notify("Scanning prompts.csv for character tags...", type="info")
-                        tags = await asyncio.to_thread(extract_characters_from_prompts, project.id)
-                        with client:
-                            if tags:
-                                ui.notify(f"Discovered and indexed {len(tags)} character tags!", type="positive")
-                            else:
-                                ui.notify("No new bracketed character tags found in prompts.csv.", type="info")
-                        await refresh_workspace_with_scroll()
-
-                    ui.button(
-                        'Scan Tags', 
-                        icon='tag', 
-                        on_click=run_prompt_scan
-                    ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
-                    .tooltip("Scan prompts.csv for bracketed character tags")
-
-                    async def run_auto_merge():
-                        client = ui.context.client
-                        with client:
-                            ui.notify("Running smart auto-merge of character tags...", type="info")
-                        merged_log = await asyncio.to_thread(auto_merge_project_characters, project.id)
-                        with client:
-                            if merged_log:
-                                ui.notify(f"Auto-merged {len(merged_log)} duplicate tags!", type="positive")
-                            else:
-                                ui.notify("No matching alias tags to merge found.", type="info")
-                        await refresh_workspace_with_scroll()
-
-                    ui.button(
-                        'Auto-Merge',
-                        icon='merge_type',
-                        on_click=run_auto_merge
-                    ).classes('bg-teal-600 hover:bg-teal-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
-                    .tooltip("Fuzzy-merge common names, titles, and possessives")
-
-                    def try_open_import():
-                        matching_projects = get_matching_source_projects(project.id)
-                        if not matching_projects:
-                            ui.notify("No completed projects with matching character tags found.", type="info")
-                        else:
-                            open_import_profiles_dialog(project, matching_projects, refresh_workspace_with_scroll)
-
-                    ui.button(
-                        'Import Profiles',
-                        icon='cloud_download',
-                        on_click=try_open_import
-                    ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
-                    .tooltip("Import curated profiles from overlapping project(s)")
-
-                    # Character Reset Button
+                    # Reset DB confirmation action (now tucked compactly on the right)
                     def confirm_reset():
                         with ui.dialog() as dialog, ui.card().classes('w-[400px] p-6 rounded-xl flex flex-col gap-4'):
                             ui.label('Reset Character Database?').classes('text-base font-bold text-red-600')
@@ -1417,20 +1348,115 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         dialog.open()
 
                     ui.button(
-                        'Reset',
+                        'Reset DB',
                         icon='restart_alt',
-                        on_click=confirm_reset,
-                        color='red'
-                    ).classes('text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
+                        on_click=confirm_reset
+                    ).props('flat dense').classes('text-red-600 hover:bg-red-50 text-xs px-2.5 py-1.5 rounded-lg font-semibold')\
                     .tooltip("Wipe all character data for this project and start over")
 
-                # Settings/Prompt Button aligned right
-                ui.button(
-                    'Prompt Template',
-                    icon='edit_note',
-                    on_click=open_prompt_editor_dialog
-                ).classes('bg-slate-600 hover:bg-slate-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-sm')\
-                    .tooltip("Customize visual profiler LLM instructions")
+            # Active Profiling Progress Row (Visible only during active execution)
+            if is_profiling_all:
+                with ui.row().classes('w-full items-center gap-3 bg-purple-50/40 border border-purple-200 p-2.5 rounded-lg shrink-0'):
+                    def stop_profiling():
+                        global cancel_profiling_all, profiling_progress
+                        cancel_profiling_all = True
+                        profiling_progress = "Stopping..."
+                        draw_header_toolbar.refresh()
+                        ui.notify("Stop requested...", type="warning")
+
+                    ui.button(
+                        'Stop Batch', 
+                        icon='stop', 
+                        on_click=stop_profiling
+                    ).classes('bg-red-600 hover:bg-red-700 text-white font-bold text-xs px-2.5 py-1.5 rounded-lg shadow-sm shrink-0')
+
+                    ui.spinner(size='xs', color='purple').classes('shrink-0')
+                    ui.label(profiling_progress).classes('text-xs font-bold text-purple-700 animate-pulse truncate flex-1')
+
+            # Line 2: Curation Tools & Prompt Editors (Unified & Compact Split Row)
+            with ui.row().classes('w-full items-center justify-between border-t pt-2.5 border-slate-200 flex-wrap gap-2'):
+                # Group 1: Curation Actions (Left-aligned)
+                with ui.row().classes('items-center gap-1.5 flex-wrap'):
+                    ui.icon('edit', size='16px', color='slate-400')
+                    ui.label('Curation:').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wider mr-1')
+                    
+                    ui.button(
+                        'Add Character',
+                        icon='person_add',
+                        on_click=lambda: open_add_character_dialog(project.id, refresh_workspace_with_scroll)
+                    ).props('outline dense').classes('text-slate-700 font-semibold text-xs px-2.5 py-1 rounded-lg hover:bg-slate-100')\
+                    .tooltip("Manually add a character profile")
+
+                    async def run_prompt_scan():
+                        client = ui.context.client
+                        with client:
+                            ui.notify("Scanning prompts.csv for character tags...", type="info")
+                        tags = await asyncio.to_thread(extract_characters_from_prompts, project.id)
+                        with client:
+                            if tags:
+                                ui.notify(f"Discovered and indexed {len(tags)} character tags!", type="positive")
+                            else:
+                                ui.notify("No new bracketed character tags found in prompts.csv.", type="info")
+                        await refresh_workspace_with_scroll()
+
+                    ui.button(
+                        'Scan Tags', 
+                        icon='tag', 
+                        on_click=run_prompt_scan
+                    ).props('outline dense').classes('text-slate-700 font-semibold text-xs px-2.5 py-1 rounded-lg hover:bg-slate-100')\
+                    .tooltip("Scan prompts.csv for bracketed character tags")
+
+                    async def run_auto_merge():
+                        client = ui.context.client
+                        with client:
+                            ui.notify("Running smart auto-merge of character tags...", type="info")
+                        merged_log = await asyncio.to_thread(auto_merge_project_characters, project.id)
+                        with client:
+                            if merged_log:
+                                ui.notify(f"Auto-merged {len(merged_log)} duplicate tags!", type="positive")
+                            else:
+                                ui.notify("No matching alias tags to merge found.", type="info")
+                        await refresh_workspace_with_scroll()
+
+                    ui.button(
+                        'Auto-Merge',
+                        icon='merge_type',
+                        on_click=run_auto_merge
+                    ).props('outline dense').classes('text-slate-700 font-semibold text-xs px-2.5 py-1 rounded-lg hover:bg-slate-100')\
+                    .tooltip("Fuzzy-merge common names, titles, and possessives")
+
+                    def try_open_import():
+                        matching_projects = get_matching_source_projects(project.id)
+                        if not matching_projects:
+                            ui.notify("No completed projects with matching character tags found.", type="info")
+                        else:
+                            open_import_profiles_dialog(project, matching_projects, refresh_workspace_with_scroll)
+
+                    ui.button(
+                        'Import Profiles',
+                        icon='cloud_download',
+                        on_click=try_open_import
+                    ).props('outline dense').classes('text-slate-700 font-semibold text-xs px-2.5 py-1 rounded-lg hover:bg-slate-100')\
+                    .tooltip("Import curated profiles from overlapping project(s)")
+
+                # Group 2: Instructions / Templates (Right-aligned)
+                with ui.row().classes('items-center gap-1.5'):
+                    ui.icon('settings', size='16px', color='slate-400')
+                    ui.label('Templates:').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wider mr-1')
+                    
+                    ui.button(
+                        'Factual',
+                        icon='science',
+                        on_click=lambda: open_prompt_editor_dialog("factual")
+                    ).props('outline dense').classes('text-purple-700 hover:bg-purple-50 font-semibold text-xs px-2.5 py-1 rounded-lg')\
+                    .tooltip("Customize factual extraction system instructions")
+
+                    ui.button(
+                        'Speculative',
+                        icon='psychology',
+                        on_click=lambda: open_prompt_editor_dialog("speculative")
+                    ).props('outline dense').classes('text-indigo-700 hover:bg-indigo-50 font-semibold text-xs px-2.5 py-1 rounded-lg')\
+                    .tooltip("Customize speculative casting/generation system instructions")
 
 
     @ui.refreshable

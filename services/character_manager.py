@@ -742,7 +742,8 @@ async def run_stateful_character_profiling(
     llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
     model_name = get_setting("llm_model", "local-model")
     
-    factual_template_raw = get_default_character_template()
+    # Load user-configured factual template from flat file (or fallback)
+    factual_template_raw = load_prompt_template_from_file("factual")
 
     with Session(engine) as session:
         project = session.get(Project, project_id)
@@ -885,7 +886,8 @@ async def run_stateful_character_profiling(
         missing_fields = [f for f in core_fields if not state_checklist.get(f) or str(state_checklist.get(f)).strip() == ""]
         
         if missing_fields:
-            speculative_template_raw = get_speculative_character_template()
+            # Load user-configured speculative template from flat file (or fallback)
+            speculative_template_raw = load_prompt_template_from_file("speculative")
             
             known_display = "\n".join([f"- {k}: {v}" for k, v in state_checklist.items() if v]) or "None"
             unknown_display = "\n".join([f"- {k}" for k in missing_fields]) or "None"
@@ -927,6 +929,12 @@ async def run_stateful_character_profiling(
 
                 if progress_callback:
                     progress_callback(char.id, len(sampled_chunks), len(sampled_chunks), state_checklist)
+
+                # Update internal checklist changes for timeline assignment
+                db_event.demographics = state_checklist["demographics"]
+                db_event.physical_build = state_checklist["physical_build"]
+                db_event.hair_and_face = state_checklist["hair_and_face"]
+                db_event.distinguishing_marks = state_checklist["distinguishing_marks"]
 
             except Exception as e:
                 print(f"[Profiler] Error during speculative casting call: {str(e)}")
@@ -972,6 +980,46 @@ def save_setting(key: str, value: str):
         session.add(setting)
         session.commit()
 
+def get_template_file_path(mode: str) -> Path:
+    """Returns the flat file Path for the given template mode."""
+    filename = "factual_template.txt" if mode == "factual" else "speculative_template.txt"
+    return Path("prompt_templates") / "characters" / filename
+
+
+def save_prompt_template_to_file(mode: str, value: str):
+    """Saves the template to a flat file as the primary source of truth, creating directories if needed."""
+    file_path = get_template_file_path(mode)
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(value)
+    except Exception as e:
+        print(f"[Templates] Failed to save {mode} template to {file_path}: {e}")
+
+
+def load_prompt_template_from_file(mode: str) -> str:
+    """Loads the template from a flat file, falling back to database setting then system default."""
+    file_path = get_template_file_path(mode)
+    if file_path.exists():
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            print(f"[Templates] Failed to read {mode} template from {file_path}: {e}")
+            
+    # Fallback to database setting (allows migrating legacy profiles)
+    setting_key = "character_profiler_template" if mode == "factual" else "character_speculative_template"
+    db_val = get_setting(setting_key, "")
+    if db_val:
+        # Self-heal: Save database setting back to flat file for future access
+        save_prompt_template_to_file(mode, db_val)
+        return db_val
+        
+    # Final fallback to hardcoded system default
+    if mode == "factual":
+        return get_default_character_template()
+    else:
+        return get_speculative_character_template()
 
 def auto_merge_project_characters(project_id: int, similarity_threshold: float = 0.8) -> List[Dict[str, Any]]:
     """
