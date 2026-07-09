@@ -37,6 +37,8 @@ except ImportError:
 
 
 class QuickCharactersModal:
+    # ui/components/quick_characters_modal.py
+
     def __init__(self, project_id: int, book_id: int, initial_char_id: Optional[int] = None, on_change_callback: Optional[callable] = None):
         self.project_id = project_id
         self.book_id = book_id
@@ -44,7 +46,8 @@ class QuickCharactersModal:
         
         # State tracking
         self.selected_char_id: Optional[int] = initial_char_id
-        self.active_row_id: Optional[int] = None  # Direct DOM tracking node ID
+        self.selected_event_id: Optional[int] = None  # Tracks which chronological event state is being edited
+        self.active_row_id: Optional[int] = None
         self.is_profiling = False
         self.search_query = ""
         
@@ -55,12 +58,13 @@ class QuickCharactersModal:
             self.books_list = session.exec(select(Book).where(Book.project_id == self.project_id)).all()
             
         self.frequencies = get_character_frequency_map(self.project.name, self.books_list)
-        self.dialog = ui.dialog()
+        
+        # Force the dialog to be built globally in the persistent page-layout slot
+        # This prevents it from being destroyed when dynamic sub-containers (like chips) are cleared.
+        with ui.context.client:
+            self.dialog = ui.dialog()
 
     def open(self):
-        # Capture the active user page/client context before spawning the background task
-        self.client = ui.context.client
-        
         with self.dialog, ui.card().classes('w-full max-w-[95vw] lg:max-w-5xl h-[650px] p-5 rounded-xl flex flex-col gap-3 outline-none bg-white'):
             # --- MODAL HEADER ---
             with ui.row().classes('w-full justify-between items-center border-b pb-2 flex-shrink-0'):
@@ -105,7 +109,6 @@ class QuickCharactersModal:
     def scroll_to_active(self):
         """Dispatches a micro-task client query to scroll the highlighted card into viewport context."""
         if self.active_row_id and hasattr(self, 'client') and self.client:
-            # Execute directly on the captured client reference to bypass empty background task slot stacks
             self.client.run_javascript(f"""
                 const el = document.getElementById('c{self.active_row_id}');
                 if (el) {{
@@ -120,6 +123,49 @@ class QuickCharactersModal:
     def trigger_workspace_refresh(self):
         if self.on_change_callback:
             self.on_change_callback()
+
+    def get_sorted_events(self, char_id: int) -> List[CharacterTimelineEvent]:
+        """Loads and chronologically orders all timeline state events for a character."""
+        with Session(engine) as session:
+            events = session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == char_id)
+            ).all()
+            
+        book_order_map = {b.id: (b.book_order or 0) for b in self.books_list}
+        
+        def event_sort_key(ev):
+            if ev.book_id is None:
+                return (-1, -1, -1)  # Base state is always first
+            order = book_order_map.get(ev.book_id, 9999)
+            return (order, ev.chapter_num or 0, ev.scene_num or 0)
+            
+        return sorted(events, key=event_sort_key)
+
+    def get_active_event_for_scene(self, char_id: int) -> Optional[CharacterTimelineEvent]:
+        """Calculates which timeline event is active at the current workspace scene coordinate."""
+        from ui import state
+        target_ch = int(float(getattr(state, 'book_active_chapter', 1)))
+        target_sc = int(float(getattr(state, 'book_active_scene', 1)))
+        
+        sorted_evs = self.get_sorted_events(char_id)
+        book_order_map = {b.id: (b.book_order or 0) for b in self.books_list}
+        target_book_order = book_order_map.get(self.book_id, 0)
+        
+        active_ev = None
+        for ev in sorted_evs:
+            if ev.book_id is None:
+                active_ev = ev
+                continue
+            ev_order = book_order_map.get(ev.book_id, 0)
+            if ev_order < target_book_order:
+                active_ev = ev
+            elif ev_order == target_book_order:
+                if ev.chapter_num < target_ch:
+                    active_ev = ev
+                elif ev.chapter_num == target_ch and ev.scene_num <= target_sc:
+                    active_ev = ev
+        return active_ev
 
     @ui.refreshable
     def draw_left_list(self):
@@ -149,6 +195,7 @@ class QuickCharactersModal:
         valid_ids = [item[0].id for item in char_data]
         if self.selected_char_id not in valid_ids:
             self.selected_char_id = valid_ids[0] if valid_ids else None
+            self.selected_event_id = None  # Reset state tracking on selection drift
             self.draw_right_details.refresh()
             
         if not char_data:
@@ -163,7 +210,7 @@ class QuickCharactersModal:
             row_el = ui.row().classes(f'w-full p-2.5 rounded-lg cursor-pointer transition-colors justify-between items-center {bg_class}')
             
             if is_selected:
-                self.active_row_id = row_el.id  # Extract tracking ID
+                self.active_row_id = row_el.id
                 
             with row_el:
                 with ui.column().classes('gap-0 flex-1 min-w-0'):
@@ -173,6 +220,7 @@ class QuickCharactersModal:
                 
             def select_this(cid=c.id):
                 self.selected_char_id = cid
+                self.selected_event_id = None  # Allow chronological auto-calculation on change
                 self.draw_left_list.refresh()
                 self.draw_right_details.refresh()
                 
@@ -192,29 +240,31 @@ class QuickCharactersModal:
             if not char:
                 return
             
-            base_ev = session.exec(
-                select(CharacterTimelineEvent)
-                .where(CharacterTimelineEvent.character_id == char.id)
-                .where(CharacterTimelineEvent.book_id == None)
-            ).first()
-            if not base_ev:
-                base_ev = CharacterTimelineEvent(
-                    character_id=char.id,
-                    book_id=None,
-                    chapter_num=0,
-                    scene_num=0,
-                    label="Base State"
-                )
-                session.add(base_ev)
-                session.commit()
-                session.refresh(base_ev)
-                
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
             all_project_chars = session.exec(
                 select(Character)
                 .where(Character.project_id == self.project_id)
                 .where(Character.id != char.id)
             ).all()
+
+        # Load chronologically sorted list of states
+        sorted_evs = self.get_sorted_events(char.id)
+        
+        # Self-heal/Calculate chronological active event state
+        if self.selected_event_id is None:
+            active_ev = self.get_active_event_for_scene(char.id)
+            self.selected_event_id = active_ev.id if active_ev else None
+            
+        # Select active event reference
+        current_ev = None
+        for ev in sorted_evs:
+            if ev.id == self.selected_event_id:
+                current_ev = ev
+                break
+                
+        if not current_ev and sorted_evs:
+            current_ev = sorted_evs[0]
+            self.selected_event_id = current_ev.id
 
         with Session(engine) as session:
             c_mentions = sum(self.frequencies.get(a.alias.lower(), 0) for a in aliases)
@@ -272,12 +322,39 @@ class QuickCharactersModal:
                             session.commit()
                     save_project_characters_to_json(self.project_id)
                     self.selected_char_id = None
+                    self.selected_event_id = None
                     ui.notify("Character profile deleted.", type="warning")
                     self.draw_left_list.refresh()
                     self.draw_right_details.refresh()
                     self.trigger_workspace_refresh()
                     
                 ui.button(icon='delete', on_click=delete_quick_char, color='red').props('unelevated dense').classes('p-1.5 rounded-lg text-white').tooltip('Delete Character Profile')
+
+        # --- CHRONOLOGICAL TIMELINE STATE SELECTOR BAR ---
+        with ui.row().classes('w-full items-center justify-between bg-purple-50 border border-purple-100 p-2.5 rounded-lg flex-shrink-0 gap-2'):
+            def get_ev_label(ev):
+                if ev.book_id is None:
+                    return "Base Character State"
+                b_name = next((b.name for b in self.books_list if b.id == ev.book_id), "Unknown Book")
+                return f"Ch {ev.chapter_num}, Sc {ev.scene_num} State Overide ({ev.label or 'State'})"
+                
+            opts = {ev.id: get_ev_label(ev) for ev in sorted_evs}
+            
+            def on_state_change(e):
+                self.selected_event_id = e.value
+                self.draw_right_details.refresh()
+                
+            ui.select(
+                options=opts, 
+                value=self.selected_event_id, 
+                on_change=on_state_change,
+                label="Timeline Active State"
+            ).classes('flex-1 bg-white').props('dense outlined clearable=false')
+            
+            ui.button(
+                icon='add_circle',
+                on_click=lambda: self.open_add_timeline_dialog(char.id)
+            ).classes('bg-purple-600 text-white font-bold text-xs p-2 rounded-lg').tooltip('Add Timeline Override State')
 
         with ui.row().classes('w-full items-center gap-2 flex-shrink-0'):
             async def run_research_quick(speculate: bool = False):
@@ -308,6 +385,7 @@ class QuickCharactersModal:
                 ui.button('Research (LLM)', icon='science', on_click=lambda: run_research_quick(False)).classes('text-white font-bold text-xs bg-purple-600 hover:bg-purple-700')
                 ui.button('Deduce Vibe', icon='theater_comedy', on_click=lambda: run_research_quick(True)).classes('text-white font-bold text-xs bg-indigo-600 hover:bg-indigo-700')
 
+        # --- PHYSICAL TRAITS INPUT GRID (BOUND TO SELECTED EVENT) ---
         with ui.grid().classes('w-full grid-cols-1 md:grid-cols-2 gap-2 mt-1'):
             trait_fields = [
                 ("demographics", "Demographics (Age, Race, Gender)"),
@@ -336,12 +414,12 @@ class QuickCharactersModal:
                 return handler
 
             for key, label in trait_fields:
-                val = getattr(base_ev, key) or ""
-                ui.input(label=label, value=val).classes('w-full bg-white').props('outlined dense').on('blur', make_quick_trait_handler(base_ev.id, key))
+                val = getattr(current_ev, key) or ""
+                ui.input(label=label, value=val).classes('w-full bg-white').props('outlined dense').on('blur', make_quick_trait_handler(current_ev.id, key))
 
         ui.label('Compiled Visual Prompt').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide mt-1')
         
-        def handle_quick_desc_blur(e, ev_id=base_ev.id):
+        def handle_quick_desc_blur(e, ev_id=current_ev.id):
             new_val = e.sender.value.strip()
             with Session(engine) as session:
                 db_ev = session.get(CharacterTimelineEvent, ev_id)
@@ -353,7 +431,7 @@ class QuickCharactersModal:
             ui.notify("Visual Prompt overridden!", type="info")
             self.trigger_workspace_refresh()
 
-        compiled_desc_area = ui.textarea(value=base_ev.visual_description or "").classes('w-full bg-white font-mono text-xs').props('outlined dense autogrow').on('blur', handle_quick_desc_blur)
+        compiled_desc_area = ui.textarea(value=current_ev.visual_description or "").classes('w-full bg-white font-mono text-xs').props('outlined dense autogrow').on('blur', handle_quick_desc_blur)
 
         with ui.column().classes('w-full bg-slate-50 p-3 rounded-lg border gap-2 mt-1'):
             ui.label('Assigned Aliases & Target Tags').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wider')
@@ -425,6 +503,7 @@ class QuickCharactersModal:
                         save_project_characters_to_json(self.project_id)
                         ui.notify("Characters successfully merged!", type="positive")
                         self.selected_char_id = char.id
+                        self.selected_event_id = None
                         self.draw_left_list.refresh()
                         self.draw_right_details.refresh()
                         self.trigger_workspace_refresh()
@@ -535,6 +614,128 @@ class QuickCharactersModal:
 
         dialog.open()
 
+    def open_add_timeline_dialog(self, character_id: int):
+        """Spawns an inline dialogue to append coordinate-based timeline transitions to the active cast member."""
+        from ui import state
+        default_ch = int(float(getattr(state, 'book_active_chapter', 1)))
+        default_sc = int(float(getattr(state, 'book_active_scene', 1)))
+
+        with ui.dialog() as dialog, ui.card().classes('w-[450px] p-5 rounded-xl flex flex-col gap-3'):
+            ui.label('Add Timeline Override Event').classes('text-sm font-bold text-slate-800')
+            
+            book_opts = {b.id: b.name for b in self.books_list}
+            if not book_opts:
+                ui.label('No books imported in this project yet.').classes('text-xs text-red-500')
+                ui.button('Close', on_click=dialog.close).props('flat')
+                dialog.open()
+                return
+                
+            book_select = ui.select(options=book_opts, value=self.book_id, label="Target Book").classes('w-full bg-white').props('dense outlined')
+            chapter_input = ui.number(label="Chapter Number", value=default_ch, min=1, step=1).classes('w-full').props('outlined dense')
+            scene_input = ui.number(label="Scene Number", value=default_sc, min=1, step=1).classes('w-full').props('outlined dense')
+            label_input = ui.input(label="Event Label", placeholder="e.g. Gandalf the White").classes('w-full').props('outlined dense')
+            
+            copied_status = ui.label("").classes('text-[11px] text-green-600 font-semibold')
+            copied_traits = {}
+            
+            def copy_previous():
+                """Queries chronological state machine up to current coordinate to clone values."""
+                with Session(engine) as session:
+                    events = session.exec(
+                        select(CharacterTimelineEvent)
+                        .where(CharacterTimelineEvent.character_id == character_id)
+                    ).all()
+                    
+                    tgt_book = session.get(Book, book_select.value)
+                    tgt_order = tgt_book.book_order if tgt_book else 0
+                    tgt_ch = int(chapter_input.value or 1)
+                    tgt_sc = int(scene_input.value or 1)
+                    
+                    book_order_map = {b.id: (b.book_order or 0) for b in self.books_list}
+                    
+                    matched = []
+                    base_ev = None
+                    for ev in events:
+                        if ev.book_id is None:
+                            base_ev = ev
+                            continue
+                        ev_order = book_order_map.get(ev.book_id, 0)
+                        if ev_order < tgt_order:
+                            matched.append((ev, ev_order))
+                        elif ev_order == tgt_order:
+                            if ev.chapter_num < tgt_ch:
+                                matched.append((ev, ev_order))
+                            elif ev.chapter_num == tgt_ch and ev.scene_num <= tgt_sc:
+                                matched.append((ev, ev_order))
+                                
+                    resolved = base_ev
+                    if matched:
+                        matched.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
+                        resolved = matched[-1][0]
+                    
+                    if resolved:
+                        copied_traits["demographics"] = resolved.demographics
+                        copied_traits["physical_build"] = resolved.physical_build
+                        copied_traits["hair_and_face"] = resolved.hair_and_face
+                        copied_traits["distinguishing_marks"] = resolved.distinguishing_marks
+                        copied_traits["visual_description"] = resolved.visual_description
+                        copied_status.text = f"Cloned traits from existing: '{resolved.label or 'Base State'}'!"
+                    else:
+                        copied_status.text = "No previous chronological state to clone."
+
+            ui.button('Clone Previous State Traits', icon='content_copy', on_click=copy_previous).classes('text-xs text-slate-700 bg-slate-100 hover:bg-slate-200 border w-full')
+            
+            def save_new_event():
+                b_id = book_select.value
+                ch = int(chapter_input.value or 1)
+                sc = int(scene_input.value or 1)
+                lbl = label_input.value.strip() or "Override State"
+                
+                with Session(engine) as session:
+                    dup = session.exec(
+                        select(CharacterTimelineEvent)
+                        .where(CharacterTimelineEvent.character_id == character_id)
+                        .where(CharacterTimelineEvent.book_id == b_id)
+                        .where(CharacterTimelineEvent.chapter_num == ch)
+                        .where(CharacterTimelineEvent.scene_num == sc)
+                    ).first()
+                    
+                    if dup:
+                        ui.notify("An override event already exists at this scene coordinate.", type="warning")
+                        return
+                    
+                    new_ev = CharacterTimelineEvent(
+                        character_id=character_id,
+                        book_id=b_id,
+                        chapter_num=ch,
+                        scene_num=sc,
+                        label=lbl,
+                        demographics=copied_traits.get("demographics"),
+                        physical_build=copied_traits.get("physical_build"),
+                        hair_and_face=copied_traits.get("hair_and_face"),
+                        distinguishing_marks=copied_traits.get("distinguishing_marks"),
+                        visual_description=copied_traits.get("visual_description")
+                    )
+                    session.add(new_ev)
+                    session.commit()
+                    
+                    # Redirect active editing selector target to this new event state
+                    self.selected_event_id = new_ev.id
+                    
+                save_project_characters_to_json(self.project_id)
+                ui.notify("Timeline override event added!", type="positive")
+                dialog.close()
+                self.draw_right_details.refresh()
+                self.trigger_workspace_refresh()
+
+            with ui.row().classes('w-full justify-end gap-2 border-t pt-3 mt-2'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Create Event', on_click=save_new_event).classes('bg-blue-600 text-white font-bold text-xs px-3 py-1.5 rounded-lg')
+
+        dialog.open()
+        # Prepopulate cloning on window mount
+        copy_previous()
+
     def quick_add_new_character(self):
         with ui.dialog() as add_dialog, ui.card().classes('w-[350px] p-4 rounded-xl flex flex-col gap-3'):
             ui.label('Add New Character').classes('text-sm font-bold text-slate-800')
@@ -561,6 +762,7 @@ class QuickCharactersModal:
                 ui.notify(f"Added character '{name}'!", type="positive")
                 add_dialog.close()
                 self.selected_char_id = new_char.id
+                self.selected_event_id = None
                 self.draw_left_list.refresh()
                 self.draw_right_details.refresh()
                 self.trigger_workspace_refresh()
