@@ -13,6 +13,7 @@ from services.character_manager import compile_character_visual_prompt, save_pro
 from ui.pages.project.characters_tab import get_character_frequency_map
 from ui.components.prompt_editor_view import render_prompt_editor_view
 from ui.components.autocomplete import PromptAutocompleteManager
+from ui.components.quick_characters_modal import QuickCharactersModal
 from ui import state
 
 try:
@@ -266,226 +267,27 @@ def render_book_tabs(book_id: int):
         return [t.strip() for t in bracket_regex.findall(prompt_text) if t.strip()]
 
     def open_character_edit_dialog(char_id: int):
-        """Spawns an independent edit dialog that loads the chronologically active timeline state."""
-        with Session(engine) as session:
-            char = session.get(Character, char_id)
-            if not char:
-                ui.notify("Character not found.", type="negative")
-                return
-            
-            books_list = session.exec(select(Book).where(Book.project_id == project.id)).all()
-            book_order_map = {b.id: (b.book_order or 0) for b in books_list}
-            target_book_order = book_order_map.get(book_id, 0)
-            
-            target_ch = int(float(getattr(state, 'book_active_chapter', 1)))
-            target_sc = int(float(getattr(state, 'book_active_scene', 1)))
+        """Spawns the quick characters manager modal pre-selected to a specific character."""
+        modal = QuickCharactersModal(
+            project_id=project.id,
+            book_id=book_id,
+            initial_char_id=char_id,
+            on_change_callback=lambda: [
+                render_scene_character_chips(modal_prompt_input.value) if modal_prompt_input else None
+            ]
+        )
+        modal.open()
 
-            events = session.exec(
-                select(CharacterTimelineEvent)
-                .where(CharacterTimelineEvent.character_id == char.id)
-            ).all()
-            
-            matched_evs = []
-            base_ev = None
-            for ev in events:
-                if ev.book_id is None:
-                    base_ev = ev
-                    continue
-                ev_order = book_order_map.get(ev.book_id, 0)
-                if ev_order < target_book_order:
-                    matched_evs.append((ev, ev_order))
-                elif ev_order == target_book_order:
-                    if ev.chapter_num < target_ch:
-                        matched_evs.append((ev, ev_order))
-                    elif ev.chapter_num == target_ch and ev.scene_num <= target_sc:
-                        matched_evs.append((ev, ev_order))
-                        
-            active_ev = base_ev
-            if matched_evs:
-                matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
-                active_ev = matched_evs[-1][0]
-                
-            if not active_ev:
-                active_ev = CharacterTimelineEvent(
-                    character_id=char.id,
-                    book_id=None,
-                    chapter_num=0,
-                    scene_num=0,
-                    label="Base State"
-                )
-                session.add(active_ev)
-                session.commit()
-                session.refresh(active_ev)
-                
-            active_ev_id = active_ev.id
-            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-            
-            frequencies = get_character_frequency_map(project_name, [book])
-            total_hits = sum(frequencies.get(a.alias.lower(), 0) for a in aliases)
-            if not aliases:
-                total_hits = frequencies.get(char.name.lower(), 0)
-
-        with ui.context.client:
-            with ui.dialog() as char_dialog, ui.card().classes('w-[520px] max-w-[95vw] p-5 rounded-xl flex flex-col gap-3 overflow-hidden outline-none focus:outline-none'):
-                
-                with ui.row().classes('w-full justify-between items-center border-b pb-2 flex-shrink-0'):
-                    with ui.column().classes('gap-0'):
-                        ui.label(f"Edit Profile: {char.name}").classes('text-sm font-bold text-slate-800')
-                        ui.label(f"{total_hits} mentions in {book_name}").classes('text-[11px] text-slate-400 font-medium')
-                    
-                    with ui.row().classes('items-center gap-2'):
-                        def toggle_modal_lock(e):
-                            with Session(engine) as session:
-                                db_char = session.get(Character, char_id)
-                                if db_char:
-                                    db_char.locked = e.value
-                                    session.add(db_char)
-                                    session.commit()
-                            save_project_characters_to_json(project.id)
-                            ui.notify(f"Profile {'Locked' if e.value else 'Unlocked'}", type="info")
-
-                        lock_switch = ui.switch(value=char.locked, on_change=toggle_modal_lock).props('dense')
-                        ui.label('Locked').classes('text-xs font-semibold text-slate-500 mr-2')
-
-                with ui.column().classes('w-full flex-1 overflow-y-auto pr-1 gap-3 max-h-[55vh] min-h-0'):
-                    
-                    with ui.row().classes('w-full items-center justify-between bg-blue-50/50 border border-blue-100 p-2.5 rounded-lg flex-shrink-0'):
-                        with ui.column().classes('gap-0'):
-                            ui.label('Active State:').classes('text-[9px] font-black text-blue-600 uppercase tracking-wider')
-                            ui.label(f"'{active_ev.label or 'Base State'}'").classes('text-xs font-bold text-slate-700')
-                        
-                        if active_ev.book_id != book_id or active_ev.chapter_num != target_ch or active_ev.scene_num != target_sc:
-                            async def create_timeline_change_here():
-                                with Session(engine) as session:
-                                    new_ev = CharacterTimelineEvent(
-                                        character_id=char_id,
-                                        book_id=book_id,
-                                        chapter_num=target_ch,
-                                        scene_num=target_sc,
-                                        label=f"Ch {target_ch}, Sc {target_sc} Change",
-                                        demographics=active_ev.demographics,
-                                        physical_build=active_ev.physical_build,
-                                        hair_and_face=active_ev.hair_and_face,
-                                        distinguishing_marks=active_ev.distinguishing_marks,
-                                        visual_description=active_ev.visual_description
-                                    )
-                                    session.add(new_ev)
-                                    session.commit()
-                                save_project_characters_to_json(project.id)
-                                ui.notify("Created a new timeline override event starting at this scene!", type="positive")
-                                char_dialog.close()
-                                open_character_edit_dialog(char_id)
-                                
-                            ui.button(
-                                'Add Timeline Change', 
-                                icon='add_circle', 
-                                on_click=create_timeline_change_here
-                            ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-[10px] px-2.5 py-1.5 rounded-md')
-
-                    ui.label('Physical Traits').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide')
-                    
-                    demo_input = ui.input(label="Demographics", value=active_ev.demographics or "").classes('w-full bg-white').props('outlined dense')
-                    hair_input = ui.input(label="Hair & Face", value=active_ev.hair_and_face or "").classes('w-full bg-white').props('outlined dense')
-                    build_input = ui.input(label="Physical Build", value=active_ev.physical_build or "").classes('w-full bg-white').props('outlined dense')
-                    marks_input = ui.input(label="Distinguishing Marks", value=active_ev.distinguishing_marks or "").classes('w-full bg-white').props('outlined dense')
-
-                    def get_compiled_preview() -> str:
-                        mock_ev = CharacterTimelineEvent(
-                            character_id=char_id,
-                            demographics=demo_input.value,
-                            physical_build=build_input.value,
-                            hair_and_face=hair_input.value,
-                            distinguishing_marks=marks_input.value
-                        )
-                        return compile_character_visual_prompt(mock_ev)
-
-                    ui.label('Compiled Visual Prompt').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide mt-1')
-                    
-                    desc_textarea = ui.textarea(
-                        value=active_ev.visual_description or get_compiled_preview()
-                    ).classes('w-full font-mono text-xs').props('outlined dense autogrow')
-
-                    def on_trait_change():
-                        if not lock_switch.value:
-                            desc_textarea.value = get_compiled_preview()
-
-                    for field_el in [demo_input, hair_input, build_input, marks_input]:
-                        field_el.on('blur', on_trait_change)
-
-                    ui.label('Mapped Alias Tags').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide mt-1')
-                    
-                    @ui.refreshable
-                    def render_modal_aliases():
-                        with Session(engine) as session:
-                            curr_aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char_id)).all()
-                        
-                        with ui.row().classes('w-full gap-1.5 flex-wrap items-center bg-slate-50 p-2 rounded-lg border border-dashed outline-none focus:outline-none'):
-                            if not curr_aliases:
-                                ui.label('No aliases mapped.').classes('text-[11px] text-slate-400 italic')
-                            for a in curr_aliases:
-                                def remove_alias(alias_id=a.id):
-                                    with Session(engine) as session:
-                                        db_a = session.get(CharacterAlias, alias_id)
-                                        if db_a:
-                                            session.delete(db_a)
-                                            session.commit()
-                                    save_project_characters_to_json(project.id)
-                                    render_modal_aliases.refresh()
-                                    ui.notify("Alias tag removed.", type="info")
-
-                                ui.chip(a.alias, removable=True, on_value_change=lambda e, aid=a.id: remove_alias(aid) if not e.value else None).classes('bg-white text-xs')
-                            
-                            def add_alias():
-                                txt = alias_add_input.value.strip()
-                                if not txt:
-                                    return
-                                with Session(engine) as session:
-                                    dup = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char_id).where(CharacterAlias.alias == txt)).first()
-                                    if not dup:
-                                        new_a = CharacterAlias(character_id=char_id, alias=txt)
-                                        session.add(new_a)
-                                        session.commit()
-                                save_project_characters_to_json(project.id)
-                                alias_add_input.value = ""
-                                render_modal_aliases.refresh()
-                                ui.notify(f"Added alias: {txt}", type="positive")
-
-                            alias_add_input = ui.input(placeholder="Add Tag...").classes('w-24 text-xs').props('dense borderless')
-                            alias_add_input.on('keydown.enter', add_alias)
-                            ui.button(icon='add', on_click=add_alias).props('flat dense round').classes('text-slate-500 text-xs')
-
-                    render_modal_aliases()
-
-                with ui.row().classes('w-full justify-end gap-2 border-t pt-2 mt-2 flex-shrink-0'):
-                    def cancel():
-                        char_dialog.close()
-
-                    def save():
-                        with Session(engine) as session:
-                            db_ev = session.get(CharacterTimelineEvent, active_ev_id)
-                            db_char = session.get(Character, char_id)
-                            if db_ev:
-                                db_ev.demographics = demo_input.value.strip() if demo_input.value.strip() else None
-                                db_ev.physical_build = build_input.value.strip() if build_input.value.strip() else None
-                                db_ev.hair_and_face = hair_input.value.strip() if hair_input.value.strip() else None
-                                db_ev.distinguishing_marks = marks_input.value.strip() if marks_input.value.strip() else None
-                                db_ev.visual_description = desc_textarea.value.strip() if desc_textarea.value.strip() else None
-                                session.add(db_ev)
-                                session.commit()
-                            if db_char:
-                                db_char.locked = lock_switch.value
-                                session.add(db_char)
-                                session.commit()
-                        save_project_characters_to_json(project.id)
-                        ui.notify("Character profile state updated successfully!", type="positive")
-                        char_dialog.close()
-                        if modal_prompt_input:
-                            render_scene_character_chips(modal_prompt_input.value)
-
-                    ui.button('Cancel', on_click=cancel, color='slate').props('flat').classes('text-xs font-semibold')
-                    ui.button('Save Profile State', on_click=save).classes('bg-blue-600 text-white font-bold text-xs px-4 py-2 rounded-lg shadow-sm')
-
-            char_dialog.open()
+    def open_quick_characters_dialog():
+        """Spawns an interactive split-screen project characters quick manager dialog."""
+        modal = QuickCharactersModal(
+            project_id=project.id, 
+            book_id=book_id,
+            on_change_callback=lambda: [
+                render_scene_character_chips(modal_prompt_input.value) if modal_prompt_input else None
+            ]
+        )
+        modal.open()
 
     def render_scene_character_chips(prompt_text: str):
         """Safely clears and populates matched character tags on the scene with descriptive hover tooltips."""
@@ -557,7 +359,7 @@ def render_book_tabs(book_id: int):
                         
                         chip = ui.chip(
                             f"👤 {char.name}",
-                            on_click=lambda _, c_id=char.id: open_character_edit_dialog(c_id)
+                            on_click=lambda _, cid=char.id: open_character_edit_dialog(cid)
                         ).classes('text-[11px] bg-white hover:bg-blue-50 hover:text-blue-700 cursor-pointer border py-0.5 px-2.5 rounded-md outline-none focus:outline-none')
                         with chip:
                             ui.tooltip(tooltip_desc).classes('bg-slate-800 text-white text-[10px] p-2.5 rounded-md')
@@ -692,26 +494,21 @@ def render_book_tabs(book_id: int):
         if query:
             brackets = re.findall(r'\[(.*?)\]', query)
             if brackets:
-                # E.g. "[dino] [stone]" -> ["dino", "stone"]
                 terms = [b.strip().lower() for b in brackets if b.strip()]
             elif ',' in query:
-                # E.g. "dino, stone" -> ["dino", "stone"]
                 terms = [t.strip().lower() for t in query.split(',') if t.strip()]
             else:
-                # E.g. "dino stone" -> ["dino", "stone"]
                 terms = [t.strip().lower() for t in query.split(' ') if t.strip()]
                 if len(terms) > 1:
                     terms = [t for t in terms if t not in ('and', 'or', '&', 'with', 'in')]
 
         for p in prompts:
-            # Evaluate multi-term AND logic search
             if terms:
                 p_prompt = p.get("prompt", "").lower()
                 p_quote = p.get("quote", "").lower()
                 ch_str = f"ch {p.get('chapter', '')}"
                 sc_str = f"sc {p.get('scene', '')}"
                 
-                # Extract bracketed scene character tags and map them to database IDs
                 tags_in_prompt = re.findall(r"\[(.*?)\]", p_prompt)
                 scene_character_ids = set()
                 for tag in tags_in_prompt:
@@ -720,22 +517,18 @@ def render_book_tabs(book_id: int):
                             scene_character_ids.add(char_id)
                             break
                 
-                # Check if all typed query terms are satisfied
                 matched_all_terms = True
                 for term in terms:
-                    # Collect characters matching the keyword alias
                     term_matched_char_ids = set()
                     for char_id, aliases in character_alias_map.items():
                         if any(term in alias for alias in aliases):
                             term_matched_char_ids.add(char_id)
                             
                     if term_matched_char_ids:
-                        # Character alias tag constraint check
                         if not (term_matched_char_ids & scene_character_ids):
                             matched_all_terms = False
                             break
                     else:
-                        # Fallback raw text constraint check
                         if term not in p_prompt and term not in p_quote and term not in ch_str and term not in sc_str:
                             matched_all_terms = False
                             break
@@ -855,7 +648,6 @@ def render_book_tabs(book_id: int):
             loaded_scene_coords[0] = ch
             loaded_scene_coords[1] = sc
 
-            # Reset contextual limits to default whenever jumping to a brand new scene
             theater_context_state["window_before"] = 400
             theater_context_state["window_after"] = 400
 
@@ -1348,10 +1140,9 @@ def render_book_tabs(book_id: int):
             
             for token in tokens:
                 if token.startswith('<') and token.endswith('>'):
-                    # Keep existing HTML tags (such as the yellow quote-target highlight mark) intact
+                    # Keep existing HTML tags intact
                     highlighted_tokens.append(token)
                 else:
-                    # Apply single-pass replacement over the plain-text segment
                     text_segment = token
                     text_segment = combined_regex.sub(
                         lambda m: f'<mark class="bg-green-100 text-green-800 px-1 rounded font-semibold">{m.group(1)}</mark>', 
@@ -1415,6 +1206,24 @@ def render_book_tabs(book_id: int):
                             modal_title_el = ui.label("").classes('text-base font-bold text-slate-800 leading-none')
                             modal_subtitle_el = ui.label("").classes('text-[11px] text-slate-400 mt-1')
                         with ui.row().classes('items-center gap-1'):
+                            # Jump to Prompt Editor Button
+                            ui.button(
+                                icon='edit_note', 
+                                on_click=lambda: [
+                                    swap_view_mode('Editor'),
+                                    getattr(state, 'select_prompt_editor_scene_fn', lambda ch, sc: None)(
+                                        state.book_active_chapter, state.book_active_scene
+                                    ),
+                                    theater_dialog.close()
+                                ]
+                            ).props('flat round dense').classes('text-slate-400 hover:text-blue-600').tooltip('Edit Prompt in Workspace')
+
+                            # Quick-Curate Characters Dialog Button
+                            ui.button(
+                                icon='people', 
+                                on_click=open_quick_characters_dialog
+                            ).props('flat round dense').classes('text-slate-400 hover:text-blue-600').tooltip('Project Characters Manager')
+
                             with ui.button(icon='help_outline').props('flat round dense').classes('text-slate-400'):
                                 with ui.tooltip().classes('bg-slate-800 text-white text-xs p-3 rounded-lg gap-1 flex flex-col shadow-lg'):
                                     ui.label('Keyboard Shortcuts').classes('font-bold border-b pb-1 text-blue-400')
@@ -1443,10 +1252,8 @@ def render_book_tabs(book_id: int):
                             label="Style-Ready Visual Prompt"
                         ).classes('w-full h-32 text-xs leading-relaxed flex-shrink-0 theater-prompt-editor').props('outlined')
                         
-                        # Only commit and save to disk when focus is lost (blur)
                         modal_prompt_input.on('blur', lambda: update_prompt_text(modal_prompt_input.value, active_row_ref[0]))
                         
-                        # Set up our unified autocomplete manager on the target input
                         PromptAutocompleteManager(
                             textarea=modal_prompt_input,
                             project_id=project.id,
@@ -1533,7 +1340,6 @@ def render_book_tabs(book_id: int):
                     ui.label('Missing').classes('text-[9px]')
                 placeholder_el.visible = not img_url
 
-                # Dynamic Character Badges showing up to 4 names with overflow indicators
                 tags = extract_prompt_character_tags(item.get("prompt", ""))
                 seen_tags = set()
                 deduped_tags = []
@@ -1570,12 +1376,10 @@ def render_book_tabs(book_id: int):
     editor_view_container = ui.column().classes('w-full')
     editor_view_container.bind_visibility_from(state, 'book_view_mode', value='Editor')
 
-    # Re-evaluating Scope Inside the Refreshable Function solves layout bugs [2.2.9]
     @ui.refreshable
     def render_content():
         filtered = get_filtered_prompts()
         
-        # Permanent gallery container now correctly managed internally!
         with ui.column().classes('w-full').bind_visibility_from(state, 'book_view_mode', value='Gallery'):
             if not filtered:
                 with ui.column().classes('w-full items-center justify-center p-12 text-slate-400 border border-dashed rounded-xl bg-slate-50 outline-none focus:outline-none'):
@@ -1610,7 +1414,8 @@ def render_book_tabs(book_id: int):
             prompts_list=prompts,
             on_refresh_grid=lambda: [render_content.refresh()],
             open_character_edit_dialog_fn=open_character_edit_dialog,
-            open_theater_modal_fn=launch_theater_from_coordinate
+            open_theater_modal_fn=launch_theater_from_coordinate,
+            open_quick_characters_dialog_fn=open_quick_characters_dialog
         )
 
     # --- Viewport-Aware Scroll Listener ---

@@ -47,15 +47,19 @@ def render_prompt_editor_view(
     prompts_list: List[Dict[str, Any]], 
     on_refresh_grid: callable,
     open_character_edit_dialog_fn: callable,
-    open_theater_modal_fn: callable
+    open_theater_modal_fn: callable,
+    open_quick_characters_dialog_fn: Optional[callable] = None
 ):
     """
     Renders the complete split-screen prompt, quote, and character detail editor.
     Utilizes permanent sidebar list and split columns with zero layout shift deallocations.
     """
-    # Active selected scene coordinates tracked locally in editor scope
+    # Active selected scene coordinates tracked in global/editor state
     active_coords = [1, 1]
-    if prompts_list:
+    if hasattr(state, 'book_active_chapter') and hasattr(state, 'book_active_scene'):
+        active_coords[0] = state.book_active_chapter
+        active_coords[1] = state.book_active_scene
+    elif prompts_list:
         try:
             active_coords[0] = int(float(prompts_list[0].get("chapter", "1")))
             active_coords[1] = int(float(prompts_list[0].get("scene", "1")))
@@ -84,16 +88,26 @@ def render_prompt_editor_view(
     quote_textarea = [None]
     prompt_textarea = [None]
 
-    # Dynamic filter binding
+    # Dynamic filters binding
     search_filter = ui.input(placeholder="Search scene text...").classes('hidden')
+    editor_filter = ui.select(options=["All", "Unapproved Only", "Approved Only"], value="All").classes('hidden')
 
     def get_filtered_editor_prompts():
         query = (search_filter.value or "").strip().lower()
-        if not query:
-            return prompts_list
-            
+        status_filter = editor_filter.value
+        
         filtered = []
         for p in prompts_list:
+            is_approved = p.get("approved", "False").strip().lower() == "true"
+            if status_filter == "Unapproved Only" and is_approved:
+                continue
+            if status_filter == "Approved Only" and not is_approved:
+                continue
+                
+            if not query:
+                filtered.append(p)
+                continue
+                
             p_text = p.get("prompt", "").lower()
             q_text = p.get("quote", "").lower()
             ch_str = f"ch {p.get('chapter', '')}"
@@ -587,6 +601,29 @@ def render_prompt_editor_view(
 
         render_scene_character_chips(scene.get("prompt", ""))
 
+    # --- Sidebar Row Renderer ---
+    def select_sidebar_scene(ch_num: int, sc_num: int):
+        active_coords[0] = ch_num
+        active_coords[1] = sc_num
+        
+        # Keep global orchestration states in alignment
+        state.book_active_chapter = ch_num
+        state.book_active_scene = sc_num
+        
+        for row in sidebar_container_ref[0].default_slot.children:
+            try:
+                elem_key = row.key_coords
+                row.classes(replace="p-2 cursor-pointer rounded-lg border flex flex-col gap-1 w-full transition-all border-slate-200 hover:bg-slate-50/50 bg-white outline-none focus:outline-none")
+                if elem_key == (ch_num, sc_num):
+                    row.classes(replace="p-2 cursor-pointer rounded-lg border flex flex-col gap-1 w-full transition-all border-blue-500 border-l-4 border-l-blue-600 bg-blue-50/40 shadow-sm font-semibold outline-none focus:outline-none")
+            except Exception:
+                pass
+                
+        load_active_scene_details()
+
+    # Register dynamic focus handler into shared state
+    state.select_prompt_editor_scene_fn = select_sidebar_scene
+
     def save_active_scene_changes():
         scene = get_active_scene_dict()
         if not scene:
@@ -615,22 +652,6 @@ def render_prompt_editor_view(
         original_loaded_values["quote"] = quote_val
         
         on_refresh_grid()
-        load_active_scene_details()
-
-    # --- Sidebar Row Renderer ---
-    def select_sidebar_scene(ch_num: int, sc_num: int):
-        active_coords[0] = ch_num
-        active_coords[1] = sc_num
-        
-        for row in sidebar_container_ref[0].default_slot.children:
-            try:
-                elem_key = row.key_coords
-                row.classes(replace="p-2 cursor-pointer rounded-lg border flex flex-col gap-1 w-full transition-all border-slate-200 hover:bg-slate-50/50 bg-white outline-none focus:outline-none")
-                if elem_key == (ch_num, sc_num):
-                    row.classes(replace="p-2 cursor-pointer rounded-lg border flex flex-col gap-1 w-full transition-all border-blue-500 border-l-4 border-l-blue-600 bg-blue-50/40 shadow-sm font-semibold outline-none focus:outline-none")
-            except Exception:
-                pass
-                
         load_active_scene_details()
 
     def render_sidebar_list():
@@ -687,7 +708,7 @@ def render_prompt_editor_view(
                             if len(tags) > 2:
                                 ui.badge(f"+{len(tags)-2}", color='blue').classes('text-[8px] font-semibold py-0 px-1 rounded-sm')
 
-    # --- Main Split-Screen Workspace Builder ---
+    # --- Main Split-Screen Workspace Workspace ---
     with ui.row().classes('w-full justify-between items-center bg-white p-3 border rounded-xl shadow-2xs mb-4 outline-none focus:outline-none'):
         with ui.row().classes('items-center gap-2'):
             ui.icon('rate_review', size='sm', color='blue-600')
@@ -706,6 +727,13 @@ def render_prompt_editor_view(
                 placeholder='Search chapters, quotes, prompts...', 
                 on_change=lambda e: [search_filter.set_value(e.value), render_sidebar_list()]
             ).classes('w-full bg-slate-50 rounded-lg').props('outlined dense clearable')
+            
+            # Dynamic approved/unapproved status dropdown filter
+            ui.select(
+                options=["All", "Unapproved Only", "Approved Only"],
+                value="All",
+                on_change=lambda e: [editor_filter.set_value(e.value), render_sidebar_list()]
+            ).classes('w-full bg-slate-50 rounded-lg text-xs').props('outlined dense')
             
             sidebar_scroller = ui.scroll_area().classes('w-full flex-1')
             with sidebar_scroller:
@@ -738,8 +766,15 @@ def render_prompt_editor_view(
             # --- DETAILED PANEL COLUMN 2 (INTERACTIVE EDITOR) ---
             with ui.column().classes('w-full h-full gap-3 overflow-y-auto min-h-0 flex-nowrap border rounded-xl p-4 bg-slate-50/50 outline-none focus:outline-none'):
                 
-                # Top: Compact Horizontal Badges Row
-                ui.label("Character Profiles In Scene").classes('text-[10px] font-black text-slate-400 uppercase tracking-wider')
+                # Top: Compact Horizontal Badges Row with quick-curate characters option
+                with ui.row().classes('w-full items-center justify-between'):
+                    ui.label("Character Profiles In Scene").classes('text-[10px] font-black text-slate-400 uppercase tracking-wider')
+                    if open_quick_characters_dialog_fn:
+                        ui.button(
+                            icon='people', 
+                            on_click=open_quick_characters_dialog_fn
+                        ).props('flat dense size=sm').classes('text-slate-400 hover:text-blue-600').tooltip('Project Characters')
+                        
                 character_badges_container[0] = ui.row().classes('w-full gap-1.5 flex-wrap items-center bg-white p-2.5 rounded-lg border outline-none focus:outline-none')
                 
                 # Middle: Target Quote Block
