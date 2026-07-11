@@ -8,20 +8,23 @@ from sqlmodel import Session, select
 from database.connection import engine, get_setting
 from database.models import Project, Book, Character, CharacterAlias, CharacterStateModifier, CharacterTimelineEvent
 from services.character_manager import (
-    extract_characters_from_prompts,
     save_project_characters_to_json,
-    merge_character_aliases,
     run_stateful_character_profiling,
     get_character_mention_chunks,
     get_character_book_mentions,
     save_setting,
-    auto_merge_project_characters,
     compile_character_visual_prompt,
     ensure_book_orders,
     get_matching_source_projects,
     get_character_import_matches,
     execute_character_import
 )
+from services.character_organizer import (
+    extract_characters_from_prompts,
+    merge_character_aliases,
+    auto_merge_project_characters
+)
+from ui.components.character_organizer_modal import CharacterOrganizerModal
 
 # Active local state trackers
 selected_book_id: Optional[int] = None
@@ -1386,6 +1389,13 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         on_click=lambda: open_add_character_dialog(project.id, refresh_workspace_with_scroll)
                     ).props('outline dense').classes('text-slate-700 font-semibold text-xs px-2.5 py-1 rounded-lg hover:bg-slate-100')\
                     .tooltip("Manually add a character profile")
+
+                    ui.button(
+                        'Organizer Wizard',
+                        icon='groups',
+                        on_click=lambda: CharacterOrganizerModal(project, books, refresh_workspace_with_scroll).open()
+                    ).props('outline dense').classes('text-blue-700 border-blue-200 font-semibold text-xs px-2.5 py-1 rounded-lg hover:bg-blue-50')\
+                    .tooltip("Launch unified Goodreads seeding, prompt parsing, and resolution wizard")
 
                     async def run_prompt_scan():
                         client = ui.context.client

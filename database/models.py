@@ -28,6 +28,10 @@ class Book(SQLModel, table=True):
     prompts_mtime: Optional[float] = Field(default=None)  # Dynamic cache syncing timestamp
     duration: Optional[float] = Field(default=None)       # Cached audiobook total duration in seconds
     book_order: Optional[int] = Field(default=None, description="Chronological sorting index of the book within its project.")
+    
+    # Secondary Metadata Fields
+    author: Optional[str] = Field(default=None)
+    display_title: Optional[str] = Field(default=None, description="Official title harvested from Goodreads metadata")
 
 class Chapter(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -58,6 +62,16 @@ class Character(SQLModel, table=True):
     project_id: int = Field(foreign_key="project.id", index=True)
     name: str = Field(index=True)
     locked: bool = Field(default=False)     # True if manual curation should protect this profile from LLM extraction or compile overwrites
+    
+    # Matching and Tracking Engine Additions
+    origin: str = Field(default="Prompt Scan", description="e.g., 'Goodreads Seed' or 'Prompt Scan'")
+    merge_checked: bool = Field(default=False, description="True if manual reviews/merges for this character are completed")
+    hit_count: int = Field(default=0, description="Cached number of prompts containing this character's name or aliases")
+
+class CharacterBookLink(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    character_id: int = Field(foreign_key="character.id", index=True)
+    book_id: int = Field(foreign_key="book.id", index=True)
 
 class CharacterTimelineEvent(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
