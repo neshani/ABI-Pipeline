@@ -131,26 +131,51 @@ def render_prompt_editor_view(
     with ui.dialog() as find_replace_dialog, ui.card().classes('w-[460px] p-5 rounded-xl gap-3 outline-none focus:outline-none'):
         ui.label('Find & Replace prompts').classes('text-base font-bold text-slate-800')
         
-        find_input = ui.input('Find Text', placeholder='e.g. [Dino]').classes('w-full').props('outlined dense')
-        replace_input = ui.input('Replace With', placeholder='e.g. [Dino Captain]').classes('w-full').props('outlined dense')
+        find_input = ui.input('Find Text', placeholder='e.g. a man').classes('w-full').props('outlined dense')
+        replace_input = ui.input('Replace With', placeholder='e.g. [Ahab]').classes('w-full').props('outlined dense')
         
         # Scope filters
         char_options = ["Any Character"] + [c.name for c in book_characters]
         scope_char = ui.select(options=char_options, value="Any Character", label="Character Filter").classes('w-full').props('outlined dense')
         
+        # Exclusion filter
+        exclude_options = ["None"] + [c.name for c in book_characters]
+        exclude_char = ui.select(options=exclude_options, value="None", label="Exclude Character (and its aliases)").classes('w-full').props('outlined dense')
+        
         with ui.row().classes('w-full gap-2'):
             ch_start = ui.number('Ch Start', value=None).classes('flex-1').props('outlined dense')
             ch_end = ui.number('Ch End', value=None).classes('flex-1').props('outlined dense')
 
+        # Project scope option - uniquely named to prevent scope shadowing collisions
+        find_replace_all_books_checkbox = ui.checkbox('Apply to all books in this project?').classes('text-xs font-semibold text-slate-700 mt-1')
+
         preview_label = ui.label('No actions queued.').classes('text-xs text-slate-400 mt-1 italic')
 
-        def evaluate_find_replace_matches() -> List[Dict[str, Any]]:
+        def get_exclusion_tags() -> set:
+            tags = set()
+            if exclude_char.value != "None":
+                with Session(engine) as session:
+                    char_obj = session.exec(
+                        select(Character)
+                        .where(Character.project_id == project_id)
+                        .where(Character.name == exclude_char.value)
+                    ).first()
+                    if char_obj:
+                        tags.add(f"[{char_obj.name.lower()}]")
+                        aliases = session.exec(
+                            select(CharacterAlias).where(CharacterAlias.character_id == char_obj.id)
+                        ).all()
+                        for alias in aliases:
+                            tags.add(f"[{alias.alias.lower()}]")
+            return tags
+
+        def evaluate_matches_for_prompts(prompts_to_evaluate: List[Dict[str, Any]], exclusion_tags: set) -> List[Dict[str, Any]]:
             target_find = find_input.value.strip()
             if not target_find:
                 return []
                 
             matches = []
-            for p in prompts_list:
+            for p in prompts_to_evaluate:
                 try:
                     ch_num = int(float(p.get("chapter", "1")))
                 except ValueError:
@@ -166,16 +191,26 @@ def render_prompt_editor_view(
                     if char_tag.lower() not in p.get("prompt", "").lower():
                         continue
                         
+                if exclusion_tags:
+                    prompt_lower = p.get("prompt", "").lower()
+                    if any(tag in prompt_lower for tag in exclusion_tags):
+                        continue
+                        
                 if target_find.lower() in p.get("prompt", "").lower():
                     matches.append(p)
             return matches
 
+        def evaluate_find_replace_matches() -> List[Dict[str, Any]]:
+            exclusion_tags = get_exclusion_tags()
+            return evaluate_matches_for_prompts(prompts_list, exclusion_tags)
+
         def update_preview():
             matches = evaluate_find_replace_matches()
-            preview_label.set_text(f"Will modify {len(matches)} matching scenes.")
+            suffix = " (active book preview)" if find_replace_all_books_checkbox.value else ""
+            preview_label.set_text(f"Will modify {len(matches)} matching scenes{suffix}.")
 
-        for input_el in [find_input, scope_char, ch_start, ch_end]:
-            input_el.on('change', update_preview)
+        for input_el in [find_input, scope_char, exclude_char, ch_start, ch_end, find_replace_all_books_checkbox]:
+            input_el.on_value_change(update_preview)
 
         with ui.row().classes('w-full justify-end gap-2 mt-2'):
             ui.button('Cancel', on_click=find_replace_dialog.close).props('flat').classes('text-xs font-semibold text-slate-500')
@@ -187,30 +222,95 @@ def render_prompt_editor_view(
                     ui.notify("Find pattern cannot be empty.", type="negative")
                     return
                     
-                matches = evaluate_find_replace_matches()
-                if not matches:
-                    ui.notify("No matching scenes found to replace.", type="warning")
-                    return
-                    
-                from ui.pages.book_workspace import save_prompts_csv
+                exclusion_tags = get_exclusion_tags()
+                
+                # Retrieve structural info up front and exit SQLite session immediately
                 with Session(engine) as session:
                     project = session.get(Project, project_id)
-                    book = session.get(Book, book_id)
-                    if not project or not book:
+                    current_book = session.get(Book, book_id)
+                    if not project or not current_book:
+                        ui.notify("Project or Book not found in database.", type="negative")
                         return
+                    project_name = project.name
                     
-                    for p in matches:
-                        p["prompt"] = re.sub(re.escape(target_find), target_replace, p.get("prompt", ""), flags=re.IGNORECASE)
-                        
-                save_prompts_csv(project.name, book.name, prompts_list)
-                find_replace_dialog.close()
-                ui.notify(f"Replaced text across {len(matches)} scenes!", type="positive")
+                    if find_replace_all_books_checkbox.value:
+                        db_books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+                        books_to_process = [
+                            {"id": b.id, "name": b.name}
+                            for b in db_books
+                        ]
+                    else:
+                        books_to_process = [{"id": current_book.id, "name": current_book.name}]
+
+                from ui.pages.book_workspace import save_prompts_csv, load_prompts_csv
                 
-                register_new_tags_from_text(target_replace)
+                changed_count = 0
+                books_affected_count = 0
+                reports = []
+                
+                for b in books_to_process:
+                    b_id = b["id"]
+                    b_name = b["name"]
+                    expected_path = f"./output/{project_name}/{b_name}/prompts.csv"
+                    
+                    if b_id == book_id:
+                        # Process current active book from in-memory prompts_list to sync the immediate UI
+                        matches = evaluate_matches_for_prompts(prompts_list, exclusion_tags)
+                        if matches:
+                            for p in matches:
+                                p["prompt"] = re.sub(re.escape(target_find), target_replace, p.get("prompt", ""), flags=re.IGNORECASE)
+                            save_prompts_csv(project_name, b_name, prompts_list)
+                            changed_count += len(matches)
+                            books_affected_count += 1
+                            reports.append(f"🟢 {b_name}: Replaced {len(matches)} scenes.")
+                        else:
+                            reports.append(f"⚪ {b_name}: 0 matching scenes found.")
+                    else:
+                        # Process background books by loading directly from their CSV file
+                        other_prompts = load_prompts_csv(project_name, b_name)
+                        if not other_prompts:
+                            reports.append(f"🔴 {b_name}: CSV not found at '{expected_path}'")
+                            continue
+                            
+                        matches = evaluate_matches_for_prompts(other_prompts, exclusion_tags)
+                        if matches:
+                            for p in matches:
+                                p["prompt"] = re.sub(re.escape(target_find), target_replace, p.get("prompt", ""), flags=re.IGNORECASE)
+                            save_prompts_csv(project_name, b_name, other_prompts)
+                            changed_count += len(matches)
+                            books_affected_count += 1
+                            reports.append(f"🟢 {b_name}: Replaced {len(matches)} scenes.")
+                        else:
+                            reports.append(f"⚪ {b_name}: 0 matching scenes found.")
+                                
+                # Print output logging
+                for report in reports:
+                    state.add_console_log(f"[Find & Replace] {report}")
+
+                # Display detailed diagnostic execution window to the user
+                with ui.dialog() as report_dialog, ui.card().classes('w-[520px] p-5 rounded-xl gap-3 outline-none focus:outline-none'):
+                    ui.label('Find & Replace Execution Summary').classes('text-base font-bold text-slate-800')
+                    
+                    with ui.column().classes('w-full gap-2 max-h-60 overflow-y-auto border p-3 rounded-lg bg-slate-50'):
+                        for report in reports:
+                            if "🔴" in report:
+                                ui.label(report).classes('text-xs text-rose-600 font-mono')
+                            elif "🟢" in report:
+                                ui.label(report).classes('text-xs text-emerald-700 font-semibold font-mono')
+                            else:
+                                ui.label(report).classes('text-xs text-slate-500 font-mono')
+                                
+                    ui.label(f"Modified {changed_count} total scenes across {books_affected_count} books.").classes('text-xs font-bold text-slate-700 mt-1')
+                    
+                    with ui.row().classes('w-full justify-end mt-2'):
+                        ui.button('Dismiss', on_click=report_dialog.close).classes('bg-blue-600 text-white text-xs font-bold px-4 py-1.5 rounded-lg')
+                        
+                report_dialog.open()
                 
                 on_refresh_grid()
                 render_sidebar_list()
                 load_active_scene_details()
+                find_replace_dialog.close()
                 
             ui.button('Apply Replace', on_click=apply_find_replace).classes('bg-blue-600 text-white text-xs font-bold')
 

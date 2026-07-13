@@ -90,10 +90,17 @@ def save_prompts_csv(project_name: str, book_name: str, rows: List[Dict[str, Any
 
         from services.sync_engine import sync_prompts_csv_to_db_cache
         with Session(engine) as session:
-            book = session.exec(select(Book).where(Book.name == book_name)).first()
-            if book:
-                sync_prompts_csv_to_db_cache(book.id, session)
-                session.commit()
+            # Safely locate the unique book by matching both project name and book name
+            project = session.exec(select(Project).where(Project.name == project_name)).first()
+            if project:
+                book = session.exec(
+                    select(Book)
+                    .where(Book.name == book_name)
+                    .where(Book.project_id == project.id)
+                ).first()
+                if book:
+                    sync_prompts_csv_to_db_cache(book.id, session)
+                    session.commit()
     except Exception as e:
         print(f"[Proofreader-CSV] Error saving prompts: {e}")
 
