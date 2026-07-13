@@ -313,6 +313,17 @@ def promote_singleton_to_master(project_id: int, singleton_id: int):
             session.commit()
     save_project_characters_to_json(project_id)
 
+
+def demote_master_to_singleton(project_id: int, master_id: int):
+    """Demotes a master profile back to an unresolved singleton."""
+    with Session(engine) as session:
+        char = session.get(Character, master_id)
+        if char:
+            char.merge_checked = False
+            session.add(char)
+            session.commit()
+    save_project_characters_to_json(project_id)
+
 def zap_singleton_into_master(project_id: int, candidate_id: int, target_id: int):
     """Consolidates candidate character aliases, links, and overrides into target."""
     with Session(engine) as session:
@@ -393,7 +404,9 @@ def zap_singleton_into_master(project_id: int, candidate_id: int, target_id: int
                 session.add(base_ev)
                 session.commit()
                 
+    recalculate_project_character_hits(project_id)
     save_project_characters_to_json(project_id)
+
 
 def remove_alias_from_master_by_text(project_id: int, target_id: int, alias_text: str):
     """Deletes alias row and recreates it as a standalone unresolved singleton on the left."""
@@ -436,6 +449,8 @@ def remove_alias_from_master_by_text(project_id: int, target_id: int, alias_text
             session.add(base_ev)
             
         session.commit()
+        
+    recalculate_project_character_hits(project_id)
     save_project_characters_to_json(project_id)
 
 
@@ -781,9 +796,15 @@ def recalculate_project_character_hits(project_id: int):
         session.commit()
 
 
+# services/character_organizer.py
+
+# services/character_organizer.py
+
 def prune_unused_seeded_characters(project_id: int):
     """
     Silently deletes any unlocked character with hit_count == 0.
+    Also prunes any unused aliases (0 hits) that differ from the character's canonical name,
+    regardless of the character's locked status.
     Safety mechanism: Only triggers if prompt files actually exist in the project,
     ensuring we never prune characters before a scan is run.
     """
@@ -807,10 +828,11 @@ def prune_unused_seeded_characters(project_id: int):
         if not has_prompts:
             return
             
+        # 1. Prune unused characters
         unused_chars = session.exec(
             select(Character)
             .where(Character.project_id == project_id)
-            .where(Character.locked == False)
+            .where(Character.locked == False) # Only unlocked characters can be entirely deleted
             .where(Character.hit_count == 0)
         ).all()
         
@@ -830,5 +852,31 @@ def prune_unused_seeded_characters(project_id: int):
                 
             session.delete(uc)
             
+        # 2. Prune unused aliases for *all* remaining active characters
+        freq_map = get_character_frequency_map_db(project.name, session)
+        
+        # This query now fetches all active characters, regardless of locked status,
+        # so their aliases can be cleaned up.
+        active_chars = session.exec(
+            select(Character)
+            .where(Character.project_id == project_id)
+        ).all()
+        
+        for ac in active_chars:
+            aliases = session.exec(
+                select(CharacterAlias)
+                .where(CharacterAlias.character_id == ac.id)
+            ).all()
+            
+            for alias in aliases:
+                alias_text = alias.alias.lower().strip()
+                canonical_text = ac.name.lower().strip()
+                
+                # Delete the alias if it is not the canonical name and has 0 hits in prompts.csv
+                if alias_text != canonical_text:
+                    hits = freq_map.get(alias_text, 0)
+                    if hits == 0:
+                        session.delete(alias)
+                        
         session.commit()
     save_project_characters_to_json(project_id)

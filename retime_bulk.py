@@ -7,14 +7,18 @@ from database.models import Project, Book
 from services.transcription import transcribe_book, get_onnx_model
 from services.timing_sync import sync_book_timing
 
-def bulk_retime(project_id: int, target_book: str = None, force: bool = False):
+def bulk_retime(project_id: int, target_book: str = None, force: bool = False, only_prompts: bool = False):
     """
-    Automates re-transcribing audio files to generate precise timing JSONs,
-    then updates the existing prompts.csv with high-accuracy timestamps.
+    Automates timing map alignment, then updates the existing prompts.csv with 
+    high-accuracy timestamps. If only_prompts is True, skips speech-to-text transcription.
     """
-    print(f"[Bulk-Retime] Loading speech-to-text model...")
-    # This automatically uses the model configured in your settings (Parakeet ONNX or Faster-Whisper)
-    model = get_onnx_model() 
+    model = None
+    if not only_prompts:
+        print(f"[Bulk-Retime] Loading speech-to-text model...")
+        # This automatically uses the model configured in your settings (Parakeet ONNX or Faster-Whisper)
+        model = get_onnx_model() 
+    else:
+        print(f"[Bulk-Retime] Skipping speech-to-text model loading (/prompt_fix mode activated)...")
 
     with Session(engine) as session:
         project = session.get(Project, project_id)
@@ -43,14 +47,17 @@ def bulk_retime(project_id: int, target_book: str = None, force: bool = False):
             print(f" Processing Book: {book.name} (ID: {book.id})")
             print(f"==========================================")
             
-            # Reset book status temporarily so the transcriber doesn't skip it
-            book.status = "Imported"
-            session.add(book)
-            session.commit()
-            
-            # Step 1: Re-transcribe to generate the timing JSON (does NOT overwrite prompts.csv)
-            print(f"[Bulk-Retime] Running transcription to generate timing maps (Force={force})...")
-            transcribe_book(book.id, model, project.id, force_retranscribe=force)
+            if not only_prompts:
+                # Reset book status temporarily so the transcriber doesn't skip it
+                book.status = "Imported"
+                session.add(book)
+                session.commit()
+                
+                # Step 1: Re-transcribe to generate the timing JSON (does NOT overwrite prompts.csv)
+                print(f"[Bulk-Retime] Running transcription to generate timing maps (Force={force})...")
+                transcribe_book(book.id, model, project.id, force_retranscribe=force)
+            else:
+                print(f"[Bulk-Retime] Only recalculating prompt timestamps from physical audio. Skipping transcription...")
             
             # Step 2: Run timing synchronization (overwrites ONLY the timestamp column in prompts.csv)
             # Pass auto_approve=True to automatically approve these existing pre-approved books
@@ -132,6 +139,7 @@ and updates the timestamp column in target 'prompts.csv' flat-files.
 
 Usage:
   python retime_bulk.py <PROJECT_ID> [options]
+  python retime_bulk.py <PROJECT_ID> /prompt_fix [options]
   python retime_bulk.py /fix
   python retime_bulk.py /redo
   python retime_bulk.py /?
@@ -139,6 +147,9 @@ Usage:
 Core Commands:
   <PROJECT_ID>            Target a specific SQLModel project ID to re-transcribe 
                           and align timestamps.
+  /prompt_fix             Skips slow speech-to-text transcription and instantly
+                          recalculates prompt timestamps based on physical audio 
+                          and existing timing maps. Perfect for fixing VBR/offset drift.
   /fix, /redo             Launches interactive standalone repair mode. Repair and 
                           approve an out-of-sync 'prompts.csv' file without 
                           running slow audio re-transcription.
@@ -160,22 +171,35 @@ if __name__ == "__main__":
         print_help()
         sys.exit(1)
     
-    arg = sys.argv[1].lower()
-    if arg in ["/?", "-h", "--help", "help"]:
+    # Check for help flags
+    arg_lower_list = [a.lower() for a in sys.argv]
+    if any(h in arg_lower_list for h in ["/?", "-h", "--help", "help"]):
         print_help()
         sys.exit(0)
         
+    prompt_fix_flags = {"/prompt_fix", "/prompt", "--prompt_fix", "--prompt-fix", "-prompt_fix", "-prompt"}
+    only_prompts_opt = any(p in arg_lower_list for p in prompt_fix_flags)
+    
+    # Clean sys.argv to allow the rest of the parsing to proceed smoothly
+    cleaned_argv = [a for a in sys.argv if a.lower() not in prompt_fix_flags]
+    
+    if len(cleaned_argv) < 2:
+        # If they only passed a prompt_fix flag, launch interactive repair mode
+        run_interactive_fix()
+        sys.exit(0)
+        
+    arg = cleaned_argv[1].lower()
     if arg in ["/fix", "/redo", "-fix", "-redo", "--fix", "--redo"]:
         run_interactive_fix()
     else:
         try:
-            pid = int(sys.argv[1])
+            pid = int(cleaned_argv[1])
             
             # Parse additional optional arguments
             target_book_opt = None
             force_retranscribe_opt = False
             
-            args = sys.argv[2:]
+            args = cleaned_argv[2:]
             i = 0
             while i < len(args):
                 arg_clean = args[i].lower()
@@ -188,7 +212,7 @@ if __name__ == "__main__":
                 else:
                     i += 1
                     
-            bulk_retime(pid, target_book=target_book_opt, force=force_retranscribe_opt)
+            bulk_retime(pid, target_book=target_book_opt, force=force_retranscribe_opt, only_prompts=only_prompts_opt)
         except ValueError:
-            print(f"Error: Unknown argument or invalid project ID: '{sys.argv[1]}'. Use /? for usage details.")
+            print(f"Error: Unknown argument or invalid project ID: '{cleaned_argv[1]}'. Use /? for usage details.")
             sys.exit(1)

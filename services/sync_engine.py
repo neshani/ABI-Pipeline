@@ -351,15 +351,12 @@ def prune_stale_database_records(session: Session) -> None:
 
 def ensure_book_chapters_populated(book: Book, book_dir: Path, source_path_str: Optional[str], session: Session) -> None:
     """
-    Ensures that Chapter records for a given Book are fully populated in the database.
-    Prioritizes probing original source audiobook files for precise boundaries and stems,
-    falling back to splitting paragraphs from compiled transcript.txt files if audio is missing.
+    Ensures that Chapter records for a given Book are populated and match the current physical audio sources.
+    If physical audio formats or counts change on disk (e.g. converted from split MP3s to a single M4B),
+    automatically rebuilds the chapter plan in SQLite to stay aligned.
     """
-    existing_ch_count = len(session.exec(select(Chapter).where(Chapter.book_id == book.id)).all())
-    if existing_ch_count > 0:
-        return  # Chapters already indexed
-
     from services.scanner import find_audio_sources, create_chapter_plan_for_book
+    from sqlmodel import delete
 
     audio_type = 'none'
     audio_files = []
@@ -374,45 +371,69 @@ def ensure_book_chapters_populated(book: Book, book_dir: Path, source_path_str: 
     if audio_type == 'none' and book_dir.exists():
         audio_type, audio_files = find_audio_sources(book_dir)
 
-    if audio_type != 'none' and audio_files:
-        try:
-            create_chapter_plan_for_book(
-                book_id=book.id,
-                audio_type=audio_type,
-                files=[str(f) for f in audio_files],
-                session=session
-            )
+    # 3. Query existing database chapter status
+    existing_chapters = session.exec(
+        select(Chapter).where(Chapter.book_id == book.id).order_by(Chapter.chapter_num)
+    ).all()
+    existing_ch_count = len(existing_chapters)
+
+    # Self-healing: if the physical files on disk have changed structure, clear DB chapters to force rebuild
+    needs_rebuild = False
+    if existing_ch_count > 0:
+        db_types = {ch.type for ch in existing_chapters}
+        if audio_type == 'single_file' and 'file' in db_types:
+            needs_rebuild = True
+        elif audio_type == 'multi_file' and 'segment' in db_types:
+            needs_rebuild = True
+        elif audio_type == 'multi_file' and existing_ch_count != len(audio_files):
+            needs_rebuild = True
+
+    if existing_ch_count == 0 or needs_rebuild:
+        if existing_ch_count > 0:
+            print(f"[Sync-Engine] Audio files changed on disk for '{book.name}'. Wiping database chapters to rebuild cache...")
+            session.exec(delete(Chapter).where(Chapter.book_id == book.id))
             session.flush()
-            print(f"[Sync-Engine] Successfully parsed chapters from audio files for '{book.name}'")
-            return
-        except Exception as e:
-            print(f"[Sync-Engine] Error probing audio tracks during recovery: {e}")
 
-    # 3. Last fallback: Split raw transcript.txt if present (e.g. text or EPUB books)
-    transcript_file = book_dir / "transcript.txt"
-    if transcript_file.exists():
-        try:
-            with open(transcript_file, "r", encoding="utf-8") as f:
-                content = f.read()
-            sections = content.split("==CHAPTER==")
-            cleaned_sections = [s.strip() for s in sections if s.strip()]
-
-            for idx in range(len(cleaned_sections)):
-                ch_num = idx + 1
-                new_ch = Chapter(
+        if audio_type != 'none' and audio_files:
+            try:
+                create_chapter_plan_for_book(
                     book_id=book.id,
-                    chapter_num=ch_num,
-                    title=f"Chapter {ch_num}",
-                    status="Completed",
-                    word_count=len(cleaned_sections[idx].split()),
-                    total_images=0,
-                    completed_images=0
+                    audio_type=audio_type,
+                    files=[str(f) for f in audio_files],
+                    session=session
                 )
-                session.add(new_ch)
-            session.flush()
-            print(f"[Sync-Engine] Reconstructed chapters for '{book.name}' by splitting transcript.txt")
-        except Exception as e:
-            print(f"[Sync-Engine] Error reconstructing chapters from transcript: {e}")
+                session.flush()
+                print(f"[Sync-Engine] Successfully parsed chapters from audio files for '{book.name}'")
+                return
+            except Exception as e:
+                print(f"[Sync-Engine] Error probing audio tracks during recovery: {e}")
+
+    # 4. Last fallback: Split raw transcript.txt if present (e.g. text or EPUB books)
+    if existing_ch_count == 0:
+        transcript_file = book_dir / "transcript.txt"
+        if transcript_file.exists():
+            try:
+                with open(transcript_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                sections = content.split("==CHAPTER==")
+                cleaned_sections = [s.strip() for s in sections if s.strip()]
+
+                for idx in range(len(cleaned_sections)):
+                    ch_num = idx + 1
+                    new_ch = Chapter(
+                        book_id=book.id,
+                        chapter_num=ch_num,
+                        title=f"Chapter {ch_num}",
+                        status="Completed",
+                        word_count=len(cleaned_sections[idx].split()),
+                        total_images=0,
+                        completed_images=0
+                    )
+                    session.add(new_ch)
+                session.flush()
+                print(f"[Sync-Engine] Reconstructed chapters for '{book.name}' by splitting transcript.txt")
+            except Exception as e:
+                print(f"[Sync-Engine] Error reconstructing chapters from transcript: {e}")
 
 
 def heal_project_book_orders(project_id: int, session: Session) -> None:
