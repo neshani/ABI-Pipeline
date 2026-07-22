@@ -580,9 +580,9 @@ def render_project_tabs(
             choice = rollback_choice.value
             ui.notify("Executing rollback and archiving files...", type="info")
             await asyncio.to_thread(execute_project_rollback_io, project.id, choice)
-            await asyncio.to_thread(rescan_project_database_state, project.id)
+            await asyncio.to_thread(rescan_project_database_state, project.id, True)
             
-            render_dynamic_step_dashboard.refresh()
+            render_active_panel.refresh()
             if hasattr(state, 'active_header_refresh') and state.active_header_refresh:
                 state.active_header_refresh()
             rollback_dialog.close()
@@ -644,12 +644,25 @@ def render_project_tabs(
             except Exception as ex:
                 ui.notify(f"Failed to open project folder: {str(ex)}", type="negative")
 
+        async def force_sync_project():
+            ui.notify("Scanning project files on disk...", type="info")
+            await asyncio.to_thread(rescan_project_database_state, project.id, True)
+            ui.notify("Sync complete!", type="positive")
+            render_active_panel.refresh()
+            if hasattr(state, 'active_header_refresh') and state.active_header_refresh:
+                state.active_header_refresh()
+
         with ui.row().classes('items-center gap-2'):
             ui.button(
                 'Open Folder', 
                 icon='folder_open', 
                 on_click=open_project_folder
             ).props('flat dense').classes('text-xs text-slate-600')
+            ui.button(
+                'Sync with Disk',
+                icon='sync',
+                on_click=force_sync_project
+            ).props('flat dense').classes('text-xs text-blue-600 hover:text-blue-800')
             ui.button(
                 'Rollback Project',
                 icon='history',
@@ -661,23 +674,11 @@ def render_project_tabs(
                 on_click=delete_dialog.open
             ).props('flat dense').classes('text-xs text-rose-600 hover:text-rose-800')
     
-    def handle_tab_change(e):
-        state.active_project_tab = e.value
-        if e.value == 'Style & Workflows':
-            from ui.pages.project.style_playground import sync_style_playground_state
-            sync_style_playground_state(project.name)
-
-    with ui.tabs(on_change=handle_tab_change).classes('w-full border-b') as project_tabs:
-        tab_dash = ui.tab('Dashboard', icon='dashboard')
-        tab_play = ui.tab('Prompt-Gen Playground', icon='science')
-        tab_char = ui.tab('Characters', icon='face')
-        tab_style = ui.tab('Style & Workflows', icon='brush')
-        tab_pack = ui.tab('OIS Packager', icon='inventory_2')
-        
-    project_tabs.bind_value(state, 'active_project_tab')
-        
-    with ui.tab_panels(project_tabs, value=state.active_project_tab).classes('w-full bg-transparent p-0'):
-        with ui.tab_panel(tab_dash):
+    # Refreshable Tab Router - Only renders the selected tab panel to achieve instant loading performance!
+    @ui.refreshable
+    def render_active_panel():
+        active = state.active_project_tab
+        if active == 'Dashboard':
             with ui.column().classes('w-full gap-4'):
                 global render_dynamic_step_dashboard
                 @ui.refreshable
@@ -688,65 +689,93 @@ def render_project_tabs(
                     elif status in ("Transcribed", "Generating Prompts"):
                         render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb)
                     else:
-                        # Keeps dashboard at the ComfyUI Image Generation stage for "Prompts Created", 
-                        # "Rendering Images", "Images Created", "Proofreading", and "Finished" states
                         render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb)
                         
                 render_dynamic_step_dashboard = render_dynamic_step_dashboard_local
                 render_dynamic_step_dashboard()
 
-            @ui.refreshable
-            def render_conditional_feeds():
-                status = state.project_status
-                if status not in ("Imported", "Transcribing", "Transcribed", "Generating Prompts"):
-                    render_recent_images_feed()
-                    
-            render_conditional_feeds()
-            
-            with ui.card().classes('w-full border p-5 shadow-sm bg-white mt-4 gap-3'):
-                with ui.row().classes('w-full justify-between items-center'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon('terminal', size='sm', color='slate-700')
-                        ui.label('Process Control Console').classes('text-sm font-bold text-slate-800')
-                    ui.button('Clear Logs', on_click=lambda: (state.console_logs.clear(), log_widget.clear())).props('flat dense').classes('text-xs text-slate-500')
-                
-                log_widget = ui.log(max_lines=300).classes('w-full h-64 bg-slate-900 text-slate-100 font-mono text-xs p-3 rounded-lg leading-relaxed')
-                for line in state.console_logs:
-                    log_widget.push(line)
-                
-                state.active_log_widget = log_widget
-                state.logs_pushed_index = len(state.console_logs)
-
-            @ui.refreshable
-            def render_conditional_prompt_feed():
-                status = state.project_status
-                if status not in ("Imported", "Transcribing"):
-                    render_recent_prompts_feed()
-                    
-            render_conditional_prompt_feed()
-
-            state.action_buttons_refresh = lambda: (
-                render_dynamic_step_dashboard.refresh(), 
-                render_conditional_feeds.refresh(), 
-                render_conditional_prompt_feed.refresh()
-            )
+                @ui.refreshable
+                def render_conditional_feeds():
+                    status = state.project_status
+                    if status not in ("Imported", "Transcribing", "Transcribed", "Generating Prompts"):
+                        render_recent_images_feed()
                         
-        with ui.tab_panel(tab_play):
-            # Delegates rendering directly to the modular prompt_playground page!
+                render_conditional_feeds()
+                
+                with ui.card().classes('w-full border p-5 shadow-sm bg-white mt-4 gap-3'):
+                    with ui.row().classes('w-full justify-between items-center'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('terminal', size='sm', color='slate-700')
+                            ui.label('Process Control Console').classes('text-sm font-bold text-slate-800')
+                        ui.button('Clear Logs', on_click=lambda: (state.console_logs.clear(), log_widget.clear())).props('flat dense').classes('text-xs text-slate-500')
+                    
+                    log_widget = ui.log(max_lines=300).classes('w-full h-64 bg-slate-900 text-slate-100 font-mono text-xs p-3 rounded-lg leading-relaxed')
+                    for line in state.console_logs:
+                        log_widget.push(line)
+                    
+                    state.active_log_widget = log_widget
+                    state.logs_pushed_index = len(state.console_logs)
+
+                @ui.refreshable
+                def render_conditional_prompt_feed():
+                    status = state.project_status
+                    if status not in ("Imported", "Transcribing"):
+                        render_recent_prompts_feed()
+                        
+                render_conditional_prompt_feed()
+
+                def safe_refresh():
+                    try:
+                        render_dynamic_step_dashboard.refresh()
+                    except Exception:
+                        pass
+                    try:
+                        render_conditional_feeds.refresh()
+                    except Exception:
+                        pass
+                    try:
+                        render_conditional_prompt_feed.refresh()
+                    except Exception:
+                        pass
+
+                state.action_buttons_refresh = safe_refresh
+                            
+        elif active == 'Prompt-Gen Playground':
             render_prompt_playground_tab(project, books)
 
-        with ui.tab_panel(tab_char):
-            # Modular project-level characters tab view!
+        elif active == 'Characters':
+            # Modular project-level characters tab view loaded on demand!
             from ui.pages.project.characters_tab import render_characters_tab
             render_characters_tab(project, books)
 
-        with ui.tab_panel(tab_style):
-            # Delegates rendering directly to the modular style_playground page!
+        elif active == 'Style & Workflows':
+            # Style & Workflow tab rendered on demand!
             render_style_playground_tab(project, save_project_settings_cb)
 
-        with ui.tab_panel(tab_pack):
-            # Lazy import to keep startup footprint small and avoid workspace dependency conflicts
+        elif active == 'OIS Packager':
+            # Packager playground rendered on demand!
             from ui.pages.project.packager_playground import PackagerPlayground
             if not hasattr(state, 'packager_playground') or state.packager_playground.project_id != project.id:
                 state.packager_playground = PackagerPlayground(project.id, project.name)
             state.packager_playground.render(project, books)
+
+    def handle_tab_change(e):
+        state.active_project_tab = e.value
+        if e.value == 'Style & Workflows':
+            from ui.pages.project.style_playground import sync_style_playground_state
+            sync_style_playground_state(project.name)
+        render_active_panel.refresh()
+
+    with ui.tabs(on_change=handle_tab_change).classes('w-full border-b') as project_tabs:
+        tab_dash = ui.tab('Dashboard', icon='dashboard')
+        tab_play = ui.tab('Prompt-Gen Playground', icon='science')
+        tab_char = ui.tab('Characters', icon='face')
+        tab_style = ui.tab('Style & Workflows', icon='brush')
+        tab_pack = ui.tab('OIS Packager', icon='inventory_2')
+        
+    project_tabs.bind_value(state, 'active_project_tab')
+        
+    # Render active panel container
+    with ui.column().classes('w-full mt-4'):
+        render_active_panel()
+        
