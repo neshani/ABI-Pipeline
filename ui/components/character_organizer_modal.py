@@ -114,73 +114,84 @@ class CharacterOrganizerModal(ui.dialog):
             self.refresh_callback()
 
     def switch_view(self, view_name: str):
-        self.current_view = view_name
-        
-        self.tab_gr.classes(add='bg-slate-50' if view_name == 'gr' else '', remove='bg-slate-50' if view_name != 'gr' else '')
-        self.tab_scan.classes(add='bg-slate-50' if view_name == 'scan' else '', remove='bg-slate-50' if view_name != 'scan' else '')
-        self.tab_merge.classes(add='bg-slate-50' if view_name == 'merge' else '', remove='bg-slate-50' if view_name != 'merge' else '')
-        
-        if view_name == 'merge':
-            # Run hit recalculation dynamically to refresh zeroed states on entries
-            recalculate_project_character_hits(self.project.id)
+        with self.client:
+            self.current_view = view_name
             
-        self.draw_view()
+            self.tab_gr.classes(add='bg-slate-50' if view_name == 'gr' else '', remove='bg-slate-50' if view_name != 'gr' else '')
+            self.tab_scan.classes(add='bg-slate-50' if view_name == 'scan' else '', remove='bg-slate-50' if view_name != 'scan' else '')
+            self.tab_merge.classes(add='bg-slate-50' if view_name == 'merge' else '', remove='bg-slate-50' if view_name != 'merge' else '')
+            
+            if view_name == 'merge':
+                # Run hit recalculation dynamically to refresh zeroed states on entries
+                recalculate_project_character_hits(self.project.id)
+                
+            self.draw_view()
 
     def set_active_master(self, master_id: Optional[int]):
-        self.active_master_id = master_id
-        if master_id is not None:
-            self.active_singleton_id = None # Clear active singleton when selecting a master
-        self.refresh_masters_list_only()
-        self.refresh_unresolved_list_only()
+        with self.client:
+            self.active_master_id = master_id
+            if master_id is not None:
+                self.active_singleton_id = None # Clear active singleton when selecting a master
+            self.refresh_masters_list_only()
+            self.refresh_unresolved_list_only()
 
     def set_active_singleton(self, singleton_id: Optional[int]):
-        self.active_singleton_id = singleton_id
-        if singleton_id is not None:
-            self.active_master_id = None # Clear active master when selecting a singleton
-        self.refresh_masters_list_only()
-        self.refresh_unresolved_list_only()
+        with self.client:
+            self.active_singleton_id = singleton_id
+            if singleton_id is not None:
+                self.active_master_id = None # Clear active master when selecting a singleton
+            self.refresh_masters_list_only()
+            self.refresh_unresolved_list_only()
 
     def toggle_magnet(self, e):
-        self.magnet_filter_enabled = e.value
-        self.refresh_unresolved_list_only()
-        self.refresh_masters_list_only()
+        with self.client:
+            self.magnet_filter_enabled = e.value
+            self.refresh_unresolved_list_only()
+            self.refresh_masters_list_only()
 
     def toggle_hide_populated(self, e):
-        self.hide_populated_enabled = e.value
-        self.refresh_masters_list_only()
+        with self.client:
+            self.hide_populated_enabled = e.value
+            self.refresh_masters_list_only()
 
     def toggle_show_masters(self, e):
-        self.show_masters_in_queue = e.value
-        self.refresh_unresolved_list_only()
+        with self.client:
+            self.show_masters_in_queue = e.value
+            self.refresh_unresolved_list_only()
 
     def toggle_unresolved_sort(self):
-        self.unresolved_sort_by_hits = not self.unresolved_sort_by_hits
-        self.refresh_unresolved_list_only()
+        with self.client:
+            self.unresolved_sort_by_hits = not self.unresolved_sort_by_hits
+            self.refresh_unresolved_list_only()
 
     def toggle_masters_sort(self):
-        self.masters_sort_by_hits = not self.masters_sort_by_hits
-        self.refresh_masters_list_only()
+        with self.client:
+            self.masters_sort_by_hits = not self.masters_sort_by_hits
+            self.refresh_masters_list_only()
 
     def handle_fuzz_change(self, e):
-        new_val = e.args if hasattr(e, 'args') and e.args is not None else getattr(e, 'value', self.fuzz_threshold)
-        if isinstance(new_val, list) and len(new_val) > 0:
-            new_val = new_val[0]
-            
-        try:
-            self.fuzz_threshold = float(new_val)
-        except (ValueError, TypeError):
-            return
-            
-        self.refresh_unresolved_list_only()
-        self.refresh_masters_list_only()
+        with self.client:
+            new_val = e.args if hasattr(e, 'args') and e.args is not None else getattr(e, 'value', self.fuzz_threshold)
+            if isinstance(new_val, list) and len(new_val) > 0:
+                new_val = new_val[0]
+                
+            try:
+                self.fuzz_threshold = float(new_val)
+            except (ValueError, TypeError):
+                return
+                
+            self.refresh_unresolved_list_only()
+            self.refresh_masters_list_only()
 
     def handle_unresolved_search(self, e):
-        self.unresolved_filter_text = e.value.strip().lower() if e.value else ""
-        self.refresh_unresolved_list_only()
+        with self.client:
+            self.unresolved_filter_text = e.value.strip().lower() if e.value else ""
+            self.refresh_unresolved_list_only()
 
     def handle_masters_search(self, e):
-        self.masters_filter_text = e.value.strip().lower() if e.value else ""
-        self.refresh_masters_list_only()
+        with self.client:
+            self.masters_filter_text = e.value.strip().lower() if e.value else ""
+            self.refresh_masters_list_only()
 
     def populate_active_chips_inline(self, char_id: int, tgt_name: str):
         with Session(engine) as session:
@@ -197,8 +208,9 @@ class CharacterOrganizerModal(ui.dialog):
                     
                     def make_rollback_cb(al=alias, tid=char_id):
                         def rollback_alias():
-                            remove_alias_from_master_by_text(self.project.id, tid, al)
-                            self.draw_view()
+                            with self.client:
+                                remove_alias_from_master_by_text(self.project.id, tid, al)
+                                self.draw_view()
                         return rollback_alias
                         
                     ui.button(icon='close', on_click=make_rollback_cb()).props('flat round dense').classes('text-green-400 hover:text-green-600 text-[9px] w-4 h-4 p-0 min-h-0')
@@ -227,17 +239,18 @@ class CharacterOrganizerModal(ui.dialog):
             
             def make_zap_cb(cid=item["id"], el=row_el, name=item["name"]):
                 def on_zap():
-                    if self.active_master_id is None:
-                        ui.notify("Select an active target profile (Green) on the right first!", type="warning")
-                        return
-                    
-                    zap_singleton_into_master(self.project.id, cid, self.active_master_id)
-                    el.delete()
-                    self.rendered_singleton_ids.discard(cid)
-                    
-                    self.refresh_active_chips_only()
-                    self.refresh_unresolved_list_only()
-                    self.refresh_masters_list_only()
+                    with self.client:
+                        if self.active_master_id is None:
+                            ui.notify("Select an active target profile (Green) on the right first!", type="warning")
+                            return
+                        
+                        zap_singleton_into_master(self.project.id, cid, self.active_master_id)
+                        el.delete()
+                        self.rendered_singleton_ids.discard(cid)
+                        
+                        self.refresh_active_chips_only()
+                        self.refresh_unresolved_list_only()
+                        self.refresh_masters_list_only()
                 return on_zap
                 
             ui.button(icon='chevron_right').on('click.stop', make_zap_cb()).props('dense unelevated').classes('bg-blue-600 hover:bg-blue-700 text-white w-7 h-7 rounded-md shrink-0 flex items-center justify-center')
@@ -254,9 +267,10 @@ class CharacterOrganizerModal(ui.dialog):
             if not item["is_master"]:
                 def make_promote_cb(cid=item["id"], name=item["name"]):
                     def on_promote():
-                        promote_singleton_to_master(self.project.id, cid)
-                        self.set_active_master(cid)
-                        ui.notify(f"Promoted '{name}' to Master Profile!", type="success")
+                        with self.client:
+                            promote_singleton_to_master(self.project.id, cid)
+                            self.set_active_master(cid)
+                            ui.notify(f"Promoted '{name}' to Master Profile!", type="success")
                     return on_promote
                     
                 ui.button(icon='star_border').on('click.stop', make_promote_cb()).props('dense flat round').classes('text-slate-400 hover:text-blue-600 shrink-0').tooltip('Promote to Master')
@@ -323,71 +337,73 @@ class CharacterOrganizerModal(ui.dialog):
         Pass 1: Merges singletons matching exactly one master profile.
         Pass 2: Groups remaining singletons with each other, promoting the one with the highest hit frequency.
         """
-        singletons = get_unresolved_singletons(self.project.id)
-        masters = get_master_profiles(self.project.id)
-        
-        if not singletons:
-            ui.notify("No unresolved singletons to auto-merge.", type="info")
-            return
+        with self.client:
+            singletons = get_unresolved_singletons(self.project.id)
+            masters = get_master_profiles(self.project.id)
             
-        merged_count = 0
-        promoted_count = 0
-        processed_ids = set()
-        
-        # Pass 1: Resolve Singleton-to-Master mapping (unambiguous matches)
-        for sing in singletons:
-            matched_masters = []
-            for m in masters:
-                if is_loose_match(sing["name"], m["name"], m["aliases"], self.fuzz_threshold):
-                    matched_masters.append(m)
-                    
-            if len(matched_masters) == 1:
-                target_master = matched_masters[0]
-                zap_singleton_into_master(self.project.id, sing["id"], target_master["id"])
-                processed_ids.add(sing["id"])
-                merged_count += 1
-                target_master["aliases"].append(sing["name"])
+            if not singletons:
+                ui.notify("No unresolved singletons to auto-merge.", type="info")
+                return
                 
-        # Pass 2: Resolve Singleton-to-Singleton matches (unseeded environments)
-        remaining_singletons = [s for s in singletons if s["id"] not in processed_ids]
-        
-        for sing in remaining_singletons:
-            if sing["id"] in processed_ids:
-                continue
-                
-            cluster = [sing]
-            for other in remaining_singletons:
-                if other["id"] == sing["id"] or other["id"] in processed_ids:
-                    continue
-                if is_loose_match(other["name"], sing["name"], [], self.fuzz_threshold):
-                    cluster.append(other)
-                    
-            if len(cluster) > 1:
-                # Sort cluster descending by hit frequency to find the optimal canonical master
-                cluster.sort(key=lambda x: x["hit_count"], reverse=True)
-                parent = cluster[0]
-                
-                promote_singleton_to_master(self.project.id, parent["id"])
-                promoted_count += 1
-                processed_ids.add(parent["id"])
-                
-                for child in cluster[1:]:
-                    zap_singleton_into_master(self.project.id, child["id"], parent["id"])
-                    processed_ids.add(child["id"])
+            merged_count = 0
+            promoted_count = 0
+            processed_ids = set()
+            
+            # Pass 1: Resolve Singleton-to-Master mapping (unambiguous matches)
+            for sing in singletons:
+                matched_masters = []
+                for m in masters:
+                    if is_loose_match(sing["name"], m["name"], m["aliases"], self.fuzz_threshold):
+                        matched_masters.append(m)
+                        
+                if len(matched_masters) == 1:
+                    target_master = matched_masters[0]
+                    zap_singleton_into_master(self.project.id, sing["id"], target_master["id"])
+                    processed_ids.add(sing["id"])
                     merged_count += 1
+                    target_master["aliases"].append(sing["name"])
                     
-        if merged_count > 0 or promoted_count > 0:
-            ui.notify(f"Auto-merged {merged_count} characters and promoted {promoted_count} new master profiles!", type="positive")
-            self.draw_view()
-        else:
-            ui.notify("No unambiguous fuzzy matches found at current threshold.", type="info")
+            # Pass 2: Resolve Singleton-to-Singleton matches (unseeded environments)
+            remaining_singletons = [s for s in singletons if s["id"] not in processed_ids]
+            
+            for sing in remaining_singletons:
+                if sing["id"] in processed_ids:
+                    continue
+                    
+                cluster = [sing]
+                for other in remaining_singletons:
+                    if other["id"] == sing["id"] or other["id"] in processed_ids:
+                        continue
+                    if is_loose_match(other["name"], sing["name"], [], self.fuzz_threshold):
+                        cluster.append(other)
+                        
+                if len(cluster) > 1:
+                    # Sort cluster descending by hit frequency to find the optimal canonical master
+                    cluster.sort(key=lambda x: x["hit_count"], reverse=True)
+                    parent = cluster[0]
+                    
+                    promote_singleton_to_master(self.project.id, parent["id"])
+                    promoted_count += 1
+                    processed_ids.add(parent["id"])
+                    
+                    for child in cluster[1:]:
+                        zap_singleton_into_master(self.project.id, child["id"], parent["id"])
+                        processed_ids.add(child["id"])
+                        merged_count += 1
+                        
+            if merged_count > 0 or promoted_count > 0:
+                ui.notify(f"Auto-merged {merged_count} characters and promoted {promoted_count} new master profiles!", type="positive")
+                self.draw_view()
+            else:
+                ui.notify("No unambiguous fuzzy matches found at current threshold.", type="info")
 
     def run_explicit_pruning(self):
         """Silently deletes any unlocked character with hit_count == 0."""
-        prune_unused_seeded_characters(self.project.id)
-        ui.notify("Pruned unused seeded characters with 0 hits.", type="positive")
-        self.safe_invoke_callback()
-        self.draw_view()
+        with self.client:
+            prune_unused_seeded_characters(self.project.id)
+            ui.notify("Pruned unused seeded characters with 0 hits.", type="positive")
+            self.safe_invoke_callback()
+            self.draw_view()
 
     def render_master_row(self, m):
         if m["id"] == self.active_master_id:
@@ -433,9 +449,10 @@ class CharacterOrganizerModal(ui.dialog):
                             if not m["locked"]:
                                 def make_demote_cb(mid=m["id"]):
                                     def on_demote():
-                                        demote_master_to_singleton(self.project.id, mid)
-                                        ui.notify("Character demoted back to Unresolved Queue.", type="info")
-                                        self.draw_view()
+                                        with self.client:
+                                            demote_master_to_singleton(self.project.id, mid)
+                                            ui.notify("Character demoted back to Unresolved Queue.", type="info")
+                                            self.draw_view()
                                     return on_demote
                                 ui.button(icon='undo').on('click.stop', make_demote_cb).props('dense flat round size=xs').classes('text-slate-400 hover:text-red-500 shrink-0 ml-1').tooltip('Demote to Unresolved Singleton')
                                 
@@ -563,11 +580,12 @@ class CharacterOrganizerModal(ui.dialog):
 
     def run_tag_scan(self):
         """Executes the prompt tag scanning process."""
-        ui.notify("Scanning prompts for bracketed character tags...", type="info")
-        discovered = extract_characters_from_prompts(self.project.id)
-        ui.notify(f"Scan complete! Cataloged {len(discovered)} tags.", type="positive")
-        self.safe_invoke_callback()
-        self.switch_view('merge')
+        with self.client:
+            ui.notify("Scanning prompts for bracketed character tags...", type="info")
+            discovered = extract_characters_from_prompts(self.project.id)
+            ui.notify(f"Scan complete! Cataloged {len(discovered)} tags.", type="positive")
+            self.safe_invoke_callback()
+            self.switch_view('merge')
 
     def draw_view(self):
         self.workspace.clear()
@@ -676,25 +694,26 @@ class CharacterOrganizerModal(ui.dialog):
                         self.refresh_masters_list_only()
 
     def handle_paste(self, e):
-        raw_text = e.value.strip() if e.value else ""
-        if not raw_text:
-            return
-        
-        ui.timer(0.1, lambda: self.gobbler_input.set_value(''), once=True)
-        
-        result = parse_goodreads_dump(raw_text)
-        if not result["success"]:
-            ui.notify("No valid Goodreads character list or metadata detected in paste.", type="warning")
-            return
+        with self.client:
+            raw_text = e.value.strip() if e.value else ""
+            if not raw_text:
+                return
             
-        with Session(engine) as session:
-            matched_book = find_matching_project_book(self.project.id, result["title"], session)
+            ui.timer(0.1, lambda: self.gobbler_input.set_value(''), once=True)
             
-        if matched_book:
-            self.associate_and_stage(result, matched_book.id)
-            ui.notify(f"Successfully gobbled {len(result['characters'])} characters for book: '{matched_book.name}'", type="positive")
-        else:
-            self.show_book_selector_dialog(result)
+            result = parse_goodreads_dump(raw_text)
+            if not result["success"]:
+                ui.notify("No valid Goodreads character list or metadata detected in paste.", type="warning")
+                return
+                
+            with Session(engine) as session:
+                matched_book = find_matching_project_book(self.project.id, result["title"], session)
+                
+            if matched_book:
+                self.associate_and_stage(result, matched_book.id)
+                ui.notify(f"Successfully gobbled {len(result['characters'])} characters for book: '{matched_book.name}'", type="positive")
+            else:
+                self.show_book_selector_dialog(result)
 
     def associate_and_stage(self, result: Dict[str, Any], book_id: Optional[int]):
         if book_id is not None:
@@ -734,10 +753,11 @@ class CharacterOrganizerModal(ui.dialog):
                 ui.button("Cancel", on_click=selector.close).props("flat dense").classes("text-xs text-slate-500")
                 
                 def on_confirm():
-                    selected_book_id = radio.value
-                    self.associate_and_stage(result, selected_book_id)
-                    selector.close()
-                    ui.notify(f"Linked {len(result['characters'])} characters successfully.", type="positive")
+                    with self.client:
+                        selected_book_id = radio.value
+                        self.associate_and_stage(result, selected_book_id)
+                        selector.close()
+                        ui.notify(f"Linked {len(result['characters'])} characters successfully.", type="positive")
                     
                 ui.button("Associate", on_click=on_confirm).classes("bg-blue-600 text-white font-bold text-xs px-3 py-1 rounded")
         selector.open()
@@ -767,37 +787,40 @@ class CharacterOrganizerModal(ui.dialog):
                     ui.label(f"{char_name}{count_lbl}")
                     
                     def remove_char(target_name=char_name):
-                        self.staged_characters.pop(target_name, None)
-                        self.draw_chipboard()
+                        with self.client:
+                            self.staged_characters.pop(target_name, None)
+                            self.draw_chipboard()
                             
                     ui.button(icon='close', on_click=remove_char).props('flat round dense').classes('text-blue-400 hover:text-blue-600 text-[10px] w-4 h-4 p-0 min-h-0')
 
     def execute_import(self):
-        if not self.staged_characters:
-            ui.notify("No characters are currently staged to import.", type="warning")
-            return
+        with self.client:
+            if not self.staged_characters:
+                ui.notify("No characters are currently staged to import.", type="warning")
+                return
+                
+            flat_staged_names = {name: data["book_ids"] for name, data in self.staged_characters.items()}
+                
+            for book_id, meta in self.staged_book_metadata.items():
+                update_book_metadata(book_id, meta.get("title"), meta.get("author"))
+                
+            commit_seeded_characters(self.project.id, flat_staged_names)
             
-        flat_staged_names = {name: data["book_ids"] for name, data in self.staged_characters.items()}
+            ui.notify(f"Successfully created {len(self.staged_characters)} seeded characters!", type="positive")
+            self.staged_characters.clear()
+            self.staged_book_metadata.clear()
+            self.draw_chipboard()
             
-        for book_id, meta in self.staged_book_metadata.items():
-            update_book_metadata(book_id, meta.get("title"), meta.get("author"))
-            
-        commit_seeded_characters(self.project.id, flat_staged_names)
-        
-        ui.notify(f"Successfully created {len(self.staged_characters)} seeded characters!", type="positive")
-        self.staged_characters.clear()
-        self.staged_book_metadata.clear()
-        self.draw_chipboard()
-        
-        self.safe_invoke_callback()
-        self.switch_view('scan')
+            self.safe_invoke_callback()
+            self.switch_view('scan')
 
     def reset_steps(self):
         """Legacy compatibility reset, clears memory stage arrays."""
-        self.staged_characters.clear()
-        self.staged_book_metadata.clear()
-        self.active_master_id = None
-        self.active_singleton_id = None
-        self.draw_chipboard()
-        ui.notify("Workspace state reset.", type="warning")
-        self.switch_view('gr')
+        with self.client:
+            self.staged_characters.clear()
+            self.staged_book_metadata.clear()
+            self.active_master_id = None
+            self.active_singleton_id = None
+            self.draw_chipboard()
+            ui.notify("Workspace state reset.", type="warning")
+            self.switch_view('gr')

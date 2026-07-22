@@ -1,6 +1,7 @@
 import re
 import csv
 import difflib
+import functools
 from pathlib import Path
 from typing import List, Dict, Any, Set, Optional
 from sqlmodel import Session, select
@@ -11,8 +12,19 @@ from services.character_manager import (
     compile_character_visual_prompt
 )
 
+# In-memory cache for prompt tag frequencies to avoid repeating heavy CSV parsing on every single click
+_FREQ_MAP_CACHE: Dict[str, Dict[str, int]] = {}
+
+def clear_frequency_map_cache():
+    """Clears the cached frequency map, forcing a fresh disk read when prompts update."""
+    _FREQ_MAP_CACHE.clear()
+
+
 def get_character_frequency_map_db(project_name: str, session: Session) -> Dict[str, int]:
-    """Scans prompts.csv files to build a map of bracket tag occurrences for a project."""
+    """Scans prompts.csv files to build a map of bracket tag occurrences for a project (cached in memory)."""
+    if project_name in _FREQ_MAP_CACHE:
+        return _FREQ_MAP_CACHE[project_name]
+        
     frequencies = {}
     bracket_regex = re.compile(r"\[(.*?)\]")
     base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
@@ -36,6 +48,8 @@ def get_character_frequency_map_db(project_name: str, session: Session) -> Dict[
                         frequencies[clean_tag] = frequencies.get(clean_tag, 0) + 1
         except Exception:
             pass
+            
+    _FREQ_MAP_CACHE[project_name] = frequencies
     return frequencies
 
 
@@ -44,6 +58,7 @@ def extract_characters_from_prompts(project_id: int) -> Set[str]:
     Scans the prompts.csv file of every book in the project, looking for bracketed names [Dino].
     Automatically indexes them in the database and saves them to characters.json.
     """
+    clear_frequency_map_cache()
     discovered_tags: Set[str] = set()
     bracket_regex = re.compile(r"\[(.*?)\]")
 
@@ -193,8 +208,9 @@ TITLES = MALE_HONORIFICS.union(FEMALE_HONORIFICS).union({
     "colonel", "general", "sheriff", "deputy", "chief"
 })
 
+@functools.lru_cache(maxsize=8192)
 def extract_name_details(name_str: str) -> Dict[str, Any]:
-    """Isolates core clean word tokens, sifting out honorific prefixes."""
+    """Isolates core clean word tokens, sifting out honorific prefixes (cached)."""
     val = name_str.lower().strip()
     if val.endswith("'s") or val.endswith("’s"):
         val = val[:-2].strip()
@@ -241,7 +257,14 @@ def is_loose_match(cand_name: str, master_name: str, master_aliases: List[str], 
         if long_cand_tokens.intersection(long_var_tokens):
             return True
             
-        # 2. Loose fuzzy similarity check (captures misspelt transcriptions)
+        # 2. Loose fuzzy similarity check with cheap mathematical bound pruning (skips SequenceMatcher overhead)
+        len_cand = len(cand_details["clean_full"])
+        len_var = len(var_details["clean_full"])
+        if len_cand + len_var > 0:
+            max_possible_ratio = (2.0 * min(len_cand, len_var)) / (len_cand + len_var)
+            if max_possible_ratio < threshold:
+                continue
+                
         ratio = difflib.SequenceMatcher(None, cand_details["clean_full"], var_details["clean_full"]).ratio()
         if ratio >= threshold:
             return True
@@ -249,7 +272,7 @@ def is_loose_match(cand_name: str, master_name: str, master_aliases: List[str], 
     return False
 
 def get_unresolved_singletons(project_id: int) -> List[Dict[str, Any]]:
-    """Gets left-pane list of singletons with no aliases or seed headers."""
+    """Gets left-pane list of singletons with no aliases or seed headers (N+1 Query Fixed)."""
     with Session(engine) as session:
         chars = session.exec(
             select(Character)
@@ -258,10 +281,22 @@ def get_unresolved_singletons(project_id: int) -> List[Dict[str, Any]]:
             .where(Character.origin != "Goodreads Seed")
         ).all()
         
+        # Batch query all character aliases at once to prevent the N+1 loop bottleneck
+        aliases = session.exec(
+            select(CharacterAlias)
+            .join(Character)
+            .where(Character.project_id == project_id)
+        ).all()
+        
+        from collections import defaultdict
+        char_aliases = defaultdict(list)
+        for a in aliases:
+            char_aliases[a.character_id].append(a)
+            
         results = []
         for c in chars:
-            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == c.id)).all()
-            if len(aliases) > 1:
+            c_aliases = char_aliases[c.id]
+            if len(c_aliases) > 1:
                 continue
             results.append({
                 "id": c.id,
@@ -273,17 +308,28 @@ def get_unresolved_singletons(project_id: int) -> List[Dict[str, Any]]:
     return results
 
 def get_master_profiles(project_id: int) -> List[Dict[str, Any]]:
-    """Gets right-pane consolidated list of master profiles."""
+    """Gets right-pane consolidated list of master profiles (N+1 Query Fixed)."""
     with Session(engine) as session:
         chars = session.exec(
             select(Character)
             .where(Character.project_id == project_id)
         ).all()
         
+        # Batch query all character aliases at once to prevent the N+1 loop bottleneck
+        aliases = session.exec(
+            select(CharacterAlias)
+            .join(Character)
+            .where(Character.project_id == project_id)
+        ).all()
+        
+        from collections import defaultdict
+        char_aliases = defaultdict(list)
+        for a in aliases:
+            char_aliases[a.character_id].append(a.alias)
+            
         results = []
         for c in chars:
-            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == c.id)).all()
-            alias_list = [a.alias for a in aliases]
+            alias_list = char_aliases[c.id]
             
             is_seeded = (c.origin == "Goodreads Seed")
             is_promoted = c.merge_checked
@@ -771,8 +817,7 @@ def commit_seeded_characters(project_id: int, staged_data: Dict[str, Set[int]]):
 
 def recalculate_project_character_hits(project_id: int):
     """
-    Scans prompts.csv files and updates cached character hit counts.
-    Allows us to track active vs obsolete seeded names.
+    Scans prompts.csv files and updates cached character hit counts (N+1 and file I/O optimized).
     """
     with Session(engine) as session:
         project = session.get(Project, project_id)
@@ -782,10 +827,23 @@ def recalculate_project_character_hits(project_id: int):
         freq_map = get_character_frequency_map_db(project.name, session)
         
         characters = session.exec(select(Character).where(Character.project_id == project_id)).all()
+        
+        # Batch query all character aliases at once to prevent the N+1 loop bottleneck
+        aliases = session.exec(
+            select(CharacterAlias)
+            .join(Character)
+            .where(Character.project_id == project_id)
+        ).all()
+        
+        from collections import defaultdict
+        char_aliases = defaultdict(list)
+        for a in aliases:
+            char_aliases[a.character_id].append(a)
+            
         for char in characters:
-            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
+            aliases_list = char_aliases[char.id]
             total_hits = 0
-            for a in aliases:
+            for a in aliases_list:
                 total_hits += freq_map.get(a.alias.lower().strip(), 0)
                 
             if total_hits == 0:
@@ -795,10 +853,6 @@ def recalculate_project_character_hits(project_id: int):
             session.add(char)
         session.commit()
 
-
-# services/character_organizer.py
-
-# services/character_organizer.py
 
 def prune_unused_seeded_characters(project_id: int):
     """
