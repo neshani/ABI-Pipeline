@@ -263,6 +263,7 @@ def select_project(project_id: int):
     state.active_book_id = None
     state.active_project_tab = 'Dashboard'
     state.active_log_widget = None  # Clear log references on panel change
+    state.stop_after_current_book = False  # Reset book-by-book stop behavior
     
     # Fast load settings from project folder
     load_project_settings_from_disk(project_id)
@@ -294,6 +295,7 @@ async def async_select_book(book_id: int, client):
     state.active_book_id = book_id
     state.active_book_tab = 'Dashboard'
     state.active_log_widget = None  # Clear log references on panel change
+    state.stop_after_current_book = False  # Reset book-by-book stop behavior
     
     # Instantly scroll the browser window back to the top of the page
     try:
@@ -322,6 +324,7 @@ def select_book_from_portal(project_id: int, book_id: int):
     
     state.active_project_id = project_id
     load_project_settings_from_disk(project_id)
+    state.stop_after_current_book = False  # Reset book-by-book stop behavior
     
     # Set the initial baseline for transition checking to prevent spurious complete alerts
     with Session(engine) as session:
@@ -351,6 +354,7 @@ def exit_to_portal():
     state.active_book_id = None
     state.active_tool = None
     state.active_log_widget = None
+    state.stop_after_current_book = False  # Reset book-by-book stop behavior
     header_controls.refresh()
     main_layout.refresh()
 
@@ -840,6 +844,15 @@ async def async_run_project_image_gen_logic(project_id: int):
                     db_book.progress = 1.0
                     session.add(db_book)
                     session.commit()
+
+            # Elegant check: Halt generations if "stop after current book" is toggled
+            if getattr(state, "stop_after_current_book", False):
+                # Ensure we only halt if we finished the book currently loaded in the user's workspace
+                active_book_id = getattr(state, "active_book_id", None)
+                if active_book_id is None or book_id == active_book_id:
+                    state.add_console_log(f"[Image-Gen] Stop requested after current book. Halting process cleanly at the end of active book '{book_name}'.")
+                    state.cancel_image_gen_flag = True
+                    break
 
                     
 async def run_project_image_gen(project_id: int):

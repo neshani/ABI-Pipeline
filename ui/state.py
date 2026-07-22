@@ -85,6 +85,7 @@ cancel_prompt_gen_flag: bool = False
 # --- Dynamic Image Generation Task States ---
 image_gen_active: bool = False
 cancel_image_gen_flag: bool = False
+stop_after_current_book: bool = False  # Graceful circuit-breaker to halt batch loops after active book completion
 
 # --- Style Playground & Workflow Analyzer Bindings ---
 comfy_online: bool = False

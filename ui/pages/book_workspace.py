@@ -1049,7 +1049,7 @@ def render_book_tabs(book_id: int):
                 on_change=lambda e: render_content.refresh()
             ).classes('flex-1 bg-slate-50 rounded-lg').props('outlined dense clearable')
 
-            # 3. Action Buttons (Regen / Stop)
+            # 3. Action Buttons (Regen / Stop / Stop After Book Toggle)
             ui.button(
                 'Regen', 
                 icon='refresh', 
@@ -1062,6 +1062,31 @@ def render_book_tabs(book_id: int):
                 on_click=trigger_stop_rendering
             ).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-3 py-1 h-8 rounded-lg') \
              .bind_visibility_from(state, 'image_gen_active')
+
+            # Conditional stop at the end of active book toggle
+            def toggle_stop_after_book():
+                state.stop_after_current_book = not getattr(state, 'stop_after_current_book', False)
+                status_str = "ENABLED" if state.stop_after_current_book else "DISABLED"
+                ui.notify(f"Stop at end of current book: {status_str}", type="info", timeout=1.5)
+                update_stop_after_btn_style()
+
+            btn_stop_after = ui.button(
+                icon='auto_stories',
+                on_click=toggle_stop_after_book
+            ).props('dense').classes('h-8 px-2.5 rounded-lg transition-colors duration-200')
+            
+            with btn_stop_after:
+                ui.tooltip('Stop rendering automatically at the end of this book')
+
+            def update_stop_after_btn_style():
+                if getattr(state, 'stop_after_current_book', False):
+                    # Solid cool-slate gray when active
+                    btn_stop_after.classes(replace='h-8 px-2.5 rounded-lg bg-slate-700 hover:bg-slate-800 text-white font-bold shadow-sm')
+                else:
+                    # Light outline/muted gray when inactive
+                    btn_stop_after.classes(replace='h-8 px-2.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500 border border-slate-200')
+
+            update_stop_after_btn_style()
 
         # Right-aligned toolbar group (Gallery/Prompt switcher)
         with ui.row().classes('items-center gap-0.5 bg-slate-100 p-0.5 rounded-lg border flex-nowrap'):
