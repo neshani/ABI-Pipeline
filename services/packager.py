@@ -13,42 +13,42 @@ from concurrent.futures import ThreadPoolExecutor
 # --- Ken Burns Animation Presets ---
 PORTRAIT_PRESETS = [
     # 21: MS Pan Left
-    [{"position": 0.0, "scale": 1.85, "pan_x": 0.6986343885785224, "pan_y": 0.4998313226999163},
-     {"position": 1.0, "scale": 1.85, "pan_x": 0.28978978978979003, "pan_y": 0.4939939939939939}],
+    [{"position": 0.0, "scale": 1.85, "pan_x": 0.71, "pan_y": 0.5},
+     {"position": 1.0, "scale": 1.85, "pan_x": 0.29, "pan_y": 0.5}],
     # 22: MS Pan Right
-    [{"position": 0.0, "scale": 1.85, "pan_x": 0.2897897897897898, "pan_y": 0.506006006006006},
-     {"position": 1.0, "scale": 1.85, "pan_x": 0.7102102102102098, "pan_y": 0.493993993993994}],
+    [{"position": 0.0, "scale": 1.85, "pan_x": 0.29, "pan_y": 0.5},
+     {"position": 1.0, "scale": 1.85, "pan_x": 0.71, "pan_y": 0.5}],
     # 23: MS Zoom Pan Down
-    [{"position": 0.0, "scale": 1.3100000000000005, "pan_x": 0.43214588634435946, "pan_y": 0.5},
-     {"position": 0.5, "scale": 1.9050000000000007, "pan_x": 0.30077277003136527, "pan_y": 0.4890182942638114},
-     {"position": 1.0, "scale": 2.229999999999998, "pan_x": 0.7192326856003992, "pan_y": 0.5978204192303685}],
+    [{"position": 0.0, "scale": 1.31, "pan_x": 0.43, "pan_y": 0.5},
+     {"position": 0.5, "scale": 1.90, "pan_x": 0.30, "pan_y": 0.5},
+     {"position": 1.0, "scale": 2.23, "pan_x": 0.71, "pan_y": 0.6}],
     # 24: MS Zoom Pan Up
     [{"position": 0.0, "scale": 1.16, "pan_x": 0.5, "pan_y": 0.5},
-     {"position": 0.5, "scale": 2.119999999999999, "pan_x": 0.6939203354297697, "pan_y": 0.5419287211740037},
-     {"position": 1.0, "scale": 2.179999999999999, "pan_x": 0.27573904179408765, "pan_y": 0.443934760448522}],
+     {"position": 0.5, "scale": 2.12, "pan_x": 0.69, "pan_y": 0.54},
+     {"position": 1.0, "scale": 2.18, "pan_x": 0.27, "pan_y": 0.44}],
     # 25: MS Zoom Out
-    [{"position": 0.0, "scale": 2.25, "pan_x": 0.5000000000000009, "pan_y": 0.4308641975308644},
+    [{"position": 0.0, "scale": 2.25, "pan_x": 0.5, "pan_y": 0.43},
      {"position": 1.0, "scale": 1.24, "pan_x": 0.5, "pan_y": 0.5}]
 ]
 
 LANDSCAPE_PRESETS = [
     # 26: DS Pan Up
-    [{"position": 0.0, "scale": 1.85, "pan_x": 0.4966216216216216, "pan_y": 0.7162162162162162},
-     {"position": 1.0, "scale": 1.85, "pan_x": 0.5, "pan_y": 0.31081081081081047}],
+    [{"position": 0.0, "scale": 1.85, "pan_x": 0.5, "pan_y": 0.71},
+     {"position": 1.0, "scale": 1.85, "pan_x": 0.5, "pan_y": 0.31}],
     # 27: DS Pan Down
-    [{"position": 0.0, "scale": 1.85, "pan_x": 0.4932432432432434, "pan_y": 0.28716216216216206},
-     {"position": 1.0, "scale": 1.85, "pan_x": 0.4999999999999999, "pan_y": 0.7128378378378378}],
+    [{"position": 0.0, "scale": 1.85, "pan_x": 0.5, "pan_y": 0.29},
+     {"position": 1.0, "scale": 1.85, "pan_x": 0.5, "pan_y": 0.71}],
     # 28: DS Zoom In pan down
     [{"position": 0.0, "scale": 1.2, "pan_x": 0.5, "pan_y": 0.5},
-     {"position": 0.5, "scale": 2.0, "pan_x": 0.5, "pan_y": 0.3187500000000005},
+     {"position": 0.5, "scale": 2.0, "pan_x": 0.5, "pan_y": 0.32},
      {"position": 1.0, "scale": 1.8, "pan_x": 0.5, "pan_y": 0.7}],
     # 29: DS Zoom In Pan Up
     [{"position": 0.0, "scale": 1.2, "pan_x": 0.5, "pan_y": 0.5},
-     {"position": 0.5, "scale": 2.0, "pan_x": 0.496875, "pan_y": 0.7062500000000003},
-     {"position": 1.0, "scale": 1.8, "pan_x": 0.5, "pan_y": 0.31944444444444475}],
+     {"position": 0.5, "scale": 2.0, "pan_x": 0.5, "pan_y": 0.71},
+     {"position": 1.0, "scale": 1.8, "pan_x": 0.5, "pan_y": 0.32}],
     # 30: DS Zoom Out
-    [{"position": 0.0, "scale": 2.0, "pan_x": 0.5031250000000002, "pan_y": 0.30625000000000013},
-     {"position": 1.0, "scale": 1.2, "pan_x": 0.5052083333333335, "pan_y": 0.5416666666666671}]
+    [{"position": 0.0, "scale": 2.0, "pan_x": 0.5, "pan_y": 0.31},
+     {"position": 1.0, "scale": 1.2, "pan_x": 0.5, "pan_y": 0.54}]
 ]
 
 
