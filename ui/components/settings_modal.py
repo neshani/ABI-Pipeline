@@ -284,7 +284,7 @@ class SettingsModal:
                         ).props('flat dense').classes('h-10 text-blue-600').tooltip('Scan Connection for Models')
 
             # 2. UI & Notifications Accordion
-            with ui.expansion('Notifications & Alerts', icon='notifications').classes('w-full border rounded-lg bg-slate-50/50'):
+            with ui.expansion('Notifications & Export Options', icon='notifications').classes('w-full border rounded-lg bg-slate-50/50'):
                 with ui.column().classes('w-full p-4 gap-3 bg-white'):
                     
                     def on_notification_toggle(e):
@@ -306,6 +306,11 @@ class SettingsModal:
                         value=self.settings.get('enable_desktop_notifications', False)
                     ).bind_value(self.settings, 'enable_desktop_notifications').on_value_change(on_notification_toggle)
                     
+                    ui.checkbox(
+                        'Export Word-Timestamped JSON (subtitles.json) for Read-Along',
+                        value=self.settings.get('save_word_timestamps', True)
+                    ).bind_value(self.settings, 'save_word_timestamps').tooltip('Generates a word-level timing JSON file formatted for subtitle/read-along sync tools')
+
                     ui.number(
                         'Alert Item Count Threshold',
                         value=int(self.settings.get('notification_threshold', 30)),
@@ -326,7 +331,7 @@ class SettingsModal:
                             }
                         ).bind_value(self.settings, 'stt_engine').on_value_change(self.update_installation_statuses).classes('w-full text-sm')
                         
-                        # Subtext with the newly uncovered file sizes and speed benchmarks
+                        # Subtext with file sizes and speed benchmarks
                         with ui.column().classes('bg-slate-50 p-3 rounded-lg border border-slate-100 mt-1 gap-1.5 text-[11px] text-slate-600 leading-normal'):
                             ui.label('• Parakeet ONNX: Ultra-fast parallel sequential batching. Transcribes a 20-hour audiobook in ~5 to 8 minutes on GPU. Footprint: ~300 MB packages + ~2.5 GB model weights.').classes('font-medium')
                             ui.label('• Faster-Whisper: Highly detailed phrase-level timing maps, but processes audio sequentially. Transcribes a 20-hour audiobook in ~35 minutes on GPU. Footprint: ~3.5 GB PyTorch packages + ~484 MB model weights.').classes('font-medium')

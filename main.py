@@ -209,6 +209,7 @@ DEFAULT_SETTINGS = {
     "output_dir": "./output",
     "enable_desktop_notifications": False,
     "notification_threshold": 30,
+    "save_word_timestamps": False,
     "wizard_completed": False
 }
 

@@ -346,6 +346,12 @@ def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bo
 
     working_dir.mkdir(parents=True, exist_ok=True)
 
+    # Determine original audiobook source directory next to audio files
+    source_audio_dir = None
+    if book_path:
+        p = Path(book_path)
+        source_audio_dir = p if p.is_dir() else p.parent
+
     try:
         state_data = {
             "project_name": project_name,
@@ -359,6 +365,8 @@ def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bo
     except Exception as se:
         print(f"[Sync-Engine] Failed to write transcription recovery state: {se}")
 
+    cumulative_offset_ms = 0
+
     for chapter in chapters:
         if project_id in cancelled_projects:
             print("[ABI-Pipeline] Transcription cancelled by user.")
@@ -366,14 +374,27 @@ def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bo
 
         chapter_txt = working_dir / f"chapter_{chapter.chapter_num}.txt"
         
+        # Determine exact timeline offset in milliseconds for continuous timestamps
+        if chapter.type == 'segment':
+            start_offset_ms = int(round((chapter.start_time or 0.0) * 1000))
+        else:
+            start_offset_ms = cumulative_offset_ms
+
         if chapter.status == "Completed" and not force_retranscribe:
             if chapter_txt.exists():
                 print(f"[ABI-Pipeline] Chapter {chapter.chapter_num} ('{chapter.title}') already complete. Skipping transcription.")
+                # Advance cumulative offset using file duration
+                try:
+                    probe = ffmpeg.probe(chapter.input_file)
+                    ch_dur_ms = int(round(float(probe['format']['duration']) * 1000))
+                    cumulative_offset_ms += ch_dur_ms
+                except Exception:
+                    pass
                 continue
             else:
                 print(f"[ABI-Pipeline] Chapter {chapter.chapter_num} status is 'Completed' but text file is missing. Will re-transcribe.")
 
-        print(f"[ABI-Pipeline] Processing Chapter {chapter.chapter_num}: '{chapter.title}' (Status: {chapter.status})")
+        print(f"[ABI-Pipeline] Processing Chapter {chapter.chapter_num}: '{chapter.title}' (Status: {chapter.status}, Offset: {start_offset_ms}ms)")
 
         with Session(engine) as session:
             db_chapter = session.get(Chapter, chapter.id)
@@ -382,7 +403,14 @@ def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bo
                 session.add(db_chapter)
                 session.commit()
 
-        transcript_text = transcribe_chapter(chapter, model, working_dir)
+        transcript_text, chapter_dur_ms = transcribe_chapter(
+            chapter, 
+            model, 
+            working_dir, 
+            start_offset_ms=start_offset_ms
+        )
+
+        cumulative_offset_ms = start_offset_ms + chapter_dur_ms
 
         if transcript_text:
             with open(chapter_txt, "w", encoding="utf-8") as f:
@@ -422,7 +450,7 @@ def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bo
 
     if project_id not in cancelled_projects:
         print(f"[ABI-Pipeline] Combining chapter texts and merging timing metadata for '{book_name}'...")
-        combine_chapters(working_dir, book_output_dir)
+        combine_chapters(working_dir, book_output_dir, source_audio_dir=source_audio_dir)
 
         try:
             metadata_file = book_output_dir / "metadata.json"
@@ -443,7 +471,6 @@ def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bo
             if db_book:
                 db_book.status = "Transcribed"
                 session.add(db_book)
-                session.commit()
         if working_dir.exists():
             try:
                 shutil.rmtree(working_dir)
@@ -469,8 +496,99 @@ def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bo
             session.commit()
 
 
-def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
-    """Preprocesses a chapter's audio track, slices it, and performs speech-to-text in parallel batches."""
+def tokens_to_words(tokens: list[str], timestamps: list[float], start_offset_ms: int = 0) -> list[dict]:
+    """
+    Combines subword tokens and token-level timestamps from Parakeet ONNX into whole word objects
+    with native millisecond start_ms and end_ms boundaries.
+    """
+    if not tokens or not timestamps or len(tokens) != len(timestamps):
+        return []
+
+    words = []
+    curr_word_chars = []
+    curr_start_ms = None
+    curr_last_ts_ms = None
+
+    for i, (tok, ts) in enumerate(zip(tokens, timestamps)):
+        ts_ms = start_offset_ms + int(round(ts * 1000))
+        
+        # Detect token word boundaries (leading spaces or BPE unicode space prefix)
+        is_word_start = tok.startswith(' ') or tok.startswith(' ') or (i == 0)
+        
+        if is_word_start and curr_word_chars:
+            word_str = "".join(curr_word_chars).strip()
+            if word_str:
+                end_ms = max(curr_start_ms + 80, ts_ms)
+                words.append({
+                    "word": word_str,
+                    "start_ms": curr_start_ms,
+                    "end_ms": end_ms
+                })
+            curr_word_chars = []
+            curr_start_ms = None
+
+        clean_tok = tok.lstrip(' ').lstrip(' ')
+        if curr_start_ms is None:
+            curr_start_ms = ts_ms
+
+        curr_word_chars.append(clean_tok)
+        curr_last_ts_ms = ts_ms
+
+    # Final word closeout
+    if curr_word_chars and curr_start_ms is not None:
+        word_str = "".join(curr_word_chars).strip()
+        if word_str:
+            end_ms = max(curr_start_ms + 80, curr_last_ts_ms + 120)
+            words.append({
+                "word": word_str,
+                "start_ms": curr_start_ms,
+                "end_ms": end_ms
+            })
+
+    return words
+
+
+def split_words_into_sentences(words_data: list[dict]) -> list[dict]:
+    """
+    Groups a flat list of word-timestamp dicts into sentence-level subtitle blocks.
+    Each block contains start_ms, end_ms, text, and its corresponding list of word objects.
+    """
+    if not words_data:
+        return []
+
+    sentences = []
+    current_words = []
+
+    for item in words_data:
+        current_words.append(item)
+        word_str = item["word"]
+        
+        # Split sentence at punctuation (. ! ?)
+        if re.search(r'[.!?]["’\'”]?$', word_str):
+            sent_text = " ".join(w["word"] for w in current_words)
+            sentences.append({
+                "start_ms": current_words[0]["start_ms"],
+                "end_ms": current_words[-1]["end_ms"],
+                "text": sent_text,
+                "words": current_words
+            })
+            current_words = []
+
+    # Handle trailing words without end punctuation
+    if current_words:
+        sent_text = " ".join(w["word"] for w in current_words)
+        sentences.append({
+            "start_ms": current_words[0]["start_ms"],
+            "end_ms": current_words[-1]["end_ms"],
+            "text": sent_text,
+            "words": current_words
+        })
+
+    return sentences
+
+
+def transcribe_chapter(chapter: Chapter, model, working_dir: Path, start_offset_ms: int = 0) -> tuple[str, int]:
+    """Preprocesses a chapter's audio track, slices it, and performs speech-to-text with native word timing extraction."""
     import traceback
     import time
     import json
@@ -493,25 +611,39 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
         )
     except Exception as e:
         print(f"FFmpeg preprocessing failed for chapter {chapter.chapter_num}: {e}")
-        return ""
+        return "", 0
+
+    chapter_dur_ms = 0
+    try:
+        probe = ffmpeg.probe(str(preprocessed_wav))
+        chapter_dur_ms = int(round(float(probe['format']['duration']) * 1000))
+    except Exception:
+        pass
+
+    save_subtitles = get_setting("save_word_timestamps", "True") in ("True", True)
 
     if type(model).__name__ == "WhisperModel":
-        print(f"[ABI-Pipeline] Transcribing '{chapter.title}' with Faster-Whisper (built-in VAD)...")
+        print(f"[ABI-Pipeline] Transcribing '{chapter.title}' with Faster-Whisper...")
         start_time = time.time()
         
         segments, info = model.transcribe(
             str(preprocessed_wav), 
             vad_filter=True, 
-            vad_parameters=dict(min_silence_duration_ms=500)
+            vad_parameters=dict(min_silence_duration_ms=500),
+            word_timestamps=save_subtitles
         )
         
         segments_list = list(segments)
         timing_map = []
+        all_chapter_words = []
         current_char_offset = 0
         cleaned_texts = []
         
         for segment in segments_list:
             text_str = segment.text.strip()
+            if not text_str:
+                continue
+
             cleaned_texts.append(text_str)
             text_len = len(text_str)
             
@@ -521,11 +653,41 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
                 "char_start": current_char_offset,
                 "char_end": current_char_offset + text_len
             })
-            current_char_offset += text_len + 1  # accounts for space separator in join()
-            
+            current_char_offset += text_len + 1  # accounts for space separator
+
+            if save_subtitles:
+                if hasattr(segment, "words") and segment.words:
+                    for w in segment.words:
+                        w_text = w.word.strip()
+                        if w_text:
+                            all_chapter_words.append({
+                                "word": w_text,
+                                "start_ms": start_offset_ms + int(round(w.start * 1000)),
+                                "end_ms": start_offset_ms + int(round(w.end * 1000))
+                            })
+                else:
+                    words_in_seg = text_str.split()
+                    total_chars = max(1, sum(len(w) for w in words_in_seg))
+                    seg_dur_ms = max(1, int(round((segment.end - segment.start) * 1000)))
+                    curr_ms = start_offset_ms + int(round(segment.start * 1000))
+                    for w_text in words_in_seg:
+                        w_dur = int(round((len(w_text) / total_chars) * seg_dur_ms))
+                        all_chapter_words.append({
+                            "word": w_text,
+                            "start_ms": curr_ms,
+                            "end_ms": curr_ms + w_dur
+                        })
+                        curr_ms += w_dur
+
         chapter_json = working_dir / f"chapter_{chapter.chapter_num}.json"
         with open(chapter_json, "w", encoding="utf-8") as jf:
             json.dump(timing_map, jf, indent=4)
+
+        if save_subtitles:
+            subtitle_sentences = split_words_into_sentences(all_chapter_words)
+            sub_json = working_dir / f"chapter_{chapter.chapter_num}_subtitles.json"
+            with open(sub_json, "w", encoding="utf-8") as sjf:
+                json.dump(subtitle_sentences, sjf, indent=4)
             
         total_time = time.time() - start_time
         print(f"[ABI-Pipeline] Chapter {chapter.chapter_num} complete! Total time: {total_time:.2f}s")
@@ -533,7 +695,7 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
         if preprocessed_wav.exists():
             preprocessed_wav.unlink()
             
-        return " ".join(cleaned_texts).strip()
+        return " ".join(cleaned_texts).strip(), chapter_dur_ms
 
     temp_chunk_dir = working_dir / f"chapter_{chapter.chapter_num}_chunks"
     print(f"[ABI-Pipeline] Chunking with ffmpeg silence detection...")
@@ -541,17 +703,21 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
 
     if not chunk_paths:
         if preprocessed_wav.exists(): preprocessed_wav.unlink()
-        return ""
+        return "", chapter_dur_ms
 
     batch_size = int(get_setting("batch_size", 8))
-    print(f"[ABI-Pipeline] Generated {len(chunk_paths)} chunks. Starting inference (Batch Size: {batch_size})...")
+    print(f"[ABI-Pipeline] Generated {len(chunk_paths)} chunks. Starting inference (Batch Size: {batch_size}, Native Timestamps: {save_subtitles})...")
     
     chunks_with_metadata = [(i, str(p), os.path.getsize(p)) for i, p in enumerate(chunk_paths)]
     chunks_with_metadata.sort(key=lambda x: x[2], reverse=True)
     
     all_texts = [None] * len(chunk_paths)
+    all_chunk_words = [[] for _ in range(len(chunk_paths))]
     num_batches = math.ceil(len(chunks_with_metadata) / batch_size)
     start_time_total = time.time()
+
+    # Wrap model with timestamp provider if subtitles are requested
+    inference_model = model.with_timestamps() if save_subtitles else model
     
     for i in range(num_batches):
         batch_start_time = time.time()
@@ -563,20 +729,34 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
         original_indices = [m[0] for m in batch_meta]
 
         try:
-            batch_results = model.recognize(batch_chunks)
+            batch_results = inference_model.recognize(batch_chunks)
             if batch_results:
-                if isinstance(batch_results, str):
+                if not isinstance(batch_results, list):
                     batch_results = [batch_results]
+                
                 for idx, result in zip(original_indices, batch_results):
                     if result:
-                        all_texts[idx] = result.strip()
+                        text_val = result.text.strip() if hasattr(result, "text") else str(result).strip()
+                        all_texts[idx] = text_val
                         
+                        if save_subtitles and hasattr(result, "tokens") and hasattr(result, "timestamps"):
+                            chunk_start_t, _ = chunk_timings[idx]
+                            chunk_offset_ms = start_offset_ms + int(round(chunk_start_t * 1000))
+                            chunk_words = tokens_to_words(result.tokens, result.timestamps, chunk_offset_ms)
+                            all_chunk_words[idx] = chunk_words
+
         except Exception as batch_error:
             print(f"\n[STT Fallback] Batch inference failed on chapter {chapter.chapter_num}, batch {i+1}. Error: {batch_error}")
             for idx, chunk in zip(original_indices, batch_chunks):
                 try:
-                    result = model.recognize(chunk)
-                    if result: all_texts[idx] = result.strip()
+                    result = inference_model.recognize(chunk)
+                    if result:
+                        text_val = result.text.strip() if hasattr(result, "text") else str(result).strip()
+                        all_texts[idx] = text_val
+                        if save_subtitles and hasattr(result, "tokens") and hasattr(result, "timestamps"):
+                            chunk_start_t, _ = chunk_timings[idx]
+                            chunk_offset_ms = start_offset_ms + int(round(chunk_start_t * 1000))
+                            all_chunk_words[idx] = tokens_to_words(result.tokens, result.timestamps, chunk_offset_ms)
                 except Exception: pass
             
         batch_time = time.time() - batch_start_time
@@ -585,9 +765,12 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
         gc.collect()
 
     timing_map = []
+    all_chapter_words = []
     current_char_offset = 0
     cleaned_texts = []
-    for idx, text in enumerate(all_texts):
+
+    for idx in range(len(chunk_paths)):
+        text = all_texts[idx]
         text_str = text.strip() if text else ""
         cleaned_texts.append(text_str)
         text_len = len(text_str)
@@ -599,11 +782,20 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
             "char_start": current_char_offset,
             "char_end": current_char_offset + text_len
         })
-        current_char_offset += text_len + 1  # accounts for space separator in join()
+        current_char_offset += text_len + 1  # accounts for space separator
+
+        if save_subtitles and all_chunk_words[idx]:
+            all_chapter_words.extend(all_chunk_words[idx])
 
     chapter_json = working_dir / f"chapter_{chapter.chapter_num}.json"
     with open(chapter_json, "w", encoding="utf-8") as jf:
         json.dump(timing_map, jf, indent=4)
+
+    if save_subtitles:
+        subtitle_sentences = split_words_into_sentences(all_chapter_words)
+        sub_json = working_dir / f"chapter_{chapter.chapter_num}_subtitles.json"
+        with open(sub_json, "w", encoding="utf-8") as sjf:
+            json.dump(subtitle_sentences, sjf, indent=4)
 
     total_time = time.time() - start_time_total
     avg_speed = len(chunk_paths) / total_time if total_time > 0 else 0
@@ -614,11 +806,11 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path) -> str:
         try: shutil.rmtree(temp_chunk_dir)
         except Exception: pass
 
-    return " ".join(cleaned_texts).strip()
+    return " ".join(cleaned_texts).strip(), chapter_dur_ms
 
 
-def combine_chapters(working_dir: Path, book_output_dir: Path) -> None:
-    """Appends all temporary chapter text files into the final transcript.txt inside the structured book directory."""
+def combine_chapters(working_dir: Path, book_output_dir: Path, source_audio_dir: Optional[Path] = None) -> None:
+    """Appends all temporary chapter text files into final transcript.txt and merges transcript.json."""
     import json
     final_text_path = book_output_dir / "transcript.txt"
     chapter_files = sorted(
@@ -643,6 +835,8 @@ def combine_chapters(working_dir: Path, book_output_dir: Path) -> None:
     )
     master_timing = {"chapters": {}}
     for t_file in timing_files:
+        if t_file.stem.endswith("_subtitles"):
+            continue
         try:
             ch_num = t_file.stem.split('_')[1]
             with open(t_file, "r", encoding="utf-8") as f:
@@ -653,3 +847,35 @@ def combine_chapters(working_dir: Path, book_output_dir: Path) -> None:
     if master_timing["chapters"]:
         with open(book_output_dir / "transcript_timing.json", "w", encoding="utf-8") as f:
             json.dump(master_timing, f, indent=4)
+
+    # Combine chapter subtitle word-timestamp JSON files into continuous transcript.json
+    subtitle_files = sorted(
+        list(working_dir.glob("chapter_*_subtitles.json")),
+        key=lambda x: int(x.stem.split('_')[1])
+    )
+    if subtitle_files:
+        master_subtitles = []
+        for s_file in subtitle_files:
+            try:
+                with open(s_file, "r", encoding="utf-8") as sf:
+                    chapter_subs = json.load(sf)
+                    master_subtitles.extend(chapter_subs)
+            except Exception as e:
+                print(f"[Subtitle-Sync] Error reading {s_file.name}: {e}")
+
+        if master_subtitles:
+            # 1. Save copy to ABI-Pipeline output directory
+            transcript_json_path = book_output_dir / "transcript.json"
+            with open(transcript_json_path, "w", encoding="utf-8") as sof:
+                json.dump(master_subtitles, sof, indent=2)
+            print(f"[ABI-Pipeline] Saved transcript.json to output directory: {transcript_json_path}")
+
+            # 2. Save directly to original audiobook folder next to audio files
+            if source_audio_dir and source_audio_dir.exists():
+                try:
+                    audio_dir_transcript = source_audio_dir / "transcript.json"
+                    with open(audio_dir_transcript, "w", encoding="utf-8") as asof:
+                        json.dump(master_subtitles, asof, indent=2)
+                    print(f"[ABI-Pipeline] Saved transcript.json directly to audiobook folder: {audio_dir_transcript}")
+                except Exception as e:
+                    print(f"[ABI-Pipeline] Warning: Could not write transcript.json to audiobook folder {source_audio_dir}: {e}")
