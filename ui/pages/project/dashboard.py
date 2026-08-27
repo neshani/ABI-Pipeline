@@ -141,7 +141,7 @@ def execute_project_delete_io(project_id: int) -> bool:
         return False
 
 
-def rescan_project_database_state(project_id: int) -> None:
+def rescan_project_database_state(project_id: int, force: bool = False) -> None:
     """Invokes sync operations across all project books to dynamically align database indexes with flat files."""
     from services.sync_engine import sync_book_from_disk
     from database.connection import touch_project
@@ -158,7 +158,7 @@ def rescan_project_database_state(project_id: int) -> None:
     is_prompt_gen = getattr(state, "prompt_gen_active", False) and state.active_project_id == project_id
     is_image_gen = getattr(state, "image_gen_active", False) and state.active_project_id == project_id
 
-    skip_sync = is_transcribing or is_prompt_gen or is_image_gen
+    skip_sync = (is_transcribing or is_prompt_gen or is_image_gen) and not force
 
     with Session(engine) as session:
         project = session.get(Project, project_id)
@@ -189,11 +189,11 @@ def rescan_project_database_state(project_id: int) -> None:
         state.project_status = project.status
         
         # Restore active execution properties so global timers can track progress transitions cleanly
-        if is_transcribing:
+        if is_transcribing and not force:
             state.active_task_type = "transcription"
-        elif is_prompt_gen:
+        elif is_prompt_gen and not force:
             state.active_task_type = "prompt_gen"
-        elif is_image_gen:
+        elif is_image_gen and not force:
             state.active_task_type = "image_gen"
         else:
             if state.active_project_id == project_id:
@@ -585,6 +585,8 @@ def render_project_tabs(
             render_active_panel.refresh()
             if hasattr(state, 'active_header_refresh') and state.active_header_refresh:
                 state.active_header_refresh()
+            if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
+                state.action_buttons_refresh()
             rollback_dialog.close()
             ui.notify("Project rolled back successfully!", type="positive")
             
@@ -651,6 +653,8 @@ def render_project_tabs(
             render_active_panel.refresh()
             if hasattr(state, 'active_header_refresh') and state.active_header_refresh:
                 state.active_header_refresh()
+            if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
+                state.action_buttons_refresh()
 
         with ui.row().classes('items-center gap-2'):
             ui.button(
@@ -744,16 +748,13 @@ def render_project_tabs(
             render_prompt_playground_tab(project, books)
 
         elif active == 'Characters':
-            # Modular project-level characters tab view loaded on demand!
             from ui.pages.project.characters_tab import render_characters_tab
             render_characters_tab(project, books)
 
         elif active == 'Style & Workflows':
-            # Style & Workflow tab rendered on demand!
             render_style_playground_tab(project, save_project_settings_cb)
 
         elif active == 'OIS Packager':
-            # Packager playground rendered on demand!
             from ui.pages.project.packager_playground import PackagerPlayground
             if not hasattr(state, 'packager_playground') or state.packager_playground.project_id != project.id:
                 state.packager_playground = PackagerPlayground(project.id, project.name)
@@ -778,4 +779,3 @@ def render_project_tabs(
     # Render active panel container
     with ui.column().classes('w-full mt-4'):
         render_active_panel()
-        

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 from sqlmodel import Session, select
 from database.connection import engine, get_setting
-from database.models import Project, Book, Character, CharacterAlias, CharacterStateModifier, CharacterTimelineEvent
+from database.models import Project, Book, Character, CharacterAlias, CharacterBookLink, CharacterStateModifier, CharacterTimelineEvent
 from services.prompt_engine import smart_chunk_text, get_llm_response
 
 def get_characters_json_path(project_id: int, session: Optional[Session] = None) -> Optional[Path]:
@@ -80,20 +80,28 @@ def compile_character_visual_prompt(obj) -> str:
 
 def save_project_characters_to_json(project_id: int):
     """
-    Serializes all project characters, aliases, and timeline override events to characters.json.
-    Ensures that manual edits and LLM descriptions are always safely preserved on disk.
+    Serializes all project characters, aliases, book links, and timeline override events to characters.json.
+    Ensures that manual edits, book links, and LLM descriptions are always safely preserved on disk.
     """
     json_path = get_characters_json_path(project_id)
     if not json_path:
         return
 
     with Session(engine) as session:
-        # Pull all characters belonging to the project
         characters = session.exec(select(Character).where(Character.project_id == project_id)).all()
         
         serialized_data = []
         for char in characters:
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
+            book_links = session.exec(select(CharacterBookLink).where(CharacterBookLink.character_id == char.id)).all()
+            
+            # Resolve book names from links
+            linked_book_names = []
+            for link in book_links:
+                book = session.get(Book, link.book_id)
+                if book and book.name not in linked_book_names:
+                    linked_book_names.append(book.name)
+
             timeline_events = session.exec(
                 select(CharacterTimelineEvent)
                 .where(CharacterTimelineEvent.character_id == char.id)
@@ -125,7 +133,10 @@ def save_project_characters_to_json(project_id: int):
             char_entry = {
                 "name": char.name,
                 "locked": char.locked,
+                "origin": getattr(char, "origin", "Prompt Scan"),
+                "merge_checked": getattr(char, "merge_checked", False),
                 "aliases": [alias.alias for alias in aliases],
+                "books": linked_book_names,
                 "timeline": timeline_serialized
             }
             serialized_data.append(char_entry)
@@ -188,10 +199,9 @@ def robust_json_load(json_str: str) -> Any:
 
 def sync_project_characters_from_json(project_id: int, session: Optional[Session] = None):
     """
-    Rebuilds the SQLModel character entries and timeline overrides from characters.json if the database was wiped.
+    Rebuilds the SQLModel character entries, book links, and timeline overrides from characters.json if the database was wiped.
     Maintains our strict File-as-Source-of-Truth database indexing principles.
     """
-    # Resolve the path using the shared session
     json_path = get_characters_json_path(project_id, session)
     if not json_path or not json_path.exists():
         return
@@ -210,7 +220,7 @@ def sync_project_characters_from_json(project_id: int, session: Optional[Session
         should_close = True
 
     try:
-        # Clear out existing SQLModel character caches for this project to perform a clean sync
+        # Clear out existing SQLModel character caches and relations for this project to perform a clean sync
         old_chars = session.exec(select(Character).where(Character.project_id == project_id)).all()
         for oc in old_chars:
             aliases_to_del = session.exec(
@@ -219,6 +229,12 @@ def sync_project_characters_from_json(project_id: int, session: Optional[Session
             for a in aliases_to_del:
                 session.delete(a)
             
+            links_to_del = session.exec(
+                select(CharacterBookLink).where(CharacterBookLink.character_id == oc.id)
+            ).all()
+            for lk in links_to_del:
+                session.delete(lk)
+
             evs_to_del = session.exec(
                 select(CharacterTimelineEvent).where(CharacterTimelineEvent.character_id == oc.id)
             ).all()
@@ -228,20 +244,33 @@ def sync_project_characters_from_json(project_id: int, session: Optional[Session
             session.delete(oc)
         session.flush()
 
+        # Build book lookup cache for this project
+        project_books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+        book_name_to_id = {b.name: b.id for b in project_books}
+
         # Reconstruct tables from file mapping
         for char_data in data:
             new_char = Character(
                 project_id=project_id,
                 name=char_data["name"],
-                locked=char_data.get("locked", False)
+                locked=char_data.get("locked", False),
+                origin=char_data.get("origin", "Prompt Scan"),
+                merge_checked=char_data.get("merge_checked", False)
             )
             session.add(new_char)
-            session.flush()  # flush to acquire character ID for relational attachments
+            session.flush()  # flush to acquire character ID
 
             # Attach extracted aliases
             for alias_text in char_data.get("aliases", []):
                 new_alias = CharacterAlias(character_id=new_char.id, alias=alias_text)
                 session.add(new_alias)
+
+            # Attach book links
+            for b_name in char_data.get("books", []):
+                b_id = book_name_to_id.get(b_name)
+                if b_id:
+                    new_link = CharacterBookLink(character_id=new_char.id, book_id=b_id)
+                    session.add(new_link)
 
             # Rebuild Timeline Events
             timeline_list = char_data.get("timeline", [])
@@ -263,16 +292,8 @@ def sync_project_characters_from_json(project_id: int, session: Optional[Session
                 session.add(base_ev)
             else:
                 for ev_data in timeline_list:
-                    book_name = ev_data.get("book_name")
-                    b_id = None
-                    if book_name:
-                        b = session.exec(
-                            select(Book)
-                            .where(Book.project_id == project_id)
-                            .where(Book.name == book_name)
-                        ).first()
-                        if b:
-                            b_id = b.id
+                    b_name = ev_data.get("book_name")
+                    b_id = book_name_to_id.get(b_name) if b_name else None
                     
                     prof = ev_data.get("profile", {})
                     new_ev = CharacterTimelineEvent(
@@ -390,10 +411,10 @@ def get_character_mention_chunks(
 
 def get_character_book_mentions(project_id: int, character_id: int) -> Dict[str, int]:
     """
-    Scans prompts.csv files dynamically to return a mapping of Book Name -> Mention Count
-    for all aliases belonging to the given character across the project.
+    Returns a mapping of Book Name -> Mention Count for all aliases belonging
+    to the given character across the project using cached frequency maps.
     """
-    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    from services.character_organizer import get_book_character_frequency_map
     book_mentions = {}
     
     with Session(engine) as session:
@@ -402,30 +423,20 @@ def get_character_book_mentions(project_id: int, character_id: int) -> Dict[str,
             return {}
         books = session.exec(select(Book).where(Book.project_id == project_id)).all()
         aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == character_id)).all()
-        alias_texts = {a.alias.lower() for a in aliases}
+        alias_texts = {a.alias.lower().strip() for a in aliases}
+        char = session.get(Character, character_id)
+        if char:
+            alias_texts.add(char.name.lower().strip())
 
-    if not alias_texts:
-        return {}
+        if not alias_texts:
+            return {}
 
-    bracket_regex = re.compile(r"\[(.*?)\]")
-    for book in books:
-        csv_path = base_output_dir / project.name / book.name / "prompts.csv"
-        if not csv_path.exists():
-            continue
-        count = 0
-        try:
-            with open(csv_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f, delimiter="|")
-                for row in reader:
-                    prompt_text = row.get("prompt", "")
-                    for match in bracket_regex.findall(prompt_text):
-                        if match.strip().lower() in alias_texts:
-                            count += 1
-        except Exception:
-            pass
-        if count > 0:
-            book_mentions[book.name] = count
-            
+        for book in books:
+            freq_map = get_book_character_frequency_map(project.name, book.name, session)
+            total = sum(freq_map.get(tag, 0) for tag in alias_texts)
+            if total > 0:
+                book_mentions[book.name] = total
+                
     return book_mentions
 
 
@@ -1001,8 +1012,8 @@ def replace_character_tags_in_prompt(
     scene_num: Optional[int] = None
 ) -> str:
     """
-    Scans a prompt string for bracketed tags, resolves timeline event descriptions chronologically
-    based on coordinates, and returns a modified prompt string containing compiled descriptions.
+    Scans a prompt string for bracketed tags, resolves characters using book-aware linking and recency fallback,
+    and returns a modified prompt string containing compiled physical descriptions.
     """
     bracket_regex = re.compile(r"\[(.*?)\]")
     matches = bracket_regex.findall(prompt)
@@ -1021,80 +1032,131 @@ def replace_character_tags_in_prompt(
 
         for match in matches:
             tag = match.strip()
-            alias = session.exec(
+            tag_lower = tag.lower()
+
+            # 1. Gather all candidate characters matching either alias or canonical name
+            candidate_chars = []
+            
+            alias_matches = session.exec(
                 select(CharacterAlias)
                 .join(Character)
-                .where(CharacterAlias.alias == tag)
                 .where(Character.project_id == project_id)
-            ).first()
-            
-            if not alias:
-                char = session.exec(
-                    select(Character)
-                    .where(Character.project_id == project_id)
-                    .where(Character.name == tag)
-                ).first()
-            else:
-                char = session.get(Character, alias.character_id)
+                .where(CharacterAlias.alias.ilike(tag))
+            ).all()
+            for am in alias_matches:
+                c = session.get(Character, am.character_id)
+                if c and c not in candidate_chars:
+                    candidate_chars.append(c)
+                    
+            direct_name_matches = session.exec(
+                select(Character)
+                .where(Character.project_id == project_id)
+                .where(Character.name.ilike(tag))
+            ).all()
+            for dnm in direct_name_matches:
+                if dnm not in candidate_chars:
+                    candidate_chars.append(dnm)
 
-            if char:
-                try:
-                    session.refresh(char)
-                except Exception:
-                    pass
-
-                if char.id in expanded_character_ids:
-                    replacement = char.name
-                else:
-                    # Resolve active timeline event!
-                    events = session.exec(
-                        select(CharacterTimelineEvent)
-                        .where(CharacterTimelineEvent.character_id == char.id)
-                    ).all()
-                    
-                    base_ev = None
-                    matched_evs = []
-                    for ev in events:
-                        if ev.book_id is None:
-                            base_ev = ev
-                            continue
-                        
-                        ev_order = book_order_map.get(ev.book_id, 0)
-                        
-                        if ev_order < target_book_order:
-                            matched_evs.append((ev, ev_order))
-                        elif ev_order == target_book_order:
-                            if chapter_num is not None and ev.chapter_num < chapter_num:
-                                matched_evs.append((ev, ev_order))
-                            elif chapter_num is not None and ev.chapter_num == chapter_num:
-                                if scene_num is not None and ev.scene_num <= scene_num:
-                                    matched_evs.append((ev, ev_order))
-                    
-                    resolved_ev = base_ev
-                    if matched_evs:
-                        matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
-                        resolved_ev = matched_evs[-1][0]
-                    
-                    if not resolved_ev:
-                        resolved_ev = CharacterTimelineEvent(
-                            character_id=char.id,
-                            book_id=None,
-                            chapter_num=0,
-                            scene_num=0,
-                            label="Base State"
-                        )
-                        session.add(resolved_ev)
-                        session.commit()
-                        session.refresh(resolved_ev)
-                        
-                    replacement = compile_character_description_from_event(
-                        char, resolved_ev, enabled_fields, use_sentence_structure
-                    )
-                    expanded_character_ids.add(char.id)
-                
-                modified_prompt = modified_prompt.replace(f"[{tag}]", replacement, 1)
-            else:
+            if not candidate_chars:
+                # No character entity found; strip brackets and keep raw tag text
                 modified_prompt = modified_prompt.replace(f"[{tag}]", tag, 1)
+                continue
+
+            # 2. Book-Aware Disambiguation
+            char = None
+            if len(candidate_chars) == 1:
+                char = candidate_chars[0]
+            else:
+                # Multi-match collision: check which candidate is explicitly linked to current book_id
+                if book_id:
+                    linked_candidates = []
+                    for cand in candidate_chars:
+                        link = session.exec(
+                            select(CharacterBookLink)
+                            .where(CharacterBookLink.character_id == cand.id)
+                            .where(CharacterBookLink.book_id == book_id)
+                        ).first()
+                        if link:
+                            linked_candidates.append(cand)
+                            
+                    if len(linked_candidates) == 1:
+                        char = linked_candidates[0]
+                    elif len(linked_candidates) > 1:
+                        # Multiple linked to same book: prioritize exact name match over alias match
+                        exact_name = [c for c in linked_candidates if c.name.lower() == tag_lower]
+                        char = exact_name[0] if exact_name else linked_candidates[0]
+
+                # Fallback: find candidate linked to closest previous book (chronological recency)
+                if not char and book_id:
+                    scored_candidates = []
+                    for cand in candidate_chars:
+                        links = session.exec(
+                            select(CharacterBookLink).where(CharacterBookLink.character_id == cand.id)
+                        ).all()
+                        cand_orders = [book_order_map.get(lk.book_id, 0) for lk in links if lk.book_id in book_order_map]
+                        cand_orders_before = [order for order in cand_orders if order < target_book_order]
+                        best_order = max(cand_orders_before) if cand_orders_before else -1
+                        scored_candidates.append((cand, best_order))
+                    
+                    scored_candidates.sort(key=lambda x: x[1], reverse=True)
+                    if scored_candidates and scored_candidates[0][1] >= 0:
+                        char = scored_candidates[0][0]
+
+                # Final fallback: choose first candidate (or exact name match)
+                if not char:
+                    exact_name = [c for c in candidate_chars if c.name.lower() == tag_lower]
+                    char = exact_name[0] if exact_name else candidate_chars[0]
+
+            # 3. Build Description or Canonical Name
+            if char.id in expanded_character_ids:
+                replacement = char.name
+            else:
+                events = session.exec(
+                    select(CharacterTimelineEvent)
+                    .where(CharacterTimelineEvent.character_id == char.id)
+                ).all()
+                
+                base_ev = None
+                matched_evs = []
+                for ev in events:
+                    if ev.book_id is None:
+                        base_ev = ev
+                        continue
+                    
+                    ev_order = book_order_map.get(ev.book_id, 0)
+                    
+                    if ev_order < target_book_order:
+                        matched_evs.append((ev, ev_order))
+                    elif ev_order == target_book_order:
+                        if chapter_num is not None and ev.chapter_num < chapter_num:
+                            matched_evs.append((ev, ev_order))
+                        elif chapter_num is not None and ev.chapter_num == chapter_num:
+                            if scene_num is not None and ev.scene_num <= scene_num:
+                                matched_evs.append((ev, ev_order))
+                
+                resolved_ev = base_ev
+                if matched_evs:
+                    matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
+                    resolved_ev = matched_evs[-1][0]
+                
+                if not resolved_ev:
+                    resolved_ev = CharacterTimelineEvent(
+                        character_id=char.id,
+                        book_id=None,
+                        chapter_num=0,
+                        scene_num=0,
+                        label="Base State"
+                    )
+                    session.add(resolved_ev)
+                    session.commit()
+                    session.refresh(resolved_ev)
+                    
+                replacement = compile_character_description_from_event(
+                    char, resolved_ev, enabled_fields, use_sentence_structure
+                )
+                expanded_character_ids.add(char.id)
+            
+            modified_prompt = modified_prompt.replace(f"[{tag}]", replacement, 1)
                 
     return modified_prompt
 
@@ -1511,36 +1573,152 @@ def execute_character_import(
 
 def reset_project_characters(project_id: int):
     """
-    Completely wipes all characters, aliases, and timeline events for a project.
+    Completely wipes all characters, aliases, book links, and timeline events for a project.
     Resets the characters.json file to an empty state.
     """
     with Session(engine) as session:
-        # 1. Find all characters belonging to this project
         chars = session.exec(select(Character).where(Character.project_id == project_id)).all()
         char_ids = [c.id for c in chars]
 
         if char_ids:
-            # 2. Delete Relational Data first
-            # Aliases
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id.in_(char_ids))).all()
             for a in aliases:
                 session.delete(a)
 
-            # Timeline Events
+            book_links = session.exec(select(CharacterBookLink).where(CharacterBookLink.character_id.in_(char_ids))).all()
+            for bl in book_links:
+                session.delete(bl)
+
             events = session.exec(select(CharacterTimelineEvent).where(CharacterTimelineEvent.character_id.in_(char_ids))).all()
             for e in events:
                 session.delete(e)
-            
-            # Modifiers (if any)
-            modifiers = session.exec(select(CharacterStateModifier).where(CharacterStateModifier.character_id.in_(char_ids))).all()
-            for m in modifiers:
-                session.delete(m)
 
-            # 3. Delete Characters
             for c in chars:
                 session.delete(c)
 
         session.commit()
 
-    # 4. Sync the now-empty state to the characters.json file
     save_project_characters_to_json(project_id)
+
+def link_character_to_book(character_id: int, book_id: int, session: Optional[Session] = None) -> bool:
+    """
+    Ensures a CharacterBookLink relation exists between the character and book.
+    Returns True if a new link was created, False if it already existed.
+    """
+    should_close = False
+    if session is None:
+        session = Session(engine)
+        should_close = True
+
+    try:
+        existing = session.exec(
+            select(CharacterBookLink)
+            .where(CharacterBookLink.character_id == character_id)
+            .where(CharacterBookLink.book_id == book_id)
+        ).first()
+
+        if not existing:
+            link = CharacterBookLink(character_id=character_id, book_id=book_id)
+            session.add(link)
+            session.commit()
+            return True
+        return False
+    finally:
+        if should_close:
+            session.close()
+
+
+def merge_character_into_target(
+    source_char_id: int,
+    target_char_id: int,
+    book_id: Optional[int] = None
+) -> bool:
+    """
+    Reverse-merges source character into target character ("Become Alias" pattern).
+    - Source name and aliases become aliases of target.
+    - Source book links are reparented/merged into target.
+    - Custom timeline overrides and baseline traits from source are migrated.
+    - Deletes source character and syncs characters.json.
+    """
+    if source_char_id == target_char_id:
+        return False
+
+    with Session(engine) as session:
+        src = session.get(Character, source_char_id)
+        tgt = session.get(Character, target_char_id)
+        if not src or not tgt:
+            return False
+
+        project_id = tgt.project_id
+
+        # 1. Transfer source canonical name as an alias on target
+        existing_tgt_aliases = {
+            a.alias.lower().strip()
+            for a in session.exec(select(CharacterAlias).where(CharacterAlias.character_id == tgt.id)).all()
+        }
+        existing_tgt_aliases.add(tgt.name.lower().strip())
+
+        if src.name.lower().strip() not in existing_tgt_aliases:
+            session.add(CharacterAlias(character_id=tgt.id, alias=src.name.strip()))
+            existing_tgt_aliases.add(src.name.lower().strip())
+
+        # 2. Transfer source aliases to target
+        src_aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == src.id)).all()
+        for sa in src_aliases:
+            if sa.alias.lower().strip() not in existing_tgt_aliases:
+                session.add(CharacterAlias(character_id=tgt.id, alias=sa.alias.strip()))
+                existing_tgt_aliases.add(sa.alias.lower().strip())
+            session.delete(sa)
+
+        # 3. Transfer and consolidate book links
+        existing_tgt_links = {
+            lk.book_id
+            for lk in session.exec(select(CharacterBookLink).where(CharacterBookLink.character_id == tgt.id)).all()
+        }
+
+        src_links = session.exec(select(CharacterBookLink).where(CharacterBookLink.character_id == src.id)).all()
+        for sl in src_links:
+            if sl.book_id not in existing_tgt_links:
+                session.add(CharacterBookLink(character_id=tgt.id, book_id=sl.book_id))
+                existing_tgt_links.add(sl.book_id)
+            session.delete(sl)
+
+        # Ensure active book_id is linked to target
+        if book_id and book_id not in existing_tgt_links:
+            session.add(CharacterBookLink(character_id=tgt.id, book_id=book_id))
+
+        # 4. Migrate timeline events (fill empty target base traits from source base, reparent overrides)
+        src_events = session.exec(select(CharacterTimelineEvent).where(CharacterTimelineEvent.character_id == src.id)).all()
+        target_base = session.exec(
+            select(CharacterTimelineEvent)
+            .where(CharacterTimelineEvent.character_id == tgt.id)
+            .where(CharacterTimelineEvent.book_id == None)
+        ).first()
+
+        for ev in src_events:
+            if ev.book_id is None:
+                if target_base:
+                    if not target_base.demographics and ev.demographics: target_base.demographics = ev.demographics
+                    if not target_base.physical_build and ev.physical_build: target_base.physical_build = ev.physical_build
+                    if not target_base.hair_and_face and ev.hair_and_face: target_base.hair_and_face = ev.hair_and_face
+                    if not target_base.distinguishing_marks and ev.distinguishing_marks: target_base.distinguishing_marks = ev.distinguishing_marks
+                    session.add(target_base)
+                session.delete(ev)
+            else:
+                ev.character_id = tgt.id
+                session.add(ev)
+
+        # 5. Delete source character
+        session.delete(src)
+        session.commit()
+
+        if tgt and not tgt.locked:
+            if target_base:
+                target_base.visual_description = compile_character_visual_prompt(target_base)
+                session.add(target_base)
+                session.commit()
+
+    from services.character_organizer import recalculate_project_character_hits
+    recalculate_project_character_hits(project_id)
+    save_project_characters_to_json(project_id)
+    return True

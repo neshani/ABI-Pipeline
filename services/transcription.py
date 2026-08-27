@@ -100,7 +100,7 @@ def chunk_audio_with_ffmpeg(audio_path: Path, output_dir: Path) -> tuple[List[Pa
 def get_onnx_model():
     """
     Dynamically loads the onnx-asr model locally or via huggingface.
-    Optimized for high-performance FP16 execution on Nvidia GPUs with memory limits.
+    Optimized for high-performance CUDA/GPU execution on Nvidia GPUs.
     """
     import onnx_asr
     import onnxruntime as ort
@@ -117,7 +117,7 @@ def get_onnx_model():
     
     def patch_onnx_asr_model(model):
         """
-        Monkeypatches the onnx-asr TDT decoder to prevent AssertionErrors on FP16 models
+        Monkeypatches the onnx-asr TDT decoder to prevent AssertionErrors
         due to off-by-one or mismatched downsampling length calculations.
         """
         if hasattr(model, 'asr'):
@@ -142,53 +142,51 @@ def get_onnx_model():
                     
                     asr_class._decoding = patched_decoding
                     asr_class._patched_for_fp16 = True
-                    print("[ABI-Pipeline] Patched TDT decoder sequence lengths to prevent FP16 assertions.")
+                    print("[ABI-Pipeline] Patched TDT decoder sequence lengths to prevent dimension assertions.")
         return model
 
     if device_setting == "GPU/CUDA":
         gpu_options = {
             "device_id": "0",
             "arena_extend_strategy": "kNextPowerOfTwo",
-            "cudnn_conv_algo_search": "HEURISTIC",   # <--- Restored fast HEURISTIC search
-            "cudnn_conv_use_max_workspace": "1",      # Allows RTX 3090 to use its massive VRAM for math
+            "cudnn_conv_algo_search": "HEURISTIC",   # Restored fast HEURISTIC search
+            "cudnn_conv_use_max_workspace": "1",      # Allows RTX 3090/4090 to use VRAM for math
             "do_copy_in_default_stream": "1",
         }
         providers = [("CUDAExecutionProvider", gpu_options), "CPUExecutionProvider"]
         
-        print(f"Initializing Parakeet ONNX engine in FP16 mode on: {device_setting}")
+        print(f"Initializing Parakeet ONNX v2 engine on: {device_setting}")
         try:
-            local_fp16_exists = os.path.exists(os.path.join(model_dir, "encoder-model.fp16.onnx"))
-            if local_fp16_exists:
+            local_exists = os.path.exists(os.path.join(model_dir, "encoder-model.onnx"))
+            if local_exists:
                 model = onnx_asr.load_model(
-                    "nemo-parakeet-tdt-0.6b-v3", 
+                    "nemo-parakeet-tdt-0.6b-v2", 
                     model_dir, 
-                    quantization="fp16",
                     providers=providers,
                     sess_options=sess_options
                 )
             else:
                 model = onnx_asr.load_model(
-                    "nemo-parakeet-tdt-0.6b-v3", 
-                    quantization="fp16",
+                    "nemo-parakeet-tdt-0.6b-v2", 
                     providers=providers,
                     sess_options=sess_options
                 )
             return patch_onnx_asr_model(model)
         except Exception as e:
-            print(f"GPU FP16 initialization failed: {e}. Falling back gracefully to CPU Execution...")
+            print(f"GPU initialization failed: {e}. Falling back gracefully to CPU Execution...")
             providers = ["CPUExecutionProvider"]
 
-    print(f"Loading Parakeet ONNX model on CPU (Providers: {providers})")
+    print(f"Loading Parakeet ONNX v2 model on CPU (Providers: {providers})")
     if os.path.exists(os.path.join(model_dir, "encoder-model.onnx")):
         model = onnx_asr.load_model(
-            "nemo-parakeet-tdt-0.6b-v3", 
+            "nemo-parakeet-tdt-0.6b-v2", 
             model_dir, 
             providers=providers,
             sess_options=sess_options
         )
     else:
         model = onnx_asr.load_model(
-            "nemo-parakeet-tdt-0.6b-v3", 
+            "nemo-parakeet-tdt-0.6b-v2", 
             providers=providers,
             sess_options=sess_options
         )

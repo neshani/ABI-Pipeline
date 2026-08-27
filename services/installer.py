@@ -19,7 +19,7 @@ os.makedirs(MODEL_STORAGE_DIR, exist_ok=True)
 
 # Correct Hugging Face Repository IDs
 MODEL_REPOS = {
-    "Parakeet ONNX": "istupakov/parakeet-tdt-0.6b-v3-onnx",
+    "Parakeet ONNX": "istupakov/parakeet-tdt-0.6b-v2-onnx",
     "Whisper": "Systran/faster-whisper-small"
 }
 
@@ -99,13 +99,8 @@ def check_model_downloaded(engine_name: str, device: str = "CPU") -> bool:
     """Checks if all necessary model weight files exist locally based on target hardware."""
     model_dir = get_model_dir(engine_name)
     if "ONNX" in engine_name:
-        if device == "GPU/CUDA":
-            # GPU requires both config.json and the fp16 quantized encoder file
-            return os.path.exists(os.path.join(model_dir, "config.json")) and \
-                   os.path.exists(os.path.join(model_dir, "encoder-model.fp16.onnx"))
-        else:
-            # CPU only requires the standard fp32 encoder file
-            return os.path.exists(os.path.join(model_dir, "encoder-model.onnx"))
+        # Parakeet v2 uses encoder-model.onnx for both CPU and CUDA inference
+        return os.path.exists(os.path.join(model_dir, "encoder-model.onnx"))
     else:
         # Check for Whisper's key model weights file
         return os.path.exists(os.path.join(model_dir, "model.bin"))
@@ -213,23 +208,15 @@ async def download_model_weights(
 ) -> bool:
     """
     Downloads model files using hf download inside a background thread.
-    If GPU/CUDA is active, downloads both base FP32 configs and quantized FP16 models
-    and merges them into your workspace to keep things 100% offline-compatible.
+    Downloads the model files into your workspace to keep things 100% offline-compatible.
     """
     local_dir = get_model_dir(engine_name)
     
     # Map target repositories dynamically
     repos = []
-    if engine_name == "Parakeet ONNX":
-        # Base files (config, vocabulary)
-        repos.append("istupakov/parakeet-tdt-0.6b-v3-onnx")
-        if device == "GPU/CUDA":
-            # FP16 quantized execution files
-            repos.append("grikdotnet/parakeet-tdt-0.6b-fp16")
-    else:
-        repo_id = MODEL_REPOS.get(engine_name)
-        if repo_id:
-            repos.append(repo_id)
+    repo_id = MODEL_REPOS.get(engine_name)
+    if repo_id:
+        repos.append(repo_id)
 
     if not repos:
         log_callback(f"Error: No model repositories defined for {engine_name}.\n")
@@ -251,7 +238,6 @@ async def download_model_weights(
                 "--local-dir", local_dir
             ]
             try:
-                # Specifically using encoding="utf-8" and env=env to prevent Windows charmap decoder crashes
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -291,7 +277,7 @@ async def download_model_weights(
             
     if success:
         progress_callback(1.0)
-        log_callback("\nAll necessary repositories successfully downloaded and merged locally!\n")
+        log_callback("\nModel repository successfully downloaded locally!\n")
     else:
         log_callback("\nDownload encountered an error. Please retry.\n")
         
