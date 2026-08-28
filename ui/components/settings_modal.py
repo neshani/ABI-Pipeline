@@ -58,6 +58,7 @@ class SettingsModal:
         self.model_status = False
         self.installing = False
         self.download_progress = 0.0
+        self.subtitles_online = False
         
         # Build the Dialog UI element
         with ui.dialog() as self.dialog, ui.card().classes('w-full max-w-xl p-6 rounded-xl'):
@@ -68,15 +69,46 @@ class SettingsModal:
 
     def update_installation_statuses(self) -> None:
         """Query backend to check if chosen engine is fully installed and ready."""
-        engine = self.settings.get("stt_engine", "Parakeet ONNX")
-        device = self.settings.get("stt_device", "CPU")
-        self.dep_status = check_dependencies(engine, device)
-        self.model_status = check_model_downloaded(engine, device)
+        engine = self.settings.get("stt_engine", "ABI-Subtitles")
+        device = self.settings.get("stt_device", "GPU/CUDA")
+        
+        if engine == "ABI-Subtitles":
+            from services.subtitles_client import SubtitlesClient
+            client = SubtitlesClient(self.settings.get("subtitles_server_url", "http://127.0.0.1:5050"))
+            self.subtitles_online = client.is_alive()
+            self.dep_status = {"status": True, "missing": []}
+            self.model_status = self.subtitles_online
+        else:
+            self.dep_status = check_dependencies(engine, device)
+            self.model_status = check_model_downloaded(engine, device)
+            
         self.update_ui_elements()
 
     def update_ui_elements(self) -> None:
         """Refresh individual UI elements depending on the status values."""
-        # Dependency Indicator
+        engine = self.settings.get("stt_engine", "ABI-Subtitles")
+        
+        if engine == "ABI-Subtitles":
+            if self.subtitles_online:
+                self.dep_label.set_text("✓ ABI-Subtitles Server is ONLINE and reachable.")
+                self.dep_label.classes('text-emerald-600', remove='text-rose-500 text-slate-500')
+                self.model_label.set_text("✓ DirectML inference engine active (~180x realtime).")
+                self.model_label.classes('text-emerald-600', remove='text-rose-500 text-slate-500')
+                self.action_btn.set_text("Server Connected")
+                self.action_btn.disable()
+                self.action_btn.classes('bg-emerald-600', remove='bg-blue-600 bg-amber-600')
+            else:
+                url = self.settings.get("subtitles_server_url", "http://127.0.0.1:5050")
+                self.dep_label.set_text(f"— ABI-Subtitles Server is OFFLINE (Cannot connect to {url})")
+                self.dep_label.classes('text-rose-500', remove='text-emerald-600 text-slate-500')
+                self.model_label.set_text("— Launch ABI-Subtitles app to enable high-speed transcription.")
+                self.model_label.classes('text-rose-500', remove='text-emerald-600 text-slate-500')
+                self.action_btn.set_text("Refresh Connection")
+                self.action_btn.enable()
+                self.action_btn.classes('bg-blue-600', remove='bg-emerald-600 bg-amber-600')
+            return
+
+        # Fallback for Python-managed engines (Parakeet ONNX / Faster-Whisper)
         if self.dep_status["status"]:
             self.dep_label.set_text("✓ Python dependencies installed.")
             self.dep_label.classes('text-emerald-600', remove='text-rose-500 text-slate-500')
@@ -85,7 +117,6 @@ class SettingsModal:
             self.dep_label.set_text(f"— Missing packages: {missing_str}")
             self.dep_label.classes('text-rose-500', remove='text-emerald-600 text-slate-500')
             
-        # Model File Indicator
         if self.model_status:
             self.model_label.set_text("✓ Model weights downloaded locally.")
             self.model_label.classes('text-emerald-600', remove='text-rose-500 text-slate-500')
@@ -93,7 +124,6 @@ class SettingsModal:
             self.model_label.set_text("— Model weights missing.")
             self.model_label.classes('text-rose-500', remove='text-emerald-600 text-slate-500')
 
-        # Main Button Controller
         ready = self.dep_status["status"] and self.model_status
         if ready:
             self.action_btn.set_text("Engine Ready")
@@ -105,16 +135,23 @@ class SettingsModal:
             self.action_btn.classes('bg-blue-600', remove='bg-emerald-600 bg-amber-600')
 
     async def execute_installation_pipeline(self) -> None:
-        """Background process that installs dependencies and downloads models without freezing UI."""
+        """Background process that installs dependencies and downloads models or tests connection."""
+        engine = self.settings.get("stt_engine", "ABI-Subtitles")
+        
+        if engine == "ABI-Subtitles":
+            self.update_installation_statuses()
+            if self.subtitles_online:
+                ui.notify("Connected to ABI-Subtitles server!", type="positive")
+            else:
+                ui.notify("Could not connect to ABI-Subtitles server. Is the app running?", type="warning")
+            return
+
         self.installing = True
         self.action_btn.disable()
         self.terminal_log.clear()
         self.progress_bar.set_value(0.0)
-        
-        engine = self.settings.get("stt_engine", "Parakeet ONNX")
         device = self.settings.get("stt_device", "CPU")
         
-        # Step 1: Install Python Libraries (if missing)
         had_missing_deps = len(self.dep_status["missing"]) > 0
         if not self.dep_status["status"]:
             success = await run_pip_install(self.dep_status["missing"], self.write_to_terminal)
@@ -124,7 +161,6 @@ class SettingsModal:
                 self.update_installation_statuses()
                 return
             
-        # Step 2: Download Model Weights (if missing)
         if not self.model_status:
             success = await download_model_weights(
                 engine, 
@@ -138,11 +174,9 @@ class SettingsModal:
                 self.update_installation_statuses()
                 return
 
-        # Success!
         self.installing = False
         self.update_installation_statuses()
         
-        # Flag a clean restart requirement if new libraries containing DLLs/binaries were deployed
         if had_missing_deps:
             state.needs_restart = True
             ui.notify("Engine setup completed! Please quit the app and run start.bat again to apply libraries.", type="warning", timeout=0)
@@ -177,11 +211,9 @@ class SettingsModal:
     def write_to_terminal(self, text: str) -> None:
         """Pipes console logs into our terminal widget."""
         self.terminal_log.push(text)
-        # Safe client-bound JavaScript execution eliminates Client Deletion warning alerts
         if self.terminal_log.client.has_socket_connection:
             self.terminal_log.client.run_javascript('const logs = document.querySelectorAll(".nicegui-log"); logs.forEach(el => el.scrollTop = el.scrollHeight);')
 
-            
     def update_download_progress(self, val: float) -> None:
         """Updates progress bar."""
         self.progress_bar.set_value(val)
@@ -195,7 +227,6 @@ class SettingsModal:
 
     def open(self) -> None:
         """Syncs settings with current database values and opens settings dialog."""
-        # 1. Sync settings in memory with latest database entries to prevent out-of-sync states
         from database.connection import get_setting
         for k in list(self.settings.keys()):
             db_val = get_setting(k)
@@ -209,7 +240,6 @@ class SettingsModal:
                 else:
                     self.settings[k] = db_val
 
-        # 2. Prevent NiceGUI's blank dropdown bug by ensuring the saved value is in the options list
         saved_model = self.settings.get('llm_model', '')
         if not saved_model:
             saved_model = 'local-model'
@@ -235,7 +265,6 @@ class SettingsModal:
         ui.label('Global Configuration').classes('text-xl font-bold text-slate-800 mb-2')
         
         with ui.column().classes('w-full gap-4'):
-            # Dynamic warning card bound to restart state
             with ui.card().classes('w-full bg-amber-50 border border-amber-200 p-4 rounded-xl gap-2') \
                     .bind_visibility_from(state, 'needs_restart'):
                 with ui.row().classes('items-center gap-2 text-amber-900 font-bold text-xs'):
@@ -255,7 +284,7 @@ class SettingsModal:
                         ).classes('bg-amber-600 text-white font-semibold text-xs')
                         ui.label('Manually launch start.bat afterwards').classes('text-[8px] text-amber-600 mt-1 font-semibold')
 
-            # 1. ComfyUI and LLM settings (Expanded by default)
+            # 1. ComfyUI and LLM settings
             with ui.expansion('AI Server & Connections', icon='settings', value=True).classes('w-full border rounded-lg'):
                 with ui.column().classes('w-full p-4 gap-3'):
                     ui.input('ComfyUI Base URL').bind_value(self.settings, 'comfy_url').classes('w-full')
@@ -264,11 +293,9 @@ class SettingsModal:
                     ui.input('LLM API Endpoint URL', placeholder="e.g., http://localhost:11434").bind_value(self.settings, 'llm_url').classes('w-full')
                     ui.input('LLM API Key (Optional)', password=True, password_toggle_button=True).bind_value(self.settings, 'llm_api_key').classes('w-full')
                     
-                    # Local LLM Launcher Configuration
                     ui.input('Local LLM Host Executable Path', placeholder="e.g., E:/llama-cpp/llama-server.exe").bind_value(self.settings, 'llm_launch_path').classes('w-full')
                     ui.input('Local LLM Launch Arguments', placeholder="e.g., --models-preset models.ini --port 1357").bind_value(self.settings, 'llm_launch_args').classes('w-full')
                     
-                    # Row with Model Dropdown & Dynamic Refresh Option
                     with ui.row().classes('w-full items-end gap-2'):
                         saved_model = self.settings.get('llm_model', '')
                         initial_options = [saved_model] if saved_model else ['local-model']
@@ -286,7 +313,6 @@ class SettingsModal:
             # 2. UI & Notifications Accordion
             with ui.expansion('Notifications & Export Options', icon='notifications').classes('w-full border rounded-lg bg-slate-50/50'):
                 with ui.column().classes('w-full p-4 gap-3 bg-white'):
-                    
                     def on_notification_toggle(e):
                         if e.value:
                             ui.run_javascript('''
@@ -307,7 +333,7 @@ class SettingsModal:
                     ).bind_value(self.settings, 'enable_desktop_notifications').on_value_change(on_notification_toggle)
                     
                     ui.checkbox(
-                        'Export Word-Timestamped JSON (subtitles.json) for Read-Along',
+                        'Export Word-Timestamped JSON (transcript.json) for Read-Along',
                         value=self.settings.get('save_word_timestamps', True)
                     ).bind_value(self.settings, 'save_word_timestamps').tooltip('Generates a word-level timing JSON file formatted for subtitle/read-along sync tools')
 
@@ -317,29 +343,34 @@ class SettingsModal:
                         placeholder='e.g., 30'
                     ).bind_value(self.settings, 'notification_threshold').classes('w-full').tooltip('Only notifies if the batch contains at least this many processed items')
 
-            # 3. STT Selection & Installation Status (Collapsed at the bottom)
-            with ui.expansion('Transcription Setup (One-Time)', icon='construction').classes('w-full border rounded-lg bg-slate-50/50'):
+            # 3. STT Selection & Configuration
+            with ui.expansion('Transcription Setup', icon='construction', value=False).classes('w-full border rounded-lg bg-slate-50/50'):
                 with ui.column().classes('w-full p-4 gap-4 bg-white'):
                     
-                    # Engine Radio Selector
                     with ui.column().classes('w-full gap-1'):
                         ui.label('STT Engine').classes('text-xs font-bold text-slate-500')
                         self.engine_radio = ui.radio(
                             options={
-                                'Parakeet ONNX': 'Parakeet ONNX (Recommended - ~160x Speed)',
-                                'Whisper': 'Faster-Whisper (Backup - ~38x Speed)'
+                                'ABI-Subtitles': 'ABI-Subtitles (Recommended - ~180x DirectML)',
+                                'Parakeet ONNX': 'Parakeet ONNX (Python Local - ~65x)',
+                                'Whisper': 'Faster-Whisper (Python Local - ~38x)'
                             }
                         ).bind_value(self.settings, 'stt_engine').on_value_change(self.update_installation_statuses).classes('w-full text-sm')
                         
-                        # Subtext with file sizes and speed benchmarks
                         with ui.column().classes('bg-slate-50 p-3 rounded-lg border border-slate-100 mt-1 gap-1.5 text-[11px] text-slate-600 leading-normal'):
-                            ui.label('• Parakeet ONNX: Ultra-fast parallel sequential batching. Transcribes a 20-hour audiobook in ~5 to 8 minutes on GPU. Footprint: ~300 MB packages + ~2.5 GB model weights.').classes('font-medium')
-                            ui.label('• Faster-Whisper: Highly detailed phrase-level timing maps, but processes audio sequentially. Transcribes a 20-hour audiobook in ~35 minutes on GPU. Footprint: ~3.5 GB PyTorch packages + ~484 MB model weights.').classes('font-medium')
+                            ui.label('• ABI-Subtitles: External DirectML server with asynchronous queue. 160x–190x speed. Transcribes a 20-hour audiobook in ~6 minutes. Zero Python VRAM footprint.').classes('font-medium')
+                            ui.label('• Parakeet ONNX: Python in-process ONNX runtime engine. Transcribes a 20-hour audiobook in ~18 minutes on GPU.').classes('font-medium')
+                            ui.label('• Faster-Whisper: Sequential Whisper engine. Transcribes a 20-hour audiobook in ~35 minutes on GPU.').classes('font-medium')
 
-                    ui.separator()
+                    # ABI-Subtitles specific server settings
+                    with ui.column().classes('w-full gap-2 border-t pt-3') \
+                            .bind_visibility_from(self.settings, 'stt_engine', backward=lambda e: e == 'ABI-Subtitles'):
+                        ui.input('ABI-Subtitles Server URL', placeholder='http://127.0.0.1:5050').bind_value(self.settings, 'subtitles_server_url').classes('w-full')
+                        ui.input('ABI-Subtitles Executable Path (Optional)', placeholder='e.g., E:/ABI-Subtitles/abi-subtitles.exe').bind_value(self.settings, 'subtitles_launch_path').classes('w-full')
 
-                    # Hardware Target Radio Selector
-                    with ui.column().classes('w-full gap-1'):
+                    # Hardware Target Selector (for in-process Python engines)
+                    with ui.column().classes('w-full gap-1 border-t pt-3') \
+                            .bind_visibility_from(self.settings, 'stt_engine', backward=lambda e: e != 'ABI-Subtitles'):
                         ui.label('STT Device / Hardware Target').classes('text-xs font-bold text-slate-500')
                         self.device_radio = ui.radio(
                             options={
@@ -348,21 +379,18 @@ class SettingsModal:
                             }
                         ).bind_value(self.settings, 'stt_device').on_value_change(self.update_installation_statuses).classes('w-full text-sm')
                     
-                    # Real-Time Status Indicators
                     with ui.column().classes('gap-1 mt-1'):
-                        self.dep_label = ui.label("Checking dependencies...").classes('text-xs text-slate-500 font-medium')
-                        self.model_label = ui.label("Checking model files...").classes('text-xs text-slate-500 font-medium')
+                        self.dep_label = ui.label("Checking status...").classes('text-xs text-slate-500 font-medium')
+                        self.model_label = ui.label("Checking engine...").classes('text-xs text-slate-500 font-medium')
                     
-                    # Action Button & Progress Bar
-                    self.action_btn = ui.button('Install & Download Engine', on_click=self.execute_installation_pipeline).classes('w-full mt-2 bg-blue-600 text-white rounded-lg text-sm')
+                    self.action_btn = ui.button('Check / Install Engine', on_click=self.execute_installation_pipeline).classes('w-full mt-2 bg-blue-600 text-white rounded-lg text-sm')
                     self.progress_bar = ui.linear_progress(value=0.0).classes('w-full')
 
-                    # Installation Console Log Output
-                    ui.label('Installation Console Output').classes('text-xs font-bold text-slate-500 mt-2')
-                    self.terminal_log = ui.log().classes('h-36 w-full bg-slate-950 p-2 text-emerald-400 font-mono text-[10px] rounded-lg')
-
+                    with ui.column().classes('w-full') \
+                            .bind_visibility_from(self.settings, 'stt_engine', backward=lambda e: e != 'ABI-Subtitles'):
+                        ui.label('Installation Console Output').classes('text-xs font-bold text-slate-500 mt-2')
+                        self.terminal_log = ui.log().classes('h-36 w-full bg-slate-950 p-2 text-emerald-400 font-mono text-[10px] rounded-lg')
                     
-            # Actions Bottom Bar
             with ui.row().classes('w-full justify-end gap-3 mt-2'):
                 ui.button('Cancel', on_click=self.dialog.close).props('flat color=slate')
                 ui.button('Save Configurations', on_click=self.save_and_close).classes('bg-blue-600 text-white')

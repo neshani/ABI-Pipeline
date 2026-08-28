@@ -203,13 +203,15 @@ DEFAULT_SETTINGS = {
     "llm_model": "unsloth/gemma-4-e4b-it",
     "llm_launch_path": "",
     "llm_launch_args": "",
-    "stt_engine": "Parakeet ONNX",
+    "stt_engine": "ABI-Subtitles",
     "stt_device": "GPU/CUDA",
+    "subtitles_server_url": "http://127.0.0.1:5050",
+    "subtitles_launch_path": "",
     "batch_size": 30,
     "output_dir": "./output",
     "enable_desktop_notifications": False,
     "notification_threshold": 30,
-    "save_word_timestamps": False,
+    "save_word_timestamps": True,
     "wizard_completed": False
 }
 
@@ -374,28 +376,37 @@ def refresh_dashboard():
 
 # --- Transcription Action Handlers ---
 def start_transcribing(project_id: int):
-    try:
-        import onnx_asr
-    except ImportError:
-        ui.notify(
-            "Required dependency 'onnx-asr' is not installed. Check the dynamic installer in Settings.", 
-            type="negative",
-            close_button=True
-        )
-        return
+    stt_engine = get_setting("stt_engine", "ABI-Subtitles")
+    if stt_engine == "ABI-Subtitles":
+        from services.subtitles_client import SubtitlesClient
+        client = SubtitlesClient()
+        if not client.is_alive():
+            ui.notify(
+                f"ABI-Subtitles server is offline at {client.base_url}. Please launch ABI-Subtitles first.", 
+                type="negative",
+                close_button=True
+            )
+            return
+    elif stt_engine == "Parakeet ONNX":
+        try:
+            import onnx_asr
+        except ImportError:
+            ui.notify(
+                "Required dependency 'onnx-asr' is not installed. Check the dynamic installer in Settings.", 
+                type="negative",
+                close_button=True
+            )
+            return
 
-    # Clear cancellation tracking status
     state.was_manually_cancelled = False
     state.active_task_type = "transcription"
 
     start_project_transcription(project_id)
     ui.notify("Background audiobook transcription started!", type="positive")
     
-    # Touch project modification timestamp
     from database.connection import touch_project
     touch_project(project_id)
     
-    # Fast trigger to update action buttons and stepper layout
     state.project_status = "Transcribing"
     if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
         state.action_buttons_refresh()
@@ -1421,6 +1432,30 @@ def launch_comfyui():
         ui.notify(f"Failed to launch ComfyUI process: {str(e)}", type="negative")
 
 
+def launch_subtitles_host():
+    """Launches the standalone ABI-Subtitles app in a non-blocking background subprocess."""
+    sub_path_str = get_setting("subtitles_launch_path", "")
+    if not sub_path_str:
+        ui.notify("ABI-Subtitles executable path is not configured in settings.", type="warning")
+        return
+        
+    sub_file = Path(sub_path_str).resolve()
+    if not sub_file.exists() or not sub_file.is_file():
+        ui.notify(f"ABI-Subtitles executable not found: {sub_file}", type="negative")
+        return
+
+    working_dir = sub_file.parent
+    try:
+        if os.name == 'nt':
+            subprocess.Popen([str(sub_file)], cwd=str(working_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
+        else:
+            subprocess.Popen([str(sub_file)], cwd=str(working_dir))
+        ui.notify("Launching ABI-Subtitles process...", type="info")
+        state.add_console_log(f"[Subtitles-Launcher] Process launched: {sub_file.name}")
+    except Exception as e:
+        ui.notify(f"Failed to launch ABI-Subtitles: {str(e)}", type="negative")
+        state.add_console_log(f"[Subtitles-Launcher] Error launching ABI-Subtitles: {str(e)}")
+
 def launch_llm_host():
     """Launches the configured local LLM host in a non-blocking background subprocess."""
     llm_path_str = get_setting("llm_launch_path", "")
@@ -1785,6 +1820,14 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
     header_controls()
 
     with ui.row().classes('items-center gap-3'):
+        # Launch Subtitles Button (Visible if path configured or engine is ABI-Subtitles)
+        ui.button(
+            'Launch Subtitles',
+            icon='closed_caption',
+            on_click=launch_subtitles_host
+        ).props('flat dense').classes('text-xs text-amber-400 hover:text-amber-300 font-bold px-2 py-1 bg-slate-700/50 rounded border border-slate-600/30') \
+            .bind_visibility_from(app_settings, 'subtitles_launch_path', backward=lambda val: bool(val and val.strip()))
+
         # Launch Comfy Button (Visible only if local comfy path is populated)
         ui.button(
             'Launch Comfy', 

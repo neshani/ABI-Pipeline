@@ -6,13 +6,15 @@ import threading
 import subprocess
 import math
 import gc
+import json
+import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import ffmpeg
 from sqlmodel import Session, select
 from database.connection import engine, get_setting
 from database.models import Project, Book, Chapter
-
+from services.subtitles_client import SubtitlesClient
 
 # Thread-safe global trackers for active/cancelled jobs
 active_projects = set()
@@ -109,17 +111,13 @@ def get_onnx_model():
     device_setting = get_setting("stt_device", "GPU/CUDA")
     
     sess_options = ort.SessionOptions()
-    sess_options.intra_op_num_threads = 8  # Use multiple CPU cores for audio feature extraction
+    sess_options.intra_op_num_threads = 8
     sess_options.inter_op_num_threads = 8
     sess_options.enable_mem_pattern = False
     sess_options.enable_cpu_mem_arena = False
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     
     def patch_onnx_asr_model(model):
-        """
-        Monkeypatches the onnx-asr TDT decoder to prevent AssertionErrors
-        due to off-by-one or mismatched downsampling length calculations.
-        """
         if hasattr(model, 'asr'):
             asr_class = model.asr.__class__
             if hasattr(asr_class, '_decoding'):
@@ -149,8 +147,8 @@ def get_onnx_model():
         gpu_options = {
             "device_id": "0",
             "arena_extend_strategy": "kNextPowerOfTwo",
-            "cudnn_conv_algo_search": "HEURISTIC",   # Restored fast HEURISTIC search
-            "cudnn_conv_use_max_workspace": "1",      # Allows RTX 3090/4090 to use VRAM for math
+            "cudnn_conv_algo_search": "HEURISTIC",
+            "cudnn_conv_use_max_workspace": "1",
             "do_copy_in_default_stream": "1",
         }
         providers = [("CUDAExecutionProvider", gpu_options), "CPUExecutionProvider"]
@@ -213,6 +211,13 @@ def start_project_transcription(project_id: int) -> None:
 def cancel_project_transcription(project_id: int) -> None:
     """Requests a cancellation/stop of any active transcription for this project."""
     cancelled_projects.add(project_id)
+    
+    # Also forward cancel to ABI-Subtitles server if active
+    try:
+        client = SubtitlesClient()
+        client.cancel_jobs()
+    except Exception:
+        pass
 
 
 def transcribe_project_worker(project_id: int) -> None:
@@ -230,9 +235,24 @@ def transcribe_project_worker(project_id: int) -> None:
         books = session.exec(select(Book).where(Book.project_id == project_id)).all()
         book_ids = [b.id for b in books]
 
-    try:
-        stt_engine = get_setting("stt_engine", "Parakeet ONNX")
-        if stt_engine == "Whisper":
+    stt_engine = get_setting("stt_engine", "ABI-Subtitles")
+    model = None
+
+    if stt_engine == "ABI-Subtitles":
+        sub_client = SubtitlesClient()
+        if not sub_client.is_alive():
+            print(f"[ABI-Subtitles] Server not reachable at {sub_client.base_url}. Please launch ABI-Subtitles first.")
+            with Session(engine) as session:
+                project = session.get(Project, project_id)
+                if project:
+                    project.status = "Imported"
+                    session.add(project)
+                    session.commit()
+            active_projects.discard(project_id)
+            return
+        model = sub_client
+    elif stt_engine == "Whisper":
+        try:
             from faster_whisper import WhisperModel
             model_dir = os.path.abspath(".models/whisper")
             device_setting = get_setting("stt_device", "GPU/CUDA")
@@ -241,35 +261,47 @@ def transcribe_project_worker(project_id: int) -> None:
             
             print(f"\n[ABI-Pipeline] Loading Faster-Whisper on {device} ({compute_type})...")
             model = WhisperModel(model_dir, device=device, compute_type=compute_type, local_files_only=True)
-        else:
+        except Exception as e:
+            print(f"CRITICAL: Failed to load Whisper STT model weights: {e}")
+            with Session(engine) as session:
+                project = session.get(Project, project_id)
+                if project:
+                    project.status = "Failed"
+                    session.add(project)
+                    session.commit()
+            active_projects.discard(project_id)
+            return
+    else:
+        try:
             model = get_onnx_model()
-    except Exception as e:
-        print(f"CRITICAL: Failed to load STT model weights: {e}")
-        with Session(engine) as session:
-            project = session.get(Project, project_id)
-            if project:
-                project.status = "Failed"
-                session.add(project)
-                session.commit()
-        active_projects.discard(project_id)
-        return
+        except Exception as e:
+            print(f"CRITICAL: Failed to load STT model weights: {e}")
+            with Session(engine) as session:
+                project = session.get(Project, project_id)
+                if project:
+                    project.status = "Failed"
+                    session.add(project)
+                    session.commit()
+            active_projects.discard(project_id)
+            return
 
     for book_id in book_ids:
         if project_id in cancelled_projects:
             break
         transcribe_book(book_id, model, project_id)
 
-    try:
-        if hasattr(model, 'asr'):
-            if hasattr(model.asr, '_encoder'):
-                model.asr._encoder.set_providers([])
-            if hasattr(model.asr, '_decoder_joint'):
-                model.asr._decoder_joint.set_providers([])
-    except Exception as e:
-        pass
+    if stt_engine != "ABI-Subtitles":
+        try:
+            if hasattr(model, 'asr'):
+                if hasattr(model.asr, '_encoder'):
+                    model.asr._encoder.set_providers([])
+                if hasattr(model.asr, '_decoder_joint'):
+                    model.asr._decoder_joint.set_providers([])
+        except Exception:
+            pass
 
-    del model
-    gc.collect()
+        del model
+        gc.collect()
 
     with Session(engine) as session:
         project = session.get(Project, project_id)
@@ -284,11 +316,343 @@ def transcribe_project_worker(project_id: int) -> None:
     active_projects.discard(project_id)
 
 
+def transcribe_book_with_subtitles_server(book_id: int, client: SubtitlesClient, project_id: int, force_retranscribe: bool = False) -> None:
+    """
+    High-speed transcription using the ABI-Subtitles standalone DirectML server.
+    For single-file M4Bs: passes the single file to /v1/jobs, then partitions clean_json in Python.
+    For multi-file books: enqueues chapter tracks via /v1/jobs/batch.
+    """
+    working_dir = Path("./workspace_temp") / f"book_{book_id}"
+
+    if force_retranscribe:
+        print(f"[ABI-Subtitles] Force flag active. Clearing cache: {working_dir}")
+        if working_dir.exists():
+            try:
+                shutil.rmtree(working_dir)
+            except Exception:
+                pass
+        with Session(engine) as session:
+            chapters_to_reset = session.exec(select(Chapter).where(Chapter.book_id == book_id)).all()
+            for ch in chapters_to_reset:
+                ch.status = "Pending"
+                session.add(ch)
+            session.commit()
+
+    with Session(engine) as session:
+        book = session.get(Book, book_id)
+        if not book:
+            return
+        if book.status == "Transcribed" and not force_retranscribe:
+            return
+
+        book_name = book.name
+        book_path = book.path
+        project = session.get(Project, project_id)
+        project_name = project.name if project else "Default_Project"
+        project_path = project.path if project else ""
+
+        book.status = "Transcribing"
+        session.add(book)
+        session.commit()
+
+        chapters = session.exec(select(Chapter).where(Chapter.book_id == book_id).order_by(Chapter.chapter_num)).all()
+        total_chapters = len(chapters)
+
+    base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
+    book_output_dir = base_output_dir / project_name / book_name
+    book_output_dir.mkdir(parents=True, exist_ok=True)
+    working_dir.mkdir(parents=True, exist_ok=True)
+
+    source_audio_dir = None
+    if book_path:
+        p = Path(book_path)
+        source_audio_dir = p if p.is_dir() else p.parent
+
+    is_single_file_segmented = any(c.type == 'segment' for c in chapters)
+
+    if is_single_file_segmented:
+        # --- SINGLE-FILE M4B WORKFLOW: Send single file, partition in memory ---
+        source_audio_file = chapters[0].input_file
+        print(f"[ABI-Subtitles] Single-file M4B detected: '{Path(source_audio_file).name}'. Enqueuing full file (zero-copy)...")
+        
+        job_summary = client.enqueue_job(source_audio_file, response_format="clean_json")
+        if not job_summary:
+            print(f"[ABI-Subtitles] Failed to enqueue job for {source_audio_file}")
+            return
+
+        job_id = job_summary["job_id"]
+        print(f"[ABI-Subtitles] Job enqueued successfully: {job_id}. Polling progress...")
+
+        # Safe poll loop: query status and summary without premature deletion
+        clean_json_data = None
+        last_pct_logged = -1
+
+        while True:
+            if project_id in cancelled_projects:
+                client.cancel_jobs(job_id)
+                print("[ABI-Subtitles] Transcription cancelled by user.")
+                return
+
+            # 1. Update live UI progress from /v1/jobs/status
+            status_resp = client.get_queue_status()
+            if status_resp and status_resp.get("active_progress"):
+                prog = status_resp["active_progress"]
+                if prog.get("job_id") == job_id:
+                    pct = prog.get("percent", 0.0)
+                    speedup = prog.get("speedup", 0.0)
+                    eta = prog.get("eta_seconds", 0.0)
+
+                    # Log every ~5% or if speedup changes
+                    if abs(pct - last_pct_logged) >= 5.0 or (speedup > 0 and last_pct_logged == 0):
+                        print(f"  -> Progress: {pct:.1f}% (Speedup: {speedup:.1f}x • ETA: {int(eta)}s)")
+                        last_pct_logged = pct
+
+                    with Session(engine) as session:
+                        db_book = session.get(Book, book_id)
+                        if db_book:
+                            db_book.progress = pct / 100.0
+                            session.add(db_book)
+                            session.commit()
+            elif status_resp and not status_resp.get("active_progress"):
+                # Rust is currently decoding audio before inference starts
+                print("  -> Decoding audio in parallel before inference starts...", end="\r")
+                
+
+            # 2. Check safe job summary
+            summary = client.get_job_summary(job_id)
+            if summary:
+                job_status = summary.get("status", "").lower()
+                if job_status == "completed":
+                    print(f"[ABI-Subtitles] Job {job_id} reported completed! Fetching result payload...")
+                    status_code, result_data = client.get_job_result(job_id, delete_on_retrieval=True)
+                    if status_code == 200 and isinstance(result_data, dict):
+                        clean_json_data = result_data
+                        break
+                    else:
+                        print(f"[ABI-Subtitles] Error retrieving result payload (status {status_code})")
+                        return
+                elif job_status == "failed":
+                    print(f"[ABI-Subtitles] Job {job_id} failed: {summary.get('error')}")
+                    return
+                elif job_status == "cancelled":
+                    print(f"[ABI-Subtitles] Job {job_id} was cancelled.")
+                    return
+
+            time.sleep(1.0)
+
+        # Partition clean_json across chapters by DB chapter start_time and end_time
+        print(f"[ABI-Subtitles] Received full transcript. Partitioning across {total_chapters} chapters...")
+        all_segments = clean_json_data.get("segments", [])
+        all_words = clean_json_data.get("words", [])
+        total_duration = clean_json_data.get("duration", 0.0)
+
+        for ch in chapters:
+            ch_start = ch.start_time or 0.0
+            ch_end = ch.end_time if ch.end_time and ch.end_time > ch_start else total_duration
+
+            ch_segments = [s for s in all_segments if ch_start <= s["start"] < ch_end]
+            ch_words = [w for w in all_words if ch_start <= w["start"] < ch_end]
+
+            ch_text = " ".join(s["text"] for s in ch_segments).strip()
+            
+            # Save chapter_N.txt
+            chapter_txt = working_dir / f"chapter_{ch.chapter_num}.txt"
+            with open(chapter_txt, "w", encoding="utf-8") as f:
+                f.write(ch_text)
+
+            # Build timing map for chapter
+            timing_map = []
+            char_offset = 0
+            for seg in ch_segments:
+                txt = seg["text"].strip()
+                t_len = len(txt)
+                timing_map.append({
+                    "start": seg["start"],
+                    "end": seg["end"],
+                    "char_start": char_offset,
+                    "char_end": char_offset + t_len
+                })
+                char_offset += t_len + 1
+
+            chapter_json = working_dir / f"chapter_{ch.chapter_num}.json"
+            with open(chapter_json, "w", encoding="utf-8") as jf:
+                json.dump(timing_map, jf, indent=4)
+
+            # Build subtitles JSON for chapter (with continuous ms timestamps)
+            word_objs = []
+            for w in ch_words:
+                word_objs.append({
+                    "word": w["word"].strip(),
+                    "start_ms": int(round(w["start"] * 1000)),
+                    "end_ms": int(round(w["end"] * 1000))
+                })
+            subtitle_sentences = split_words_into_sentences(word_objs)
+
+            sub_json = working_dir / f"chapter_{ch.chapter_num}_subtitles.json"
+            with open(sub_json, "w", encoding="utf-8") as sjf:
+                json.dump(subtitle_sentences, sjf, indent=4)
+
+            with Session(engine) as session:
+                db_ch = session.get(Chapter, ch.id)
+                if db_ch:
+                    db_ch.status = "Completed"
+                    session.add(db_ch)
+                    session.commit()
+
+    else:
+        # --- MULTI-FILE WORKFLOW: Enqueue pending chapter tracks ---
+        pending_chapters = [c for c in chapters if c.status != "Completed" or not (working_dir / f"chapter_{c.chapter_num}.txt").exists()]
+        if not pending_chapters:
+            print(f"[ABI-Subtitles] All chapters already completed for '{book_name}'.")
+        else:
+            print(f"[ABI-Subtitles] Enqueuing {len(pending_chapters)} track(s) for '{book_name}'...")
+            paths_to_enqueue = [c.input_file for c in pending_chapters]
+            batch_resp = client.enqueue_batch(paths_to_enqueue, response_format="clean_json")
+            if not batch_resp:
+                print("[ABI-Subtitles] Failed to enqueue batch tracks.")
+                return
+
+            job_records = {job["job_id"]: ch for job, ch in zip(batch_resp.get("jobs", []), pending_chapters)}
+            completed_job_ids = set()
+
+            cumulative_offset_ms = 0
+            for ch in chapters:
+                if ch not in pending_chapters:
+                    try:
+                        probe = ffmpeg.probe(ch.input_file)
+                        cumulative_offset_ms += int(round(float(probe['format']['duration']) * 1000))
+                    except Exception:
+                        pass
+
+            while len(completed_job_ids) < len(job_records):
+                if project_id in cancelled_projects:
+                    client.cancel_jobs()
+                    print("[ABI-Subtitles] Transcription cancelled by user.")
+                    return
+
+                for job_id, ch in list(job_records.items()):
+                    if job_id in completed_job_ids:
+                        continue
+
+                    summary = client.get_job_summary(job_id)
+                    if not summary:
+                        continue
+
+                    job_status = summary.get("status", "").lower()
+                    if job_status == "completed":
+                        status_code, result_data = client.get_job_result(job_id, delete_on_retrieval=True)
+                        if status_code == 200 and isinstance(result_data, dict):
+                            completed_job_ids.add(job_id)
+                            
+                            ch_text = result_data.get("text", "").strip()
+                            ch_segments = result_data.get("segments", [])
+                            ch_words = result_data.get("words", [])
+
+                            # Save chapter_N.txt
+                            chapter_txt = working_dir / f"chapter_{ch.chapter_num}.txt"
+                            with open(chapter_txt, "w", encoding="utf-8") as f:
+                                f.write(ch_text)
+
+                            # Timing map
+                            timing_map = []
+                            char_offset = 0
+                            for seg in ch_segments:
+                                txt = seg["text"].strip()
+                                t_len = len(txt)
+                                timing_map.append({
+                                    "start": seg["start"],
+                                    "end": seg["end"],
+                                    "char_start": char_offset,
+                                    "char_end": char_offset + t_len
+                                })
+                                char_offset += t_len + 1
+
+                            chapter_json = working_dir / f"chapter_{ch.chapter_num}.json"
+                            with open(chapter_json, "w", encoding="utf-8") as jf:
+                                json.dump(timing_map, jf, indent=4)
+
+                            # Subtitles with offset
+                            word_objs = []
+                            for w in ch_words:
+                                word_objs.append({
+                                    "word": w["word"].strip(),
+                                    "start_ms": cumulative_offset_ms + int(round(w["start"] * 1000)),
+                                    "end_ms": cumulative_offset_ms + int(round(w["end"] * 1000))
+                                })
+                            subtitle_sentences = split_words_into_sentences(word_objs)
+
+                            sub_json = working_dir / f"chapter_{ch.chapter_num}_subtitles.json"
+                            with open(sub_json, "w", encoding="utf-8") as sjf:
+                                json.dump(subtitle_sentences, sjf, indent=4)
+
+                            track_dur_ms = int(round(result_data.get("duration", 0.0) * 1000))
+                            cumulative_offset_ms += track_dur_ms
+
+                            with Session(engine) as session:
+                                db_ch = session.get(Chapter, ch.id)
+                                if db_ch:
+                                    db_ch.status = "Completed"
+                                    session.add(db_ch)
+                                    session.commit()
+
+                                completed_count = len(session.exec(
+                                    select(Chapter).where(Chapter.book_id == book_id).where(Chapter.status == "Completed")
+                                ).all())
+                                db_book = session.get(Book, book_id)
+                                if db_book:
+                                    db_book.progress = completed_count / total_chapters if total_chapters > 0 else 1.0
+                                    session.add(db_book)
+                                    session.commit()
+
+                            print(f"[ABI-Subtitles] Chapter {ch.chapter_num} ('{ch.title}') complete.")
+
+                    elif job_status == "failed":
+                        completed_job_ids.add(job_id)
+                        print(f"[ABI-Subtitles] Job failed for Chapter {ch.chapter_num}: {summary.get('error')}")
+
+                time.sleep(1.0)
+
+    # Final assemble
+    if project_id not in cancelled_projects:
+        print(f"[ABI-Pipeline] Combining chapter texts and merging timing metadata for '{book_name}'...")
+        combine_chapters(working_dir, book_output_dir, source_audio_dir=source_audio_dir)
+
+        try:
+            metadata_file = book_output_dir / "metadata.json"
+            meta_data = {
+                "project_name": project_name,
+                "project_path": project_path,
+                "book_name": book_name,
+                "book_path": book_path,
+                "audio_type": "single_file" if is_single_file_segmented else "multi_file"
+            }
+            with open(metadata_file, "w", encoding="utf-8") as mf:
+                json.dump(meta_data, mf, indent=4)
+        except Exception as me:
+            print(f"[Sync-Engine] Failed to write completed book metadata: {me}")
+
+        with Session(engine) as session:
+            db_book = session.get(Book, book_id)
+            if db_book:
+                db_book.status = "Transcribed"
+                db_book.progress = 1.0
+                session.add(db_book)
+                session.commit()
+
+        if working_dir.exists():
+            try:
+                shutil.rmtree(working_dir)
+            except Exception:
+                pass
+        print(f"[ABI-Pipeline] Book '{book_name}' transcription finished successfully.")
+
+
 def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bool = False) -> None:
     """Processes all chapters of an individual audiobook sequential track-by-track."""
-    import json
-    import shutil
-    
+    if isinstance(model, SubtitlesClient):
+        transcribe_book_with_subtitles_server(book_id, model, project_id, force_retranscribe)
+        return
+
     working_dir = Path("./workspace_temp") / f"book_{book_id}"
     
     if force_retranscribe:
@@ -299,7 +663,6 @@ def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bo
             except Exception as e:
                 print(f"[ABI-Pipeline] Warning: Could not remove directory {working_dir}: {e}")
         
-        # Reset all chapter statuses to Pending in database
         with Session(engine) as session:
             chapters_to_reset = session.exec(
                 select(Chapter).where(Chapter.book_id == book_id)
@@ -344,7 +707,6 @@ def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bo
 
     working_dir.mkdir(parents=True, exist_ok=True)
 
-    # Determine original audiobook source directory next to audio files
     source_audio_dir = None
     if book_path:
         p = Path(book_path)
@@ -372,7 +734,6 @@ def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bo
 
         chapter_txt = working_dir / f"chapter_{chapter.chapter_num}.txt"
         
-        # Determine exact timeline offset in milliseconds for continuous timestamps
         if chapter.type == 'segment':
             start_offset_ms = int(round((chapter.start_time or 0.0) * 1000))
         else:
@@ -381,7 +742,6 @@ def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bo
         if chapter.status == "Completed" and not force_retranscribe:
             if chapter_txt.exists():
                 print(f"[ABI-Pipeline] Chapter {chapter.chapter_num} ('{chapter.title}') already complete. Skipping transcription.")
-                # Advance cumulative offset using file duration
                 try:
                     probe = ffmpeg.probe(chapter.input_file)
                     ch_dur_ms = int(round(float(probe['format']['duration']) * 1000))
@@ -469,6 +829,7 @@ def transcribe_book(book_id: int, model, project_id: int, force_retranscribe: bo
             if db_book:
                 db_book.status = "Transcribed"
                 session.add(db_book)
+                session.commit()
         if working_dir.exists():
             try:
                 shutil.rmtree(working_dir)
@@ -510,7 +871,6 @@ def tokens_to_words(tokens: list[str], timestamps: list[float], start_offset_ms:
     for i, (tok, ts) in enumerate(zip(tokens, timestamps)):
         ts_ms = start_offset_ms + int(round(ts * 1000))
         
-        # Detect token word boundaries (leading spaces or BPE unicode space prefix)
         is_word_start = tok.startswith(' ') or tok.startswith(' ') or (i == 0)
         
         if is_word_start and curr_word_chars:
@@ -532,7 +892,6 @@ def tokens_to_words(tokens: list[str], timestamps: list[float], start_offset_ms:
         curr_word_chars.append(clean_tok)
         curr_last_ts_ms = ts_ms
 
-    # Final word closeout
     if curr_word_chars and curr_start_ms is not None:
         word_str = "".join(curr_word_chars).strip()
         if word_str:
@@ -561,7 +920,6 @@ def split_words_into_sentences(words_data: list[dict]) -> list[dict]:
         current_words.append(item)
         word_str = item["word"]
         
-        # Split sentence at punctuation (. ! ?)
         if re.search(r'[.!?]["’\'”]?$', word_str):
             sent_text = " ".join(w["word"] for w in current_words)
             sentences.append({
@@ -572,7 +930,6 @@ def split_words_into_sentences(words_data: list[dict]) -> list[dict]:
             })
             current_words = []
 
-    # Handle trailing words without end punctuation
     if current_words:
         sent_text = " ".join(w["word"] for w in current_words)
         sentences.append({
@@ -587,10 +944,6 @@ def split_words_into_sentences(words_data: list[dict]) -> list[dict]:
 
 def transcribe_chapter(chapter: Chapter, model, working_dir: Path, start_offset_ms: int = 0) -> tuple[str, int]:
     """Preprocesses a chapter's audio track, slices it, and performs speech-to-text with native word timing extraction."""
-    import traceback
-    import time
-    import json
-    
     preprocessed_wav = working_dir / f"temp_chapter_{chapter.chapter_num}_preprocessed.wav"
     try:
         ffmpeg_input = ffmpeg.input(chapter.input_file)
@@ -651,7 +1004,7 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path, start_offset_
                 "char_start": current_char_offset,
                 "char_end": current_char_offset + text_len
             })
-            current_char_offset += text_len + 1  # accounts for space separator
+            current_char_offset += text_len + 1
 
             if save_subtitles:
                 if hasattr(segment, "words") and segment.words:
@@ -714,7 +1067,6 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path, start_offset_
     num_batches = math.ceil(len(chunks_with_metadata) / batch_size)
     start_time_total = time.time()
 
-    # Wrap model with timestamp provider if subtitles are requested
     inference_model = model.with_timestamps() if save_subtitles else model
     
     for i in range(num_batches):
@@ -780,7 +1132,7 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path, start_offset_
             "char_start": current_char_offset,
             "char_end": current_char_offset + text_len
         })
-        current_char_offset += text_len + 1  # accounts for space separator
+        current_char_offset += text_len + 1
 
         if save_subtitles and all_chunk_words[idx]:
             all_chapter_words.extend(all_chunk_words[idx])
@@ -809,7 +1161,6 @@ def transcribe_chapter(chapter: Chapter, model, working_dir: Path, start_offset_
 
 def combine_chapters(working_dir: Path, book_output_dir: Path, source_audio_dir: Optional[Path] = None) -> None:
     """Appends all temporary chapter text files into final transcript.txt and merges transcript.json."""
-    import json
     final_text_path = book_output_dir / "transcript.txt"
     chapter_files = sorted(
         list(working_dir.glob("chapter_*.txt")),
@@ -862,13 +1213,11 @@ def combine_chapters(working_dir: Path, book_output_dir: Path, source_audio_dir:
                 print(f"[Subtitle-Sync] Error reading {s_file.name}: {e}")
 
         if master_subtitles:
-            # 1. Save copy to ABI-Pipeline output directory
             transcript_json_path = book_output_dir / "transcript.json"
             with open(transcript_json_path, "w", encoding="utf-8") as sof:
                 json.dump(master_subtitles, sof, indent=2)
             print(f"[ABI-Pipeline] Saved transcript.json to output directory: {transcript_json_path}")
 
-            # 2. Save directly to original audiobook folder next to audio files
             if source_audio_dir and source_audio_dir.exists():
                 try:
                     audio_dir_transcript = source_audio_dir / "transcript.json"
