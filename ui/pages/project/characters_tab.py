@@ -19,7 +19,8 @@ from services.character_manager import (
     get_character_import_matches,
     execute_character_import,
     merge_character_into_target,
-    link_character_to_book
+    link_character_to_book,
+    detach_alias_to_character
 )
 from services.character_organizer import (
     extract_characters_from_prompts,
@@ -309,7 +310,7 @@ def open_batch_profiler_dialog(
             with ui.column().classes('gap-0.5'):
                 ui.label('Minimum Mentions Limit').classes('text-xs font-semibold text-slate-700')
                 ui.label('Skips low-frequency background characters.').classes('text-[10px] text-slate-400')
-            min_mentions_input = ui.number(value=5, min=1, step=1).classes('w-16 bg-white').props('outlined dense')
+            min_mentions_input = ui.number(value=1, min=1, step=1).classes('w-16 bg-white').props('outlined dense')
 
         with ui.tabs().classes('w-full border-b shrink-0') as tabs:
             factual_tab = ui.tab('Factual').classes('text-xs font-bold')
@@ -1871,7 +1872,6 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 bg_class = "bg-blue-50 border-l-4 border-blue-600 font-semibold text-blue-900" if is_selected else "hover:bg-slate-50 text-slate-700"
                 border_class = "" if is_selected else "border-l border-slate-100"
                 
-                # Compact height in Clean & Merge mode vs Rich height in Profiles mode
                 row_padding = 'p-2' if active_view_mode == "merge" else 'p-2.5'
                 row_el = ui.row().classes(f'w-full {row_padding} rounded-lg cursor-pointer transition-colors justify-between items-center {bg_class} {border_class}')
                 row_elements[char.id] = row_el
@@ -1900,9 +1900,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         else:
                             ui.label(f"{s_hits} hits").classes('text-[9px] font-bold bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded')
 
-                        if active_view_mode == "profiles":
-                            bar_color = "text-green-600 font-bold" if completion_count == 4 else "text-purple-600" if completion_count >= 2 else "text-slate-400"
-                            ui.label(f"{completion_count}/4 traits").classes(f'text-[9px] font-bold {bar_color}')
+                        bar_color = "text-green-600 font-bold" if completion_count == 4 else "text-purple-600" if completion_count >= 2 else "text-slate-400"
+                        ui.label(f"{completion_count}/4 traits").classes(f'text-[9px] font-bold {bar_color}')
 
     @ui.refreshable
     def draw_details_panel():
@@ -1976,16 +1975,22 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
 
                 with ui.row().classes('w-full gap-2 flex-wrap items-center'):
                     for alias in aliases:
-                        def make_delete_alias(alias_obj=alias, char_id=char.id):
+                        is_canonical = alias.alias.lower().strip() == char.name.lower().strip()
+
+                        def make_detach_alias(alias_obj=alias, char_id=char.id):
                             async def handle():
-                                with Session(engine) as session:
-                                    db_alias = session.get(CharacterAlias, alias_obj.id)
-                                    if db_alias:
-                                        session.delete(db_alias)
-                                        session.commit()
-                                save_project_characters_to_json(project.id)
-                                await refresh_workspace_with_scroll()
-                                ui.notify("Alias tag removed.", type="info")
+                                new_id = await asyncio.to_thread(
+                                    detach_alias_to_character,
+                                    project.id,
+                                    char_id,
+                                    alias_obj.id,
+                                    selected_book_id
+                                )
+                                if new_id:
+                                    await refresh_workspace_with_scroll()
+                                    ui.notify(f"Detached '{alias_obj.alias}' into a standalone character!", type="positive")
+                                else:
+                                    ui.notify("Failed to detach alias.", type="warning")
                             return handle
 
                         with ui.row().classes(
@@ -1997,10 +2002,13 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                     project.id, a, c_id, refresh_workspace_with_scroll
                                 )
                             ).tooltip("Click to view transcript occurrences")
-                            
-                            ui.icon('cancel', size='14px', color='slate-400').classes(
-                                'cursor-pointer hover:text-red-500 transition-colors'
-                            ).on('click', make_delete_alias(alias, char.id))
+
+                            if not is_canonical:
+                                ui.icon('cancel', size='14px', color='slate-400').classes(
+                                    'cursor-pointer hover:text-red-500 transition-colors'
+                                ).on('click', make_detach_alias(alias, char.id)).tooltip("Detach into standalone character")
+                            else:
+                                ui.badge('Primary', color='blue-50').classes('text-[9px] text-blue-600 font-bold px-1 rounded')
 
                 # Quick Add Alias Input
                 with ui.row().classes('w-full items-center gap-2 mt-0.5'):
@@ -2079,6 +2087,14 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 ).classes('w-56 font-extrabold text-lg text-slate-800').props('dense borderless').on('blur', handle_name_blur)
                 
                 ui.badge(f'{mentions} mentions', color='blue-50').classes('text-blue-700 text-xs font-bold px-2 py-0.5 rounded-full')
+
+                char_trait_count = 0
+                if active_event:
+                    fields = [active_event.demographics, active_event.physical_build, active_event.hair_and_face, active_event.distinguishing_marks]
+                    char_trait_count = sum(1 for f in fields if f and str(f).strip() and str(f).lower() != "null")
+                char_badge_color = 'green-100' if char_trait_count == 4 else 'purple-100' if char_trait_count >= 2 else 'slate-100'
+                char_badge_text = 'text-green-800' if char_trait_count == 4 else 'text-purple-800' if char_trait_count >= 2 else 'text-slate-600'
+                ui.badge(f'{char_trait_count}/4 traits', color=char_badge_color).classes(f'{char_badge_text} text-xs font-bold px-2 py-0.5 rounded-full')
                 
             with ui.row().classes('items-center gap-2 flex-grow justify-end'):
                 # Mode-Aware AI Check Button (Left-Click: Copy Rendered Prompt, Right-Click: Template Editor)
@@ -2168,6 +2184,19 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
 
                 # 💡 Smart Suggested Merges Section
                 suggested_matches = get_suggested_alias_merges(project.id, char.id, selected_book_id)
+                sug_traits = {}
+                if suggested_matches:
+                    sug_ids = [s["character_id"] for s in suggested_matches]
+                    with Session(engine) as session:
+                        evs = session.exec(
+                            select(CharacterTimelineEvent)
+                            .where(CharacterTimelineEvent.character_id.in_(sug_ids))
+                            .where(CharacterTimelineEvent.book_id == None)
+                        ).all()
+                        for ev in evs:
+                            fields = [ev.demographics, ev.physical_build, ev.hair_and_face, ev.distinguishing_marks]
+                            sug_traits[ev.character_id] = sum(1 for f in fields if f and str(f).strip() and str(f).lower() != "null")
+
                 with ui.column().classes('w-full bg-amber-50/40 border border-amber-200/80 p-4 rounded-xl gap-3'):
                     with ui.row().classes('w-full items-center justify-between'):
                         with ui.row().classes('items-center gap-1.5'):
@@ -2180,6 +2209,10 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     else:
                         with ui.column().classes('w-full gap-2'):
                             for sug in suggested_matches:
+                                t_count = sug_traits.get(sug["character_id"], 0)
+                                badge_color = 'green-100' if t_count == 4 else 'purple-100' if t_count >= 2 else 'slate-100'
+                                badge_text_color = 'text-green-800' if t_count == 4 else 'text-purple-800' if t_count >= 2 else 'text-slate-600'
+
                                 with ui.row().classes('w-full items-center justify-between bg-white border border-amber-200 p-2.5 rounded-lg shadow-sm'):
                                     with ui.column().classes('gap-0.5 flex-1 min-w-0 cursor-pointer group')\
                                         .on('click', lambda _, s_id=sug["character_id"]: select_char(s_id))\
@@ -2187,6 +2220,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                         with ui.row().classes('items-center gap-2'):
                                             ui.label(sug["name"]).classes('text-xs font-bold text-slate-800 group-hover:text-blue-600 transition-colors truncate')
                                             ui.badge(f"{sug['hits']} hits", color='amber-100').classes('text-amber-800 text-[9px] font-bold px-1.5 py-0.5 rounded')
+                                            ui.badge(f"{t_count}/4 traits", color=badge_color).classes(f'{badge_text_color} text-[9px] font-bold px-1.5 py-0.5 rounded')
                                         ui.label(f"Match reason: {sug['reason']}").classes('text-[10px] text-slate-400')
 
                                     async def merge_suggestion(sug_id=sug["character_id"], sug_name=sug["name"]):

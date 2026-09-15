@@ -289,7 +289,6 @@ class SettingsModal:
                 with ui.column().classes('w-full p-4 gap-3'):
                     ui.input('ComfyUI Base URL').bind_value(self.settings, 'comfy_url').classes('w-full')
                     ui.input('Local Comfy Directory Path').bind_value(self.settings, 'comfy_path').classes('w-full')
-                    ui.input('ComfyUI Launch Arguments', placeholder="e.g., --windows-standalone-build").bind_value(self.settings, 'comfy_args').classes('w-full')
                     ui.input('LLM API Endpoint URL', placeholder="e.g., http://localhost:11434").bind_value(self.settings, 'llm_url').classes('w-full')
                     ui.input('LLM API Key (Optional)', password=True, password_toggle_button=True).bind_value(self.settings, 'llm_api_key').classes('w-full')
                     
@@ -365,6 +364,12 @@ class SettingsModal:
                     # ABI-Subtitles specific server settings
                     with ui.column().classes('w-full gap-2 border-t pt-3') \
                             .bind_visibility_from(self.settings, 'stt_engine', backward=lambda e: e == 'ABI-Subtitles'):
+                        with ui.row().classes('w-full justify-between items-center text-xs bg-blue-50/70 p-2.5 rounded-lg border border-blue-100'):
+                            with ui.row().classes('items-center gap-1.5 text-blue-900'):
+                                ui.icon('download', size='16px', color='blue-600')
+                                ui.label('Need to install or update the standalone server?').classes('font-medium')
+                            ui.link('Download ABI-Subtitles ↗', 'https://audiobooksilluminated.com/downloads/', new_tab=True).classes('text-blue-600 hover:text-blue-800 font-bold underline')
+                        
                         ui.input('ABI-Subtitles Server URL', placeholder='http://127.0.0.1:5050').bind_value(self.settings, 'subtitles_server_url').classes('w-full')
                         ui.input('ABI-Subtitles Executable Path (Optional)', placeholder='e.g., E:/ABI-Subtitles/abi-subtitles.exe').bind_value(self.settings, 'subtitles_launch_path').classes('w-full')
 
@@ -390,7 +395,7 @@ class SettingsModal:
                             .bind_visibility_from(self.settings, 'stt_engine', backward=lambda e: e != 'ABI-Subtitles'):
                         ui.label('Installation Console Output').classes('text-xs font-bold text-slate-500 mt-2')
                         self.terminal_log = ui.log().classes('h-36 w-full bg-slate-950 p-2 text-emerald-400 font-mono text-[10px] rounded-lg')
-                    
+                              
             with ui.row().classes('w-full justify-end gap-3 mt-2'):
                 ui.button('Cancel', on_click=self.dialog.close).props('flat color=slate')
                 ui.button('Save Configurations', on_click=self.save_and_close).classes('bg-blue-600 text-white')

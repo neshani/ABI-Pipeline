@@ -562,16 +562,29 @@ def render_book_tabs(book_id: int):
         return filtered
 
     def update_prompt_text(val: str, row_dict: dict):
-        if row_dict:
-            row_dict["prompt"] = val.strip()
-            save_prompts_csv(project_name, book_name, prompts)
-            try:
-                ch = int(float(row_dict.get("chapter", "1")))
-                sc = int(float(row_dict.get("scene", "1")))
-                if (ch, sc) in grid_card_references:
-                    grid_card_references[(ch, sc)]["item"]["prompt"] = val.strip()
-            except ValueError:
-                pass
+        if not row_dict or val is None:
+            return
+        cleaned = val.strip()
+        # Guard: never allow an accidental blank or UI clear to overwrite a valid prompt
+        if not cleaned and row_dict.get("prompt"):
+            return
+        if cleaned == row_dict.get("prompt", ""):
+            return
+        row_dict["prompt"] = cleaned
+        save_prompts_csv(project_name, book_name, prompts)
+        try:
+            ch = int(float(row_dict.get("chapter", "1")))
+            sc = int(float(row_dict.get("scene", "1")))
+            if (ch, sc) in grid_card_references:
+                grid_card_references[(ch, sc)]["item"]["prompt"] = cleaned
+        except ValueError:
+            pass
+
+    # --- Active Theater Review Queue & FIFO History State ---
+    theater_queue: List[Dict[str, Any]] = []
+    theater_cursor: int = 0
+    history_stack: List[Dict[str, Any]] = []
+    history_pointer: int = -1  # -1 indicates active in live queue; >= 0 indicates inspecting history
 
     def get_current_filtered_index(filtered_list: list) -> int:
         for idx, p in enumerate(filtered_list):
@@ -585,41 +598,59 @@ def render_book_tabs(book_id: int):
         return 0
 
     def update_active_scene_ui():
-        filtered = get_filtered_prompts()
-        if not filtered:
-            return
-            
+        nonlocal theater_cursor, history_pointer
         current_scene = None
-        for p in filtered:
-            try:
-                ch = int(float(p.get("chapter", "1")))
-                sc = int(float(p.get("scene", "1")))
-            except ValueError:
-                ch, sc = 1, 1
-            if ch == state.book_active_chapter and sc == state.book_active_scene:
-                current_scene = p
-                break
-                
+        is_history = False
+        history_offset = 0
+
+        if history_pointer != -1 and 0 <= history_pointer < len(history_stack):
+            current_scene = history_stack[history_pointer]
+            is_history = True
+            history_offset = len(history_stack) - history_pointer
+        elif theater_queue:
+            theater_cursor = min(max(0, theater_cursor), len(theater_queue) - 1)
+            current_scene = theater_queue[theater_cursor]
+
         if not current_scene:
-            current_scene = filtered[0]
-            try:
-                state.book_active_chapter = int(float(current_scene.get("chapter", "1")))
-                state.book_active_scene = int(float(current_scene.get("scene", "1")))
-            except ValueError:
-                state.book_active_chapter, state.book_active_scene = 1, 1
-                
+            # Active filter review queue is empty
+            active_row_ref[0] = None
+            loaded_scene_coords[0] = -1
+            loaded_scene_coords[1] = -1
+
+            if modal_img_el:
+                modal_img_el.visible = False
+            if modal_placeholder:
+                modal_placeholder.visible = True
+            if modal_title_el:
+                modal_title_el.set_text("Review Queue Complete")
+            if modal_subtitle_el:
+                modal_subtitle_el.set_text("All scenes matching the active filter have been reviewed.")
+            if modal_badge_missing:
+                modal_badge_missing.visible = False
+            if modal_badge_approved:
+                modal_badge_approved.visible = False
+            if modal_badge_review:
+                modal_badge_review.visible = False
+            if modal_quote_el:
+                modal_quote_el.set_text("")
+            if modal_prompt_input:
+                modal_prompt_input.set_value("")
+            return
+
         active_row_ref[0] = current_scene
-        current_idx = get_current_filtered_index(filtered)
-        
+
         try:
             ch = int(float(current_scene.get("chapter", "1")))
             sc = int(float(current_scene.get("scene", "1")))
         except ValueError:
             ch, sc = 1, 1
-            
+
+        state.book_active_chapter = ch
+        state.book_active_scene = sc
+
         img_url = images_cache.get((ch, sc))
         is_approved = current_scene.get("approved", "False").strip().lower() == "true"
-        
+
         if modal_img_el:
             if img_url:
                 if modal_img_el.source != img_url:
@@ -627,16 +658,20 @@ def render_book_tabs(book_id: int):
                 modal_img_el.visible = True
             else:
                 modal_img_el.visible = False
-                
+
         if modal_placeholder:
             modal_placeholder.visible = not img_url
-            
+
         if modal_title_el:
             modal_title_el.set_text(f"Chapter {current_scene.get('chapter')}, Scene {current_scene.get('scene')}")
-            
+
         if modal_subtitle_el:
-            modal_subtitle_el.set_text(f"Review Scene: {current_idx + 1} of {len(filtered)}")
-            
+            if is_history:
+                step_str = f"{history_offset} step back" if history_offset == 1 else f"{history_offset} steps back"
+                modal_subtitle_el.set_text(f"Viewing History ({step_str}) • Press [F] to return to review queue")
+            else:
+                modal_subtitle_el.set_text(f"Review Scene: {theater_cursor + 1} of {len(theater_queue)} remaining")
+
         if modal_badge_missing:
             modal_badge_missing.visible = not img_url
         if modal_badge_approved:
@@ -646,10 +681,14 @@ def render_book_tabs(book_id: int):
 
         for (grid_ch, grid_sc), ref in grid_card_references.items():
             ref["card"].classes(remove="ring-4 ring-blue-500 ring-offset-2")
-            
+
         if (ch, sc) in grid_card_references:
             target_ref = grid_card_references[(ch, sc)]
             target_ref["card"].classes(add="ring-4 ring-blue-500 ring-offset-2")
+
+        # Always update target narration quote text for the active scene
+        if modal_quote_el:
+            modal_quote_el.set_text(f'"{current_scene.get("quote", "")}"')
 
         if loaded_scene_coords[0] != ch or loaded_scene_coords[1] != sc:
             loaded_scene_coords[0] = ch
@@ -658,68 +697,93 @@ def render_book_tabs(book_id: int):
             theater_context_state["window_before"] = 400
             theater_context_state["window_after"] = 400
 
-            if modal_quote_el:
-                modal_quote_el.set_text(f'"{current_scene.get("quote", "")}"')
-                
             if modal_prompt_input:
                 modal_prompt_input.set_value(current_scene.get("prompt", ""))
-                
+
             if modal_context_html[0]:
                 update_theater_context_view()
+        elif modal_prompt_input and not modal_prompt_input.value and current_scene.get("prompt"):
+            # Self-heal prompt input if it was cleared by a previous empty state
+            modal_prompt_input.set_value(current_scene.get("prompt", ""))
 
         if modal_prompt_input:
             render_scene_character_chips(modal_prompt_input.value)
 
     def next_scene():
-        filtered = get_filtered_prompts()
-        if not filtered:
+        nonlocal theater_cursor, history_pointer
+        if history_pointer != -1:
+            # Walking forward through visited history back toward live queue
+            if history_pointer < len(history_stack) - 1:
+                history_pointer += 1
+            else:
+                history_pointer = -1
+            update_active_scene_ui()
             return
-        idx = get_current_filtered_index(filtered)
-        next_idx = min(idx + 1, len(filtered) - 1)
-        next_scene_obj = filtered[next_idx]
-        try:
-            state.book_active_chapter = int(float(next_scene_obj.get("chapter", "1")))
-            state.book_active_scene = int(float(next_scene_obj.get("scene", "1")))
-        except ValueError:
-            pass
-        update_active_scene_ui()
+
+        if not theater_queue:
+            return
+
+        # Skipping forward without approving: store in history so 'Prev' can return
+        current_scene = theater_queue[theater_cursor]
+        history_stack.append(current_scene)
+        if len(history_stack) > 20:
+            history_stack.pop(0)
+
+        if theater_cursor < len(theater_queue) - 1:
+            theater_cursor += 1
+            update_active_scene_ui()
+        else:
+            ui.notify("End of review queue reached.", type="info", timeout=1.0)
 
     def prev_scene():
-        filtered = get_filtered_prompts()
-        if not filtered:
+        nonlocal theater_cursor, history_pointer
+        if history_pointer != -1:
+            # Walking further back in history
+            if history_pointer > 0:
+                history_pointer -= 1
+                update_active_scene_ui()
+            else:
+                ui.notify("Earliest history item reached.", type="info", timeout=1.0)
             return
-        idx = get_current_filtered_index(filtered)
-        prev_idx = max(idx - 1, 0)
-        prev_scene_obj = filtered[prev_idx]
-        try:
-            state.book_active_chapter = int(float(prev_scene_obj.get("chapter", "1")))
-            state.book_active_scene = int(float(prev_scene_obj.get("scene", "1")))
-        except ValueError:
-            pass
-        update_active_scene_ui()
+
+        # Currently in active review queue: step into history stack if available
+        if history_stack:
+            history_pointer = len(history_stack) - 1
+            update_active_scene_ui()
+        elif theater_cursor > 0:
+            theater_cursor -= 1
+            update_active_scene_ui()
+        else:
+            ui.notify("Beginning of review queue reached.", type="info", timeout=1.0)
 
     def approve_current():
-        filtered = get_filtered_prompts()
-        if not filtered:
-            return
-            
-        row = None
-        for p in filtered:
+        nonlocal theater_cursor, history_pointer
+        if history_pointer != -1 and 0 <= history_pointer < len(history_stack):
+            # Approving while inspecting an item from history
+            row = history_stack[history_pointer]
+            row["approved"] = "True"
+            save_prompts_csv(project_name, book_name, prompts)
+
             try:
-                ch = int(float(p.get("chapter", "1")))
-                sc = int(float(p.get("scene", "1")))
+                ch = int(float(row.get("chapter", "1")))
+                sc = int(float(row.get("scene", "1")))
+                if (ch, sc) in grid_card_references:
+                    grid_card_references[(ch, sc)]["item"]["approved"] = "True"
             except ValueError:
-                ch, sc = 1, 1
-            if ch == state.book_active_chapter and sc == state.book_active_scene:
-                row = p
-                break
-                
-        if not row:
+                pass
+
+            update_grid_views_in_place()
+            ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('scene')} Approved!", type="positive", timeout=1.0)
+            next_scene()
             return
-            
+
+        if not theater_queue:
+            return
+
+        row = theater_queue[theater_cursor]
         row["approved"] = "True"
         save_prompts_csv(project_name, book_name, prompts)
-        
+
         try:
             ch = int(float(row.get("chapter", "1")))
             sc = int(float(row.get("scene", "1")))
@@ -727,35 +791,62 @@ def render_book_tabs(book_id: int):
                 grid_card_references[(ch, sc)]["item"]["approved"] = "True"
         except ValueError:
             pass
-            
+
         update_grid_views_in_place()
         ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('scene')} Approved!", type="positive", timeout=1.0)
-        next_scene()
+
+        # Log into visited FIFO history
+        history_stack.append(row)
+        if len(history_stack) > 20:
+            history_stack.pop(0)
+
+        # In filtered review modes, remove the approved item immediately from queue
+        if filter_mode.value in ("Unapproved Only", "Missing Only"):
+            theater_queue.pop(theater_cursor)
+            if theater_cursor >= len(theater_queue):
+                theater_cursor = max(0, len(theater_queue) - 1)
+        else:
+            theater_cursor = min(theater_cursor + 1, len(theater_queue) - 1)
+
+        update_active_scene_ui()
 
     def delete_current():
-        filtered = get_filtered_prompts()
-        if not filtered:
-            return
-            
-        row = None
-        for p in filtered:
+        nonlocal theater_cursor, history_pointer
+        if history_pointer != -1 and 0 <= history_pointer < len(history_stack):
+            # Deleting while inspecting an item from history
+            row = history_stack[history_pointer]
+            row["approved"] = "False"
+            save_prompts_csv(project_name, book_name, prompts)
+
+            was_deleted = delete_scene_image_file(project_name, book_name, row.get("chapter", "1"), row.get("scene", "1"))
+
             try:
-                ch = int(float(p.get("chapter", "1")))
-                sc = int(float(p.get("scene", "1")))
+                ch = int(float(row.get("chapter", "1")))
+                sc = int(float(row.get("scene", "1")))
+                images_cache.pop((ch, sc), None)
+                if (ch, sc) in grid_card_references:
+                    grid_card_references[(ch, sc)]["item"]["approved"] = "False"
             except ValueError:
-                ch, sc = 1, 1
-            if ch == state.book_active_chapter and sc == state.book_active_scene:
-                row = p
-                break
-                
-        if not row:
+                pass
+
+            update_grid_views_in_place()
+            if was_deleted:
+                ui.notify(f"Deleted image for Ch {row.get('chapter')}, Sc {row.get('scene')}!", type="warning", timeout=1.0)
+            else:
+                ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('scene')} file was already missing.", type="info", timeout=1.0)
+
+            update_active_scene_ui()
             return
-            
+
+        if not theater_queue:
+            return
+
+        row = theater_queue[theater_cursor]
         row["approved"] = "False"
         save_prompts_csv(project_name, book_name, prompts)
-        
+
         was_deleted = delete_scene_image_file(project_name, book_name, row.get("chapter", "1"), row.get("scene", "1"))
-        
+
         try:
             ch = int(float(row.get("chapter", "1")))
             sc = int(float(row.get("scene", "1")))
@@ -764,15 +855,32 @@ def render_book_tabs(book_id: int):
                 grid_card_references[(ch, sc)]["item"]["approved"] = "False"
         except ValueError:
             pass
-            
+
         update_grid_views_in_place()
-        
+
         if was_deleted:
             ui.notify(f"Deleted image for Ch {row.get('chapter')}, Sc {row.get('scene')}!", type="warning", timeout=1.0)
         else:
             ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('scene')} file was already missing.", type="info", timeout=1.0)
-        
-        next_scene()
+
+        # Log deleted scene into history so user can inspect, edit prompt, or undo if needed
+        history_stack.append(row)
+        if len(history_stack) > 20:
+            history_stack.pop(0)
+
+        if filter_mode.value == "Unapproved Only":
+            # Image is now missing (no longer unapproved-with-image), remove from queue
+            theater_queue.pop(theater_cursor)
+            if theater_queue:
+                if theater_cursor >= len(theater_queue):
+                    theater_cursor = max(0, len(theater_queue) - 1)
+            else:
+                # If that was the last scene in queue, smoothly remain on it in history mode
+                history_pointer = len(history_stack) - 1
+        else:
+            theater_cursor = min(theater_cursor + 1, len(theater_queue) - 1)
+
+        update_active_scene_ui()
 
     async def trigger_batch_restart():
         start_fn = getattr(state, 'start_image_generation_cb', None)
@@ -840,8 +948,33 @@ def render_book_tabs(book_id: int):
                 ref["placeholder"].visible = True
 
     def launch_theater_from_coordinate(ch_val: int, sc_val: int):
+        nonlocal theater_cursor, history_pointer
         state.book_active_chapter = ch_val
         state.book_active_scene = sc_val
+
+        # Populate active queue from currently applied filter
+        filtered = get_filtered_prompts()
+        theater_queue.clear()
+        theater_queue.extend(filtered)
+
+        # Locate clicked item in queue
+        found_idx = 0
+        for idx, item in enumerate(theater_queue):
+            try:
+                ch = int(float(item.get("chapter", "1")))
+                sc = int(float(item.get("scene", "1")))
+                if ch == ch_val and sc == sc_val:
+                    found_idx = idx
+                    break
+            except ValueError:
+                pass
+
+        theater_cursor = found_idx
+        history_pointer = -1
+        history_stack.clear()
+        loaded_scene_coords[0] = -1
+        loaded_scene_coords[1] = -1
+
         theater_dialog.open()
         update_active_scene_ui()
 
@@ -1066,25 +1199,35 @@ def render_book_tabs(book_id: int):
             # Conditional stop at the end of active book toggle
             def toggle_stop_after_book():
                 state.stop_after_current_book = not getattr(state, 'stop_after_current_book', False)
-                status_str = "ENABLED" if state.stop_after_current_book else "DISABLED"
-                ui.notify(f"Stop at end of current book: {status_str}", type="info", timeout=1.5)
+                status_str = "ARMED" if state.stop_after_current_book else "DISABLED"
+                ui.notify(f"Stop at end of book: {status_str}", type="info", timeout=1.5)
                 update_stop_after_btn_style()
 
             btn_stop_after = ui.button(
                 icon='auto_stories',
-                on_click=toggle_stop_after_book
-            ).props('dense').classes('h-8 px-2.5 rounded-lg transition-colors duration-200')
+                on_click=toggle_stop_after_book,
+                color=None
+            ).props('unelevated dense').classes('h-8 px-2.5 rounded-lg transition-all duration-200')
             
             with btn_stop_after:
-                ui.tooltip('Stop rendering automatically at the end of this book')
+                btn_stop_tooltip = ui.tooltip('')
 
             def update_stop_after_btn_style():
-                if getattr(state, 'stop_after_current_book', False):
-                    # Solid cool-slate gray when active
-                    btn_stop_after.classes(replace='h-8 px-2.5 rounded-lg bg-slate-700 hover:bg-slate-800 text-white font-bold shadow-sm')
+                is_armed = getattr(state, 'stop_after_current_book', False)
+                if is_armed:
+                    # Inset / latched amber armed state with glowing border and inner shadow
+                    btn_stop_after.classes(
+                        replace='h-8 px-2.5 rounded-lg bg-amber-500 hover:bg-amber-600 text-white '
+                                'shadow-inner ring-2 ring-amber-400 ring-offset-1 font-bold translate-y-[1px]'
+                    )
+                    btn_stop_tooltip.set_text('Stop at end of book: ARMED (Click to disarm)')
                 else:
-                    # Light outline/muted gray when inactive
-                    btn_stop_after.classes(replace='h-8 px-2.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500 border border-slate-200')
+                    # Muted, unpressed flat state
+                    btn_stop_after.classes(
+                        replace='h-8 px-2.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-400 '
+                                'hover:text-slate-600 border border-slate-200 shadow-none'
+                    )
+                    btn_stop_tooltip.set_text('Stop at end of book: OFF (Click to arm)')
 
             update_stop_after_btn_style()
 
@@ -1516,6 +1659,13 @@ def render_book_tabs(book_id: int):
                 render_content.refresh()
                 
             if theater_dialog.value:
+                # If queue was exhausted and a new image regenerated, refresh queue so it becomes live
+                if not theater_queue and filter_mode.value != "All":
+                    refreshed = get_filtered_prompts()
+                    if refreshed:
+                        theater_queue.extend(refreshed)
+                        theater_cursor = 0
+                        history_pointer = -1
                 update_active_scene_ui()
 
     state.book_update_timer = ui.timer(3.0, check_for_image_updates)

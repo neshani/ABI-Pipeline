@@ -197,7 +197,6 @@ app.on_shutdown(lambda: os._exit(123) if should_restart else os._exit(0))
 DEFAULT_SETTINGS = {
     "comfy_url": "http://127.0.0.1:8188",
     "comfy_path": "",
-    "comfy_args": "--windows-standalone-build",
     "llm_url": "http://127.0.0.1:11434",
     "llm_api_key": "",
     "llm_model": "unsloth/gemma-4-e4b-it",
@@ -400,6 +399,12 @@ def start_transcribing(project_id: int):
 
     state.was_manually_cancelled = False
     state.active_task_type = "transcription"
+
+    # Initialize Telemetry Timers for Transcription
+    import time
+    state.batch_start_time = time.time()
+    state.batch_elapsed_sec = 0.0
+    state.batch_eta_label = "ETA: Estimating..."
 
     start_project_transcription(project_id)
     ui.notify("Background audiobook transcription started!", type="positive")
@@ -983,15 +988,33 @@ async def check_for_active_transcriptions():
                     "books": []
                 }
                 
+                db_updated = False
                 for b in books:
+                    book_dur = b.duration or 0.0
+                    
+                    # If book duration is not yet populated, derive it dynamically from chapter slice timestamps
+                    if book_dur <= 0.0:
+                        chapters = session.exec(select(Chapter).where(Chapter.book_id == b.id)).all()
+                        if chapters:
+                            calc_dur = sum(max(0.0, (c.end_time or 0.0) - (c.start_time or 0.0)) for c in chapters)
+                            if calc_dur > 0.0:
+                                book_dur = calc_dur
+                                b.duration = calc_dur
+                                session.add(b)
+                                db_updated = True
+
                     stats = get_book_stats_cached(project.name, b.name)
                     updates["books"].append({
                         "id": b.id,
-                        "progress": b.progress,
+                        "progress": b.progress or 0.0,
                         "status": b.status,
-                        "duration": b.duration or 0.0,  # Grab book duration
+                        "duration": book_dur,
                         "stats": stats
                     })
+                    
+                if db_updated:
+                    session.commit()
+
                 return updates
 
         res = await asyncio.to_thread(perform_background_sync)
@@ -1021,8 +1044,23 @@ async def check_for_active_transcriptions():
 
         # Update timing statistics
         import time
-        if state.image_gen_active and state.batch_start_time:
+        if (state.image_gen_active or state.project_status == "Transcribing") and state.batch_start_time:
             state.batch_elapsed_sec = time.time() - state.batch_start_time
+
+        # --- Real-Time Transcription RTFx & Project ETA Calculation ---
+        total_duration = sum(b["duration"] for b in res["books"])
+        completed_duration = sum(b["progress"] * b["duration"] for b in res["books"])
+        remaining_duration = max(0.0, total_duration - completed_duration)
+
+        transcription_rtfx = 0.0
+        if state.project_status == "Transcribing" and state.batch_start_time and state.batch_elapsed_sec > 3.0:
+            if completed_duration > 0:
+                transcription_rtfx = completed_duration / state.batch_elapsed_sec
+                if transcription_rtfx > 0:
+                    proj_eta_sec = remaining_duration / transcription_rtfx
+                    state.batch_eta_label = f"ETA: {format_eta(proj_eta_sec)}"
+            else:
+                state.batch_eta_label = "ETA: Decoding audio..."
 
         # Update UI state binders on the main thread safely
         for b_data in res["books"]:
@@ -1034,7 +1072,15 @@ async def check_for_active_transcriptions():
             # Dynamic subtitle based on project step status
             if state.project_status in ("Imported", "Transcribing"):
                 if b_data["status"] == "Transcribing":
-                    state.books_subtitle[b_id] = f"Transcribing... {int(b_data['progress'] * 100)}%"
+                    pct_int = int(b_data["progress"] * 100)
+                    if b_data["progress"] <= 0.0:
+                        state.books_subtitle[b_id] = "Transcribing... 0% (Decoding audio...)"
+                    elif transcription_rtfx > 0 and b_data["duration"] > 0:
+                        b_rem_audio = max(0.0, b_data["duration"] * (1.0 - b_data["progress"]))
+                        b_eta_sec = b_rem_audio / transcription_rtfx
+                        state.books_subtitle[b_id] = f"Transcribing... {pct_int}% (ETA: {format_eta(b_eta_sec)})"
+                    else:
+                        state.books_subtitle[b_id] = f"Transcribing... {pct_int}% (Estimating...)"
                 elif stats["has_transcript"]:
                     state.books_subtitle[b_id] = f"{stats['word_count']:,} words • {stats['estimated_scenes']} est. scenes"
                 else:
@@ -1059,10 +1105,8 @@ async def check_for_active_transcriptions():
                 else:
                     state.books_subtitle[b_id] = f"Rendered: {stats['generated_images']}/{total_scenes} ({stats['approved_prompts']} approved)"
 
-        # --- CORRECTION: Duration-Weighted Batch Progress Calculation ---
-        total_duration = sum(b["duration"] for b in res["books"])
+        # --- Duration-Weighted Batch Progress Calculation ---
         if total_duration > 0:
-            completed_duration = sum(b["progress"] * b["duration"] for b in res["books"])
             avg_progress = completed_duration / total_duration
         else:
             books_count = len(res["books"])
@@ -1103,6 +1147,7 @@ async def check_for_active_transcriptions():
             
         # 2. State Transition Completion Event Detector (Process Just Ended)
         elif (old_status in active_statuses or getattr(state, "active_task_type", None) is not None) and new_status not in active_statuses:
+            state.batch_start_time = None
             if was_cancelled:
                 state.was_manually_cancelled = False
                 ui.run_javascript('''
@@ -1218,15 +1263,16 @@ def render_split_panel_shell(project_id: int):
                     ui.linear_progress(show_value=False).classes('w-full h-1.5 rounded-full') \
                         .bind_value_from(state, 'project_progress')
 
-            # --- Project Real-Time Telemetry telemetry ---
+            # --- Project Real-Time Telemetry ---
             with ui.card().classes('w-full bg-slate-50 border p-2.5 rounded-lg gap-1') \
-                    .bind_visibility_from(state, 'image_gen_active'):
+                    .bind_visibility_from(state, 'project_status', backward=lambda s: s in ('Transcribing', 'Rendering Images') or getattr(state, 'image_gen_active', False)):
                 with ui.row().classes('w-full justify-between items-center text-[9px] font-black text-slate-500 uppercase tracking-wider'):
                     ui.label('Batch Telemetry')
                     ui.label().classes('text-blue-600 font-bold').bind_text_from(state, 'batch_eta_label')
                 with ui.row().classes('w-full justify-between items-center text-[9px] font-semibold text-slate-400'):
                     ui.label().bind_text_from(state, 'batch_elapsed_sec', backward=lambda s: f"Elapsed: {int(s//60)}m {int(s%60)}s")
-            
+
+                               
             ui.separator()
             ui.label('Books & Volumes').classes('text-[10px] font-bold text-slate-400 tracking-wider uppercase px-1')
             
@@ -1363,73 +1409,72 @@ state.active_header_refresh = header_controls.refresh
 # --- Process Control and VRAM Clearing Utilities (Phase B) ---
 
 def launch_comfyui():
-    """Launches ComfyUI in a non-blocking background subprocess, auto-detecting standalone portable installations."""
+    """Launches ComfyUI using its native run_nvidia_gpu.bat without injecting custom arguments or virtual environment DLLs."""
     comfy_path_str = get_setting("comfy_path", "F:/AI/ComfyUI/ComfyUI")
     if not comfy_path_str:
         ui.notify("ComfyUI path is not configured in settings.", type="warning")
         return
         
-    comfy_dir = Path(comfy_path_str).resolve()
+    target_path = Path(comfy_path_str).resolve()
     
-    # Auto-resolve path: if they pointed to the inner 'ComfyUI' folder, promote to the parent standalone folder
-    if comfy_dir.name.lower() == "comfyui" and (comfy_dir.parent / "run_nvidia_gpu.bat").exists():
-        comfy_dir = comfy_dir.parent
-        state.add_console_log(f"[Comfy-Launcher] Auto-resolved ComfyUI root directory to: {comfy_dir}")
+    # If the configured path points directly to a file (e.g., run_nvidia_gpu.bat)
+    if target_path.is_file():
+        comfy_dir = target_path.parent
+        bat_file = target_path
+    else:
+        comfy_dir = target_path
+        # Auto-resolve path: if pointing to inner 'ComfyUI' folder, check parent standalone root
+        if comfy_dir.name.lower() == "comfyui" and (comfy_dir.parent / "run_nvidia_gpu.bat").exists():
+            comfy_dir = comfy_dir.parent
+            state.add_console_log(f"[Comfy-Launcher] Auto-resolved ComfyUI root directory to: {comfy_dir}")
+        bat_file = comfy_dir / "run_nvidia_gpu.bat"
 
-    # If the folder still does not exist
     if not comfy_dir.exists():
         ui.notify(f"ComfyUI directory not found: {comfy_dir}", type="negative")
         return
 
-    bat_file = comfy_dir / "run_nvidia_gpu.bat"
-    sh_file = comfy_dir / "run_nvidia_gpu.sh"
-    python_file = comfy_dir / "main.py"
-    inner_python_file = comfy_dir / "ComfyUI" / "main.py"
-    
-    # Locate embedded python installations in portable packages
-    embedded_py_win = comfy_dir / "python_embeded" / "python.exe"
-    embedded_py_unix = comfy_dir / "python_embeded" / "bin" / "python"
-    
-    # Retrieve startup launch arguments safely using shlex to parse string elements
-    import shlex
-    comfy_args_str = get_setting("comfy_args", "--windows-standalone-build") or ""
-    comfy_args_list = shlex.split(comfy_args_str)
-    
+    # Clean child process environment to prevent DLL / cuDNN version mismatch from ABI-Pipeline
+    clean_env = os.environ.copy()
+    try:
+        prefixes = {
+            str(Path(sys.prefix).resolve()).lower(),
+            str(Path(sys.executable).parent.parent.resolve()).lower()
+        }
+        paths = clean_env.get("PATH", "").split(os.pathsep)
+        clean_paths = [
+            p for p in paths 
+            if not any(prefix in str(Path(p).resolve()).lower() for prefix in prefixes)
+        ]
+        clean_env["PATH"] = os.pathsep.join(clean_paths)
+    except Exception:
+        pass
+
+    clean_env.pop("PYTHONPATH", None)
+    clean_env.pop("PYTHONHOME", None)
+
     try:
         if os.name == 'nt':  # Windows
-            # Prioritize direct embedded Python execution to ensure all custom parameters
-            # (like --port, --highvram) are forwarded properly. Standalone ComfyUI .bat files
-            # do not forward command-line parameters natively because they lack a `%*` suffix.
-            if embedded_py_win.exists() and inner_python_file.exists():
-                subprocess.Popen([str(embedded_py_win), "-s", "ComfyUI\\main.py"] + comfy_args_list, cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
-                ui.notify("Launching ComfyUI via embedded python...", type="info")
-            elif bat_file.exists():
-                subprocess.Popen([str(bat_file)] + comfy_args_list, cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
-                ui.notify("Launching ComfyUI via run_nvidia_gpu.bat...", type="info")
-            elif python_file.exists():
-                venv_python = comfy_dir / "venv" / "Scripts" / "python.exe"
-                py_exec = str(venv_python) if venv_python.exists() else sys.executable
-                subprocess.Popen([py_exec, "main.py"] + comfy_args_list, cwd=str(comfy_dir), creationflags=subprocess.CREATE_NEW_CONSOLE)
-                ui.notify(f"Launching ComfyUI via Python interpreter ({py_exec})...", type="info")
+            if bat_file.exists():
+                subprocess.Popen(
+                    ["cmd.exe", "/c", str(bat_file)],
+                    cwd=str(comfy_dir),
+                    env=clean_env,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE
+                )
+                ui.notify(f"Launching ComfyUI via {bat_file.name}...", type="info")
+                state.add_console_log(f"[Comfy-Launcher] Started {bat_file.name} in {comfy_dir}")
             else:
-                ui.notify("Could not locate run_nvidia_gpu.bat, embedded python, or main.py.", type="warning")
+                ui.notify(f"Could not find run_nvidia_gpu.bat in {comfy_dir}", type="warning")
         else:  # Linux / macOS
-            # Prioritize direct embedded or local Python execution to bypass static .sh constraints
-            if embedded_py_unix.exists() and inner_python_file.exists():
-                subprocess.Popen([str(embedded_py_unix), "-s", "ComfyUI/main.py"] + comfy_args_list, cwd=str(comfy_dir))
-                ui.notify("Launching ComfyUI via embedded python...", type="info")
-            elif sh_file.exists():
-                subprocess.Popen(["bash", str(sh_file)] + comfy_args_list, cwd=str(comfy_dir))
-                ui.notify("Launching ComfyUI via shell script...", type="info")
-            elif python_file.exists():
-                venv_python = comfy_dir / "venv" / "bin" / "python"
-                py_exec = str(venv_python) if venv_python.exists() else sys.executable
-                subprocess.Popen([py_exec, "main.py"] + comfy_args_list, cwd=str(comfy_dir))
-                ui.notify("Launching ComfyUI via Python interpreter...", type="info")
+            sh_file = comfy_dir / "run_nvidia_gpu.sh"
+            if sh_file.exists():
+                subprocess.Popen(["bash", str(sh_file)], cwd=str(comfy_dir), env=clean_env)
+                ui.notify("Launching ComfyUI via run_nvidia_gpu.sh...", type="info")
             else:
-                ui.notify("Could not locate shell script, embedded python, or main.py.", type="warning")
+                ui.notify(f"Could not find run_nvidia_gpu.sh in {comfy_dir}", type="warning")
     except Exception as e:
         ui.notify(f"Failed to launch ComfyUI process: {str(e)}", type="negative")
+        state.add_console_log(f"[Comfy-Launcher] Launch error: {str(e)}")
 
 
 def launch_subtitles_host():
@@ -1820,17 +1865,22 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
     header_controls()
 
     with ui.row().classes('items-center gap-3'):
-        # Launch Subtitles Button (Visible if path configured or engine is ABI-Subtitles)
+        # Launch Subtitles Button (Visible only if engine is ABI-Subtitles AND path is configured)
+        is_subtitles_active = lambda _: (
+            app_settings.get('stt_engine') == 'ABI-Subtitles' and 
+            bool(app_settings.get('subtitles_launch_path', '').strip())
+        )
         ui.button(
-            'Launch Subtitles',
+            'ABI-Subs',
             icon='closed_caption',
             on_click=launch_subtitles_host
         ).props('flat dense').classes('text-xs text-amber-400 hover:text-amber-300 font-bold px-2 py-1 bg-slate-700/50 rounded border border-slate-600/30') \
-            .bind_visibility_from(app_settings, 'subtitles_launch_path', backward=lambda val: bool(val and val.strip()))
+            .bind_visibility_from(app_settings, 'stt_engine', backward=is_subtitles_active) \
+            .bind_visibility_from(app_settings, 'subtitles_launch_path', backward=is_subtitles_active)
 
         # Launch Comfy Button (Visible only if local comfy path is populated)
         ui.button(
-            'Launch Comfy', 
+            'Comfy', 
             icon='bolt', 
             on_click=launch_comfyui
         ).props('flat dense').classes('text-xs text-blue-400 hover:text-blue-300 font-bold px-2 py-1 bg-slate-700/50 rounded border border-slate-600/30') \
@@ -1838,7 +1888,7 @@ with ui.header(elevated=False).classes('bg-slate-800 text-white px-6 py-4 justif
         
         # Launch LLM Button (Visible only if path is populated)
         ui.button(
-            'Launch LLM',
+            'LLM',
             icon='psychology',
             on_click=launch_llm_host
         ).props('flat dense').classes('text-xs text-emerald-400 hover:text-emerald-300 font-bold px-2 py-1 bg-slate-700/50 rounded border border-slate-600/30') \

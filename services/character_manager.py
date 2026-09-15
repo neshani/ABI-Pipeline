@@ -1722,3 +1722,117 @@ def merge_character_into_target(
     recalculate_project_character_hits(project_id)
     save_project_characters_to_json(project_id)
     return True
+
+def detach_alias_to_character(
+    project_id: int,
+    character_id: int,
+    alias_id: int,
+    current_book_id: Optional[int] = None
+) -> Optional[int]:
+    """
+    Detaches an alias from a character and restores it as a standalone Character.
+    - Removes the CharacterAlias from the source character.
+    - Creates a new Character with the alias name (or reuses existing if present).
+    - Creates a Base State CharacterTimelineEvent for the new character.
+    - Creates a self-referential CharacterAlias for the new character.
+    - Links the new character to books where the alias appears, the current book,
+      or inherits book links from the parent character so it never disappears from view.
+    - Recalculates project character hits and syncs characters.json.
+    Returns the new character ID.
+    """
+    from services.character_organizer import (
+        get_book_character_frequency_map,
+        recalculate_project_character_hits
+    )
+
+    with Session(engine) as session:
+        alias_record = session.get(CharacterAlias, alias_id)
+        parent_char = session.get(Character, character_id)
+
+        if not alias_record or not parent_char or alias_record.character_id != character_id:
+            return None
+
+        alias_name = alias_record.alias.strip()
+
+        # Disallow detaching if it matches the character's canonical name
+        if alias_name.lower() == parent_char.name.lower().strip():
+            return None
+
+        # 1. Remove the alias from the parent character
+        session.delete(alias_record)
+        session.flush()
+
+        # 2. Check if a character with this name already exists in the project
+        existing_char = session.exec(
+            select(Character)
+            .where(Character.project_id == project_id)
+            .where(Character.name.ilike(alias_name))
+        ).first()
+
+        if existing_char:
+            new_char = existing_char
+        else:
+            new_char = Character(
+                project_id=project_id,
+                name=alias_name,
+                locked=False,
+                origin="Alias Detached",
+                merge_checked=False
+            )
+            session.add(new_char)
+            session.flush()
+
+            base_ev = CharacterTimelineEvent(
+                character_id=new_char.id,
+                book_id=None,
+                chapter_num=0,
+                scene_num=0,
+                label="Base State"
+            )
+            session.add(base_ev)
+            session.flush()
+            base_ev.visual_description = compile_character_visual_prompt(base_ev)
+            session.add(base_ev)
+
+            self_alias = CharacterAlias(character_id=new_char.id, alias=alias_name)
+            session.add(self_alias)
+            session.flush()
+
+        # 3. Determine and assign book links so it appears in the active book view
+        project = session.get(Project, project_id)
+        project_name = project.name if project else ""
+
+        books_to_link: Set[int] = set()
+        project_books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+        for b in project_books:
+            freq_map = get_book_character_frequency_map(project_name, b.name, session)
+            if freq_map.get(alias_name.lower(), 0) > 0:
+                books_to_link.add(b.id)
+
+        # Ensure the currently viewed book is linked
+        if current_book_id:
+            books_to_link.add(current_book_id)
+
+        # Fallback: Inherit parent character's links if transcript frequencies are empty
+        if not books_to_link:
+            parent_links = session.exec(
+                select(CharacterBookLink).where(CharacterBookLink.character_id == character_id)
+            ).all()
+            for pl in parent_links:
+                books_to_link.add(pl.book_id)
+
+        existing_links = {
+            lk.book_id for lk in session.exec(
+                select(CharacterBookLink).where(CharacterBookLink.character_id == new_char.id)
+            ).all()
+        }
+        for b_id in books_to_link:
+            if b_id not in existing_links:
+                session.add(CharacterBookLink(character_id=new_char.id, book_id=b_id))
+
+        session.commit()
+        new_char_id = new_char.id
+
+    recalculate_project_character_hits(project_id)
+    save_project_characters_to_json(project_id)
+    return new_char_id
