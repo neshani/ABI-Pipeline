@@ -21,6 +21,7 @@ contact_sheet_base64 = ""
 lora_chooser_dialog_ref = None
 playground_image_dialog_ref = None
 character_settings_dialog_ref = None
+freeform_prompt_dialog_ref = None
 
 # Static element references for the detail preview modal (prevents refresh bugs)
 modal_title_label = None
@@ -553,6 +554,13 @@ def open_playground_image_modal(img_src: str, title: str, prompt: str, quote: st
             modal_quote_container.visible = False
             
     playground_image_dialog_ref.open()
+
+
+def open_freeform_prompt_modal(project_name: str):
+    """Opens the freeform 'Custom Prompt' dialog for hand-written prompt rendering."""
+    if not freeform_prompt_dialog_ref:
+        return
+    freeform_prompt_dialog_ref.open()
 
 
 def _get_resolved_workflow_settings() -> List[str]:
@@ -1098,6 +1106,8 @@ def fetch_real_prompts(project_name: str, book_name: str, count: int = 4, prompt
 
 def draw_style_test_sample(project_name: str, book_name: str):
     """Pulls randomized visual prompt scenes using the active state.style_prompt_seed for consistency."""
+    # Loading book scenes explicitly hands the card list back to book mode.
+    state.style_freeform_active = False
     state.style_test_prompts = fetch_real_prompts(
         project_name=project_name,
         book_name=book_name,
@@ -1118,6 +1128,11 @@ def draw_style_test_sample(project_name: str, book_name: str):
 
 def sync_style_playground_state(project_name: str):
     """Re-evaluates available transcripts/prompts and refreshes the style playground cards and overrides."""
+    # Freeform prompts are user-authored, not book-derived. Never resample or
+    # clear them here, otherwise re-entering the tab would discard the prompt.
+    if state.style_freeform_active:
+        return
+
     if not state.playground_book_selection:
         state.style_has_source_material = False
         state.style_test_prompts = []
@@ -1248,6 +1263,123 @@ async def execute_style_playground_batch(project_name: str):
     state.style_playground_loading = False
     render_style_playground_cards.refresh()
     ui.notify("Visual test batch processing complete!", type="positive")
+
+
+def _resolve_active_workflow_json() -> Optional[Dict[str, Any]]:
+    """Loads the currently selected ComfyUI API workflow JSON, or None if unavailable.
+
+    Mirrors the resolution order used by execute_style_playground_batch
+    ('./workflows', then the legacy './Comfy_Workflows'), kept separate so the
+    existing book-driven batch path is left untouched.
+    """
+    wf_path = Path("./workflows") / state.style_selected_workflow
+    if not wf_path.exists():
+        wf_path = Path("./Comfy_Workflows") / state.style_selected_workflow
+
+    if not wf_path.exists():
+        ui.notify(f"Workflow file '{state.style_selected_workflow}' not found.", type="negative")
+        return None
+
+    try:
+        with open(wf_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        ui.notify(f"Failed to load workflow JSON: {str(e)}", type="negative")
+        return None
+
+
+async def execute_style_freeform_batch(project_name: str):
+    """Renders user-authored prompts through the active workflow/overrides/LoRAs.
+
+    Mirrors execute_style_playground_batch but sources prompt text from the
+    freeform modal instead of prompts.csv. Character-tag replacement is skipped
+    because freeform text carries no #tags# markup, and the Style Prefix/Suffix
+    are applied only when the user opts in.
+    """
+    prompt_text = (state.style_freeform_prompt or "").strip()
+    if not prompt_text:
+        ui.notify("Enter a prompt to render.", type="warning")
+        return
+
+    if not state.style_selected_workflow:
+        ui.notify("Please select a workflow first.", type="warning")
+        return
+
+    if not state.comfy_online:
+        ui.notify("Cannot run: ComfyUI is offline. Please launch ComfyUI and retry connection.", type="negative", icon="cloud_off")
+        return
+
+    workflow_json = _resolve_active_workflow_json()
+    if not workflow_json:
+        return
+
+    # Clamp the requested batch size to the supported 1-4 range.
+    try:
+        count = int(state.style_freeform_batch_size)
+    except (TypeError, ValueError):
+        count = 1
+    count = max(1, min(4, count))
+
+    comfy_url = get_setting("comfy_url", "127.0.0.1:8188")
+    if "http" in comfy_url:
+        comfy_url = comfy_url.replace("http://", "").replace("https://", "").strip("/")
+
+    use_modifiers = bool(state.style_freeform_use_style_modifiers)
+    prefix = state.style_prompt_prefix if use_modifiers else ""
+    suffix = getattr(state, "style_prompt_suffix", "") if use_modifiers else ""
+
+    # Take over the shared card list so results land in the existing thumbnails.
+    # Each entry gets a fresh random seed so batch runs explore variations.
+    state.style_freeform_active = True
+    state.style_test_prompts = [
+        {"prompt": prompt_text, "quote": "", "chapter": 0, "scene": i + 1}
+        for i in range(count)
+    ]
+    state.style_test_seeds = [random.randint(100000, 999999) for _ in range(count)]
+    state.style_test_images = ["LOADING"] * count
+    state.style_playground_loading = True
+    render_style_playground_cards.refresh()
+
+    from services.comfy_client import ComfyClient
+    client = ComfyClient(comfy_url)
+
+    for idx in range(count):
+        seed = state.style_test_seeds[idx]
+
+        def run_image(seed=seed):
+            return client.generate_image_sync(
+                workflow_json=workflow_json,
+                prompt_text=prompt_text,
+                neg_prompt_text=state.style_negative_prompt,
+                seed=seed,
+                overrides=state.style_workflow_overrides,
+                prefix=prefix,
+                suffix=suffix
+            )
+
+        logs = ""
+        try:
+            img_bytes, logs = await asyncio.to_thread(run_image)
+            if img_bytes:
+                encoded = base64.b64encode(img_bytes).decode("utf-8")
+                state.style_test_images[idx] = f"data:image/png;base64,{encoded}"
+            else:
+                state.style_test_images[idx] = None
+                ui.notify("Render produced no output.", type="warning")
+        except Exception as e:
+            state.style_test_images[idx] = None
+            state.add_console_log(f"[Freeform] Exception rendering card {idx+1}: {str(e)}")
+            ui.notify(f"Render failed: {str(e)}", type="negative")
+
+        for line in logs.split("\n"):
+            if line.strip():
+                state.add_console_log(line)
+
+        render_style_playground_cards.refresh()
+
+    state.style_playground_loading = False
+    render_style_playground_cards.refresh()
+    ui.notify(f"Custom prompt rendered ({count} image{'s' if count > 1 else ''}).", type="positive")
 
 
 style_chooser_instance = None
@@ -1856,8 +1988,12 @@ def render_style_playground_cards(project_name: str = ""):
             quote = item.get("quote", "") if is_dict else ""
             seed = state.style_test_seeds[idx] if idx < len(state.style_test_seeds) else state.style_image_seed
 
-            card_title = f"Ch {chapter}, Scene {scene_num}"
-            full_title_header = f"{card_title} • {book_title}"
+            if state.style_freeform_active:
+                card_title = "Custom Prompt"
+                full_title_header = f"Custom Prompt • Variant {idx + 1}"
+            else:
+                card_title = f"Ch {chapter}, Scene {scene_num}"
+                full_title_header = f"{card_title} • {book_title}"
 
             with ui.card().classes('w-full border p-2.5 rounded-lg shadow-xs gap-2 bg-white'):
                 with ui.row().classes('w-full justify-between items-center pb-1 border-b border-dashed'):
@@ -1941,6 +2077,7 @@ def render_character_settings_content():
 
 def render_style_playground_tab(project, save_project_settings_cb=None):
     global contact_sheet_dialog_ref, lora_chooser_dialog_ref, playground_image_dialog_ref, character_settings_dialog_ref
+    global freeform_prompt_dialog_ref
     global modal_title_label, modal_image_el, modal_no_image_placeholder, modal_prompt_label, modal_rendered_prompt_label, modal_quote_container, modal_quote_label, modal_download_btn
     
     # Query current volume listings inside database index
@@ -2055,6 +2192,12 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                                 "• Style Prompt Suffix: Appended to the end of every scene prompt.",
                                 "• Style Negative Prompt: Visual attributes and styles the generator must avoid."
                             ]
+                        )
+                        ui.button(
+                            icon='edit_note',
+                            on_click=lambda: open_freeform_prompt_modal(project.name)
+                        ).props('flat round dense size=sm').classes('text-slate-600').tooltip(
+                            'Custom Prompt: render your own prompt text using the active workflow, node overrides, and LoRA selections'
                         )
                     
                 # A. Style Preset Library Loader & Saver (Streamlined Compact Bar)
@@ -2209,6 +2352,47 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
             with ui.row().classes('w-full justify-end border-t pt-2'):
                 ui.button('Close', on_click=character_settings_dialog.close).classes('bg-slate-700 text-white text-xs')
 
+    # --- Freeform "Custom Prompt" Dialog ---
+    with ui.dialog() as freeform_prompt_dialog:
+        with ui.card().classes('w-full max-w-2xl p-5 rounded-xl gap-4 bg-white'):
+            with ui.row().classes('w-full justify-between items-center pb-1 border-b'):
+                with ui.column().classes('gap-0'):
+                    ui.label('Custom Prompt').classes('text-base font-bold text-slate-800')
+                    ui.label('Render your own prompt through the active workflow, node overrides, and LoRAs.').classes('text-xs text-slate-500')
+                ui.button(icon='close', on_click=freeform_prompt_dialog.close).props('flat round size=sm').classes('text-slate-400')
+
+            ui.textarea(
+                label="Image Prompt"
+            ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_freeform_prompt') \
+             .tooltip("Hand-written prompt text. Bypasses prompts.csv entirely.")
+
+            with ui.row().classes('w-full items-center justify-between gap-4 flex-wrap'):
+                ui.switch(
+                    'Apply Style Prefix & Suffix',
+                    value=state.style_freeform_use_style_modifiers,
+                    on_change=lambda e: setattr(state, 'style_freeform_use_style_modifiers', e.value)
+                ).classes('text-xs font-semibold').tooltip(
+                    "Off by default: renders your prompt on its own. Turn on to prepend/append the active style's prefix and suffix."
+                )
+
+                with ui.row().classes('items-center gap-2'):
+                    ui.label('Images').classes('text-xs font-bold text-slate-700')
+                    ui.number(
+                        min=1, max=4, step=1
+                    ).classes('w-20 text-xs').props('outlined dense').bind_value(state, 'style_freeform_batch_size') \
+                     .tooltip("1 to 4. Each image is rendered with a new random seed.")
+
+            ui.separator()
+
+            with ui.row().classes('w-full justify-end gap-2 border-t pt-2'):
+                ui.label('Results appear in the preview thumbnails below.').classes('text-[10px] text-slate-400 mr-auto self-center')
+                ui.button('Cancel', on_click=freeform_prompt_dialog.close).classes('text-xs text-slate-600')
+                ui.button(
+                    'Render',
+                    icon='play_arrow',
+                    on_click=lambda: asyncio.create_task(execute_style_freeform_batch(project.name))
+                ).classes('bg-blue-600 text-white text-xs font-bold')
+
     # Create the static, persistent modal structure once
     with ui.dialog() as playground_image_dialog:
         with ui.card().classes('w-full max-w-5xl p-5 rounded-xl gap-4 bg-white h-[85vh] flex flex-col'):
@@ -2246,3 +2430,4 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
     lora_chooser_dialog_ref = lora_chooser_dialog
     playground_image_dialog_ref = playground_image_dialog
     character_settings_dialog_ref = character_settings_dialog
+    freeform_prompt_dialog_ref = freeform_prompt_dialog

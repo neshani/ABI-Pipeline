@@ -100,6 +100,16 @@ style_test_images: List[Optional[str]] = []  # List of Base64-encoded strings or
 style_test_seeds: List[int] = []
 style_lock_samples: bool = False
 style_playground_loading: bool = False
+
+# --- Freeform ("Custom Prompt") Playground Mode ---
+# Lets the user render hand-written prompts through the active workflow, LoRA
+# selections, and node overrides without sourcing text from a book's prompts.csv.
+# When active, the sample-sync engine must not overwrite style_test_prompts, and
+# character-tag replacement is skipped because freeform text has no #tags# syntax.
+style_freeform_active: bool = False
+style_freeform_prompt: str = ""
+style_freeform_use_style_modifiers: bool = False  # Whether to apply Style Prefix/Suffix
+style_freeform_batch_size: int = 1  # 1-4; each entry gets a fresh random seed
 style_discovered_params: Dict[str, Any] = {}  # Dynamic structures found by introspection
 style_workflow_overrides: Dict[str, Any] = {}  # {node_id: {field_name: value}}
 style_contact_sheet_overlay: str = ""  # Custom text banner drawn bottom-center of the sheet
