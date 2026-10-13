@@ -138,6 +138,10 @@ stats_refresh_callback: Optional[Any] = None
 batch_start_time: Optional[float] = None
 batch_elapsed_sec: float = 0.0
 batch_eta_label: str = "ETA: Estimating..."
+# Live inference rate reported by the ABI-Subtitles server (audio-seconds per
+# wall-second) for the job it is currently decoding/inferring. Sticky across
+# the server's per-file decode gap; 0.0 means "use the pipeline's own estimate".
+transcription_speedup: float = 0.0
 
 # --- GPU / VRAM NVML Telemetry State ---
 gpu_telemetry_supported: bool = False

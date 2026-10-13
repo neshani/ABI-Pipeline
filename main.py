@@ -405,6 +405,7 @@ def start_transcribing(project_id: int):
     state.batch_start_time = time.time()
     state.batch_elapsed_sec = 0.0
     state.batch_eta_label = "ETA: Estimating..."
+    state.transcription_speedup = 0.0
 
     start_project_transcription(project_id)
     ui.notify("Background audiobook transcription started!", type="positive")
@@ -1054,11 +1055,20 @@ async def check_for_active_transcriptions():
 
         transcription_rtfx = 0.0
         if state.project_status == "Transcribing" and state.batch_start_time and state.batch_elapsed_sec > 3.0:
-            if completed_duration > 0:
+            # Prefer the ABI-Subtitles server's own measured inference rate. The
+            # cumulative completed/elapsed average below collapses - and makes the
+            # ETA climb - whenever the server is decoding a file or moving between
+            # files, because completed progress stalls while the wall clock keeps
+            # running.
+            server_rtfx = getattr(state, "transcription_speedup", 0.0)
+            if server_rtfx > 0:
+                transcription_rtfx = server_rtfx
+            elif completed_duration > 0:
                 transcription_rtfx = completed_duration / state.batch_elapsed_sec
-                if transcription_rtfx > 0:
-                    proj_eta_sec = remaining_duration / transcription_rtfx
-                    state.batch_eta_label = f"ETA: {format_eta(proj_eta_sec)}"
+
+            if transcription_rtfx > 0:
+                proj_eta_sec = remaining_duration / transcription_rtfx
+                state.batch_eta_label = f"ETA: {format_eta(proj_eta_sec)}"
             else:
                 state.batch_eta_label = "ETA: Decoding audio..."
 
@@ -1148,6 +1158,7 @@ async def check_for_active_transcriptions():
         # 2. State Transition Completion Event Detector (Process Just Ended)
         elif (old_status in active_statuses or getattr(state, "active_task_type", None) is not None) and new_status not in active_statuses:
             state.batch_start_time = None
+            state.transcription_speedup = 0.0
             if was_cancelled:
                 state.was_manually_cancelled = False
                 ui.run_javascript('''

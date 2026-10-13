@@ -119,11 +119,16 @@ def find_audio_sources(book_dir: Path) -> tuple[str, List[Path]]:
     # Get a single flat list of files in the directory
     all_files = [f for f in book_dir.iterdir() if f.is_file()]
 
-    # 1. Look for single-file chapter containers (.m4b, .m4a)
+    # 1. Look for M4B / M4A containers. A lone container is a true single-file
+    # audiobook (its chapters live inside the file); a folder of them is a
+    # multi-file audiobook whose "chapters" are the individual files. Do NOT
+    # collapse a folder of M4Bs down to the first file.
     m4_files = sorted([
         f for f in all_files if f.suffix.lower() in {'.m4b', '.m4a'}
     ])
-    if m4_files:
+    if len(m4_files) > 1:
+        return 'multi_file', m4_files
+    elif len(m4_files) == 1:
         return 'single_file', [m4_files[0]]
 
     # 2. Look for multi-file MP3 tracks
@@ -212,17 +217,37 @@ def create_chapter_plan_for_book(book_id: int, audio_type: str, files: List[str]
     Probes audiobook files to generate and insert the individual Chapter models.
     """
     if audio_type == 'multi_file':
-        # Every file is treated as a separate chapter
+        # Every file is treated as a separate chapter. Probe each track so the
+        # chapter timeline and the cached Book.duration are populated up front:
+        # both the transcription ETA and the duration-weighted progress depend
+        # on them (they were previously left NULL for every multi-file book).
+        cumulative_time = 0.0
         for i, file_path in enumerate(files):
+            track_dur = 0.0
+            try:
+                metadata = ffmpeg.probe(file_path)
+                track_dur = float(metadata['format']['duration'])
+            except Exception as e:
+                print(f"[Scanner] Failed to probe duration for {Path(file_path).name}: {e}")
+
             chapter = Chapter(
                 book_id=book_id,
                 chapter_num=i + 1,
                 title=Path(file_path).stem,
                 input_file=file_path,
                 type='file',
+                start_time=cumulative_time if track_dur > 0 else None,
+                end_time=(cumulative_time + track_dur) if track_dur > 0 else None,
                 status="Pending"
             )
             session.add(chapter)
+            cumulative_time += track_dur
+
+        if cumulative_time > 0:
+            book = session.get(Book, book_id)
+            if book:
+                book.duration = cumulative_time
+                session.add(book)
 
     elif audio_type == 'single_file' and files:
         single_file = files[0]

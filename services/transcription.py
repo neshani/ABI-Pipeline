@@ -358,6 +358,14 @@ def transcribe_book_with_subtitles_server(book_id: int, client: SubtitlesClient,
         chapters = session.exec(select(Chapter).where(Chapter.book_id == book_id).order_by(Chapter.chapter_num)).all()
         total_chapters = len(chapters)
 
+        # Total book audio (seconds) for live/duration-weighted progress. Prefer the
+        # cached Book.duration; fall back to the chapter timeline for older imports.
+        book_total_duration = book.duration or 0.0
+        if book_total_duration <= 0.0 and chapters:
+            book_total_duration = sum(
+                max(0.0, (c.end_time or 0.0) - (c.start_time or 0.0)) for c in chapters
+            )
+
     base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
     book_output_dir = base_output_dir / project_name / book_name
     book_output_dir.mkdir(parents=True, exist_ok=True)
@@ -401,6 +409,14 @@ def transcribe_book_with_subtitles_server(book_id: int, client: SubtitlesClient,
                     pct = prog.get("percent", 0.0)
                     speedup = prog.get("speedup", 0.0)
                     eta = prog.get("eta_seconds", 0.0)
+
+                    # Hand the server's measured inference rate to the UI ETA
+                    # calculation (main.py). Keep the last non-zero value so the
+                    # estimate survives the server's per-file decode gap instead
+                    # of collapsing to a falling cumulative average.
+                    if speedup > 0:
+                        import ui.state as ui_state
+                        ui_state.transcription_speedup = speedup
 
                     # Log every ~5% or if speedup changes
                     if abs(pct - last_pct_logged) >= 5.0 or (speedup > 0 and last_pct_logged == 0):
@@ -530,6 +546,26 @@ def transcribe_book_with_subtitles_server(book_id: int, client: SubtitlesClient,
                     print("[ABI-Subtitles] Transcription cancelled by user.")
                     return
 
+                # Live telemetry for the track currently being inferred. This gives
+                # the book smooth sub-track progress (previously it only moved when a
+                # whole track finished) and the true inference rate for the UI ETA.
+                status_resp = client.get_queue_status()
+                if status_resp and status_resp.get("active_progress"):
+                    prog = status_resp["active_progress"]
+                    active_speedup = prog.get("speedup", 0.0) or 0.0
+                    if active_speedup > 0:
+                        import ui.state as ui_state
+                        ui_state.transcription_speedup = active_speedup
+                    active_ch = job_records.get(prog.get("job_id"))
+                    if active_ch is not None and book_total_duration > 0:
+                        done_audio = (active_ch.start_time or 0.0) + (prog.get("current_sec", 0.0) or 0.0)
+                        with Session(engine) as session:
+                            db_book = session.get(Book, book_id)
+                            if db_book:
+                                db_book.progress = min(0.999, done_audio / book_total_duration)
+                                session.add(db_book)
+                                session.commit()
+
                 for job_id, ch in list(job_records.items()):
                     if job_id in completed_job_ids:
                         continue
@@ -595,12 +631,20 @@ def transcribe_book_with_subtitles_server(book_id: int, client: SubtitlesClient,
                                     session.add(db_ch)
                                     session.commit()
 
-                                completed_count = len(session.exec(
+                                completed_chapters = session.exec(
                                     select(Chapter).where(Chapter.book_id == book_id).where(Chapter.status == "Completed")
-                                ).all())
+                                ).all()
+                                if book_total_duration > 0:
+                                    completed_audio = sum(
+                                        max(0.0, (c.end_time or 0.0) - (c.start_time or 0.0))
+                                        for c in completed_chapters
+                                    )
+                                    new_progress = min(1.0, completed_audio / book_total_duration)
+                                else:
+                                    new_progress = len(completed_chapters) / total_chapters if total_chapters > 0 else 1.0
                                 db_book = session.get(Book, book_id)
                                 if db_book:
-                                    db_book.progress = completed_count / total_chapters if total_chapters > 0 else 1.0
+                                    db_book.progress = new_progress
                                     session.add(db_book)
                                     session.commit()
 
