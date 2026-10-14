@@ -111,8 +111,18 @@ def smart_chunk_text(text: str, max_chunk_words: int) -> List[str]:
     return chunks
 
 
-async def get_llm_response(prompt: str, llm_url: str, model_name: str) -> str:
-    """Dispatches asynchronous request to local Ollama or LM Studio OpenAI-compatible endpoints."""
+async def get_llm_response(
+    prompt: str,
+    llm_url: str,
+    model_name: str,
+    temperature: float = 0.7,
+    extra_payload: Optional[Dict[str, Any]] = None
+) -> str:
+    """Dispatches asynchronous request to local Ollama or LM Studio OpenAI-compatible endpoints.
+
+    ``extra_payload`` merges into the request body, e.g. to disable a model's
+    thinking mode: ``{"chat_template_kwargs": {"enable_thinking": False}}``.
+    """
     endpoint = llm_url.rstrip("/")
     if "/v1" not in endpoint and "/api" not in endpoint:
         endpoint = f"{endpoint}/v1/chat/completions"
@@ -128,8 +138,10 @@ async def get_llm_response(prompt: str, llm_url: str, model_name: str) -> str:
     payload = {
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7
+        "temperature": temperature
     }
+    if extra_payload:
+        payload.update(extra_payload)
     
     async with httpx.AsyncClient() as client:
         try:
@@ -146,7 +158,7 @@ async def get_llm_response(prompt: str, llm_url: str, model_name: str) -> str:
                         "model": model_name,
                         "prompt": prompt,
                         "stream": False,
-                        "options": {"temperature": 0.7}
+                        "options": {"temperature": temperature}
                     }
                     resp = await client.post(direct_endpoint, json=direct_payload, timeout=60.0)
                     resp.raise_for_status()
@@ -260,12 +272,15 @@ async def generate_prompt_for_chunk_async(
     task: dict, 
     llm_url: str, 
     model_name: str, 
-    template: str, 
     semaphore: asyncio.Semaphore
 ) -> dict:
-    """Generates prompt for a single chunk using a concurrency semaphore."""
+    """Generates prompt for a single chunk using a concurrency semaphore.
+
+    ``task["prompt"]`` is already fully composed (shared block plus the
+    shot-role fragment chosen for this scene) by the caller.
+    """
     async with semaphore:
-        final_prompt = template.replace("<text>", task["chunk"])
+        final_prompt = task["prompt"]
         raw_response = await get_llm_response(final_prompt, llm_url, model_name)
         parsed = parse_llm_response(raw_response)
         return {
@@ -364,12 +379,6 @@ async def start_project_prompt_gen(project_id: int):
         if not chunk_size_words or chunk_size_words <= 0:
             chunk_size_words = 350
 
-        # Load Prompt Template
-        template_name = state.playground_selected_template or "default"
-        template_text = load_template_by_name(template_name)
-        if not template_text:
-            template_text = load_template_by_name("default")
-
         base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
 
         for book_dict in books_data:
@@ -410,18 +419,48 @@ async def start_project_prompt_gen(project_id: int):
 
             chapters = [ch for ch in full_text.split("==CHAPTER==") if ch.strip()]
             
-            tasks = []
+            # Enumerate every scene once. Planning is skipped when nothing is
+            # pending, so re-running on a finished book costs no LLM time.
+            all_scenes = []
             for i, chapter_text in enumerate(chapters):
-                chapter_num = i + 1
                 chunks = smart_chunk_text(chapter_text, chunk_size_words)
-                for j, chunk_text in enumerate(chunks):
-                    scene_num = j + 1
-                    if (chapter_num, scene_num) not in completed_scenes:
-                        tasks.append({
-                            "chunk": chunk_text,
-                            "chapter_num": chapter_num,
-                            "scene_num": scene_num
-                        })
+                all_scenes.extend((i + 1, j + 1, chunk_text)
+                                  for j, chunk_text in enumerate(chunks))
+            pending = [(c, s, t) for (c, s, t) in all_scenes
+                       if (c, s) not in completed_scenes]
+
+            # Shot mode for this book, plus a snapshot of the active prompt
+            # variants taken once per book so a mid-run change cannot split it.
+            from services import prompt_library as prompt_lib
+            from services import shot_planner
+            shot_mode = prompt_lib.get_shot_mode(project_name, book_name)
+            selection = prompt_lib.active_selection()
+            shot_map = {}
+            if pending:
+                shot_map = await shot_planner.ensure_book_plan(
+                    project_name, book_name, llm_url, model_name,
+                    chunk_words=chunk_size_words, mode=shot_mode,
+                    log=state.add_console_log,
+                )
+            state.add_console_log(
+                f"[Prompt-Gen] Shot mode for '{book_name}': {shot_mode}"
+                + (f" - {len(shot_map)} planned scenes" if shot_map else "")
+                + ("" if pending else " - nothing pending, skipping")
+            )
+
+            tasks = []
+            for chapter_num, scene_num, chunk_text in pending:
+                # NONE is a valid plan outcome, but pacing is one image per
+                # chunk, so those scenes fall back to the single prompt.
+                role = prompt_lib.resolve_role(
+                    shot_map.get((chapter_num, scene_num)), shot_mode
+                ) or "single"
+                tasks.append({
+                    "chunk": chunk_text,
+                    "chapter_num": chapter_num,
+                    "scene_num": scene_num,
+                    "prompt": prompt_lib.render_with_selection(role, chunk_text, selection),
+                })
 
             total_chunks = len(completed_scenes) + len(tasks)
             state.add_console_log(f"[Prompt-Gen] Total chunks/scenes: {total_chunks} ({len(tasks)} pending)")
@@ -466,7 +505,7 @@ async def start_project_prompt_gen(project_id: int):
                 if state.cancel_prompt_gen_flag:
                     break
                 try:
-                    res = await generate_prompt_for_chunk_async(first_task, llm_url, model_name, template_text, warm_up_sem)
+                    res = await generate_prompt_for_chunk_async(first_task, llm_url, model_name, warm_up_sem)
                     if res and res["status"] != "error":
                         warm_up_success = True
                         warm_up_res = res
@@ -539,7 +578,7 @@ async def start_project_prompt_gen(project_id: int):
                     return None
 
                 try:
-                    res = await generate_prompt_for_chunk_async(task_data, llm_url, model_name, template_text, semaphore)
+                    res = await generate_prompt_for_chunk_async(task_data, llm_url, model_name, semaphore)
                     
                     if state.cancel_prompt_gen_flag:
                         return None

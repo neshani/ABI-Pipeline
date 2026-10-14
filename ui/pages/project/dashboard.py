@@ -318,30 +318,54 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
                     on_click=handle_approve_all
                 ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-3 py-1.5 rounded')
 
+        # --- Shot Planner mode ---
+        # NB: NiceGUI select takes dict options as {value: label}.
+        shot_mode_options = {
+            "auto": "Plan shots (auto)",
+            "wide": "All WIDE",
+            "character": "All CHARACTER",
+            "insert": "All INSERT",
+            "off": "Custom single prompt",
+        }
+
+        def handle_default_shot_mode(val: str):
+            from services import prompt_library as prompt_lib
+            prompt_lib.set_default_shot_mode(val)
+            ui.notify(f"Shot Planner: {shot_mode_options.get(val, val)}", type="info")
+
+        def handle_book_shot_mode(book_name: str, val: str):
+            from services import prompt_library as prompt_lib
+            if not val:
+                prompt_lib.clear_shot_mode(project.name, book_name)
+                ui.notify(f"{book_name}: inherits the project default", type="info")
+            else:
+                prompt_lib.set_shot_mode(project.name, book_name, val)
+                ui.notify(f"{book_name}: {shot_mode_options.get(val, val)}", type="info")
+
+        from services import prompt_library as _pl
+
         with ui.row().classes('w-full items-center gap-3 bg-slate-50 p-3 rounded-lg border mt-1'):
-            ui.icon('description', size='sm', color='slate-500')
+            ui.icon('movie_filter', size='sm', color='slate-500')
             with ui.column().classes('gap-0 flex-1'):
-                ui.label('Active Guidelines Prompt Template').classes('text-xs font-bold text-slate-700')
-                ui.label('Select template rules. Customize rules or add templates inside the Playground tab.').classes('text-[9px] text-slate-500')
-            
-            def handle_dashboard_template_change(val: str):
-                if not val:
-                    return
-                state.playground_selected_template = val
-                loaded = load_template_by_name(val)
-                if loaded:
-                    state.playground_template = loaded
-                    # Auto-persist chosen template layout settings immediately
-                    from services.project_settings import save_project_settings_to_disk
-                    if state.active_project_id:
-                        save_project_settings_to_disk(state.active_project_id)
-                    ui.notify(f"Active Prompt Template changed to: {val}", type="info")
+                ui.label('Shot Planner').classes('text-xs font-bold text-slate-700')
+                ui.label('How each scene decides its prompt. Prompts themselves are edited in the Prompt-Gen Playground.').classes('text-[9px] text-slate-500')
 
             ui.select(
-                options=available_templates,
-                value=state.playground_selected_template,
-                on_change=lambda e: handle_dashboard_template_change(e.value)
-            ).classes('w-48 bg-white').props('outlined dense')
+                options=shot_mode_options,
+                value=_pl.get_default_shot_mode(),
+                on_change=lambda e: handle_default_shot_mode(e.value),
+            ).classes('w-56 bg-white').props('outlined dense')
+
+        with ui.expansion('Per-volume overrides (optional)').classes('w-full border rounded bg-slate-50 text-xs'):
+            for b in books:
+                override = _pl.get_shot_mode_override(project.name, b.name)
+                with ui.row().classes('w-full items-center gap-3 px-2 py-1'):
+                    ui.label(b.name).classes('text-[11px] flex-1 truncate')
+                    ui.select(
+                        options={"": "Inherit project default", **shot_mode_options},
+                        value=override or "",
+                        on_change=lambda e, bn=b.name: handle_book_shot_mode(bn, e.value),
+                    ).classes('w-60').props('dense outlined')
 
         # --- Dynamic Scene Chunk Size Setting ---
         with ui.row().classes('w-full items-center gap-3 bg-slate-50 p-3 rounded-lg border mt-1'):
@@ -745,7 +769,8 @@ def render_project_tabs(
                 state.action_buttons_refresh = safe_refresh
                             
         elif active == 'Prompt-Gen Playground':
-            render_prompt_playground_tab(project, books)
+            from ui.pages.project.prompt_lab import render_prompt_lab
+            render_prompt_lab(project, books)
 
         elif active == 'Characters':
             from ui.pages.project.characters_tab import render_characters_tab
