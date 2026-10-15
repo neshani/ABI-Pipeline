@@ -72,6 +72,13 @@ def shot_direction_text() -> str:
     return read_variant(PLANNER_SLOT, get_active_variant(PLANNER_SLOT))
 
 
+def planner_text(selection: Optional[Dict[str, str]] = None) -> str:
+    """The Shot Planner prompt for a captured selection, else the active one."""
+    if selection is None:
+        return shot_direction_text()
+    return read_variant(PLANNER_SLOT, selection.get(PLANNER_SLOT, PLANNER_SLOT))
+
+
 def list_variants(role: str) -> List[str]:
     """Variant stems for a role: ``<role>.txt`` plus ``<role>_*.txt``.
 

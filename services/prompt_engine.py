@@ -527,10 +527,11 @@ async def start_project_prompt_gen(project_id: int):
                 shot_map = await shot_planner.ensure_book_plan(
                     project_name, book_name, llm_url, model_name,
                     chunk_words=chunk_size_words, mode=shot_mode,
-                    log=state.add_console_log,
+                    log=state.add_console_log, selection=selection,
                 )
             state.add_console_log(
                 f"[Prompt-Gen] Shot mode for '{book_name}': {shot_mode}"
+                + f" - planner {selection.get('shot_direction', '?')}"
                 + (f" - {len(shot_map)} planned scenes" if shot_map else "")
                 + ("" if pending else " - nothing pending, skipping")
             )

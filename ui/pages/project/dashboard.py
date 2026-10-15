@@ -74,8 +74,8 @@ def execute_project_rollback_io(project_id: int, choice: str) -> None:
         state.add_console_log(f"[Rollback-Engine] Processing on-disk assets for book: {book.name}")
             
         # Choices cascade logically to maintain functional data constraints:
-        # - "transcripts": Archives transcript.txt, prompts.csv, and images/
-        # - "prompts": Archives prompts.csv and images/
+        # - "transcripts": Archives transcript.txt, prompts.csv, shot_plan.csv, and images/
+        # - "prompts": Archives prompts.csv, shot_plan.csv, and images/
         # - "images": Archives images/
         
         # 1. Archive transcripts
@@ -100,7 +100,22 @@ def execute_project_rollback_io(project_id: int, choice: str) -> None:
                 except Exception as e:
                     state.add_console_log(f"[Rollback-Engine] Error archiving prompts.csv: {str(e)}")
                     
-        # 3. Archive rendered images (All options archive generated visual records)
+        # 3. Archive the shot plan wherever the prompts go. It is LLM output
+        # derived from the same transcript and planner prompt, so a regenerated
+        # prompts.csv must not inherit the previous run's shot choices. (Only
+        # chunk size and the planner prompt digest are checked for reuse, so a
+        # re-transcribed book would otherwise keep a plan for the old text.)
+        if choice in ("transcripts", "prompts"):
+            plan_path = book_dir / "shot_plan.csv"
+            if plan_path.exists():
+                new_plan = book_dir / f"shot_plan_backup_{timestamp}.csv"
+                try:
+                    plan_path.rename(new_plan)
+                    state.add_console_log(f"[Rollback-Engine] Archived shot plan to: {new_plan.name}")
+                except Exception as e:
+                    state.add_console_log(f"[Rollback-Engine] Error archiving shot_plan.csv: {str(e)}")
+
+        # 4. Archive rendered images (All options archive generated visual records)
         images_dir = book_dir / "images"
         if images_dir.exists() and images_dir.is_dir():
             new_images = book_dir / f"images_backup_{timestamp}"
@@ -915,8 +930,8 @@ def render_project_tabs(
         
         rollback_choice = ui.radio({
             'images': 'Archive Images and regenerate images (Archives images only)',
-            'prompts': 'Archive prompts and regenerate prompts (Includes archiving images)',
-            'transcripts': 'Archive transcripts and re-transcribe audio (Includes archiving prompts and images)'
+            'prompts': 'Archive prompts and regenerate prompts (Includes images and the shot plan)',
+            'transcripts': 'Archive transcripts and re-transcribe audio (Includes prompts, images and the shot plan)'
         }, value='images').classes('text-xs w-full gap-2 p-2 border rounded bg-slate-50/50')
         
         async def confirm_action():

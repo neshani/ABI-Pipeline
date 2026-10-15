@@ -257,6 +257,83 @@ async def async_load_comfy_and_lora_choices():
     render_workflow_overrides_ui.refresh()
 
 
+# --- LoRA trigger words ---
+# A LoRA's trigger words are carried inside the active role's Style Prompt
+# Suffix. The last fragment injected per LoRA node is remembered so switching
+# LoRAs can strip the previous one; the LoRA library is the fallback, which
+# keeps removal working after a restart when this in-memory map is gone.
+_lora_trigger_injections: Dict[str, str] = {}
+
+
+def _lora_triggers_for(lora_path: Optional[str]) -> str:
+    """The trigger string the library records for a LoRA path ('' when none)."""
+    if not lora_path:
+        return ""
+    for item in associated_loras_list:
+        if item.get("lora_path") == lora_path:
+            raw = (item.get("triggers") or "").strip()
+            return "" if raw == "." else raw
+    return ""
+
+
+def _tidy_suffix_commas(text: str) -> str:
+    """Collapse the comma seams left behind when a trigger fragment is removed."""
+    cleaned = text
+    while ", ," in cleaned:
+        cleaned = cleaned.replace(", ,", ",")
+    while ",," in cleaned:
+        cleaned = cleaned.replace(",,", ",")
+    cleaned = cleaned.replace("  ", " ").strip()
+    if cleaned.endswith(","):
+        cleaned = cleaned[:-1].rstrip()
+    return cleaned
+
+
+def _write_style_suffix(value: str) -> None:
+    _commit_text_field("prompt_suffix", value)
+    try:
+        render_style_text_editor.refresh()
+    except Exception:
+        pass
+
+
+def _insert_lora_triggers(fragment: str) -> None:
+    """Place trigger words at the head of the active role's suffix."""
+    if not fragment:
+        return
+    current = getattr(state, _VIEW_ATTRS["prompt_suffix"])
+    if fragment in current:
+        return
+    stripped = current.strip()
+    body = stripped[1:].lstrip() if stripped.startswith(",") else stripped
+    _write_style_suffix(f", {fragment}, {body}" if body else f", {fragment}")
+
+
+def swap_lora_triggers(node_id: str, previous_lora_path: Optional[str], new_triggers: str) -> str:
+    """Swap one LoRA's trigger words for another inside the active role's suffix.
+
+    The outgoing fragment is found from what we last injected for this node, then
+    from the previously selected LoRA's library entry - the fallback is what lets
+    removal work across a restart. A new trigger of ``.`` (or blank) inserts
+    nothing, so the suffix is simply left clean. Returns the fragment now present
+    in the suffix, or ``''`` when the new LoRA has none.
+    """
+    previous = _lora_trigger_injections.get(node_id) or _lora_triggers_for(previous_lora_path)
+    if previous:
+        current = getattr(state, _VIEW_ATTRS["prompt_suffix"])
+        if previous in current:
+            _write_style_suffix(_tidy_suffix_commas(current.replace(previous, "")))
+
+    raw = (new_triggers or "").strip()
+    fragment = "" if raw == "." else raw
+    if fragment:
+        _insert_lora_triggers(fragment)
+        _lora_trigger_injections[node_id] = fragment
+    else:
+        _lora_trigger_injections.pop(node_id, None)
+    return fragment
+
+
 def open_lora_chooser_modal(node_id: str):
     """Pre-selects the active LoRA and opens the Visual LoRA Chooser overlay."""
     global chooser_active_node_id, chooser_selected_lora_id
@@ -320,30 +397,24 @@ def render_lora_preview_panel():
                 
                 def apply_selection():
                     if selected_lora and chooser_active_node_id:
-                        update_override_state(chooser_active_node_id, "lora_name", selected_lora["lora_path"])
-                        update_override_state(chooser_active_node_id, "strength_model", float(selected_lora["strength"]))
-                        
-                        triggers_to_add = selected_lora.get("triggers", "").strip()
-                        if triggers_to_add and triggers_to_add != ".":
-                            current_prefix = getattr(state, _VIEW_ATTRS["prompt_prefix"])
-                            if triggers_to_add not in current_prefix:
-                                cleaned_prefix = current_prefix.strip()
-                                if cleaned_prefix and not cleaned_prefix.endswith(","):
-                                    cleaned_prefix += ","
-                                _commit_text_field(
-                                    "prompt_prefix",
-                                    f"{cleaned_prefix} {triggers_to_add}, ".strip().replace("  ", " ")
-                                )
-                                try:
-                                    render_style_text_editor.refresh()
-                                except Exception:
-                                    pass
-                                ui.notify(f"Selected LoRA and appended trigger words: '{triggers_to_add}'", type="positive")
-                            else:
-                                ui.notify("Selected LoRA successfully!", type="positive")
+                        node_id = chooser_active_node_id
+                        # Capture the outgoing LoRA before the override is rewritten,
+                        # so its trigger words can be swapped out of the suffix.
+                        previous_lora_path = state.style_workflow_overrides.get(node_id, {}).get("lora_name")
+                        update_override_state(node_id, "lora_name", selected_lora["lora_path"])
+                        update_override_state(node_id, "strength_model", float(selected_lora["strength"]))
+
+                        fragment = swap_lora_triggers(
+                            node_id, previous_lora_path, selected_lora.get("triggers", "")
+                        )
+                        if fragment:
+                            ui.notify(
+                                f"Selected LoRA and set trigger words in the suffix: '{fragment}'",
+                                type="positive"
+                            )
                         else:
                             ui.notify("Selected LoRA successfully!", type="positive")
-                            
+
                         lora_chooser_dialog_ref.close()
                         render_workflow_overrides_ui.refresh()
                         
@@ -2277,15 +2348,17 @@ def render_workflow_overrides_ui():
                                         on_click=lambda nid=node_id: open_lora_chooser_modal(nid)
                                     ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Open Visual LoRA Chooser")
                             
-                            # Render triggers section if any benchmarked lora is selected
+                            # Render triggers section if a benchmarked lora with
+                            # real triggers is selected ("." means none).
                             active_bench = None
                             for item in associated_loras_list:
                                 if item["lora_path"] == current_lora_name:
                                     active_bench = item
                                     break
-                                    
-                            if active_bench and active_bench.get("triggers"):
-                                triggers_text = active_bench["triggers"]
+
+                            bench_triggers = (active_bench.get("triggers") or "").strip() if active_bench else ""
+                            if bench_triggers and bench_triggers != ".":
+                                triggers_text = bench_triggers
                                 with ui.row().classes('w-full items-center justify-between p-2 bg-blue-50/50 rounded border border-blue-100 text-xs mt-1'):
                                     with ui.column().classes('gap-0 flex-1 min-w-0'):
                                         ui.label("Trigger Words:").classes('text-[9px] font-bold text-blue-400 uppercase')
@@ -2297,27 +2370,18 @@ def render_workflow_overrides_ui():
                                             on_click=lambda t=triggers_text: (ui.clipboard.write(t), ui.notify("Trigger words copied to clipboard!", type="positive"))
                                         ).props('flat dense').classes('text-blue-600').tooltip("Copy triggers to clipboard")
                                         
-                                        def add_to_prefix_val(t=triggers_text):
-                                            current = getattr(state, _VIEW_ATTRS["prompt_prefix"])
-                                            if t not in current:
-                                                cleaned_prefix = current.strip()
-                                                if cleaned_prefix and not cleaned_prefix.endswith(","):
-                                                    cleaned_prefix += ","
-                                                new_prefix = f"{cleaned_prefix} {t}, ".strip().replace("  ", " ")
-                                                _commit_text_field("prompt_prefix", new_prefix)
+                                        def add_triggers_to_suffix(t=triggers_text):
+                                            fragment = swap_lora_triggers(node_id, current_lora_name, t)
+                                            if fragment:
                                                 ui.notify(
-                                                    f"Added triggers to the {ROLE_LABELS.get(state.style_active_role, 'style')} prefix!",
+                                                    f"Set trigger words in the {ROLE_LABELS.get(state.style_active_role, 'style')} suffix!",
                                                     type="positive"
                                                 )
-                                                try:
-                                                    render_style_text_editor.refresh()
-                                                except Exception:
-                                                    pass
 
                                         ui.button(
                                             icon="playlist_add",
-                                            on_click=lambda: add_to_prefix_val()
-                                        ).props('flat dense').classes('text-blue-600').tooltip("Append triggers to Style Prompt Prefix")
+                                            on_click=lambda: add_triggers_to_suffix()
+                                        ).props('flat dense').classes('text-blue-600').tooltip("Insert trigger words into the Style Prompt Suffix")
                                         
                             ui.number(
                                 label="Strength",

@@ -12,6 +12,11 @@ The chunk size used is recorded in the plan, and each scene carries a digest of
 its chunk, because ``(chapter, scene)`` only maps back to the same text while
 the transcript and the chunk size are unchanged. ``scene_chunk`` re-derives a
 chunk on demand; ``verify_plan`` reports any scene whose text has drifted.
+
+The plan also records a digest of the Shot Planner prompt that produced it, so
+a plan built with one planner variant is never reused after the active variant
+is switched (or edited). Without that, a stored plan silently decides a book's
+shot choices for every later run.
 """
 from __future__ import annotations
 
@@ -23,7 +28,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from database.connection import get_setting
 from services.prompt_engine import get_llm_response, smart_chunk_text
-from services.prompt_library import SHOT_TYPES, shot_direction_text
+from services.prompt_library import SHOT_TYPES, planner_text
 
 # Chunks per request. 30 keeps the window well inside a 98k context and keeps
 # the reply list short enough for a small model to keep in order.
@@ -31,7 +36,8 @@ DEFAULT_WINDOW = 30
 DEFAULT_CHUNK_WORDS = 350
 
 PLAN_FILENAME = "shot_plan.csv"
-PLAN_COLUMNS = ("chapter", "scene", "shot_type", "chunk_words", "chunk_hash")
+PLAN_COLUMNS = ("chapter", "scene", "shot_type", "chunk_words", "chunk_hash",
+                "prompt_hash")
 
 _LINE = re.compile(r"^\s*(\d+)\s*[:.\)\-]\s*\**([A-Za-z]+)")
 _ALIASES = {
@@ -76,9 +82,14 @@ async def plan_chunks(
     model: str,
     window: int = DEFAULT_WINDOW,
     log: Optional[Callable[[str], None]] = None,
+    template: Optional[str] = None,
 ) -> List[str]:
-    """Shot type per chunk, in order. Anything unparsed falls back to NONE."""
-    template = shot_direction_text()
+    """Shot type per chunk, in order. Anything unparsed falls back to NONE.
+
+    ``template`` pins the Shot Planner prompt; when omitted the active variant
+    is read live, which is what the Prompt Lab test bench wants.
+    """
+    template = template if template is not None else planner_text()
     out: List[str] = []
     for start in range(0, len(chunks), window):
         window_chunks = chunks[start:start + window]
@@ -96,6 +107,11 @@ async def plan_chunks(
 
 def chunk_digest(text: str) -> str:
     """Stable short digest of a chunk, whitespace-normalised."""
+    return hashlib.sha1(" ".join(text.split()).encode("utf-8")).hexdigest()[:10]
+
+
+def prompt_digest(text: str) -> str:
+    """Stable short digest of a prompt template, whitespace-normalised."""
     return hashlib.sha1(" ".join(text.split()).encode("utf-8")).hexdigest()[:10]
 
 
@@ -141,6 +157,7 @@ async def plan_book(
     window: int = DEFAULT_WINDOW,
     base: Optional[Path] = None,
     log: Optional[Callable[[str], None]] = None,
+    template: Optional[str] = None,
 ) -> List[Tuple[int, int, str, str]]:
     """``[(chapter_num, scene_num, shot_type, chunk_hash)]`` for a whole book.
 
@@ -159,7 +176,7 @@ async def plan_book(
             continue
         if log:
             log(f"[Shot-Plan] Chapter {chapter_num}: {len(chunks)} scenes")
-        shots = await plan_chunks(chunks, llm_url, model, window, log)
+        shots = await plan_chunks(chunks, llm_url, model, window, log, template)
         for scene_num, (shot, chunk) in enumerate(zip(shots, chunks), start=1):
             plan.append((chapter_num, scene_num, shot, chunk_digest(chunk)))
     return plan
@@ -173,15 +190,17 @@ def save_plan(
     plan: List[Tuple[int, int, str, str]],
     chunk_words: int = DEFAULT_CHUNK_WORDS,
     base: Optional[Path] = None,
+    prompt_hash: str = "",
 ) -> Path:
-    """Write ``shot_plan.csv``. Self-contained: it records the chunk size used."""
+    """Write ``shot_plan.csv``. Self-contained: it records the chunk size used
+    and the digest of the planner prompt the shot types came from."""
     path = plan_path(project_name, book_name, base)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, delimiter="|")
         writer.writerow(PLAN_COLUMNS)
         for chapter, scene, shot, digest in plan:
-            writer.writerow([chapter, scene, shot, chunk_words, digest])
+            writer.writerow([chapter, scene, shot, chunk_words, digest, prompt_hash])
     return path
 
 
@@ -207,6 +226,18 @@ def plan_chunk_words(project_name: str, book_name: str,
         return int(rows[0]["chunk_words"])
     except ValueError:
         return None
+
+
+def plan_prompt_hash(project_name: str, book_name: str,
+                     base: Optional[Path] = None) -> Optional[str]:
+    """Digest of the planner prompt the plan was built with, from the first row.
+
+    ``None`` for a plan that predates the column, which forces a re-plan.
+    """
+    rows = load_plan(project_name, book_name, base)
+    if not rows:
+        return None
+    return rows[0].get("prompt_hash") or None
 
 
 def scene_chunk(
@@ -263,23 +294,39 @@ async def ensure_book_plan(
     mode: str = "auto",
     base: Optional[Path] = None,
     log: Optional[Callable[[str], None]] = None,
+    selection: Optional[Dict[str, str]] = None,
 ) -> Dict[Tuple[int, int], str]:
     """``{(chapter, scene): shot_type}`` for a book.
 
     Only consulted in ``auto`` mode. A stored plan is reused when it was built
-    with the same chunk size; otherwise the book is planned afresh and saved.
+    with the same chunk size *and* the same Shot Planner prompt; otherwise the
+    book is planned afresh and saved. ``selection`` is the run's variant
+    snapshot, so a variant change made mid-run cannot split a book between two
+    planner prompts either.
     """
     if mode != "auto":
         return {}
 
+    template = planner_text(selection)
+    digest = prompt_digest(template)
     stored = load_plan(project_name, book_name, base)
-    if stored and plan_chunk_words(project_name, book_name, base) == chunk_words:
+    stored_words = plan_chunk_words(project_name, book_name, base)
+    stored_digest = plan_prompt_hash(project_name, book_name, base)
+    if stored and stored_words == chunk_words and stored_digest == digest:
         if log:
             log(f"[Shot-Plan] reusing stored plan for '{book_name}' ({len(stored)} scenes)")
         return {(int(r["chapter"]), int(r["scene"])): r["shot_type"] for r in stored}
+    if stored and log:
+        if stored_words != chunk_words:
+            log(f"[Shot-Plan] stored plan for '{book_name}' used {stored_words} words "
+                f"per scene, now {chunk_words} - replanning.")
+        else:
+            log(f"[Shot-Plan] planner prompt changed since the stored plan "
+                f"({stored_digest or 'none'} -> {digest}) - replanning '{book_name}'.")
 
     plan = await plan_book(project_name, book_name, llm_url, model,
-                           chunk_words=chunk_words, window=window, base=base, log=log)
+                           chunk_words=chunk_words, window=window, base=base, log=log,
+                           template=template)
     if plan and all(shot == "NONE" for _chapter, _scene, shot, _digest in plan):
         # A dead or misconfigured LLM produces an all-NONE plan. Don't persist
         # that - fall back to the single prompt instead of poisoning the plan.
@@ -287,5 +334,5 @@ async def ensure_book_plan(
             log("[Shot-Plan] planning produced no usable labels (LLM unreachable?) "
                 "- falling back to the single prompt for this book.")
         return {}
-    save_plan(project_name, book_name, plan, chunk_words, base)
+    save_plan(project_name, book_name, plan, chunk_words, base, prompt_hash=digest)
     return {(chapter, scene): shot for chapter, scene, shot, _digest in plan}
