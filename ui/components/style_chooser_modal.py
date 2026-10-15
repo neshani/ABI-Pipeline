@@ -5,14 +5,44 @@ from pathlib import Path
 from typing import Callable, Optional, Dict, Any, List
 from nicegui import ui
 from database.connection import get_setting
+from services import style_library
 from ui import state
 
-# Benchmark Prompts for uniform styling comparisons
+# Benchmark prompt per shot role, so a preview shows what that role actually
+# renders: people for CHARACTER, a place for WIDE, one object close up for INSERT.
 BENCHMARK_PROMPTS = {
-    "portrait": "A detailed close-up portrait of an old mariner with a weathered face, looking into the distance, neutral expression.",
-    "landscape": "An expansive cinematic landscape of a rocky coast with stormy waves crashing against cliffs, dramatic sky.",
-    "architecture": "A majestic stone cathedral interior, high gothic arches, dust motes dancing in shafts of light from stained glass windows."
+    "character": "A detailed close-up portrait of an old mariner with a weathered face, looking into the distance, neutral expression.",
+    "wide": "An expansive cinematic landscape of a rocky coast with stormy waves crashing against cliffs, dramatic sky.",
+    "insert": "A single brass pocket compass resting on a weathered wooden crate, extreme close-up, plain background.",
 }
+
+ROLE_LABELS = {"character": "Character", "wide": "Wide",
+               "insert": "Insert", "single": "Single"}
+ROLE_ICONS = {"character": "face", "wide": "landscape",
+              "insert": "category", "single": "filter_center_focus"}
+
+# Samples left by the pre-role benchmark prompts (portrait / landscape /
+# architecture). They are cleared once role samples exist: they were rendered
+# from different text, and for wide/insert from the base style.
+LEGACY_SAMPLE_FILES = ("portrait.png", "landscape.png", "architecture.png")
+
+
+# Subjects every style is previewed with, one per shot role. All three are always
+# rendered, including for a flat style, because seeing how a style handles an
+# object next to a landscape is worth knowing on its own. A role the style does
+# not delta simply renders its subject with the base style.
+PREVIEW_ROLES = ("character", "wide", "insert")
+
+
+def preview_roles(style_set: Optional[Dict[str, Any]]) -> List[str]:
+    """Subjects to preview: the three shot subjects, plus ``single`` when the style
+    deltas it. ``single`` has no subject of its own, so it reuses the people
+    benchmark - it is the look a planner-off book would render.
+    """
+    roles = list(PREVIEW_ROLES)
+    if "single" in style_library.role_deltas(style_set):
+        roles.append("single")
+    return roles
 
 # The 7 Default Built-in Style Presets
 DEFAULT_PRESETS = {
@@ -194,10 +224,9 @@ class StyleChooserModal:
         self.style_negative = ""
         self.style_workflow = ""
         
-        # Image base64 variables
-        self.portrait_img = None
-        self.landscape_img = None
-        self.architecture_img = None
+        # Image base64 variables, keyed by shot role
+        self.style_set: Dict[str, Any] = {}
+        self.sample_imgs: Dict[str, Optional[str]] = {}
         self.generating_samples = False
 
         # Component References
@@ -216,6 +245,7 @@ class StyleChooserModal:
         """Parses style json presets, seeding prompt/negative prompt variables with dynamic healer fallback."""
         ensure_default_presets_exist()
         self.selected_style = name
+        self.style_set = {}
         
         styles_dir = Path("./styles")
         file_path = styles_dir / f"{name}.json"
@@ -227,6 +257,7 @@ class StyleChooserModal:
                 
                 # Heal and persist missing/broken workflow definitions dynamically
                 data = heal_style_workflow(name, data)
+                self.style_set = data
                 
                 self.style_prefix = data.get("prompt_prefix", "")
                 self.style_suffix = data.get("prompt_suffix", "")
@@ -245,9 +276,10 @@ class StyleChooserModal:
                     
         # Load local image base64 cache
         samples_dir = Path("./styles/samples") / name
-        self.portrait_img = get_image_base64_or_placeholder(samples_dir / "portrait.png")
-        self.landscape_img = get_image_base64_or_placeholder(samples_dir / "landscape.png")
-        self.architecture_img = get_image_base64_or_placeholder(samples_dir / "architecture.png")
+        self.sample_imgs = {
+            role: get_image_base64_or_placeholder(samples_dir / f"{role}.png")
+            for role in preview_roles(self.style_set)
+        }
 
     async def generate_samples(self):
         """Dispatches sample generation directly in ComfyUI for standard benchmark comparisons."""
@@ -281,47 +313,58 @@ class StyleChooserModal:
             samples_dir = Path("./styles/samples") / self.selected_style
             samples_dir.mkdir(parents=True, exist_ok=True)
 
-            for category, prompt_text in BENCHMARK_PROMPTS.items():
-                seed = 42
-                state.add_console_log(f"[Style-Chooser] Rendering benchmark '{category}' for '{self.selected_style}'...")
-                
-                overrides = {}
-                styles_dir = Path("./styles")
-                file_path = styles_dir / f"{self.selected_style}.json"
-                if file_path.exists():
-                    try:
-                        with open(file_path, "r") as f:
-                            overrides = json.load(f).get("overrides", {})
-                    except Exception:
-                        pass
+            # One sample per shot subject, always all three. A role the style does
+            # not delta resolves to the Character base via effective(), so a flat
+            # style previews its one look against an object and a landscape too.
+            roles = preview_roles(self.style_set)
+            for role in roles:
+                # Fall back to the people benchmark for roles without their own
+                # prompt (currently only "single", the planner-off fallback).
+                prompt_text = BENCHMARK_PROMPTS.get(role, BENCHMARK_PROMPTS["character"])
+                eff = style_library.effective(self.style_set, role)
+                state.add_console_log(
+                    f"[Style-Chooser] Rendering '{role}' benchmark for "
+                    f"'{self.selected_style}'..."
+                )
 
-                def render_block():
+                def render_block(prompt_text=prompt_text, eff=eff):
                     return client.generate_image_sync(
                         workflow_json=wf_json,
                         prompt_text=prompt_text,
-                        neg_prompt_text=self.style_negative,
-                        seed=seed,
-                        overrides=overrides,
-                        prefix=self.style_prefix,
-                        suffix=self.style_suffix
+                        neg_prompt_text=eff["negative_prompt"],
+                        seed=42,
+                        overrides=eff["overrides"],
+                        prefix=eff["prompt_prefix"],
+                        suffix=eff["prompt_suffix"]
                     )
 
                 try:
                     img_bytes, logs = await asyncio.to_thread(render_block)
                     if img_bytes:
-                        target_file = samples_dir / f"{category}.png"
+                        target_file = samples_dir / f"{role}.png"
                         with open(target_file, "wb") as f:
                             f.write(img_bytes)
                     for line in logs.split("\n"):
                         if line.strip():
                             state.add_console_log(line)
                 except Exception as e:
-                    state.add_console_log(f"[Style-Chooser] Generation failed for category '{category}': {str(e)}")
+                    state.add_console_log(f"[Style-Chooser] Generation failed for role '{role}': {str(e)}")
+
+            # Clear samples from the retired portrait/landscape/architecture
+            # prompts so they cannot be mistaken for role previews.
+            for legacy in LEGACY_SAMPLE_FILES:
+                try:
+                    (samples_dir / legacy).unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    state.add_console_log(f"[Style-Chooser] Could not remove {legacy}: {str(e)}")
 
             # Reload updated local caches
-            self.portrait_img = get_image_base64_or_placeholder(samples_dir / "portrait.png")
-            self.landscape_img = get_image_base64_or_placeholder(samples_dir / "landscape.png")
-            self.architecture_img = get_image_base64_or_placeholder(samples_dir / "architecture.png")
+            self.sample_imgs = {
+                role: get_image_base64_or_placeholder(samples_dir / f"{role}.png")
+                for role in roles
+            }
 
             try:
                 with self.dialog:
@@ -397,40 +440,30 @@ class StyleChooserModal:
                     ui.label("PROMPT SUFFIX:").classes("font-bold text-slate-400")
                     ui.label(self.style_suffix or "None").classes("text-slate-600 leading-normal break-words whitespace-normal")
 
-                # Visual Benchmarks Row
-                with ui.grid(columns=3).classes("w-full gap-3 mt-1"):
-                    # Portrait Card
-                    with ui.card().classes("p-2 border rounded shadow-xs items-center gap-2 bg-white"):
-                        ui.label("Portrait").classes("text-[10px] font-bold text-slate-400")
-                        if self.portrait_img:
-                            ui.image(self.portrait_img).props("fit=contain").classes("w-full rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
-                                .on('click', lambda: self.show_large_preview("Portrait", self.portrait_img))
-                        else:
-                            with ui.column().classes("w-full h-24 items-center justify-center bg-slate-100 rounded border border-dashed text-slate-400"):
-                                ui.icon("face", size="sm")
-                                ui.label("No Sample").classes("text-[8px]")
+                # Visual Benchmarks Row - one card per shot subject, always three
+                roles = preview_roles(self.style_set)
+                deltas = [r for r in roles if r in style_library.role_deltas(self.style_set)]
 
-                    # Landscape Card
-                    with ui.card().classes("p-2 border rounded shadow-xs items-center gap-2 bg-white"):
-                        ui.label("Landscape").classes("text-[10px] font-bold text-slate-400")
-                        if self.landscape_img:
-                            ui.image(self.landscape_img).props("fit=contain").classes("w-full rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
-                                .on('click', lambda: self.show_large_preview("Landscape", self.landscape_img))
-                        else:
-                            with ui.column().classes("w-full h-24 items-center justify-center bg-slate-100 rounded border border-dashed text-slate-400"):
-                                ui.icon("landscape", size="sm")
-                                ui.label("No Sample").classes("text-[8px]")
+                with ui.grid(columns=len(roles) or 1).classes("w-full gap-3 mt-1"):
+                    for role in roles:
+                        label = ROLE_LABELS.get(role, role)
+                        img = self.sample_imgs.get(role)
+                        with ui.card().classes("p-2 border rounded shadow-xs items-center gap-2 bg-white"):
+                            ui.label(label).classes("text-[10px] font-bold text-slate-400")
+                            if img:
+                                ui.image(img).props("fit=contain").classes("w-full rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
+                                    .on('click', lambda _, l=label, i=img: self.show_large_preview(l, i))
+                            else:
+                                with ui.column().classes("w-full h-24 items-center justify-center bg-slate-100 rounded border border-dashed text-slate-400"):
+                                    ui.icon(ROLE_ICONS.get(role, "image"), size="sm")
+                                    ui.label("No Sample").classes("text-[8px]")
 
-                    # Architecture Card
-                    with ui.card().classes("p-2 border rounded shadow-xs items-center gap-2 bg-white"):
-                        ui.label("Architecture").classes("text-[10px] font-bold text-slate-400")
-                        if self.architecture_img:
-                            ui.image(self.architecture_img).props("fit=contain").classes("w-full rounded border cursor-zoom-in hover:opacity-90 transition-opacity") \
-                                .on('click', lambda: self.show_large_preview("Architecture", self.architecture_img))
-                        else:
-                            with ui.column().classes("w-full h-24 items-center justify-center bg-slate-100 rounded border border-dashed text-slate-400"):
-                                ui.icon("account_balance", size="sm")
-                                ui.label("No Sample").classes("text-[8px]")
+                if deltas:
+                    ui.label("Role deltas: " + ", ".join(ROLE_LABELS.get(r, r) for r in deltas)).classes(
+                        "text-[10px] text-slate-500")
+                else:
+                    ui.label("No role deltas - all three subjects use this one style.").classes(
+                        "text-[10px] text-slate-400 italic")
 
     def select_style(self, name: str):
         """Swaps the active preview selection and repopulates visual containers."""

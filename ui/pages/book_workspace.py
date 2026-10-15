@@ -65,28 +65,81 @@ def load_prompts_csv(project_name: str, book_name: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def _row_key(chapter, scene) -> str:
+    """Stable (chapter, scene) key, tolerant of ints, floats and strings."""
+    def norm(v):
+        try:
+            return str(int(float(v)))
+        except (TypeError, ValueError):
+            return str(v or "").strip()
+    return f"{norm(chapter)}|{norm(scene)}"
+
+
+def _existing_prompt_columns(target_path: Path) -> tuple:
+    """The file's header order and its rows keyed by (chapter, scene).
+
+    Used by :func:`save_prompts_csv` to carry over columns the caller's rows do
+    not know about. Returns ``([], {})`` when there is nothing readable yet.
+    """
+    if not target_path.exists():
+        return [], {}
+    try:
+        with open(target_path, mode='r', encoding='utf-8', newline='') as f:
+            reader = csv.DictReader(f, delimiter='|')
+            header = [h.strip().lower() for h in (reader.fieldnames or []) if h]
+            rows = {}
+            for row in reader:
+                cleaned = {k.strip().lower(): (v.strip() if v else "")
+                           for k, v in row.items() if k}
+                rows[_row_key(cleaned.get("chapter"), cleaned.get("scene"))] = cleaned
+        return header, rows
+    except Exception as e:
+        print(f"[Proofreader-CSV] Error reading existing prompts for merge: {e}")
+        return [], {}
+
+
 def save_prompts_csv(project_name: str, book_name: str, rows: List[Dict[str, Any]]) -> None:
-    """Serializes rows back to prompts.csv using pipes, keeping the approved column structured."""
+    """Serializes rows back to prompts.csv using pipes, keeping the approved column structured.
+
+    ``prompts.csv`` is the master record, but the rows handed here are a partial
+    view of it - they come from the ``ScenePrompt`` cache, whose schema has no
+    ``shot_role``. So any column the file already carries that a row does not is
+    copied back over from the matching ``(chapter, scene)`` row. Without that,
+    every save silently deletes ``shot_role``, and image generation then renders
+    the whole book with the base shot-role style.
+    """
     target_path = Path(f"./output/{project_name}/{book_name}/prompts.csv")
     target_path.parent.mkdir(parents=True, exist_ok=True)
     
     if not rows:
         return
-        
-    headers = ["chapter", "scene", "prompt", "quote", "approved"]
-    
+
+    existing_header, existing_rows = _existing_prompt_columns(target_path)
+
+    # Keep the file's own column order; fall back to the canonical seed for a new
+    # file, then append any column the caller introduces.
+    headers = list(existing_header) or ["chapter", "scene", "prompt", "quote", "approved"]
     for row in rows:
         for k in row.keys():
-            if k not in headers and k:
-                headers.append(k)
-                
+            if k and k.lower() not in headers:
+                headers.append(k.lower())
+
+    merged_rows = []
+    for r in rows:
+        row = {(k or "").strip().lower(): v for k, v in r.items() if k}
+        prior = existing_rows.get(_row_key(row.get("chapter"), row.get("scene")), {})
+        merged = {h: prior.get(h, "") for h in headers}
+        for h in headers:
+            if h in row and row[h] is not None:
+                merged[h] = row[h]
+        merged_rows.append(merged)
+
     try:
         with open(target_path, mode='w', encoding='utf-8', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=headers, delimiter='|')
             writer.writeheader()
-            for r in rows:
-                cleaned_row = {h: r.get(h, "") for h in headers}
-                writer.writerow(cleaned_row)
+            for merged in merged_rows:
+                writer.writerow(merged)
 
         from services.sync_engine import sync_prompts_csv_to_db_cache
         with Session(engine) as session:
