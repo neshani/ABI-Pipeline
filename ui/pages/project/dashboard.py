@@ -13,6 +13,23 @@ from ui.pages.project.prompt_playground import render_prompt_playground_tab, lis
 
 STAGES = ["Imported", "Transcription", "Prompt Gen", "Image Gen"]
 
+
+def _refresh_cleanup_progress() -> None:
+    """Refresh the transcript-cleanup dialog, if it still exists.
+
+    A cleanup run is a long-lived async task. If the panel re-renders mid-run
+    (e.g. the user switches tabs) the dialog's slot is deleted, so refreshing it
+    raises ``RuntimeError``. The run itself is unaffected - progress state lives
+    in ``ui.state`` and is re-rendered when the panel comes back.
+    """
+    callback = getattr(state, "cleanup_refresh", None)
+    if callback is None:
+        return
+    try:
+        callback()
+    except RuntimeError:
+        pass
+
 def get_active_stage_idx(status: str) -> int:
     mapping = {
         "Imported": 0,
@@ -492,6 +509,308 @@ def render_completed_step_view(project, books):
                 ui.label('Next Step: Workspace Proofreader').classes('text-xs font-bold text-slate-700')
                 ui.label('Select a specific book in the left sidebar to open the Proofreader & Interactive Editor Grid.').classes('text-[10px] text-slate-500')
 
+def render_source_text_tab(project, books):
+    """Optional repair step: match volumes to EPUB source files and rewrite
+    their transcripts from the clean book text (timings carried across)."""
+    from services import source_text as st
+
+    book_names = [b.name for b in books]
+
+    def resolved_pairs():
+        resolved = st.resolve_project_sources(project.name, book_names)
+        return [(n, str(info["chosen"])) for n, info in resolved.items() if info["chosen"]]
+
+    def unaligned_books():
+        return [b.name for b in books
+                if not st.is_cleaned(project.name, b.name)
+                and (st.book_dir(project.name, b.name) / "transcript.txt").exists()]
+
+    # --- dialogs are declared once per render (project convention) ---
+    # Progress lives in ui.state so a run survives a panel re-render.
+    with ui.dialog().props('persistent') as cleanup_dialog, \
+            ui.card().classes('w-full max-w-2xl p-6 rounded-xl gap-3'):
+
+        async def start_cleanup():
+            pairs = resolved_pairs()
+            if not pairs:
+                ui.notify('Nothing to clean - no source files matched.', type='info')
+                return
+            apply_corrections = getattr(state, 'spellfix_from_corrections', True)
+            state.cleanup_progress.update(
+                phase="running", current="", summary="",
+                rows=[{"book": n, "kind": "align", "status": "pending", "detail": ""}
+                      for n, _ in pairs],
+            )
+            _refresh_cleanup_progress()
+
+            def row_for(book_name):
+                return next(r for r in state.cleanup_progress["rows"] if r["book"] == book_name)
+
+            state.add_console_log(f'[Align] Cleaning {len(pairs)} transcript(s) in "{project.name}"...')
+            failures = 0
+            for name, epub in pairs:
+                row = row_for(name)
+                row.update(status="working", detail=f"aligning against {Path(epub).name}")
+                state.cleanup_progress["current"] = name
+                _refresh_cleanup_progress()
+                state.add_console_log(f'[Align] {name}: aligning against {Path(epub).name}')
+                try:
+                    stats = await asyncio.to_thread(st.clean_book, project.name, name, epub)
+                    row.update(status="done", detail=(
+                        f"{stats['emitted_words']:,} words · "
+                        f"{stats['safe_corrections']:,} corrections · "
+                        f"{stats['timing_chunks']:,} chunks"))
+                    state.add_console_log(f"[Align] {name}: {row['detail']}")
+                    for warning in stats.get('warnings', []):
+                        state.add_console_log(f'[Align] {name}: WARNING {warning}')
+                except Exception as ex:
+                    row.update(status="error", detail=str(ex))
+                    failures += 1
+                    state.add_console_log(f'[Align] {name} FAILED: {ex}')
+                _refresh_cleanup_progress()
+
+            # Volumes with no source: repair their spelling from the corrections
+            # learned above (and from any previous runs).
+            if apply_corrections:
+                from services import corrections as corr
+                remaining = corr.books_without_source(project.name, book_names)
+                if remaining:
+                    state.cleanup_progress["rows"].extend(
+                        {"book": n, "kind": "corrections", "status": "pending", "detail": ""}
+                        for n in remaining)
+                    _refresh_cleanup_progress()
+                    vocab = await asyncio.to_thread(corr.project_clean_vocab, project.name, book_names)
+                    agg = await asyncio.to_thread(
+                        corr.aggregate_corrections, project.name, book_names, 2, True, vocab)
+                    mapping = {a['wrong']: a['right'] for a in agg}
+                    state.add_console_log(
+                        f'[Spellfix] Applying {len(mapping)} learned corrections to '
+                        f'{len(remaining)} volume(s) without a source...')
+                    for name in remaining:
+                        row = row_for(name)
+                        row.update(status="working", detail=f"{len(mapping):,} learned corrections")
+                        state.cleanup_progress["current"] = name
+                        _refresh_cleanup_progress()
+                        try:
+                            stats = await asyncio.to_thread(
+                                corr.apply_to_book, project.name, name, mapping, False)
+                            row.update(status="done", detail=f"{stats['hits']:,} corrections applied")
+                            state.add_console_log(f"[Spellfix] {name}: {stats['hits']} corrections")
+                        except Exception as ex:
+                            row.update(status="error", detail=str(ex))
+                            failures += 1
+                            state.add_console_log(f'[Spellfix] {name} FAILED: {ex}')
+                        _refresh_cleanup_progress()
+
+            succeeded = sum(1 for r in state.cleanup_progress["rows"] if r["status"] == "done")
+            state.cleanup_progress.update(
+                phase="done", current="",
+                summary=f"{succeeded} succeeded, {failures} failed")
+            _refresh_cleanup_progress()
+            try:
+                ui.notify(f'Cleanup finished - {state.cleanup_progress["summary"]}',
+                          type='positive' if not failures else 'warning')
+            except RuntimeError:
+                pass
+
+        @ui.refreshable
+        def render_dialog():
+            if state.cleanup_progress["phase"] == "confirm":
+                ui.label('Confirm Transcript Cleanup').classes('text-lg font-bold text-slate-800')
+                ui.label(
+                    "Each volume below has its transcript.txt replaced with the book's own text "
+                    "(spelling, punctuation and quotes corrected) and transcript_timing.json rebuilt "
+                    "so quote timestamps keep working. The current ASR text and timings are backed up "
+                    "first, so this can be reverted."
+                ).classes('text-xs text-slate-500 leading-relaxed')
+
+                with ui.column().classes('w-full gap-1 max-h-72 overflow-y-auto border rounded-lg p-3 bg-slate-50'):
+                    pairs = resolved_pairs()
+                    matched_names = {name for name, _ in pairs}
+                    if not pairs:
+                        ui.label('No volumes are matched to a source file.').classes('text-xs text-slate-500 italic')
+                    for name, epub in pairs:
+                        with ui.row().classes('w-full items-center gap-2'):
+                            ui.icon('menu_book', size='16px', color='teal-500')
+                            ui.label(name).classes('text-[11px] font-semibold text-slate-700 flex-1 truncate')
+                            ui.label(Path(epub).name).classes('text-[10px] text-slate-500 truncate max-w-[45%]')
+                    if getattr(state, 'spellfix_from_corrections', True):
+                        remaining = [n for n in unaligned_books() if n not in matched_names]
+                        if remaining:
+                            ui.separator()
+                            ui.label('Without a source - repaired from learned corrections').classes(
+                                'text-[10px] font-bold text-slate-500 uppercase pt-1')
+                            for name in remaining:
+                                with ui.row().classes('w-full items-center gap-2'):
+                                    ui.icon('spellcheck', size='16px', color='amber-500')
+                                    ui.label(name).classes('text-[11px] text-slate-600 flex-1 truncate')
+
+                with ui.row().classes('w-full justify-end gap-2 mt-1'):
+                    ui.button('Cancel', on_click=cleanup_dialog.close).props('flat').classes('text-xs text-slate-600')
+                    ui.button('Clean Up', icon='auto_fix_high', on_click=start_cleanup) \
+                        .classes('bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-4')
+                return
+
+            # Running / finished view.
+            rows = state.cleanup_progress["rows"]
+            total = len(rows)
+            finished = sum(1 for r in rows if r["status"] in ("done", "error"))
+            running = state.cleanup_progress["phase"] == "running"
+            ui.label('Cleaning Transcripts' if running else 'Cleanup Complete') \
+                .classes('text-lg font-bold text-slate-800')
+            headline = state.cleanup_progress["current"] if running else state.cleanup_progress["summary"]
+            ui.label(f'{finished} of {total}  ·  {headline}').classes('text-xs text-slate-500')
+            ui.linear_progress(value=(finished / total) if total else 0.0, show_value=False) \
+                .classes('w-full')
+
+            icon_for = {
+                "pending": ("radio_button_unchecked", "slate-300"),
+                "working": ("autorenew", "blue-500"),
+                "done": ("check_circle", "emerald-500"),
+                "error": ("error", "red-500"),
+            }
+            with ui.column().classes('w-full gap-1 max-h-72 overflow-y-auto border rounded-lg p-3 bg-slate-50'):
+                for row in rows:
+                    icon, color = icon_for.get(row["status"], ("circle", "slate-400"))
+                    with ui.row().classes('w-full items-start gap-2 flex-nowrap'):
+                        ui.icon(icon, size='16px', color=color).classes('mt-0.5')
+                        with ui.column().classes('gap-0 flex-1 min-w-0'):
+                            ui.label(row["book"]).classes('text-[11px] font-semibold text-slate-700 truncate')
+                            if row["detail"]:
+                                ui.label(row["detail"]).classes('text-[10px] text-slate-500 truncate')
+
+            with ui.row().classes('w-full justify-end gap-2 mt-1'):
+                close_btn = ui.button('Close', icon='done',
+                                      on_click=lambda: (cleanup_dialog.close(), panel.refresh())) \
+                    .classes('bg-slate-700 hover:bg-slate-800 text-white text-xs px-4')
+                if running:
+                    close_btn.disable()
+
+        render_dialog()
+
+    # Let the running cleanup task refresh whichever dialog is currently mounted,
+    # and bring the progress view back if a run was already in flight.
+    state.cleanup_refresh = render_dialog.refresh
+    if state.cleanup_progress.get("phase") == "running":
+        cleanup_dialog.open()
+
+    @ui.refreshable
+    def panel():
+        cfg = st.load_source_config(project.name)
+        dirs = cfg.get('epub_dirs', [])
+        resolved = st.resolve_project_sources(project.name, book_names)
+        matched = sum(1 for info in resolved.values() if info['chosen'])
+        cleaned = sum(1 for n in book_names if st.is_cleaned(project.name, n))
+        matched_names = {n for n, info in resolved.items() if info['chosen']}
+        no_source_books = [n for n in unaligned_books() if n not in matched_names]
+
+        with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-3'):
+            with ui.row().classes('items-center gap-2'):
+                ui.icon('menu_book', size='sm', color='teal-500')
+                ui.label('Source Text (EPUB) Cleanup').classes('text-sm font-bold text-slate-800')
+                ui.badge(f'{matched}/{len(book_names)} matched', color='teal' if matched else 'slate').classes('text-[10px]')
+                if cleaned:
+                    ui.badge(f'{cleaned} cleaned', color='emerald').classes('text-[10px]')
+
+            ui.label(
+                'Optional. Point this project at a folder of EPUBs to replace the Parakeet transcripts '
+                'with the publisher text. Word timings are carried across, so quote timestamps keep '
+                'working, and volumes without a source file are simply skipped.'
+            ).classes('text-xs text-slate-500 leading-normal')
+
+            with ui.row().classes('w-full items-center gap-2'):
+                folder_input = ui.input(placeholder=r'e.g. G:\Books\My Series\ePubs') \
+                    .classes('flex-1 bg-white').props('outlined dense')
+
+                def add_folder():
+                    val = (folder_input.value or '').strip().strip('"')
+                    if not val or not Path(val).is_dir():
+                        ui.notify('Folder not found. Paste an existing folder path.', type='negative')
+                        return
+                    if st.add_epub_dir(project.name, val):
+                        folder_input.value = ''
+                        ui.notify('Source folder added.', type='positive')
+                        panel.refresh()
+                    else:
+                        ui.notify('That folder is already listed.', type='info')
+
+                ui.button('Add Folder', icon='create_new_folder', on_click=add_folder) \
+                    .classes('bg-slate-700 hover:bg-slate-800 text-white text-xs h-9 font-semibold')
+
+            if not dirs:
+                with ui.row().classes('w-full items-center gap-2 bg-slate-50 border border-dashed rounded-lg p-3'):
+                    ui.icon('info', size='16px', color='slate-400')
+                    ui.label('No source folders configured. Add one above to scan for EPUBs.').classes('text-[11px] text-slate-500')
+
+            for directory in dirs:
+                with ui.row().classes('w-full items-center gap-2 bg-slate-50 border rounded-lg px-3 py-1'):
+                    ui.icon('folder', size='16px', color='amber-500')
+                    ui.label(directory).classes('text-[11px] text-slate-600 flex-1 truncate')
+                    ui.button(icon='close',
+                              on_click=lambda _, d=directory: (st.remove_epub_dir(project.name, d), panel.refresh())) \
+                        .props('flat dense round size=sm').classes('text-slate-400')
+
+            if dirs:
+                with ui.column().classes('w-full gap-0 mt-1'):
+                    for b in books:
+                        info = resolved.get(b.name, {})
+                        candidates = info.get('candidates', [])
+                        chosen = info.get('chosen')
+                        with ui.row().classes('w-full items-center gap-2 border-b border-slate-100 py-1'):
+                            ui.label(b.name).classes('text-[11px] font-semibold text-slate-700 w-52 truncate')
+                            if st.is_cleaned(project.name, b.name):
+                                ui.badge('cleaned', color='emerald').classes('text-[9px]')
+                            if chosen is None:
+                                ui.label('no source found').classes('text-[10px] text-slate-400 italic flex-1')
+                            elif len(candidates) > 1:
+                                def on_pick(e, book=b.name):
+                                    st.set_attachment(project.name, book, e.value)
+                                    panel.refresh()
+                                ui.select(options={str(p): Path(p).name for p, _ in candidates},
+                                          value=str(chosen), on_change=on_pick) \
+                                    .classes('flex-1').props('dense outlined')
+                                ui.badge(f'{len(candidates)} options', color='amber').classes('text-[9px]')
+                            else:
+                                ui.label(Path(chosen).name).classes('text-[10px] text-slate-500 flex-1 truncate')
+                            if st.can_revert(project.name, b.name):
+                                def do_revert(name=b.name):
+                                    if st.revert_book(project.name, name):
+                                        ui.notify(f'{name}: restored the ASR transcript.', type='info')
+                                        panel.refresh()
+                                ui.button(icon='undo', on_click=do_revert) \
+                                    .props('flat dense round size=sm').classes('text-slate-400')
+
+            with ui.row().classes('w-full justify-between items-center mt-2 pt-2 border-t border-slate-100'):
+                ui.label(f'{matched} volume(s) ready to clean.' if matched else 'No volumes matched yet.'
+                         ).classes('text-xs font-semibold text-slate-400')
+
+                def open_confirm():
+                    if state.cleanup_progress.get("phase") != "running":
+                        state.cleanup_progress.update(phase="confirm", current="", rows=[], summary="")
+                    # Dialog content renders lazily; open it before refreshing
+                    # its body (same order as style_playground.py).
+                    cleanup_dialog.open()
+                    _refresh_cleanup_progress()
+
+                with ui.row().classes('items-center gap-3'):
+                    # Only meaningful once the project has at least one source
+                    # (otherwise there are no corrections to learn from).
+                    if matched and no_source_books:
+                        ui.checkbox(
+                            f'Also fix {len(no_source_books)} volume(s) without a source, '
+                            'using learned corrections',
+                            value=state.spellfix_from_corrections,
+                            on_change=lambda e: setattr(state, 'spellfix_from_corrections', e.value),
+                        ).classes('text-[11px] text-slate-600').props('dense')
+
+                    clean_btn = ui.button('Clean Up Transcripts', icon='auto_fix_high', on_click=open_confirm) \
+                        .classes('bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-5')
+                    if not matched or state.cleanup_progress.get("phase") == "running":
+                        clean_btn.disable()
+
+    panel()
+
+
 def open_large_image(img_base64: str, title: str):
     """Opens a modal popup dialog displaying the full-size rendered image using stable global references."""
     state.preview_image_title = title
@@ -776,6 +1095,9 @@ def render_project_tabs(
             from ui.pages.project.characters_tab import render_characters_tab
             render_characters_tab(project, books)
 
+        elif active == 'Source Text':
+            render_source_text_tab(project, books)
+
         elif active == 'Style & Workflows':
             render_style_playground_tab(project, save_project_settings_cb)
 
@@ -796,6 +1118,7 @@ def render_project_tabs(
         tab_dash = ui.tab('Dashboard', icon='dashboard')
         tab_play = ui.tab('Prompt-Gen Playground', icon='science')
         tab_char = ui.tab('Characters', icon='face')
+        tab_src = ui.tab('Source Text', icon='menu_book')
         tab_style = ui.tab('Style & Workflows', icon='brush')
         tab_pack = ui.tab('OIS Packager', icon='inventory_2')
         

@@ -1,17 +1,19 @@
-"""Prompt Lab - shot-role prompt editor and A/B tester.
+"""Prompt Lab - prompt editor and A/B tester.
 
-Replaces the flat single-template playground. Prompts live in
-``prompt_templates/shot_roles`` and are edited by *slot*:
+Prompts live in ``prompt_templates/shot_roles`` and are edited by *slot*:
 
-    Shared          the common block, kept visible above the role block
+    Shared          the common block, spliced with a role via its ``<role>`` marker
+    Planner         the standalone Shot Planner prompt (WIDE / CHARACTER / INSERT)
     Single/Wide/Character/Insert   role fragments spliced into Shared
 
-The left rail lists slots only; variants are chosen from each block's
-dropdown, so the rail never grows into a list of every variant.
+One textarea edits the selected slot; the variant dropdown picks which file that
+slot reads and writes. The left rail lists slots only, so it never grows into a
+list of every variant.
 
 Edits are held per slot in memory, so switching slots never loses work. The
 Test button composes from the *drafts*, not the saved files, so unsaved text
-can be tested - the sandbox behaviour the old playground had.
+can be tested - the sandbox behaviour the old playground had. Testing a role
+composes Shared + role; testing the Planner runs it over random chunks.
 """
 from __future__ import annotations
 
@@ -33,8 +35,8 @@ _lab_active_slot = "wide"
 _lab_draft: Dict[str, str] = {}
 _lab_saved: Dict[str, str] = {}
 _lab_results: List[dict] = []
+_plan_results: List[dict] = []
 _lab_loading = False
-_shared_collapsed = False
 
 _ab_role = "wide"
 _ab_a = ""
@@ -58,11 +60,21 @@ _SHOT_MODE_OPTIONS = {
     "off": "Custom single prompt",
 }
 
-_ROLE_BLURB = {
-    "shared": "Common block. Prepended to every role; holds the quote/freeze-frame/output rules.",
-    "single": "Used when the Shot Planner is off - one prompt for every chunk.",
-    "wide": "Shot type WIDE. Landscape only by default.",
-    "character": "Shot type CHARACTER. Medium view; bracket-tags proper names.",
+_SLOT_LABELS = {
+    "shared": "Shared",
+    "shot_direction": "Planner",
+    "single": "Single",
+    "wide": "Wide",
+    "character": "Character",
+    "insert": "Insert",
+}
+
+_SLOT_BLURB = {
+    "shared": "Common block. Spliced with a role via its <role> marker; holds the quote/freeze-frame/output rules.",
+    "shot_direction": "Shot Planner. Assigns WIDE / CHARACTER / INSERT to every passage; edits apply on the next plan run.",
+    "single": "Fallback role. Used when the planner is off, or when a passage has no parsed shot.",
+    "wide": "Shot type WIDE. The place is the subject.",
+    "character": "Shot type CHARACTER. People are the subject; bracket-tags proper names.",
     "insert": "Shot type INSERT. One object, close; no people.",
 }
 
@@ -83,39 +95,25 @@ def _ensure_drafts() -> None:
     for slot in pl.EDIT_SLOTS:
         if slot not in _lab_draft:
             _load_draft(slot)
-    # Shared is always displayed as its own block and is not selectable in the
-    # rail, so the active slot must always be a real role.
-    if _lab_active_slot not in pl.SHOT_ROLES:
+    if _lab_active_slot not in pl.EDIT_SLOTS:
         _lab_active_slot = "wide"
-
-
-def _test_slot() -> str:
-    """The role a test run composes against. Shared is not a role."""
-    return _lab_active_slot if _lab_active_slot in pl.SHOT_ROLES else "single"
-
-
-def _toggle_shared() -> None:
-    """Collapse or expand the Shared block."""
-    global _shared_collapsed
-    _shared_collapsed = not _shared_collapsed
-    render_slot_editors.refresh()
 
 
 # --- editor blocks ---------------------------------------------------------
 
 @ui.refreshable
 def render_slot_list() -> None:
-    for slot in pl.SHOT_ROLES:
+    for slot in pl.EDIT_SLOTS:
         active = slot == _lab_active_slot
         mark = " •" if _dirty(slot) else ""
         btn = ui.button(
-            f"{slot}{mark}",
+            f"{_SLOT_LABELS.get(slot, slot)}{mark}",
             on_click=lambda s=slot: _select_slot(s),
         ).props('flat no-caps align=left').classes(
             'w-full justify-start text-xs px-3 py-2 rounded-md ' +
             ('bg-blue-50 text-blue-700 font-bold' if active else 'text-slate-600')
         )
-        btn.tooltip(_ROLE_BLURB.get(slot, ""))
+        btn.tooltip(_SLOT_BLURB.get(slot, ""))
 
 
 def _select_slot(slot: str) -> None:
@@ -125,70 +123,49 @@ def _select_slot(slot: str) -> None:
     _load_draft(slot)
     render_slot_list.refresh()
     render_slot_editors.refresh()
+    _render_lab_results.refresh()
 
 
 @ui.refreshable
 def render_slot_editors() -> None:
     _ensure_drafts()
+    slot = _lab_active_slot
+    variant = pl.get_active_variant(slot)
+    variants = pl.list_variants(slot)
 
-    def slot_block(slot: str, is_shared: bool) -> None:
-        variant = pl.get_active_variant(slot)
-        variants = pl.list_variants(slot)
-        title = "Shared" if is_shared else f"Role: {slot.upper()}"
-        collapsed = is_shared and _shared_collapsed
+    with ui.card().classes('w-full border p-4 shadow-sm bg-white gap-3'):
+        with ui.row().classes('w-full items-center justify-between gap-2'):
+            with ui.column().classes('gap-0'):
+                ui.label(_SLOT_LABELS.get(slot, slot)).classes('text-sm font-bold text-slate-800')
+                ui.label(_SLOT_BLURB.get(slot, "")).classes('text-[10px] text-slate-400')
+            with ui.row().classes('items-center gap-1'):
+                ui.select(
+                    options=variants, value=variant, label="Variant",
+                    on_change=lambda e, s=slot: _switch_variant(s, e.value),
+                ).classes('w-56').props('dense outlined')
+                if variant != slot:
+                    ui.button(
+                        icon='delete',
+                        on_click=lambda s=slot, v=variant: _delete_variant(s, v),
+                    ).props('flat dense color=red').tooltip('Delete this variant')
 
-        with ui.card().classes('w-full border p-4 shadow-sm bg-white gap-3'):
-            with ui.row().classes('w-full items-center justify-between gap-2'):
-                header = ui.row().classes(
-                    'items-center gap-2 px-1 rounded ' +
-                    ('cursor-pointer select-none hover:bg-slate-50' if is_shared else ''))
-                with header:
-                    if is_shared:
-                        ui.icon('chevron_right' if collapsed else 'expand_more'
-                                ).classes('text-slate-400')
-                    with ui.column().classes('gap-0'):
-                        ui.label(title).classes('text-sm font-bold text-slate-800')
-                        ui.label(_ROLE_BLURB.get(slot, "")).classes('text-[10px] text-slate-400')
-                if is_shared:
-                    header.on('click', lambda: _toggle_shared())
+        ui.textarea(
+            value=_lab_draft.get(slot, ""),
+            on_change=lambda e, s=slot: _lab_draft.__setitem__(s, e.value),
+        ).classes('w-full font-mono text-xs leading-relaxed').props('outlined autogrow')
 
-                with ui.row().classes('items-center gap-1'):
-                    ui.select(
-                        options=variants, value=variant, label="Variant",
-                        on_change=lambda e, s=slot: _switch_variant(s, e.value),
-                    ).classes('w-56').props('dense outlined')
-                    if variant != slot:
-                        ui.button(
-                            icon='delete',
-                            on_click=lambda s=slot, v=variant: _delete_variant(s, v),
-                        ).props('flat dense color=red').tooltip('Delete this variant')
-
-            if collapsed:
-                ui.label("Collapsed - click the header to edit."
-                         ).classes('text-[10px] text-slate-400 italic')
-            else:
-                ui.textarea(
-                    value=_lab_draft.get(slot, ""),
-                    on_change=lambda e, s=slot: _lab_draft.__setitem__(s, e.value),
-                ).classes('w-full font-mono text-xs leading-relaxed').props('outlined autogrow')
-
-                with ui.row().classes('w-full items-center gap-2'):
-                    with ui.row().classes('items-center gap-1'):
-                        ui.button('Save', icon='save',
-                                  on_click=lambda s=slot: _save(s)).props('outline dense')
-                        if not is_shared:
-                            name_input = ui.input(placeholder="new name").props('dense outlined').classes('w-36')
-                            ui.button('Save As', icon='save_as',
-                                      on_click=lambda s=slot, w=name_input: _save_as(s, w)
-                                      ).props('outline dense')
-                        ui.button('Revert', icon='undo',
-                                  on_click=lambda s=slot: _revert(s)).props('flat dense').classes('text-slate-500')
-                    if _dirty(slot):
-                        ui.label('unsaved changes').classes('text-[10px] text-amber-600 font-bold')
-
-    slot_block("shared", True)
-    ui.separator()
-    slot_block(_lab_active_slot, False)
+        with ui.row().classes('w-full items-center gap-2'):
+            with ui.row().classes('items-center gap-1'):
+                ui.button('Save', icon='save',
+                          on_click=lambda s=slot: _save(s)).props('outline dense')
+                name_input = ui.input(placeholder="new name").props('dense outlined').classes('w-36')
+                ui.button('Save As', icon='save_as',
+                          on_click=lambda s=slot, w=name_input: _save_as(s, w)
+                          ).props('outline dense')
+                ui.button('Revert', icon='undo',
+                          on_click=lambda s=slot: _revert(s)).props('flat dense').classes('text-slate-500')
+            if _dirty(slot):
+                ui.label('unsaved changes').classes('text-[10px] text-amber-600 font-bold')
 
 
 def _switch_variant(slot: str, variant: str) -> None:
@@ -259,9 +236,41 @@ def render_slot_results() -> None:
             ui.label(res["prompt"]).classes('text-xs font-semibold text-blue-700')
 
 
+@ui.refreshable
+def render_plan_results() -> None:
+    if _lab_loading:
+        ui.label("Planning…").classes('text-xs text-slate-500')
+        return
+    if not _plan_results:
+        ui.label("No plan run yet.").classes('text-xs text-slate-400')
+        return
+    dist = Counter(r["shot"] for r in _plan_results)
+    ui.label("plan: " + "   ".join(f"{k} {v}" for k, v in dist.most_common())).classes(
+        'text-xs font-bold text-slate-600')
+    for i, res in enumerate(_plan_results, start=1):
+        with ui.card().classes('w-full border p-3 shadow-sm bg-white gap-1'):
+            with ui.row().classes('items-center gap-2'):
+                ui.badge(res["shot"], color='indigo').classes('text-[10px]')
+                ui.label(f"chunk {i}").classes('text-[10px] text-slate-400')
+            ui.label(" ".join(res["chunk"].split())[:200] + "…").classes(
+                'text-[11px] text-slate-500 italic')
+
+
+@ui.refreshable
+def _render_lab_results() -> None:
+    """Show the result set that matches the slot currently being edited."""
+    if _lab_active_slot == pl.PLANNER_SLOT:
+        render_plan_results()
+    else:
+        render_slot_results()
+
+
 async def run_slot_test(project_name: str) -> None:
     global _lab_loading
-    slot = _test_slot()
+    slot = _lab_active_slot
+    if slot == "shared":
+        ui.notify("Pick a role or the Planner to test.", type="warning")
+        return
     book = state.playground_book_selection
     if not book:
         ui.notify("Select a book volume to test against.", type="warning")
@@ -269,7 +278,8 @@ async def run_slot_test(project_name: str) -> None:
 
     _lab_loading = True
     _lab_results.clear()
-    render_slot_results.refresh()
+    _plan_results.clear()
+    _render_lab_results.refresh()
 
     chunks = fetch_test_chunks(
         project_name=project_name, book_name=book,
@@ -278,29 +288,40 @@ async def run_slot_test(project_name: str) -> None:
     )
     if not chunks:
         _lab_loading = False
-        render_slot_results.refresh()
+        _render_lab_results.refresh()
         ui.notify("No transcript found for that volume.", type="negative")
         return
 
     llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
     model = get_setting("llm_model", "local-model")
-    shared = _lab_draft.get("shared", "")
-    fragment = _lab_draft.get(slot, "")
 
-    for idx, chunk in enumerate(chunks):
-        prompt = pl.render_from(shared, fragment, chunk)
+    if slot == pl.PLANNER_SLOT:
+        # Test the unsaved planner draft by planning the sampled chunks with it.
+        template = _lab_draft.get(slot, "")
         raw = await get_llm_response(
-            prompt, llm_url, model, temperature=0.7,
+            sp.plan_prompt(chunks, template), llm_url, model, temperature=0.0,
             extra_payload={"chat_template_kwargs": {"enable_thinking": False}},
         )
-        parsed = parse_llm_response(raw)
-        _lab_results.append({
-            "quote": parsed["quote"], "prompt": parsed["prompt"],
-            "status": parsed["status"], "pct": 100 * idx // max(1, len(chunks)),
-        })
+        shots = sp.parse_shot_lines(raw, len(chunks))
+        for idx, chunk in enumerate(chunks):
+            _plan_results.append({"shot": shots.get(idx + 1, "NONE"), "chunk": chunk})
+    else:
+        shared = _lab_draft.get("shared", "")
+        fragment = _lab_draft.get(slot, "")
+        for idx, chunk in enumerate(chunks):
+            prompt = pl.render_from(shared, fragment, chunk)
+            raw = await get_llm_response(
+                prompt, llm_url, model, temperature=0.7,
+                extra_payload={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            parsed = parse_llm_response(raw)
+            _lab_results.append({
+                "quote": parsed["quote"], "prompt": parsed["prompt"],
+                "status": parsed["status"], "pct": 100 * idx // max(1, len(chunks)),
+            })
 
     _lab_loading = False
-    render_slot_results.refresh()
+    _render_lab_results.refresh()
     ui.notify("Test complete.", type="positive")
 
 
@@ -385,22 +406,27 @@ def _render_editor_tab(project, books) -> None:
         with ui.column().classes('flex-1 gap-4 min-w-0'):
             render_slot_editors()
 
-            with ui.card().classes('w-full border p-4 shadow-sm bg-white gap-3'):
-                with ui.row().classes('w-full items-center gap-4'):
-                    ui.select(options=[b.name for b in books], label="Book Volume",
-                              value=state.playground_book_selection
-                              ).bind_value(state, 'playground_book_selection').classes('flex-1')
-                    ui.number(label="Chunks", value=state.playground_chunk_count, min=1, max=10
-                              ).bind_value_to(state, 'playground_chunk_count').classes('w-24')
-                    ui.number(label="Seed", value=state.playground_seed, precision=0
-                              ).bind_value_to(state, 'playground_seed').classes('w-24')
-                    ui.button('Test this prompt', icon='bolt', color='positive',
-                              on_click=lambda: asyncio.create_task(run_slot_test(project.name))
-                              ).classes('text-white font-bold text-xs h-10')
-                ui.label(f"Composes: Shared + {_test_slot().upper()}   "
-                         f"(tests unsaved edits; nothing is written)"
-                         ).classes('text-[10px] text-slate-400')
-            render_slot_results()
+            if _lab_active_slot != "shared":
+                with ui.card().classes('w-full border p-4 shadow-sm bg-white gap-3'):
+                    with ui.row().classes('w-full items-center gap-4'):
+                        ui.select(options=[b.name for b in books], label="Book Volume",
+                                  value=state.playground_book_selection
+                                  ).bind_value(state, 'playground_book_selection').classes('flex-1')
+                        ui.number(label="Chunks", value=state.playground_chunk_count, min=1, max=10
+                                  ).bind_value_to(state, 'playground_chunk_count').classes('w-24')
+                        ui.number(label="Seed", value=state.playground_seed, precision=0
+                                  ).bind_value_to(state, 'playground_seed').classes('w-24')
+                        ui.button('Run test', icon='bolt', color='positive',
+                                  on_click=lambda: asyncio.create_task(run_slot_test(project.name))
+                                  ).classes('text-white font-bold text-xs h-10')
+                    if _lab_active_slot == pl.PLANNER_SLOT:
+                        desc = ("Plans random chunks with the Planner draft   "
+                                "(tests unsaved edits; nothing is written)")
+                    else:
+                        desc = (f"Composes: Shared + {_lab_active_slot.upper()}   "
+                                "(tests unsaved edits; nothing is written)")
+                    ui.label(desc).classes('text-[10px] text-slate-400')
+            _render_lab_results()
 
 
 def _render_ab_tab(project, books) -> None:

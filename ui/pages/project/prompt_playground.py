@@ -1,4 +1,5 @@
 import json
+import re
 import asyncio
 from pathlib import Path
 from nicegui import ui
@@ -47,13 +48,18 @@ def get_chunk_percentage(project_name: str, book_name: str, chunk: str) -> int:
         Path(f"./{book_name}_transcript.txt"),
         Path(f"./transcript.txt")
     ]
+    # Chunks are whitespace-normalised (paragraph breaks become single spaces),
+    # so normalise the transcript the same way before searching.
+    needle = re.sub(r"\s+", " ", chunk).strip()
+    if not needle:
+        return 0
     for path in possible_paths:
         if path.exists():
             try:
-                content = path.read_text(encoding="utf-8")
-                pos = content.find(chunk)
+                haystack = re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
+                pos = haystack.find(needle)
                 if pos != -1:
-                    return int((pos / len(content)) * 100)
+                    return int((pos / max(1, len(haystack))) * 100)
             except Exception:
                 pass
     return 0

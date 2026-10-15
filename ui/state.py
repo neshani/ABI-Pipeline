@@ -82,6 +82,17 @@ recent_prompts: List[Dict[str, Any]] = []  # Stores last 5 generated prompts: [{
 prompt_gen_active: bool = False
 cancel_prompt_gen_flag: bool = False
 
+# --- Transcript cleanup options ---
+# When set, "Clean Up Transcripts" also repairs volumes that have no EPUB
+# source, using the spelling corrections learned from the volumes that do.
+spellfix_from_corrections: bool = True
+
+# --- Transcript cleanup progress (survives panel re-renders / tab switches) ---
+# The cleanup run writes here; whichever Source Text panel is currently rendered
+# exposes its refresh via ``cleanup_refresh`` so the run can update it safely.
+cleanup_progress: Dict[str, Any] = {"phase": "confirm", "current": "", "rows": [], "summary": ""}
+cleanup_refresh: Optional[Any] = None
+
 # --- Dynamic Image Generation Task States ---
 image_gen_active: bool = False
 cancel_image_gen_flag: bool = False

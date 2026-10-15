@@ -3,7 +3,7 @@
 Prompts are plain-text files under ``./prompt_templates/shot_roles``:
 
     shared.txt             common block; contains a ``<role>`` marker
-    shot_direction.txt     the Shot Planner prompt (standalone)
+    shot_direction.txt     the Shot Planner prompt (standalone, variant-capable)
     single.txt             role fragment - used when the Shot Planner is off
     wide.txt               role fragment
     wide_with_figures.txt  a variant of ``wide``
@@ -13,6 +13,9 @@ Prompts are plain-text files under ``./prompt_templates/shot_roles``:
 A role's effective prompt is ``shared.txt`` with its ``<role>`` marker replaced
 by the chosen variant fragment, so the role rules always land ahead of the
 ``PASSAGE:`` block. ``<text>`` is substituted with the passage at run time.
+
+The Shot Planner is not spliced: it is read standalone by ``shot_planner`` and
+selected from its own active variant, like the roles.
 """
 from __future__ import annotations
 
@@ -23,16 +26,23 @@ from database.connection import get_setting, set_setting
 
 LIB_DIR = Path("./prompt_templates/shot_roles")
 _SHARED = "shared.txt"
-_SHOT_DIRECTION = "shot_direction.txt"
 
-# Shot types the planner may return.
+# The Shot Planner prompt is a standalone slot: it is not spliced into the
+# shared block and takes no ``<text>`` marker. Its file stem doubles as its
+# variant-slot name, so it uses the same variant machinery as the roles.
+PLANNER_SLOT = "shot_direction"
+
+# Shot types the planner may return. NONE is no longer offered to the planner;
+# it survives only as the internal sentinel for an unparsed or unanswered line
+# (kept so a dead LLM still degrades to the single prompt instead of a guess).
 SHOT_TYPES = ("WIDE", "CHARACTER", "INSERT", "NONE")
 
 # Roles that have a prompt fragment. "single" is the planner-off fallback.
 SHOT_ROLES = ("single", "wide", "character", "insert")
 
-# Slots the editor edits. "shared" is the common block, not a role.
-EDIT_SLOTS = ("shared",) + SHOT_ROLES
+# Slots the editor shows and the run-time snapshot records: the common block,
+# the standalone Shot Planner, then the role fragments.
+EDIT_SLOTS = ("shared", PLANNER_SLOT) + SHOT_ROLES
 
 # Planner modes: "auto" uses the planner's shot type; a role name forces one;
 # "off" sends everything through the single prompt.
@@ -58,7 +68,8 @@ def shared_text(variant: Optional[str] = None) -> str:
 
 
 def shot_direction_text() -> str:
-    return _read(LIB_DIR / _SHOT_DIRECTION)
+    """The active Shot Planner prompt (its own variant slot, no ``<role>``)."""
+    return read_variant(PLANNER_SLOT, get_active_variant(PLANNER_SLOT))
 
 
 def list_variants(role: str) -> List[str]:

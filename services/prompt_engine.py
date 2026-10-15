@@ -67,46 +67,79 @@ def save_template_by_name(name: str, content: str) -> None:
     target.write_text(content, encoding="utf-8")
 
 
-def smart_chunk_text(text: str, max_chunk_words: int) -> List[str]:
-    """Ported robust text chunking algorithm."""
+# Soft-window chunking. Whole paragraphs are packed until the running total
+# enters the window; a chunk therefore ends on a line break rather than at the
+# exact target. Only a paragraph *larger* than the window falls back to
+# sentence splits, and it uses a tighter window so we don't shave off
+# near-target chunks. Keep these as constants (not settings): shot_plan.csv
+# records only `chunk_words` and re-derives scenes from it, so the chunker must
+# stay a pure function of the target size.
+PARA_SLACK = 0.15   # paragraph window: target +/- 15%  (350 -> 298..402)
+SENT_SLACK = 0.05   # sentence window:  target +/- 5%   (350 -> 333..367)
+
+
+def smart_chunk_text(text: str, max_chunk_words: int,
+                     para_slack: float = PARA_SLACK,
+                     sent_slack: float = SENT_SLACK) -> List[str]:
+    """Paragraph-aware text chunking with a soft word window.
+
+    Boundaries land on line breaks (``\\n\\n``) wherever possible: a whole
+    paragraph is packed as long as it fits inside the paragraph window. Only a
+    paragraph that alone exceeds that window is split by sentences. Pass
+    ``para_slack=sent_slack=0`` for the old strict behaviour.
+    """
     if not text.strip() or max_chunk_words <= 0:
         return []
 
+    target = float(max_chunk_words)
+    para_hi = target * (1 + para_slack)
+    sent_lo, sent_hi = target * (1 - sent_slack), target * (1 + sent_slack)
+
     def split_into_sentences(paragraph_text: str) -> List[str]:
+        # Split after sentence-ending punctuation + whitespace. Lossless: no
+        # characters are dropped and a closing quote stays attached to its
+        # sentence. (The previous regex detached trailing quotes - inserting a
+        # stray space - and silently dropped runs like "..." or "?!".)
         if not paragraph_text:
             return []
-        return re.findall(r'[^.!?]+[.!?]?', paragraph_text)
+        return [s for s in re.split(r'(?<=[.!?])\s+', paragraph_text) if s]
 
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-    chunks = []
-    current_chunk_words = []
+    chunks: List[str] = []
+    current_chunk_words: List[str] = []
+
+    def flush() -> None:
+        if current_chunk_words:
+            chunks.append(" ".join(current_chunk_words))
+            current_chunk_words.clear()
+
+    def pack_sentences(sentences: List[str]) -> None:
+        for sentence in sentences:
+            sentence_words = sentence.split()
+            if not sentence_words:
+                continue
+            if (current_chunk_words
+                    and len(current_chunk_words) + len(sentence_words) > sent_hi
+                    and len(current_chunk_words) >= sent_lo):
+                flush()
+            current_chunk_words.extend(sentence_words)
 
     for paragraph in paragraphs:
         paragraph_words = paragraph.split()
         if not paragraph_words:
             continue
+        if len(paragraph_words) > para_hi:
+            # A single oversized paragraph: start a fresh chunk and split it by
+            # sentences inside the tighter window.
+            flush()
+            pack_sentences(split_into_sentences(paragraph))
+            continue
+        if current_chunk_words and len(current_chunk_words) + len(paragraph_words) > para_hi:
+            flush()
+        current_chunk_words.extend(paragraph_words)
 
-        if len(current_chunk_words) + len(paragraph_words) <= max_chunk_words:
-            current_chunk_words.extend(paragraph_words)
-        else:
-            if current_chunk_words:
-                chunks.append(" ".join(current_chunk_words))
-                current_chunk_words = []
-
-            sentences = split_into_sentences(paragraph)
-            for sentence in sentences:
-                sentence_words = sentence.strip().split()
-                if not sentence_words:
-                    continue
-
-                if len(current_chunk_words) + len(sentence_words) > max_chunk_words and current_chunk_words:
-                    chunks.append(" ".join(current_chunk_words))
-                    current_chunk_words = []
-                
-                current_chunk_words.extend(sentence_words)
-
-    if current_chunk_words:
-        chunks.append(" ".join(current_chunk_words))
+    flush()
+    return chunks
 
     return chunks
 
