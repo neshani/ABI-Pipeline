@@ -598,6 +598,16 @@ async def async_run_project_image_gen_logic(project_id: int):
     from services.comfy_client import ComfyClient
     client = ComfyClient(comfy_url)
 
+    # Style set for this run: Character base plus per-role deltas. Loaded once so
+    # a mid-batch edit in the UI cannot split the project between two styles.
+    from services import style_library
+    style_set = style_library.load_style_set(state.style_selected_preset)
+    state.add_console_log(
+        f"[Image-Gen] Style set '{state.style_selected_preset}' loaded"
+        + (f" with role overrides: {', '.join(style_library.role_deltas(style_set))}"
+           if style_library.role_deltas(style_set) else " (no role overrides)")
+    )
+
     state.add_console_log(f"[Image-Gen] Starting generation for project '{project_name}'...")
     state.add_console_log(f"[Image-Gen] Target ComfyUI API Address: {comfy_url}")
 
@@ -737,21 +747,20 @@ async def async_run_project_image_gen_logic(project_id: int):
                         session.commit()
                 continue
 
-            # Inject compiled character descriptions if replacement is enabled
-            if getattr(state, "style_enable_character_replacement", True):
-                from services.character_manager import replace_character_tags_in_prompt
-                original_prompt = prompt_text
-                prompt_text = replace_character_tags_in_prompt(
-                    prompt=prompt_text,
-                    project_id=project_id,
-                    enabled_fields=getattr(state, "style_enabled_character_traits", {}),
-                    use_sentence_structure=getattr(state, "style_use_sentence_structure", True),
-                    book_id=book_id,
-                    chapter_num=chapter,
-                    scene_num=scene
-                )
-                if original_prompt != prompt_text:
-                    state.add_console_log(f"[Image-Gen] Character tags replaced: '{original_prompt}' -> '{prompt_text}'")
+            # Inject compiled character descriptions (bracketed tags only)
+            from services.character_manager import replace_character_tags_in_prompt
+            original_prompt = prompt_text
+            prompt_text = replace_character_tags_in_prompt(
+                prompt=prompt_text,
+                project_id=project_id,
+                enabled_fields=getattr(state, "style_enabled_character_traits", {}),
+                use_sentence_structure=getattr(state, "style_use_sentence_structure", True),
+                book_id=book_id,
+                chapter_num=chapter,
+                scene_num=scene
+            )
+            if original_prompt != prompt_text:
+                state.add_console_log(f"[Image-Gen] Character tags replaced: '{original_prompt}' -> '{prompt_text}'")
 
             # Determine seed
             if state.style_use_random_image_seed:
@@ -759,7 +768,11 @@ async def async_run_project_image_gen_logic(project_id: int):
             else:
                 seed = state.style_image_seed
 
-            state.add_console_log(f"[Image-Gen] Rendering Ch {chapter}, Scene {scene} with seed {seed}...")
+            # Style for this scene's shot role (Character base + any role delta).
+            role = style_library.role_for_row(row)
+            eff = style_library.effective(style_set, role)
+
+            state.add_console_log(f"[Image-Gen] Rendering Ch {chapter}, Scene {scene} as {role} with seed {seed}...")
             
             # Start timer for actual render block execution
             import time
@@ -770,11 +783,11 @@ async def async_run_project_image_gen_logic(project_id: int):
                 return client.generate_image_sync(
                     workflow_json=workflow_json,
                     prompt_text=prompt_text,
-                    neg_prompt_text=state.style_negative_prompt,
+                    neg_prompt_text=eff["negative_prompt"],
                     seed=seed,
-                    overrides=state.style_workflow_overrides,
-                    prefix=state.style_prompt_prefix,
-                    suffix=getattr(state, "style_prompt_suffix", "")
+                    overrides=eff["overrides"],
+                    prefix=eff["prompt_prefix"],
+                    suffix=eff["prompt_suffix"]
                 )
 
             img_bytes, logs = await asyncio.to_thread(render_block)
@@ -926,6 +939,14 @@ def start_image_generation(project_id: int):
 
     # Auto-save current configurations to disk before starting
     save_project_settings_to_disk(project_id)
+
+    # Flush the in-memory style set too, so the batch renders exactly what the
+    # Style tab shows - including shot-type edits the user never pressed Save on.
+    try:
+        from ui.pages.project.style_playground import commit_active_style_set
+        commit_active_style_set()
+    except Exception as e:
+        state.add_console_log(f"[Style] Could not persist the active style set: {e}")
 
     # Initialize Telemetry Clock
     import time

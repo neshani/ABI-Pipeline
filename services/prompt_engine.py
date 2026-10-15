@@ -1,3 +1,4 @@
+import csv
 import httpx
 import re
 import os
@@ -332,6 +333,59 @@ def cancel_prompt_generation(project_id: int):
     state.add_console_log(f"[Prompt-Gen] Cancellation signal sent to Project ID {project_id}...")
 
 
+def ensure_shot_role_column(csv_path: Path) -> None:
+    """Guarantee ``shot_role`` exists and sits directly after ``quote``.
+
+    Books whose prompts.csv predates shot roles get the column added, blank on
+    the old rows - which resolve to the Character base style, i.e. exactly how
+    they were originally rendered.
+
+    The position matters: the append paths write
+    ``chapter, scene, prompt, quote, shot_role`` positionally, so a header that
+    carries shot_role anywhere else (``sync_book_timing`` moves unknown columns
+    to the end, for instance) would misalign every subsequently appended row.
+    This rewrites the file so the column always lands after ``quote``.
+    """
+    if not csv_path.exists():
+        return
+    try:
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            rows = list(csv.reader(f, delimiter="|"))
+    except Exception:
+        return
+    if not rows:
+        return
+
+    header = [h.strip().lower() for h in rows[0]]
+    current = header.index("shot_role") if "shot_role" in header else None
+
+    if current is None:
+        target = (header.index("quote") + 1) if "quote" in header else len(header)
+    else:
+        without = [h for i, h in enumerate(header) if i != current]
+        target = (without.index("quote") + 1) if "quote" in without else len(without)
+        if current == target:
+            # Already in place: nothing to do.
+            return
+
+    width = len(header)
+    without_header = [h for i, h in enumerate(header) if i != current]
+    new_header = without_header[:target] + ["shot_role"] + without_header[target:]
+
+    out_rows = [new_header]
+    for row in rows[1:]:
+        padded = list(row) + [""] * (width - len(row))
+        role = padded[current] if current is not None else ""
+        without = [v for i, v in enumerate(padded) if i != current]
+        out_rows.append(without[:target] + [role] + without[target:])
+
+    try:
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            csv.writer(f, delimiter="|").writerows(out_rows)
+    except Exception:
+        pass
+
+
 def sort_csv_by_chapter_scene(csv_path: Path):
     """Sorts the final prompts.csv file numerically by chapter and scene."""
     if not csv_path.exists():
@@ -492,6 +546,7 @@ async def start_project_prompt_gen(project_id: int):
                     "chunk": chunk_text,
                     "chapter_num": chapter_num,
                     "scene_num": scene_num,
+                    "shot_role": role,
                     "prompt": prompt_lib.render_with_selection(role, chunk_text, selection),
                 })
 
@@ -523,7 +578,11 @@ async def start_project_prompt_gen(project_id: int):
                 output_csv_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(output_csv_path, "w", encoding="utf-8", newline="") as csv_f:
                     writer = csv.writer(csv_f, delimiter="|")
-                    writer.writerow(["chapter", "scene", "prompt", "quote"])
+                    writer.writerow(["chapter", "scene", "prompt", "quote", "shot_role"])
+
+            # Migrate legacy files that predate the shot_role column so appended
+            # rows line up with the header.
+            ensure_shot_role_column(output_csv_path)
 
             # 3. Warm-Up (First Prompt) Sequential Loading Phase
             first_task = tasks[0]
@@ -571,7 +630,7 @@ async def start_project_prompt_gen(project_id: int):
 
                 with open(output_csv_path, "a", encoding="utf-8", newline="") as csv_f:
                     writer = csv.writer(csv_f, delimiter="|")
-                    writer.writerow([warm_up_res["chapter"], warm_up_res["scene"], warm_up_res["prompt"], warm_up_res["quote"]])
+                    writer.writerow([warm_up_res["chapter"], warm_up_res["scene"], warm_up_res["prompt"], warm_up_res["quote"], first_task.get("shot_role", "character")])
 
                 with Session(engine) as session:
                     db_book = session.get(Book, book_id)
@@ -630,7 +689,7 @@ async def start_project_prompt_gen(project_id: int):
                     # Append results to prompts.csv immediately
                     with open(output_csv_path, "a", encoding="utf-8", newline="") as csv_f:
                         writer = csv.writer(csv_f, delimiter="|")
-                        writer.writerow([res["chapter"], res["scene"], res["prompt"], res["quote"]])
+                        writer.writerow([res["chapter"], res["scene"], res["prompt"], res["quote"], task_data.get("shot_role", "character")])
 
                     # Update database progress in-place
                     with Session(engine) as session:

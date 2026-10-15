@@ -440,13 +440,11 @@ class StyleChooserModal:
 
     def apply_selection(self):
         """Fires the client callback applying this style selection, then closes the dialog."""
-        # Write applied metadata selections directly back to the global state bindings
+        # The callback (load_style_preset_by_name) is the single authority on the
+        # Character base, role deltas, workflow and node overrides, so nothing is
+        # written to the style state here.
         state.style_selected_preset = self.selected_style
-        state.style_prompt_prefix = self.style_prefix
-        state.style_prompt_suffix = self.style_suffix
-        state.style_negative_prompt = self.style_negative
-        state.style_selected_workflow = self.style_workflow
-        
+
         self.on_apply(self.selected_style)
         if self.dialog:
             self.dialog.close()

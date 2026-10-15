@@ -10,17 +10,17 @@ from PIL import Image, ImageDraw, ImageFont
 from nicegui import ui
 from sqlmodel import Session, select
 from database.connection import engine, get_setting
-from database.models import Book, Project, Character
+from database.models import Book, Project
 from ui import state
 from ui.components.style_chooser_modal import StyleChooserModal
 from services.character_manager import replace_character_tags_in_prompt
+from services import style_library
 
 # Module-level dialog and state holders
 contact_sheet_dialog_ref = None
 contact_sheet_base64 = ""
 lora_chooser_dialog_ref = None
 playground_image_dialog_ref = None
-character_settings_dialog_ref = None
 freeform_prompt_dialog_ref = None
 
 # Static element references for the detail preview modal (prevents refresh bugs)
@@ -46,6 +46,19 @@ expansion_states: Dict[str, bool] = {}
 
 # Keep track of the active workflow that was last successfully analyzed
 _last_analyzed_workflow: Optional[str] = None
+
+# The project whose Style tab is currently rendered (needed by callbacks that
+# only receive a role, not the project).
+_active_project_name: Optional[str] = None
+
+# Live element references for the shot-type style editor. The override markers
+# are toggled in place rather than by rebuilding the editor, so typing in a
+# textarea never loses focus.
+_editor_wraps: Dict[str, Any] = {}
+_editor_chips: Dict[str, Any] = {}
+_editor_role_revert_btn = None
+_editor_override_count_label = None
+_style_dirty_label = None
 
 
 def get_node_class_type(node_id: str) -> Optional[str]:
@@ -148,11 +161,9 @@ def save_default_to_workflow(workflow_name: str, node_id: str, param_key: str, v
                 with open(wf_path, "w", encoding="utf-8") as f:
                     json.dump(wf_json, f, indent=2)
                 
-                # Clear active style overrides for this field since it is now the workflow default baseline
-                if node_id in state.style_workflow_overrides:
-                    state.style_workflow_overrides[node_id].pop(param_key, None)
-                    if not state.style_workflow_overrides[node_id]:
-                        state.style_workflow_overrides.pop(node_id, None)
+                # This value is now the workflow baseline, so drop the override
+                # from the view, the Character base and every role delta.
+                _drop_override_everywhere(node_id, param_key)
                         
                 ui.notify(f"Saved default '{value}' into '{workflow_name}'!", type="positive")
                 
@@ -314,11 +325,19 @@ def render_lora_preview_panel():
                         
                         triggers_to_add = selected_lora.get("triggers", "").strip()
                         if triggers_to_add and triggers_to_add != ".":
-                            if triggers_to_add not in state.style_prompt_prefix:
-                                cleaned_prefix = state.style_prompt_prefix.strip()
+                            current_prefix = getattr(state, _VIEW_ATTRS["prompt_prefix"])
+                            if triggers_to_add not in current_prefix:
+                                cleaned_prefix = current_prefix.strip()
                                 if cleaned_prefix and not cleaned_prefix.endswith(","):
                                     cleaned_prefix += ","
-                                state.style_prompt_prefix = f"{cleaned_prefix} {triggers_to_add}, ".strip().replace("  ", " ")
+                                _commit_text_field(
+                                    "prompt_prefix",
+                                    f"{cleaned_prefix} {triggers_to_add}, ".strip().replace("  ", " ")
+                                )
+                                try:
+                                    render_style_text_editor.refresh()
+                                except Exception:
+                                    pass
                                 ui.notify(f"Selected LoRA and appended trigger words: '{triggers_to_add}'", type="positive")
                             else:
                                 ui.notify("Selected LoRA successfully!", type="positive")
@@ -515,7 +534,7 @@ def open_playground_image_modal(img_src: str, title: str, prompt: str, quote: st
         
     # Resolve rendered prompt
     project_id = state.active_project_id
-    if project_id and getattr(state, "style_enable_character_replacement", True):
+    if project_id:
         rendered_prompt = replace_character_tags_in_prompt(
             prompt,
             project_id,
@@ -662,7 +681,7 @@ def copy_style_settings_to_clipboard(project_name: str = "Active Project"):
         lines.append(f"  - *Extracted Prompt*: {p_text}")
         
         # Append expanded Rendered Prompt
-        if project_id and getattr(state, "style_enable_character_replacement", True):
+        if project_id:
             rendered_p = replace_character_tags_in_prompt(
                 p_text,
                 project_id,
@@ -702,7 +721,7 @@ def copy_style_primer_to_clipboard(project_name: str):
         scenes_lines.append(f"  - *Visual Prompt (Extracted)*: {p_text}")
         
         # Append expanded Rendered Prompt
-        if project_id and getattr(state, "style_enable_character_replacement", True):
+        if project_id:
             rendered_p = replace_character_tags_in_prompt(
                 p_text,
                 project_id,
@@ -791,17 +810,6 @@ def reroll_test_scenes(project_name: str, book_name: str):
     ui.notify("Pulled new random test scenes!", type="info")
 
 
-def reroll_image_seeds():
-    """Keeps the exact same prompts but randomizes all of their generation seeds."""
-    if not state.style_test_prompts:
-        ui.notify("No test scenes loaded to reroll.", type="warning")
-        return
-    state.style_test_seeds = [random.randint(100000, 999999) for _ in range(len(state.style_test_prompts))]
-    state.style_test_images = [None] * len(state.style_test_prompts)
-    render_style_playground_cards.refresh()
-    ui.notify("Randomized generation seeds (prompts kept). Ready to re-test!", type="info")
-
-
 async def regenerate_single_card(project_name: str, idx: int):
     """Randomizes the seed for a single scene card and immediately triggers independent rendering."""
     if idx >= len(state.style_test_prompts):
@@ -847,8 +855,8 @@ async def regenerate_single_card(project_name: str, idx: int):
         project_obj = session.exec(select(Project).where(Project.name == project_name)).first()
         project_id = project_obj.id if project_obj else None
 
-    # Replace tags if enabled
-    if project_id and getattr(state, "style_enable_character_replacement", True):
+    # Replace bracketed character tags
+    if project_id:
         prompt_text = replace_character_tags_in_prompt(
             raw_prompt,
             project_id,
@@ -858,15 +866,19 @@ async def regenerate_single_card(project_name: str, idx: int):
     else:
         prompt_text = raw_prompt
 
+    # Render with the style of the shot role this card was sampled for.
+    role = item.get("shot_role") if isinstance(item, dict) else None
+    eff = style_library.effective(current_style_set(), role)
+
     def run_single():
         return client.generate_image_sync(
             workflow_json=workflow_json,
             prompt_text=prompt_text,
-            neg_prompt_text=state.style_negative_prompt,
+            neg_prompt_text=eff["negative_prompt"],
             seed=seed,
-            overrides=state.style_workflow_overrides,
-            prefix=state.style_prompt_prefix,
-            suffix=state.style_prompt_suffix
+            overrides=eff["overrides"],
+            prefix=eff["prompt_prefix"],
+            suffix=eff["prompt_suffix"]
         )
 
     try:
@@ -901,76 +913,465 @@ def list_available_workflows() -> list:
     return sorted(list(set(found)))
 
 
+ROLE_LABELS = {
+    "character": "Character (base)",
+    "wide": "Wide",
+    "insert": "Insert",
+    "single": "Single",
+}
+
+_ROLE_BADGE_COLORS = {
+    "character": "blue",
+    "wide": "teal",
+    "insert": "deep-orange",
+    "single": "grey",
+}
+
+# Text field -> the view global that mirrors it for the active role.
+_VIEW_ATTRS = {
+    "prompt_prefix": "style_prompt_prefix",
+    "prompt_suffix": "style_prompt_suffix",
+    "negative_prompt": "style_negative_prompt",
+}
+
+
+def current_style_set() -> Dict[str, Any]:
+    """The in-memory style set: Character base plus per-role deltas."""
+    return {
+        "workflow": state.style_selected_workflow,
+        "prompt_prefix": state.style_base_style.get("prompt_prefix", ""),
+        "prompt_suffix": state.style_base_style.get("prompt_suffix", ""),
+        "negative_prompt": state.style_base_style.get("negative_prompt", ""),
+        "overrides": state.style_base_style.get("overrides", {}),
+        "roles": state.style_role_overrides,
+    }
+
+
+def apply_style_role_view() -> None:
+    """Rewrite the view globals to the effective style of the active role."""
+    eff = style_library.effective(current_style_set(), state.style_active_role)
+    state.style_prompt_prefix = eff["prompt_prefix"]
+    state.style_prompt_suffix = eff["prompt_suffix"]
+    state.style_negative_prompt = eff["negative_prompt"]
+    state.style_workflow_overrides = eff["overrides"]
+
+
+def _persist_project_settings(project_id: Optional[int] = None) -> None:
+    """Write the project's settings file so the chosen style survives a reopen.
+
+    The Style tab is the only place the user picks a style, so it has to be the
+    place that records it - previously nothing wrote it until image generation
+    started, which is why the choice appeared to be forgotten.
+    """
+    pid = project_id or getattr(state, "active_project_id", None)
+    if not pid:
+        return
+    try:
+        from services.project_settings import save_project_settings_to_disk
+        save_project_settings_to_disk(pid)
+    except Exception as e:
+        state.add_console_log(f"[Style] Could not save project settings: {e}")
+
+
+def _style_set_payload() -> Dict[str, Any]:
+    """The on-disk representation of the in-memory style set."""
+    data = {
+        "name": state.style_preset_save_name or state.style_selected_preset,
+        "workflow": state.style_selected_workflow,
+        "prompt_prefix": state.style_base_style.get("prompt_prefix", ""),
+        "prompt_suffix": state.style_base_style.get("prompt_suffix", ""),
+        "negative_prompt": state.style_base_style.get("negative_prompt", ""),
+        "overrides": state.style_base_style.get("overrides", {}),
+    }
+    if state.style_role_overrides:
+        data["roles"] = {r: dict(d) for r, d in state.style_role_overrides.items()}
+    return data
+
+
+def commit_active_style_set() -> None:
+    """Flush the in-memory style set to ``styles/<name>.json``.
+
+    Called before a render pass so the batch uses exactly what the Style tab
+    shows, matching the playground's long-standing behaviour of testing unsaved
+    drafts. Silent by design - the Save button is still what names a new set.
+    """
+    name = (state.style_selected_preset or "").strip()
+    if not name or name == "default":
+        return
+    try:
+        style_library.save_style_set(name, _style_set_payload())
+    except Exception as e:
+        state.add_console_log(f"[Style] Could not persist style set '{name}': {e}")
+
+
+def _style_signature(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    data = data or {}
+    return {
+        "workflow": data.get("workflow", "") or "",
+        "prompt_prefix": data.get("prompt_prefix", "") or "",
+        "prompt_suffix": data.get("prompt_suffix", "") or "",
+        "negative_prompt": data.get("negative_prompt", "") or "",
+        "overrides": data.get("overrides") or {},
+        "roles": style_library.role_deltas(data),
+    }
+
+
+def style_is_dirty() -> bool:
+    """True when the edited style differs from what is on disk."""
+    name = (state.style_selected_preset or "").strip()
+    if not name:
+        return False
+    return _style_signature(style_library.load_style_set(name)) != _style_signature(current_style_set())
+
+
+def _sync_style_dirty() -> None:
+    if _style_dirty_label is None:
+        return
+    try:
+        _style_dirty_label.set_text("Unsaved changes" if style_is_dirty() else "Saved")
+    except Exception:
+        pass
+
+
+def _role_has_overrides(role: Optional[str] = None) -> bool:
+    role = role or state.style_active_role
+    return role != style_library.BASE_ROLE and bool(state.style_role_overrides.get(role))
+
+
+def _sync_editor_highlight() -> None:
+    """Reflect override state on the editor in place (no rebuild, so no focus loss)."""
+    role = state.style_active_role
+    is_base = role == style_library.BASE_ROLE
+    delta = state.style_role_overrides.get(role, {})
+
+    for field, wrap in _editor_wraps.items():
+        overridden = (not is_base) and (field in delta)
+        try:
+            if overridden:
+                wrap.classes(add='border-amber-400 bg-amber-50/40 rounded-r')
+                wrap.classes(remove='border-transparent')
+            else:
+                wrap.classes(add='border-transparent')
+                wrap.classes(remove='border-amber-400 bg-amber-50/40 rounded-r')
+        except Exception:
+            pass
+        chip = _editor_chips.get(field)
+        if chip is not None:
+            try:
+                chip.visible = overridden
+            except Exception:
+                pass
+
+    if _editor_role_revert_btn is not None:
+        try:
+            _editor_role_revert_btn.visible = _role_has_overrides(role)
+        except Exception:
+            pass
+    if _editor_override_count_label is not None:
+        try:
+            _editor_override_count_label.set_text(
+                f"{len(state.style_role_overrides)} shot type(s) overridden"
+            )
+        except Exception:
+            pass
+
+
+def _sampled_roles() -> set:
+    roles = set()
+    for item in state.style_test_prompts:
+        if isinstance(item, dict) and item.get("shot_role"):
+            roles.add(style_library.normalize_role(item["shot_role"]))
+    return roles
+
+
+def scenes_match_shot_types() -> bool:
+    """True when the loaded tester scenes already match the active shot-type mode.
+
+    The tester pre-samples scenes, so changing the Definition's shot type (or the
+    volume's plan on disk) leaves that sample stale - and the Test button would
+    render the wrong shot type's style. This is the check the button runs first.
+    """
+    if state.style_freeform_active:
+        return True
+    if not state.style_test_prompts:
+        return False
+    if state.style_test_role_mode == "variety":
+        return True
+    target = (state.style_active_role if state.style_test_role_mode == "current"
+              else style_library.normalize_role(state.style_test_role_mode))
+    return _sampled_roles() == {target}
+
+
+def test_style_preset(project_name: str) -> None:
+    """Re-sample if the loaded scenes no longer match the shot type, then render."""
+    if not state.style_freeform_active and not scenes_match_shot_types():
+        if state.playground_book_selection:
+            draw_style_test_sample(project_name, state.playground_book_selection)
+            state.add_console_log(
+                "[Style-Playground] Scene sample did not match the active shot type - re-sampled."
+            )
+    asyncio.create_task(execute_style_playground_batch(project_name))
+
+
+def _commit_text_field(field: str, value: str, role: Optional[str] = None) -> None:
+    """Record a text edit against the Character base or the active role."""
+    role = role or state.style_active_role
+    setattr(state, _VIEW_ATTRS[field], value)
+
+    if role == style_library.BASE_ROLE:
+        state.style_base_style[field] = value
+    else:
+        delta = state.style_role_overrides.setdefault(role, {})
+        if value == state.style_base_style.get(field, ""):
+            # Landed back on the inherited value: no override needed.
+            delta.pop(field, None)
+            if not delta:
+                state.style_role_overrides.pop(role, None)
+        else:
+            delta[field] = value
+
+    # Mark the change immediately rather than waiting for a role switch.
+    _sync_editor_highlight()
+    _sync_style_dirty()
+
+
+def revert_style_field(field: str, role: Optional[str] = None) -> None:
+    """Drop one field's override so the role inherits Character again."""
+    role = role or state.style_active_role
+    if role == style_library.BASE_ROLE:
+        return
+    delta = state.style_role_overrides.get(role)
+    if delta:
+        delta.pop(field, None)
+        if not delta:
+            state.style_role_overrides.pop(role, None)
+    apply_style_role_view()
+
+
+def revert_style_role(role: Optional[str] = None) -> None:
+    """Drop every override for one role."""
+    role = role or state.style_active_role
+    state.style_role_overrides.pop(role, None)
+    apply_style_role_view()
+
+
+def select_style_role(role: str) -> None:
+    """Switch which shot type's style the Definition panel edits."""
+    state.style_active_role = style_library.normalize_role(role)
+    apply_style_role_view()
+
+    # In "Current" mode the tester mirrors the Definition's shot type, so bring
+    # the loaded scenes along instead of leaving the previous role's sample up.
+    if (state.style_test_role_mode == "current" and not state.style_freeform_active
+            and _active_project_name and state.playground_book_selection):
+        draw_style_test_sample(_active_project_name, state.playground_book_selection)
+
+    try:
+        render_style_text_editor.refresh()
+        render_workflow_overrides_ui.refresh()
+        render_style_playground_cards.refresh()
+    except Exception:
+        pass
+
+
+@ui.refreshable
+def render_style_text_editor():
+    """Prefix / Suffix / Negative editors for the active role."""
+    global _editor_role_revert_btn
+    role = state.style_active_role
+    is_base = role == style_library.BASE_ROLE
+    delta = state.style_role_overrides.get(role, {})
+
+    _editor_wraps.clear()
+    _editor_chips.clear()
+
+    with ui.column().classes('w-full gap-2'):
+        if is_base:
+            with ui.row().classes('w-full items-center gap-1.5 p-2 bg-blue-50 border border-blue-100 rounded'):
+                ui.icon('info', size='16px', color='blue')
+                ui.label(
+                    'This is the base style. Every other shot type inherits it unless overridden.'
+                ).classes('text-[10px] text-blue-800 leading-normal')
+
+        for field, label in (
+            ("prompt_prefix", "Style Prompt Prefix"),
+            ("prompt_suffix", "Style Prompt Suffix"),
+            ("negative_prompt", "Style Negative Prompt"),
+        ):
+            overridden = field in delta
+            with ui.column().classes(
+                'w-full gap-0 pl-2 border-l-4 ' +
+                ('border-amber-400 bg-amber-50/40 rounded-r' if overridden else 'border-transparent')
+            ) as wrap:
+                with ui.row().classes('w-full items-center justify-end gap-1') as chip:
+                    ui.icon('layers', size='12px', color='amber')
+                    ui.label(f'Overridden for {ROLE_LABELS.get(role, role)}').classes('text-[9px] font-bold text-amber-700')
+                    ui.button(
+                        icon='undo',
+                        on_click=lambda f=field: (
+                            revert_style_field(f),
+                            render_style_text_editor.refresh(),
+                            render_workflow_overrides_ui.refresh(),
+                        )
+                    ).props('flat round dense size=xs').classes('text-amber-700').tooltip('Revert to Character')
+                chip.visible = overridden
+
+                ui.textarea(
+                    label=label,
+                    value=getattr(state, _VIEW_ATTRS[field]),
+                    on_change=lambda e, f=field: _commit_text_field(f, e.value)
+                ).classes('w-full text-xs').props('outlined autogrow')
+
+            _editor_wraps[field] = wrap
+            _editor_chips[field] = chip
+
+        _editor_role_revert_btn = ui.button(
+            f'Revert all {ROLE_LABELS.get(role, role)} overrides',
+            icon='restart_alt',
+            on_click=lambda: (
+                revert_style_role(),
+                render_style_text_editor.refresh(),
+                render_workflow_overrides_ui.refresh(),
+            )
+        ).props('flat dense no-caps').classes('text-[10px] text-amber-700 self-start')
+        _editor_role_revert_btn.visible = _role_has_overrides(role)
+
+
+
 def load_style_presets() -> list:
-    """Discovers .json files inside local styles directory."""
-    styles_dir = Path("./styles")
-    styles_dir.mkdir(parents=True, exist_ok=True)
-    presets = [f.stem for f in styles_dir.glob("*.json")]
-    if "default" not in presets:
-        presets.append("default")
-    return sorted(presets)
+    """Style-set names on disk (plus the implicit 'default')."""
+    return style_library.list_style_sets()
 
 
 def load_style_preset_by_name(name: str):
-    """Parses style json presets, seeding prompt/negative prompt UI textboxes."""
+    """Load a style set: Character base, per-role deltas, workflow, node overrides."""
     from ui.components.style_chooser_modal import ensure_default_style_exists
     ensure_default_style_exists()
-    
+
     # Pre-populate the save preset input box with the active style's name
     state.style_preset_save_name = name
-    
-    styles_dir = Path("./styles")
-    file_path = styles_dir / f"{name}.json"
-    if file_path.exists():
-        try:
-            with open(file_path, "r") as f:
-                data = json.load(f)
-                
-            associated_wf = data.get("workflow")
-            if associated_wf:
-                handle_style_workflow_change(associated_wf, clear_overrides=False)
-                
-            state.style_prompt_prefix = data.get("prompt_prefix", "")
-            state.style_prompt_suffix = data.get("prompt_suffix", "")
-            state.style_negative_prompt = data.get("negative_prompt", "")
-            state.style_workflow_overrides = data.get("overrides", {})
-        except Exception:
-            pass
-            
-    render_workflow_overrides_ui.refresh()
+
+    data = style_library.load_style_set(name)
+    if not data:
+        # Missing/empty file: keep whatever style is currently loaded rather than
+        # blanking it, so a stale preset name cannot wipe the panel.
+        state.add_console_log(f"[Style] Style set '{name}' not found on disk; keeping the current style.")
+        return
+
+    workflow = data.get("workflow")
+    if workflow:
+        handle_style_workflow_change(workflow, clear_overrides=False)
+
+    state.style_base_style = style_library.base_style(data)
+    state.style_role_overrides = style_library.role_deltas(data)
+    if state.style_active_role not in style_library.ROLES:
+        state.style_active_role = style_library.BASE_ROLE
+    apply_style_role_view()
+
+    try:
+        render_style_text_editor.refresh()
+        render_workflow_overrides_ui.refresh()
+    except Exception:
+        pass
+    _sync_editor_highlight()
+    _sync_style_dirty()
 
 
 def save_style_preset_by_name(name: str):
-    """Saves style prefix, suffix & negative prompt variables into an on-disk style preset JSON file."""
+    """Write the Character base and every role delta to styles/<name>.json."""
     name_clean = name.strip().replace(" ", "_")
     if not name_clean:
         ui.notify("Please enter a valid Style name.", type="negative")
         return
-    styles_dir = Path("./styles")
-    styles_dir.mkdir(parents=True, exist_ok=True)
-    
-    data = {
-        "name": name,
-        "workflow": state.style_selected_workflow,
-        "prompt_prefix": state.style_prompt_prefix,
-        "prompt_suffix": state.style_prompt_suffix,
-        "negative_prompt": state.style_negative_prompt,
-        "overrides": state.style_workflow_overrides
-    }
+
+    data = _style_set_payload()
+    data["name"] = name
+
     try:
-        with open(styles_dir / f"{name_clean}.json", "w") as f:
-            json.dump(data, f, indent=2)
+        style_library.save_style_set(name_clean, data)
         state.style_selected_preset = name_clean
-        ui.notify(f"Style preset '{name_clean}' saved successfully!", type="positive")
+        state.style_preset_save_name = name_clean
+        # Remember the choice for this project, not just the process.
+        _persist_project_settings()
+        _sync_style_dirty()
+        count = len(state.style_role_overrides)
+        ui.notify(
+            f"Style set '{name_clean}' saved"
+            + (f" with {count} role override(s)." if count else "."),
+            type="positive"
+        )
     except Exception as e:
         ui.notify(f"Failed to save preset: {str(e)}", type="negative")
 
 
+def _drop_override_everywhere(node_id: str, param_key: str) -> None:
+    """Remove one node parameter from the base, every role and the view.
+
+    Used when a value is promoted to the workflow's baseline default: the
+    override is meaningless afterwards, and leaving it behind in a role delta
+    would resurrect it the next time that role's view is rebuilt.
+    """
+    base_overrides = state.style_base_style.setdefault("overrides", {})
+    base_node = base_overrides.get(node_id)
+    if base_node:
+        base_node.pop(param_key, None)
+        if not base_node:
+            base_overrides.pop(node_id, None)
+
+    for role in list(state.style_role_overrides.keys()):
+        delta = state.style_role_overrides[role]
+        role_overrides = delta.get("overrides", {})
+        role_node = role_overrides.get(node_id)
+        if role_node:
+            role_node.pop(param_key, None)
+            if not role_node:
+                role_overrides.pop(node_id, None)
+            if not role_overrides:
+                delta.pop("overrides", None)
+            if not delta:
+                state.style_role_overrides.pop(role, None)
+
+    view_node = state.style_workflow_overrides.get(node_id)
+    if view_node:
+        view_node.pop(param_key, None)
+        if not view_node:
+            state.style_workflow_overrides.pop(node_id, None)
+
+    _sync_style_dirty()
+
+
 def update_override_state(node_id: str, key: str, value: Any):
-    """Triggers on manual slider adjustments, storing changes targeting specific Node IDs."""
-    if node_id not in state.style_workflow_overrides:
-        state.style_workflow_overrides[node_id] = {}
-    state.style_workflow_overrides[node_id][key] = value
+    """Record a node-parameter edit against the base or the active role.
+
+    The view is updated first so the overrides UI keeps rendering what the user
+    just set. The change is then persisted to the Character base or the active
+    role's delta, pruning the delta when it lands back on the base value.
+    """
+    state.style_workflow_overrides.setdefault(node_id, {})[key] = value
+    role = state.style_active_role
+
+    if role == style_library.BASE_ROLE:
+        state.style_base_style.setdefault("overrides", {}).setdefault(node_id, {})[key] = value
+        _sync_style_dirty()
+        return
+
+    delta = state.style_role_overrides.setdefault(role, {})
+    role_overrides = delta.setdefault("overrides", {})
+    base_node = state.style_base_style.get("overrides", {}).get(node_id, {})
+
+    if key in base_node and base_node[key] == value:
+        role_overrides.get(node_id, {}).pop(key, None)
+        if not role_overrides.get(node_id):
+            role_overrides.pop(node_id, None)
+        if not role_overrides:
+            delta.pop("overrides", None)
+        if not delta:
+            state.style_role_overrides.pop(role, None)
+    else:
+        role_overrides.setdefault(node_id, {})[key] = value
+
+    _sync_editor_highlight()
+    _sync_style_dirty()
 
 
 def analyze_node_for_warnings(node_id: str, data: dict) -> List[str]:
@@ -1026,7 +1427,11 @@ def handle_style_workflow_change(val: str, clear_overrides: bool = True):
             
             state.style_discovered_params = client.analyze_workflow(wf_json)
             if clear_overrides:
-                state.style_workflow_overrides.clear()
+                # Node ids are specific to the previous graph, so every override
+                # (base and per-role) is dropped when the workflow changes.
+                state.style_base_style["overrides"] = {}
+                state.style_role_overrides = {}
+                state.style_workflow_overrides = {}
             
             # Commit the successfully analyzed workflow name
             _last_analyzed_workflow = val
@@ -1051,8 +1456,42 @@ def handle_style_workflow_change(val: str, clear_overrides: bool = True):
     render_workflow_overrides_ui.refresh()
 
 
-def fetch_real_prompts(project_name: str, book_name: str, count: int = 4, prompt_seed: int = 42) -> List[Dict[str, Any]]:
-    """Tries to read extracted prompts & quotes from project output directory, tracking full scene metadata."""
+def _sampled_indices(df, count: int, prompt_seed: int, mode: str) -> List[int]:
+    """Row indices to sample for a resolved role mode.
+
+    ``"variety"`` takes one row per available shot role and fills the rest from
+    the remaining pool. Any other mode filters to that role, falling back to the
+    whole frame when the volume has no scene of it - so a card can always be
+    rendered with the role style it was picked for.
+    """
+    roles = df["shot_role"].tolist()
+    if mode == "variety":
+        chosen: List[int] = []
+        for role in style_library.ROLES:
+            pool = [i for i, r in zip(df.index, roles) if r == role]
+            if pool:
+                chosen.append(random.Random(f"{prompt_seed}:{role}").choice(pool))
+        remaining = [i for i in df.index if i not in set(chosen)]
+        random.Random(prompt_seed).shuffle(remaining)
+        chosen += remaining[:max(0, count - len(chosen))]
+        return chosen[:count]
+
+    target = style_library.normalize_role(mode)
+    pool = [i for i, r in zip(df.index, roles) if r == target]
+    if not pool:
+        pool = list(df.index)
+    if not pool:
+        return []
+    return sorted(random.Random(prompt_seed).sample(pool, min(count, len(pool))))
+
+
+def fetch_real_prompts(project_name: str, book_name: str, count: int = 4,
+                       prompt_seed: int = 42, role_mode: str = "current") -> List[Dict[str, Any]]:
+    """Samples scenes from the volume's prompts.csv for the style tester.
+
+    Each item carries the ``shot_role`` it should be rendered with, so the tester
+    previews the same per-role style the batch renderer will apply.
+    """
     import pandas as pd
     
     csv_paths = [
@@ -1062,34 +1501,49 @@ def fetch_real_prompts(project_name: str, book_name: str, count: int = 4, prompt
         Path(f"./output/{project_name}/{project_name}_prompts.csv"),
         Path(f"./output/{project_name}_prompts.csv")
     ]
+
+    mode = "variety" if role_mode == "variety" else (
+        state.style_active_role if role_mode == "current" else style_library.normalize_role(role_mode)
+    )
     
-    items = []
+    items: List[Dict[str, Any]] = []
     for path in csv_paths:
-        if path.exists():
-            try:
-                df = pd.read_csv(path, sep='|')
-                valid_df = df.dropna(subset=['prompt'])
-                valid_df = valid_df[valid_df['prompt'].str.strip().str.lower() != 'none']
-                valid_df = valid_df[valid_df['prompt'].str.strip() != '']
-                
-                if not valid_df.empty:
-                    sample_size = min(count, len(valid_df))
-                    sampled_df = valid_df.sample(n=sample_size, random_state=prompt_seed)
-                    
-                    for _, row in sampled_df.iterrows():
-                        items.append({
-                            "book": book_name,
-                            "chapter": int(row.get('chapter', 1)),
-                            "scene": int(row.get('scene', 1)),
-                            "prompt": str(row['prompt']).strip(),
-                            "quote": str(row.get('quote', '')).strip()
-                        })
-                    break
-            except Exception:
-                pass
+        if not path.exists():
+            continue
+        try:
+            df = pd.read_csv(path, sep='|')
+            if 'shot_role' not in df.columns:
+                # Legacy volume generated before shot roles were recorded.
+                df['shot_role'] = ''
+
+            valid_df = df.dropna(subset=['prompt'])
+            valid_df = valid_df[valid_df['prompt'].str.strip().str.lower() != 'none']
+            valid_df = valid_df[valid_df['prompt'].str.strip() != '']
+            if valid_df.empty:
+                break
+
+            valid_df = valid_df.reset_index(drop=True).copy()
+            valid_df['shot_role'] = valid_df['shot_role'].fillna('').astype(str).str.strip().str.lower()
+            valid_df.loc[~valid_df['shot_role'].isin(style_library.ROLES), 'shot_role'] = style_library.BASE_ROLE
+
+            for i in _sampled_indices(valid_df, count, prompt_seed, mode):
+                row = valid_df.loc[i]
+                role = style_library.normalize_role(row.get('shot_role')) if mode == "variety" else mode
+                items.append({
+                    "book": book_name,
+                    "chapter": int(row.get('chapter', 1)),
+                    "scene": int(row.get('scene', 1)),
+                    "prompt": str(row['prompt']).strip(),
+                    "quote": str(row.get('quote', '')).strip(),
+                    "shot_role": role,
+                })
+            break
+        except Exception:
+            pass
 
     if not items:
         from services.prompt_engine import fetch_test_chunks
+        fallback_role = style_library.BASE_ROLE if mode == "variety" else mode
         chunks = fetch_test_chunks(project_name, book_name, count=count, mode="Seeded Random")
         if chunks:
             for idx, chunk in enumerate(chunks):
@@ -1098,7 +1552,8 @@ def fetch_real_prompts(project_name: str, book_name: str, count: int = 4, prompt
                     "chapter": 1,
                     "scene": idx + 1,
                     "prompt": f"Generating from raw passage fallback: {chunk[:80]}...",
-                    "quote": chunk
+                    "quote": chunk,
+                    "shot_role": fallback_role,
                 })
                 
     return items
@@ -1112,7 +1567,8 @@ def draw_style_test_sample(project_name: str, book_name: str):
         project_name=project_name,
         book_name=book_name,
         count=state.style_chunk_count,
-        prompt_seed=state.style_prompt_seed
+        prompt_seed=state.style_prompt_seed,
+        role_mode=state.style_test_role_mode,
     )
     
     if state.style_use_random_image_seed:
@@ -1225,8 +1681,8 @@ async def execute_style_playground_batch(project_name: str):
             
         raw_prompt = item["prompt"] if isinstance(item, dict) else item
 
-        # Replace tags if enabled
-        if project_id and getattr(state, "style_enable_character_replacement", True):
+        # Replace bracketed character tags
+        if project_id:
             prompt_text = replace_character_tags_in_prompt(
                 raw_prompt,
                 project_id,
@@ -1235,16 +1691,20 @@ async def execute_style_playground_batch(project_name: str):
             )
         else:
             prompt_text = raw_prompt
-        
+
+        # Each card renders with the style of the shot role it was sampled for.
+        role = item.get("shot_role") if isinstance(item, dict) else None
+        eff = style_library.effective(current_style_set(), role)
+
         def run_image():
             return client.generate_image_sync(
                 workflow_json=workflow_json,
                 prompt_text=prompt_text,
-                neg_prompt_text=state.style_negative_prompt,
+                neg_prompt_text=eff["negative_prompt"],
                 seed=seed,
-                overrides=state.style_workflow_overrides,
-                prefix=state.style_prompt_prefix,
-                suffix=state.style_prompt_suffix
+                overrides=eff["overrides"],
+                prefix=eff["prompt_prefix"],
+                suffix=eff["prompt_suffix"]
             )
             
         try:
@@ -1325,8 +1785,9 @@ async def execute_style_freeform_batch(project_name: str):
         comfy_url = comfy_url.replace("http://", "").replace("https://", "").strip("/")
 
     use_modifiers = bool(state.style_freeform_use_style_modifiers)
-    prefix = state.style_prompt_prefix if use_modifiers else ""
-    suffix = getattr(state, "style_prompt_suffix", "") if use_modifiers else ""
+    eff = style_library.effective(current_style_set(), state.style_active_role)
+    prefix = eff["prompt_prefix"] if use_modifiers else ""
+    suffix = eff["prompt_suffix"] if use_modifiers else ""
 
     # Take over the shared card list so results land in the existing thumbnails.
     # Each entry gets a fresh random seed so batch runs explore variations.
@@ -1350,9 +1811,9 @@ async def execute_style_freeform_batch(project_name: str):
             return client.generate_image_sync(
                 workflow_json=workflow_json,
                 prompt_text=prompt_text,
-                neg_prompt_text=state.style_negative_prompt,
+                neg_prompt_text=eff["negative_prompt"],
                 seed=seed,
-                overrides=state.style_workflow_overrides,
+                overrides=eff["overrides"],
                 prefix=prefix,
                 suffix=suffix
             )
@@ -1406,6 +1867,8 @@ def open_style_chooser_modal_globally():
     def apply_style_preset_cb(selected_name: str):
         state.style_selected_preset = selected_name
         load_style_preset_by_name(selected_name)
+        # Record the choice on the project so it is still selected after a reopen.
+        _persist_project_settings()
         ui.notify(f"Applied visual style: {selected_name}", type="positive")
         if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
             state.action_buttons_refresh()
@@ -1429,12 +1892,15 @@ def render_workflow_overrides_ui():
                 ui.label("Workflow overrides (Auto-Discovered)").classes('text-xs font-bold text-slate-700')
                 help_icon(
                     title="Workflow Overrides",
-                    description="Dynamically adjust ComfyUI node variables local to this style preset.",
+                    description="Dynamically adjust ComfyUI node variables for this style set.",
                     additional_details=[
-                        "• Preset Override: Parameter edits here apply exclusively to the active preset.",
+                        "• Edits apply to the shot type selected in the Style & Workflow Definition above.",
+                        "• Character is the base; a change made on another shot type only affects that shot type.",
                         "• Save (Disk Icon): Writes settings back to the base workflow JSON file, setting new baseline defaults for all styles using it."
                     ]
                 )
+                ui.badge(f"Editing: {ROLE_LABELS.get(state.style_active_role, state.style_active_role)}", color="indigo") \
+                    .classes('text-[10px] font-bold')
             
             if state.comfy_online:
                 ui.badge("🟢 ComfyUI Online", color="emerald").classes('text-[10px] font-bold')
@@ -1832,13 +2298,22 @@ def render_workflow_overrides_ui():
                                         ).props('flat dense').classes('text-blue-600').tooltip("Copy triggers to clipboard")
                                         
                                         def add_to_prefix_val(t=triggers_text):
-                                            if t not in state.style_prompt_prefix:
-                                                cleaned_prefix = state.style_prompt_prefix.strip()
+                                            current = getattr(state, _VIEW_ATTRS["prompt_prefix"])
+                                            if t not in current:
+                                                cleaned_prefix = current.strip()
                                                 if cleaned_prefix and not cleaned_prefix.endswith(","):
                                                     cleaned_prefix += ","
-                                                state.style_prompt_prefix = f"{cleaned_prefix} {t}, ".strip().replace("  ", " ")
-                                                ui.notify("Added triggers to Style Prompt Prefix!", type="positive")
-                                                
+                                                new_prefix = f"{cleaned_prefix} {t}, ".strip().replace("  ", " ")
+                                                _commit_text_field("prompt_prefix", new_prefix)
+                                                ui.notify(
+                                                    f"Added triggers to the {ROLE_LABELS.get(state.style_active_role, 'style')} prefix!",
+                                                    type="positive"
+                                                )
+                                                try:
+                                                    render_style_text_editor.refresh()
+                                                except Exception:
+                                                    pass
+
                                         ui.button(
                                             icon="playlist_add",
                                             on_click=lambda: add_to_prefix_val()
@@ -1988,6 +2463,11 @@ def render_style_playground_cards(project_name: str = ""):
             quote = item.get("quote", "") if is_dict else ""
             seed = state.style_test_seeds[idx] if idx < len(state.style_test_seeds) else state.style_image_seed
 
+            # The shot role this card renders with (freeform has none -> active role).
+            card_role = style_library.normalize_role(
+                item.get("shot_role") if is_dict else None
+            ) if (is_dict and item.get("shot_role")) else style_library.normalize_role(state.style_active_role)
+
             if state.style_freeform_active:
                 card_title = "Custom Prompt"
                 full_title_header = f"Custom Prompt • Variant {idx + 1}"
@@ -1997,7 +2477,13 @@ def render_style_playground_cards(project_name: str = ""):
 
             with ui.card().classes('w-full border p-2.5 rounded-lg shadow-xs gap-2 bg-white'):
                 with ui.row().classes('w-full justify-between items-center pb-1 border-b border-dashed'):
-                    ui.label(card_title).classes('text-[10px] font-black text-slate-700 uppercase')
+                    with ui.row().classes('items-center gap-1.5 min-w-0'):
+                        ui.label(card_title).classes('text-[10px] font-black text-slate-700 uppercase')
+                        ui.badge(
+                            ROLE_LABELS.get(card_role, card_role),
+                            color=_ROLE_BADGE_COLORS.get(card_role, "slate")
+                        ).classes('text-[8px] font-bold') \
+                         .tooltip('Shot type / style variant used for this render')
                     
                     # Clickable Interactive Seed Badge with native Material dice icon
                     with ui.badge(color="slate").classes('text-[9px] font-bold cursor-pointer hover:bg-slate-700 transition-all flex items-center gap-1') \
@@ -2030,55 +2516,65 @@ def render_style_playground_cards(project_name: str = ""):
                         ui.label("Click to see prompt details").classes('text-[8px] text-slate-400')
 
 
+def _prompt_csv_candidates(project_name: str, book_name: str) -> List[Path]:
+    return [
+        Path(f"./output/{project_name}/{book_name}/prompts.csv"),
+        Path(f"./output/{project_name}/{book_name}_prompts.csv"),
+        Path(f"./output/{project_name}/{book_name}/{book_name}_prompts.csv"),
+        Path(f"./output/{project_name}/{project_name}_prompts.csv"),
+        Path(f"./output/{project_name}_prompts.csv"),
+    ]
+
+
+def _volume_prompts_csv(project_name: str, book_name: str) -> Optional[Path]:
+    if not book_name:
+        return None
+    for path in _prompt_csv_candidates(project_name, book_name):
+        if path.exists():
+            return path
+    return None
+
+
 @ui.refreshable
-def render_character_settings_content():
-    """Renders the trait injection modifiers control panel."""
-    with ui.column().classes('w-full gap-4'):
-        ui.switch(
-            'Enable Character Visual Replacement', 
-            value=state.style_enable_character_replacement,
-            on_change=lambda e: setattr(state, 'style_enable_character_replacement', e.value)
-        ).classes('text-xs font-semibold')
+def render_role_mode_select(project_name: str):
+    """Shot-type source for the tester samples.
 
-        ui.switch(
-            'Use Sentence-based Structure (Prevents Trait Bleeding)',
-            value=state.style_use_sentence_structure,
-            on_change=lambda e: setattr(state, 'style_use_sentence_structure', e.value)
-        ).classes('text-xs font-semibold').tooltip("Wraps character visual details inside name-associated parentheses, keeping descriptors bounded for the AI's text encoder.")
+    Only roles actually present in the volume are offered; a legacy volume with
+    no recorded shot roles offers just Current / Variety.
+    """
+    csv_path = _volume_prompts_csv(project_name, state.playground_book_selection)
+    available = style_library.shot_roles_in_file(csv_path) if csv_path else []
 
-        ui.separator()
+    options = {
+        "current": "Current (definition shot type)",
+        "variety": "Variety (one per shot type)",
+    }
+    for role in available:
+        options[role] = f"All {ROLE_LABELS.get(role, role)}"
 
-        ui.label('Include Physical Traits:').classes('text-xs font-bold text-slate-700')
-        
-        trait_labels = {
-            "sex_or_gender": "Gender / Sex",
-            "approximate_age": "Approximate Age",
-            "ethnicity_or_race": "Race or Ethnicity",
-            "height_or_stature": "Height / Stature",
-            "weight_or_build": "Weight / Build",
-            "hair_color_and_style": "Hair Color & Style",
-            "facial_features": "Facial Features",
-            "distinguishing_marks": "Distinguishing Marks (Misc)"
-        }
+    if state.style_test_role_mode not in options:
+        state.style_test_role_mode = "current"
 
-        with ui.grid(columns=2).classes('w-full gap-2 bg-slate-50 p-3 rounded-lg border'):
-            for trait_key, label in trait_labels.items():
-                current_val = state.style_enabled_character_traits.get(trait_key, True)
-                
-                def make_toggle_handler(key=trait_key):
-                    return lambda e: state.style_enabled_character_traits.update({key: e.value})
-                    
-                ui.checkbox(
-                    label, 
-                    value=current_val, 
-                    on_change=make_toggle_handler(trait_key)
-                ).classes('text-xs')
+    ui.select(
+        options=options,
+        label="Shot Types",
+        value=state.style_test_role_mode,
+        on_change=lambda e: (
+            setattr(state, 'style_test_role_mode', e.value),
+            draw_style_test_sample(project_name, state.playground_book_selection),
+        )
+    ).classes('w-56 bg-white').props('dense outlined').tooltip(
+        'Which shot roles the sample scenes are drawn from. Each card previews its own role style.'
+    )
 
 
 def render_style_playground_tab(project, save_project_settings_cb=None):
-    global contact_sheet_dialog_ref, lora_chooser_dialog_ref, playground_image_dialog_ref, character_settings_dialog_ref
+    global contact_sheet_dialog_ref, lora_chooser_dialog_ref, playground_image_dialog_ref
     global freeform_prompt_dialog_ref
+    global _active_project_name, _style_dirty_label, _editor_override_count_label
     global modal_title_label, modal_image_el, modal_no_image_placeholder, modal_prompt_label, modal_rendered_prompt_label, modal_quote_container, modal_quote_label, modal_download_btn
+
+    _active_project_name = project.name
     
     # Query current volume listings inside database index
     with Session(engine) as session:
@@ -2101,11 +2597,6 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
     if state.style_selected_workflow:
         asyncio.create_task(async_load_comfy_and_lora_choices())
 
-    def open_character_settings_modal():
-        if character_settings_dialog_ref:
-            character_settings_dialog_ref.open()
-            render_character_settings_content.refresh()
-
     # 75% Left Column (3fr), 25% Right Column (1fr) split
     with ui.grid(columns='3fr 1fr').classes('w-full gap-4 items-start'):
         
@@ -2123,7 +2614,7 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                             additional_details=[
                                 "• Source Volume: Pulls text passages from the designated volume.",
                                 "• Casino (Dice): Selects entirely new random scene chunks.",
-                                "• Refresh Icon: Randomizes image seeds while retaining the current scene text."
+                                "• Shot Types: Which shot roles the samples are drawn from - the preview uses each card's own style."
                             ]
                         )
                     
@@ -2133,7 +2624,11 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                         ui.select(
                             options=book_names,
                             label="Source Volume",
-                            on_change=lambda e: (setattr(state, 'playground_book_selection', e.value), draw_style_test_sample(project.name, e.value))
+                            on_change=lambda e: (
+                                setattr(state, 'playground_book_selection', e.value),
+                                render_role_mode_select.refresh(project.name),
+                                draw_style_test_sample(project.name, e.value),
+                            )
                         ).classes('flex-1 bg-white').props('dense outlined').bind_value(state, 'playground_book_selection')
                         
                         # Compact scenes count dropdown (replacing the giant slider)
@@ -2153,28 +2648,15 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                                 icon='casino',
                                 on_click=lambda: reroll_test_scenes(project.name, state.playground_book_selection)
                             ).props('flat dense').classes('text-slate-600').tooltip('Reroll Scenes (pull new random passages)')
-                            
-                            # Micro Seeds refresh button
-                            ui.button(
-                                icon='refresh',
-                                on_click=reroll_image_seeds
-                            ).props('flat dense').classes('text-slate-600').tooltip('Reroll Seeds (keep prompts, randomize image generation seeds)')
-                            
-                            # Optional Character Settings Trigger button
-                            with Session(engine) as session:
-                                has_chars = session.exec(select(Character).where(Character.project_id == project.id)).first() is not None
-                            if has_chars:
-                                ui.button(
-                                    icon='person_search',
-                                    on_click=open_character_settings_modal
-                                ).props('flat dense').classes('text-blue-600').tooltip('Configure Character Prompt Injection')
+
+                            render_role_mode_select(project.name)
                         
                         # Large prominent execution button - High visibility Positive Semantic Green
                         ui.button(
                             'Test Style Preset',
                             icon='bolt',
                             color='positive',
-                            on_click=lambda: execute_style_playground_batch(project.name)
+                            on_click=lambda: test_style_preset(project.name)
                         ).classes('font-bold text-xs h-9 px-5 shadow-sm') \
                          .bind_enabled_from(state, 'style_has_source_material') \
                          .tooltip('Submits all active prompts to ComfyUI for rendering')
@@ -2186,11 +2668,13 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                         ui.label('Style & Workflow Definition').classes('text-sm font-bold text-slate-800')
                         help_icon(
                             title="Style & Workflow Definition",
-                            description="A Style Preset wraps prompt modifiers and engine overrides over a selected ComfyUI graph.",
+                            description="A Style Set wraps prompt modifiers and engine overrides over a ComfyUI graph, per shot type.",
                             additional_details=[
+                                "• Shot Type: Character is the base; every other shot inherits it unless overridden.",
                                 "• Style Prompt Prefix: Applied to the beginning of every scene prompt.",
                                 "• Style Prompt Suffix: Appended to the end of every scene prompt.",
-                                "• Style Negative Prompt: Visual attributes and styles the generator must avoid."
+                                "• Style Negative Prompt: Visual attributes and styles the generator must avoid.",
+                                "• Save: Writes the base and all overrides into styles/<name>.json."
                             ]
                         )
                         ui.button(
@@ -2200,12 +2684,11 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                             'Custom Prompt: render your own prompt text using the active workflow, node overrides, and LoRA selections'
                         )
                     
-                # A. Style Preset Library Loader & Saver (Streamlined Compact Bar)
+                # A. Style Set Library Loader & Saver (Streamlined Compact Bar)
                 with ui.row().classes('w-full items-center justify-between gap-3 p-2 bg-slate-50 rounded border border-slate-200'):
                     with ui.column().classes('gap-0 flex-grow min-w-0'):
-                        ui.label('Active Style Preset').classes('text-[9px] font-bold text-slate-400 uppercase')
+                        ui.label('Active Style Set').classes('text-[9px] font-bold text-slate-400 uppercase')
                         ui.label().classes('text-xs font-bold text-slate-800 truncate').bind_text_from(state, 'style_selected_preset')
-                    
                     ui.button(
                         'Browse', 
                         icon='photo_library', 
@@ -2217,25 +2700,31 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                         custom_style_name = ui.input(placeholder="Save Preset Name") \
                             .classes('w-36 text-xs bg-white').props('outlined dense') \
                             .bind_value(state, 'style_preset_save_name') \
-                            .tooltip("Enter a name to save these prompt templates & parameters as a reusable style preset")
+                            .tooltip("Enter a name to save the Character base and all shot-type overrides as a reusable style set")
                         ui.button(
                             icon="save",
                             on_click=lambda: save_style_preset_by_name(custom_style_name.value)
-                        ).props('flat round size=sm').classes('text-blue-600').tooltip("Save or overwrite this preset")
+                        ).props('flat round size=sm').classes('text-blue-600').tooltip("Save or overwrite this style set")
+                    _style_dirty_label = ui.label(
+                        "Unsaved changes" if style_is_dirty() else "Saved"
+                    ).classes('text-[10px] text-slate-400 flex-shrink-0')
 
-                # B. Artistic Templates (Prefix, Suffix, Negative)
-                with ui.column().classes('w-full gap-3'):
-                    ui.textarea(
-                        label="Style Prompt Prefix"
-                    ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_prompt_prefix')
+                # B. Shot-type selector + Prefix / Suffix / Negative editors
+                with ui.column().classes('w-full gap-2'):
+                    with ui.row().classes('w-full items-center gap-2'):
+                        ui.select(
+                            options={r: ROLE_LABELS[r] for r in style_library.ROLES},
+                            label="Shot Type",
+                            value=state.style_active_role,
+                            on_change=lambda e: select_style_role(e.value)
+                        ).classes('w-56 bg-white').props('outlined dense') \
+                         .tooltip("Character is the base style. The other shot types inherit it unless you override a field.")
+                        _editor_override_count_label = ui.label(
+                            f"{len(state.style_role_overrides)} shot type(s) overridden"
+                        ).classes('text-[10px] text-slate-400')
 
-                    ui.textarea(
-                        label="Style Prompt Suffix"
-                    ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_prompt_suffix')
-                    
-                    ui.textarea(
-                        label="Style Negative Prompt"
-                    ).classes('w-full text-xs').props('outlined autogrow').bind_value(state, 'style_negative_prompt')
+                    render_style_text_editor()
+                    _sync_editor_highlight()
 
                 # C. Engine & Parameters (Relocated Base Workflow JSON Selector & Dynamic Parameters)
                 with ui.column().classes('w-full gap-3 border-t pt-3'):
@@ -2246,7 +2735,7 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                     if not state.style_selected_workflow or state.style_selected_workflow not in available_workflows:
                         if available_workflows:
                             state.style_selected_workflow = available_workflows[0]
-                            handle_style_workflow_change(available_workflows[0])
+                            handle_style_workflow_change(available_workflows[0], clear_overrides=False)
                             
                     ui.select(
                         options=available_workflows,
@@ -2339,19 +2828,6 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
                 
             render_lora_chooser_content()
 
-    with ui.dialog() as character_settings_dialog:
-        with ui.card().classes('w-full max-w-lg p-5 rounded-xl gap-4 bg-white'):
-            with ui.row().classes('w-full justify-between items-center pb-1 border-b'):
-                with ui.column().classes('gap-0'):
-                    ui.label('Character Injection Options').classes('text-base font-bold text-slate-800')
-                    ui.label('Configure bracketed tag replacements for rendering.').classes('text-xs text-slate-500')
-                ui.button(icon='close', on_click=character_settings_dialog.close).props('flat round size=sm').classes('text-slate-400')
-            
-            render_character_settings_content()
-            
-            with ui.row().classes('w-full justify-end border-t pt-2'):
-                ui.button('Close', on_click=character_settings_dialog.close).classes('bg-slate-700 text-white text-xs')
-
     # --- Freeform "Custom Prompt" Dialog ---
     with ui.dialog() as freeform_prompt_dialog:
         with ui.card().classes('w-full max-w-2xl p-5 rounded-xl gap-4 bg-white'):
@@ -2429,5 +2905,4 @@ def render_style_playground_tab(project, save_project_settings_cb=None):
     contact_sheet_dialog_ref = contact_sheet_dialog
     lora_chooser_dialog_ref = lora_chooser_dialog
     playground_image_dialog_ref = playground_image_dialog
-    character_settings_dialog_ref = character_settings_dialog
     freeform_prompt_dialog_ref = freeform_prompt_dialog

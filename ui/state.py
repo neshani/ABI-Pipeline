@@ -67,15 +67,9 @@ playground_selection_mode: str = "Seeded Random"
 playground_loading: bool = False
 playground_results: List[Dict[str, Any]] = []  # [{"chunk": "", "quote": "", "prompt": "", "status": ""}]
 
-# Character prompt-replacement tuning states
-style_enable_character_replacement: bool = True
-style_use_sentence_structure: bool = True
-style_enabled_character_traits: Dict[str, bool] = {
-    "demographics": True,
-    "physical_build": True,
-    "hair_and_face": True,
-    "distinguishing_marks": True
-}
+# Character prompt-replacement tuning. The old playground modal that exposed
+# these was removed; the compiler reads its own defaults (all traits on,
+# sentence structure on), so the getattr fallbacks at the call sites hold.
 
 # --- Dynamic Prompt Generation Task States ---
 recent_prompts: List[Dict[str, Any]] = []  # Stores last 5 generated prompts: [{"book": "", "chapter": 1, "scene": 1, "prompt": "", "quote": "", "status": ""}]
@@ -99,16 +93,30 @@ cancel_image_gen_flag: bool = False
 stop_after_current_book: bool = False  # Graceful circuit-breaker to halt batch loops after active book completion
 
 # --- Style Playground & Workflow Analyzer Bindings ---
+# A style set (styles/<name>.json) is the Character base plus per-role deltas.
+# ``style_base_style`` holds the Character values; ``style_role_overrides`` holds
+# the deltas. The three style_prompt_* globals and ``style_workflow_overrides``
+# are the *view*: the effective values for ``style_active_role``, rewritten by
+# the Style & Workflow panel whenever the role changes or a field is edited.
 comfy_online: bool = False
 style_selected_preset: str = "retro_graphic_novel"
 style_preset_save_name: str = ""
 style_selected_workflow: str = ""
+style_active_role: str = "character"  # role shown in the Definition panel
+style_base_style: Dict[str, Any] = {
+    "prompt_prefix": "space opera adventure graphic novel illustration, sharp ink sketch, crisp outlines, retro-futuristic sci-fi aesthetic, cosmic wonder, detailed, ",
+    "prompt_suffix": ", high-contrast shadows, selective color accents, bold ink-wash shading",
+    "negative_prompt": "blurry, bad quality, text, watermark, photorealistic, photography, dystopian, gritty, grimy, decay, cyberpunk",
+    "overrides": {},
+}
+style_role_overrides: Dict[str, Dict[str, Any]] = {}
 style_prompt_prefix: str = "space opera adventure graphic novel illustration, sharp ink sketch, crisp outlines, retro-futuristic sci-fi aesthetic, cosmic wonder, detailed, "
 style_prompt_suffix: str = ", high-contrast shadows, selective color accents, bold ink-wash shading"
 style_negative_prompt: str = "blurry, bad quality, text, watermark, photorealistic, photography, dystopian, gritty, grimy, decay, cyberpunk"
 style_test_prompts: List[Dict[str, Any]] = []
 style_test_images: List[Optional[str]] = []  # List of Base64-encoded strings or None
 style_test_seeds: List[int] = []
+style_test_role_mode: str = "current"  # current | variety | a role name
 style_lock_samples: bool = False
 style_playground_loading: bool = False
 
