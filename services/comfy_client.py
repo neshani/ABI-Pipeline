@@ -7,6 +7,8 @@ import websocket
 import random
 from typing import Dict, Any, List, Optional, Tuple
 
+from services import vram_manager
+
 class ComfyClient:
     def __init__(self, api_address: str):
         self.api_address = api_address
@@ -231,6 +233,9 @@ class ComfyClient:
         and returns (image_bytes, logs_as_text). Zero hardcoding: modifies any 
         nodes with string placeholders or seed settings dynamically.
         """
+        # Rendering needs the GPU back from the LLM if that side is resident.
+        vram_manager.ensure_comfy()
+
         workflow = copy.deepcopy(workflow_json)
         logs = []
 

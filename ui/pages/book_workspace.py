@@ -10,6 +10,7 @@ from sqlmodel import Session, select
 from database.connection import engine, get_setting
 from database.models import Book, Project, Character, CharacterAlias, CharacterTimelineEvent
 from services.character_manager import compile_character_visual_prompt, save_project_characters_to_json, ensure_book_orders
+from services import style_library
 from ui.pages.project.characters_tab import get_character_frequency_map
 from ui.components.prompt_editor_view import render_prompt_editor_view
 from ui.components.autocomplete import PromptAutocompleteManager
@@ -23,6 +24,38 @@ except Exception:
 
 
 # --- Robust CSV Loading & Saving Utilities ---
+
+# Shot-role presentation for the workspace: canonical order, display labels and
+# badge colors. ``single`` only appears on books rendered with the planner off.
+SHOT_ROLE_ORDER = ("character", "wide", "insert", "single")
+SHOT_ROLE_LABELS = {
+    "character": "Character",
+    "wide": "Wide",
+    "insert": "Insert",
+    "single": "Single",
+}
+SHOT_ROLE_BADGE_COLORS = {
+    "character": "indigo",
+    "wide": "teal",
+    "insert": "purple",
+    "single": "slate",
+}
+SHOT_ROLE_FROM_LABEL = {label: role for role, label in SHOT_ROLE_LABELS.items()}
+
+
+def roles_present(prompts: List[Dict[str, Any]]) -> List[str]:
+    """Distinct shot roles across a book's rows, in canonical order."""
+    found = {style_library.normalize_role((p or {}).get("shot_role")) for p in prompts}
+    return [r for r in SHOT_ROLE_ORDER if r in found]
+
+
+def shot_role_matches(item: Dict[str, Any], shot_choice: str) -> bool:
+    """True when ``item`` passes the shot-type filter (``All Roles`` always does)."""
+    if not shot_choice or shot_choice == "All Roles":
+        return True
+    role = style_library.normalize_role((item or {}).get("shot_role"))
+    return SHOT_ROLE_LABELS.get(role) == shot_choice
+
 
 def load_prompts_csv(project_name: str, book_name: str) -> List[Dict[str, Any]]:
     """Discovers and parses prompts.csv from output folders, self-healing missing approved columns."""
@@ -520,6 +553,19 @@ def render_book_tabs(book_id: int):
     prompts = get_all_prompts_as_dicts()
     images_cache = get_book_images_cache(project_name, book_name)
 
+    # Attach the shot role from prompts.csv. The ScenePrompt cache has no
+    # shot_role column, so the role lives only in the CSV itself; image
+    # generation reads it from there, and the workspace mirrors it here for the
+    # grid badges and the shot-type filter. A legacy file with no role column
+    # resolves every scene to Character, which is the base style it was
+    # rendered with anyway.
+    csv_role_by_key = {}
+    for csv_row in load_prompts_csv(project_name, book_name):
+        csv_role_by_key[_row_key(csv_row.get("chapter"), csv_row.get("scene"))] = csv_row.get("shot_role", "")
+    for p in prompts:
+        raw_role = csv_role_by_key.get(_row_key(p.get("chapter"), p.get("scene")), "")
+        p["shot_role"] = style_library.normalize_role(raw_role)
+
     if not hasattr(state, 'book_active_scene_idx'):
         state.book_active_scene_idx = 0
 
@@ -595,6 +641,11 @@ def render_book_tabs(book_id: int):
                             
                 if not matched_all_terms:
                     continue
+
+            # Shot-type filter (roles resolved from prompts.csv).
+            shot_choice = shot_filter.value if shot_filter is not None else "All Roles"
+            if not shot_role_matches(p, shot_choice):
+                continue
 
             is_approved = p.get("approved", "False").strip().lower() == "true"
             try:
@@ -688,6 +739,10 @@ def render_book_tabs(book_id: int):
                 modal_quote_el.set_text("")
             if modal_prompt_input:
                 modal_prompt_input.set_value("")
+            if modal_role_select:
+                modal_role_select.disable()
+            if modal_regen_btn[0]:
+                modal_regen_btn[0].disable()
             return
 
         active_row_ref[0] = current_scene
@@ -761,6 +816,16 @@ def render_book_tabs(book_id: int):
 
         if modal_prompt_input:
             render_scene_character_chips(modal_prompt_input.value)
+
+        # Mirror the scene's shot role into the theater selector (guard the
+        # change handler so programmatic sync never counts as a user edit).
+        current_role = style_library.normalize_role(current_scene.get("shot_role"))
+        if modal_role_select:
+            modal_role_select.enable()
+            if modal_role_select.value != SHOT_ROLE_LABELS[current_role]:
+                modal_role_select.set_value(SHOT_ROLE_LABELS[current_role])
+        if modal_regen_btn[0]:
+            modal_regen_btn[0].enable()
 
     def next_scene():
         nonlocal theater_cursor, history_pointer
@@ -962,17 +1027,21 @@ def render_book_tabs(book_id: int):
 
     def update_grid_views_in_place():
         """Updates rendering frames, cards, and dots in-place with zero layout shifts."""
+        shot_choice = shot_filter.value if shot_filter is not None else "All Roles"
         for (ch, sc), ref in grid_card_references.items():
             img_url = images_cache.get((ch, sc))
             is_approved = ref["item"].get("approved", "False").strip().lower() == "true"
             has_image = bool(img_url)
-            
+
+            role_ok = shot_role_matches(ref["item"], shot_choice)
+
             should_be_visible = True
             if filter_mode.value == "Unapproved Only":
                 should_be_visible = bool(has_image and not is_approved)
             elif filter_mode.value == "Missing Only":
                 should_be_visible = not has_image
-                
+
+            should_be_visible = should_be_visible and role_ok
             ref["card"].visible = should_be_visible
             
             if not should_be_visible:
@@ -999,6 +1068,119 @@ def render_book_tabs(book_id: int):
             else:
                 ref["image"].visible = False
                 ref["placeholder"].visible = True
+
+    def apply_shot_role(label: str):
+        """Persist a shot-role change made from the theater selector.
+
+        Changing the role alone re-styles the scene on the next render; the
+        prompt *text* is regenerated only when the user asks for a new prompt.
+        """
+        row = active_row_ref[0]
+        new_role = SHOT_ROLE_FROM_LABEL.get(label)
+        if not row or not new_role:
+            return
+        if style_library.normalize_role(row.get("shot_role")) == new_role:
+            return
+
+        row["shot_role"] = new_role
+        try:
+            ch = int(float(row.get("chapter", "1")))
+            sc = int(float(row.get("scene", "1")))
+            if (ch, sc) in grid_card_references:
+                grid_card_references[(ch, sc)]["item"]["shot_role"] = new_role
+        except ValueError:
+            pass
+
+        save_prompts_csv(project_name, book_name, prompts)
+
+        # The new role makes this book multi-role; surface it in the filter.
+        new_present = roles_present(prompts)
+        if shot_filter is not None:
+            shot_filter.options = ["All Roles"] + [SHOT_ROLE_LABELS[r] for r in new_present]
+            shot_filter.set_visibility(len(new_present) > 1)
+            shot_filter.update()
+
+        render_content.refresh()
+        update_active_scene_ui()
+        ui.notify(
+            f"Shot type set to {SHOT_ROLE_LABELS[new_role]}. "
+            f"Click 'New Prompt' to regenerate the text for it.",
+            type="info", timeout=3.0
+        )
+
+    async def request_new_prompt():
+        """Regenerate one scene's prompt text with its selected shot role.
+
+        ``get_llm_response`` routes through the VRAM manager, so ComfyUI's cache
+        is released before the LLM takes the GPU - the whole reason this action
+        is safe to fire while ComfyUI is still resident.
+        """
+        row = active_row_ref[0]
+        if not row:
+            return
+        try:
+            ch = int(float(row.get("chapter", "1")))
+            sc = int(float(row.get("scene", "1")))
+        except ValueError:
+            ch, sc = 1, 1
+
+        role = style_library.normalize_role(row.get("shot_role"))
+
+        from services import shot_planner, prompt_library
+        from services.prompt_engine import get_llm_response, parse_llm_response, REFUSAL_KEYWORDS
+
+        chunk = shot_planner.scene_chunk(project_name, book_name, ch, sc)
+        if not chunk:
+            ui.notify("Could not re-derive this scene's passage from transcript.txt.", type="negative")
+            return
+
+        request_text = prompt_library.render_with_selection(role, chunk, prompt_library.active_selection())
+        llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
+        model_name = get_setting("llm_model", "local-model")
+
+        btn = modal_regen_btn[0]
+        if btn:
+            btn.props('loading')
+        state.add_console_log(
+            f"[Theater] Requesting a fresh {SHOT_ROLE_LABELS[role]} prompt for Ch {ch}, Scene {sc}."
+        )
+
+        try:
+            raw = await get_llm_response(request_text, llm_url, model_name)
+        except Exception as e:
+            raw = f"API Connection Failed: {e}"
+        finally:
+            if btn:
+                btn.props(remove='loading')
+
+        raw_text = raw if isinstance(raw, str) else str(raw)
+        parsed = parse_llm_response(raw_text)
+        # ``parse_llm_response`` falls back to the whole reply as the prompt when
+        # the model ignores the QUOTE/PROMPT format, which would let a plain
+        # refusal overwrite a good prompt. Reject those here.
+        looks_like_refusal = any(k in raw_text.lower() for k in REFUSAL_KEYWORDS)
+        if parsed["status"] == "refusal" or looks_like_refusal or not parsed.get("prompt"):
+            state.add_console_log(
+                f"[Theater] No usable prompt for Ch {ch}, Scene {sc}:\n{parsed.get('raw', '')}"
+            )
+            ui.notify("The LLM declined or returned nothing. Prompt left unchanged.", type="warning")
+            return
+
+        row["prompt"] = parsed["prompt"]
+        new_quote = (parsed.get("quote") or "").strip()
+        if new_quote:
+            row["quote"] = new_quote
+
+        save_prompts_csv(project_name, book_name, prompts)
+
+        if (ch, sc) in grid_card_references:
+            grid_card_references[(ch, sc)]["item"]["prompt"] = row["prompt"]
+            grid_card_references[(ch, sc)]["item"]["quote"] = row.get("quote", "")
+
+        # Force the modal to reload the scene's text and narration context.
+        loaded_scene_coords[0] = -1
+        update_active_scene_ui()
+        ui.notify(f"New {SHOT_ROLE_LABELS[role]} prompt generated for Ch {ch}, Scene {sc}.", type="positive")
 
     def launch_theater_from_coordinate(ch_val: int, sc_val: int):
         nonlocal theater_cursor, history_pointer
@@ -1192,6 +1374,9 @@ def render_book_tabs(book_id: int):
         value="All"
     ).classes('hidden')
 
+    # Roles actually present in this book's prompts.csv, in canonical order.
+    present_roles = roles_present(prompts)
+
     # --- Optimized Dense One-Line Toolbar Header ---
     with ui.row().classes('w-full justify-between items-center bg-white py-1.5 px-3 border rounded-xl shadow-2xs mb-3 flex-nowrap gap-2 outline-none focus:outline-none'):
         
@@ -1228,7 +1413,17 @@ def render_book_tabs(book_id: int):
                 btn_missing.on('click', lambda: set_filter('Missing Only'))
                 
                 update_button_styles(filter_mode.value)
-            
+
+            # 1b. Shot-type filter. Hidden for books whose scenes are all the
+            # base Character role (legacy files, or the planner left off).
+            shot_filter = ui.select(
+                options=["All Roles"] + [SHOT_ROLE_LABELS[r] for r in present_roles],
+                value="All Roles",
+                on_change=lambda e: render_content.refresh(),
+            ).classes('w-36 flex-shrink-0').props('outlined dense options-dense') \
+             .tooltip('Filter the gallery by shot type')
+            shot_filter.set_visibility(len(present_roles) > 1)
+
             # 2. Expanded text input filter matching the prompt editor search bar
             search_filter_container[0] = ui.input(
                 placeholder="Search chapters, quotes, prompts...",
@@ -1395,6 +1590,8 @@ def render_book_tabs(book_id: int):
     modal_badge_missing = None
     modal_badge_approved = None
     modal_badge_review = None
+    modal_role_select = None
+    modal_regen_btn = [None]
     
     active_row_ref = [None]
     grid_card_references: Dict[tuple, Dict[str, Any]] = {}
@@ -1468,6 +1665,22 @@ def render_book_tabs(book_id: int):
                         with ui.row().classes('w-full gap-2'):
                             ui.button('Delete Image', icon='delete', on_click=delete_current).classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold flex-1 py-2 outline-none focus:outline-none')
                             ui.button('Approve', icon='check', on_click=approve_current).classes('bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex-1 py-2 outline-none focus:outline-none')
+
+                    # Shot-role switcher + one-shot prompt regeneration. The
+                    # regeneration frees ComfyUI's VRAM before calling the LLM.
+                    with ui.row().classes('w-full gap-2 items-center flex-shrink-0'):
+                        ui.label('Shot').classes('text-[9px] font-black text-slate-400 uppercase tracking-wider')
+                        modal_role_select = ui.select(
+                            options=[SHOT_ROLE_LABELS[r] for r in SHOT_ROLE_ORDER],
+                            value=SHOT_ROLE_LABELS["character"],
+                            on_change=lambda e: apply_shot_role(e.value),
+                        ).classes('flex-1').props('outlined dense options-dense').tooltip(
+                            'Shot type recorded for this scene; changing it re-styles the next render.'
+                        )
+                        modal_regen_btn[0] = ui.button(
+                            'New Prompt', icon='auto_awesome', on_click=request_new_prompt
+                        ).classes('bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold px-3 py-2') \
+                         .tooltip('Ask the LLM for a fresh prompt using the selected shot type')
 
                     scene_chips_container = ui.row().classes('w-full flex-shrink-0')
 
@@ -1575,18 +1788,24 @@ def render_book_tabs(book_id: int):
                     if t.lower() not in seen_tags:
                         seen_tags.add(t.lower())
                         deduped_tags.append(t)
-                        
-                if deduped_tags:
-                    with ui.row().classes('w-full gap-1 items-center mt-1.5 px-1 flex-wrap'):
-                        for t in deduped_tags[:4]:
-                            disp = t
-                            if len(disp) > 8:
-                                disp = disp[:7] + "…"
-                            badge_el = ui.badge(disp, color='slate').classes('text-[8px] font-medium py-0 px-1 rounded-sm flex-shrink-0')
-                            with badge_el:
-                                ui.tooltip(t).classes('bg-slate-800 text-white text-[9px] p-1.5 rounded')
-                        if len(deduped_tags) > 4:
-                            ui.badge(f"+{len(deduped_tags)-4}", color='blue').classes('text-[8px] font-bold py-0 px-1 rounded-sm flex-shrink-0')
+
+                role = style_library.normalize_role(item.get("shot_role"))
+                with ui.row().classes('w-full gap-1 items-center mt-1.5 px-1 flex-wrap'):
+                    role_badge = ui.badge(
+                        SHOT_ROLE_LABELS[role], color=SHOT_ROLE_BADGE_COLORS[role]
+                    ).classes('text-[8px] font-bold py-0 px-1 rounded-sm flex-shrink-0')
+                    with role_badge:
+                        ui.tooltip(f"Shot type: {SHOT_ROLE_LABELS[role]}")
+
+                    for t in deduped_tags[:4]:
+                        disp = t
+                        if len(disp) > 8:
+                            disp = disp[:7] + "…"
+                        badge_el = ui.badge(disp, color='slate').classes('text-[8px] font-medium py-0 px-1 rounded-sm flex-shrink-0')
+                        with badge_el:
+                            ui.tooltip(t).classes('bg-slate-800 text-white text-[9px] p-1.5 rounded')
+                    if len(deduped_tags) > 4:
+                        ui.badge(f"+{len(deduped_tags)-4}", color='blue').classes('text-[8px] font-bold py-0 px-1 rounded-sm flex-shrink-0')
                         
                 with ui.row().classes('w-full justify-between items-center mt-1 px-1'):
                     ui.label(f"Ch {item.get('chapter')}, Sc {item.get('scene')}").classes('text-[10px] font-bold text-slate-700')

@@ -202,6 +202,7 @@ DEFAULT_SETTINGS = {
     "llm_model": "unsloth/gemma-4-e4b-it",
     "llm_launch_path": "",
     "llm_launch_args": "",
+    "vram_auto_switch": True,
     "stt_engine": "ABI-Subtitles",
     "stt_device": "GPU/CUDA",
     "subtitles_server_url": "http://127.0.0.1:5050",
@@ -1627,103 +1628,14 @@ with ui.dialog() as clear_comfy_dialog, ui.card().classes('w-full max-w-md p-6 r
 async def free_all_memory():
     """Unloads model weights and clears memory caches from ComfyUI and active LLM providers asynchronously to prevent UI freeze."""
     ui.notify("Dispatching VRAM/RAM clearance commands...", type="info")
-    
-    # 1. Clear ComfyUI Cache and Unload Models
-    comfy_url = get_setting("comfy_url", "127.0.0.1:8188")
-    if "http" in comfy_url:
-        comfy_url = comfy_url.replace("http://", "").replace("https://", "").strip("/")
-        
-    llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
-    model_name = get_setting("llm_model", "local-model")
-    
-    # Resolve the root host address to avoid trailing paths (e.g., "http://127.0.0.1:1234/v1" -> "http://127.0.0.1:1234")
-    import urllib.parse
-    try:
-        parsed_url = urllib.parse.urlparse(llm_url)
-        base_host_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-    except Exception:
-        base_host_url = llm_url
 
-    state.add_console_log(f"[Memory-Engine] Dispatching asynchronous target VRAM clear requests. Configured default model is '{model_name}'. Host: {base_host_url}")
+    from services import vram_manager
 
-    import httpx
-    async with httpx.AsyncClient() as client:
-        # --- TARGET 1: ComfyUI Model Unload & Cache Clear ---
-        try:
-            resp = await client.post(
-                f"http://{comfy_url}/free", 
-                json={"unload_models": True, "free_memory": True}, 
-                timeout=2.0
-            )
-            if resp.status_code == 200:
-                state.add_console_log("[Memory-Engine] Successfully requested ComfyUI model unload and cache clear.")
-            else:
-                state.add_console_log(f"[Memory-Engine] ComfyUI free returned status code: {resp.status_code}")
-        except Exception as e:
-            state.add_console_log(f"[Memory-Engine] ComfyUI clearance skipped or host offline: {str(e)}")
-
-        # --- TARGET 2: Target-Specific LM Studio Unload ---
-        try:
-            # Send targeted unload specifically for the model name saved in settings
-            await client.post(
-                f"{base_host_url}/api/v1/models/unload", 
-                json={"instance_id": model_name}, 
-                timeout=1.5
-            )
-            state.add_console_log(f"[Memory-Engine] Sent LM Studio targeted unload command for: {model_name}")
-        except Exception:
-            pass
-
-        # --- TARGET 3: Dynamic llama-server Unload ---
-        try:
-            # 1. Fetch current model status list from the server
-            models_resp = await client.get(f"{base_host_url}/models", timeout=2.0)
-            if models_resp.status_code == 200:
-                models_data = models_resp.json()
-                
-                # Normalize the structure (handles raw array list or wrapped {"data": [...]})
-                if isinstance(models_data, dict):
-                    models_list = models_data.get("data", models_data.get("models", []))
-                    if not models_list and "id" in models_data:
-                        models_list = [models_data]
-                elif isinstance(models_data, list):
-                    models_list = models_data
-                else:
-                    models_list = []
-
-                # 2. Collect IDs of all currently loaded models
-                loaded_model_ids = []
-                for item in models_list:
-                    if isinstance(item, dict):
-                        status = item.get("status", {})
-                        status_val = status.get("value") if isinstance(status, dict) else None
-                        
-                        if status_val == "loaded":
-                            m_id = item.get("id")
-                            if m_id:
-                                loaded_model_ids.append(m_id)
-
-                # 3. Request unloads for any models that are actually resident in memory
-                if loaded_model_ids:
-                    for m_id in loaded_model_ids:
-                        try:
-                            unload_resp = await client.post(
-                                f"{base_host_url}/models/unload", 
-                                json={"model": m_id}, 
-                                timeout=2.0
-                            )
-                            if unload_resp.status_code == 200:
-                                state.add_console_log(f"[Memory-Engine] Sent llama-server targeted unload command for loaded model: {m_id}")
-                            else:
-                                state.add_console_log(f"[Memory-Engine] llama-server unload returned status {unload_resp.status_code} for: {m_id}")
-                        except Exception as unload_err:
-                            state.add_console_log(f"[Memory-Engine] Error unloading model '{m_id}' from llama-server: {str(unload_err)}")
-                else:
-                    state.add_console_log("[Memory-Engine] llama-server reports no models are currently loaded.")
-            else:
-                state.add_console_log(f"[Memory-Engine] Query to llama-server /models returned status code: {models_resp.status_code}")
-        except Exception as e:
-            state.add_console_log(f"[Memory-Engine] Skipped dynamic llama-server unload or host offline: {str(e)}")
+    state.add_console_log(
+        f"[Memory-Engine] Dispatching manual VRAM/RAM clearance to ComfyUI and the LLM host "
+        f"('{get_setting('llm_model', 'local-model')}')."
+    )
+    await asyncio.to_thread(vram_manager.free_all, state.add_console_log)
 
     ui.notify("VRAM and RAM clearance commands successfully sent!", type="positive")
 

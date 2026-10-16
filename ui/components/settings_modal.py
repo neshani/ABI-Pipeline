@@ -309,6 +309,13 @@ class SettingsModal:
                             on_click=self.refresh_llm_models
                         ).props('flat dense').classes('h-10 text-blue-600').tooltip('Scan Connection for Models')
 
+                    ui.checkbox(
+                        'Auto-release VRAM when switching between ComfyUI and the LLM',
+                        value=self.settings.get('vram_auto_switch', True)
+                    ).bind_value(self.settings, 'vram_auto_switch').tooltip(
+                        'Sends the ComfyUI cache-clear before an LLM request, and unloads the LLM before rendering.'
+                    )
+
             # 2. UI & Notifications Accordion
             with ui.expansion('Notifications & Export Options', icon='notifications').classes('w-full border rounded-lg bg-slate-50/50'):
                 with ui.column().classes('w-full p-4 gap-3 bg-white'):

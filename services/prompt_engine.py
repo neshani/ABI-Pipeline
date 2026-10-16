@@ -7,6 +7,7 @@ import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from database.connection import get_setting
+from services import vram_manager
 from ui import state
 
 REFUSAL_KEYWORDS = [
@@ -157,6 +158,9 @@ async def get_llm_response(
     ``extra_payload`` merges into the request body, e.g. to disable a model's
     thinking mode: ``{"chat_template_kwargs": {"enable_thinking": False}}``.
     """
+    # Loading the LLM will evict ComfyUI if it is the one holding the GPU.
+    await vram_manager.ensure_llm_async()
+
     endpoint = llm_url.rstrip("/")
     if "/v1" not in endpoint and "/api" not in endpoint:
         endpoint = f"{endpoint}/v1/chat/completions"
