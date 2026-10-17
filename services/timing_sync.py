@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Tuple
 from sqlmodel import Session, select
 from database.connection import engine, get_setting
 from database.models import Book, Chapter
+from services import compat
 
 def get_audio_duration_with_ffmpeg(audio_path: str) -> float:
     """Queries ffmpeg.probe to retrieve track duration in seconds."""
@@ -195,10 +196,14 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
             
         write_session.commit()
 
-    # Read the current prompts.csv
+    # Read the current prompts.csv. Normalise the header first: the desired
+    # order below is expressed in current names, so a pre-rename file must be
+    # mapped onto them *before* the unknown-column diff is computed, or the
+    # rewritten file would carry both a ``shot`` and a ``scene`` column.
     rows = []
     with open(prompts_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="|")
+        reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
         fieldnames = list(reader.fieldnames) if reader.fieldnames else []
         for row in reader:
             rows.append(row)
@@ -208,7 +213,7 @@ def sync_book_timing(book_id: int, project_name: str, book_name: str, console_lo
         return True
 
     # Define exact, structured column layout required by the desktop client
-    desired_order = ["chapter", "scene", "prompt", "quote", "approved", "timestamp"]
+    desired_order = ["chapter", "shot", "prompt", "quote", "approved", "timestamp"]
     other_fields = [f for f in fieldnames if f not in desired_order]
     final_fieldnames = desired_order + other_fields
 

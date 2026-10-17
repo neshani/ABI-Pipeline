@@ -51,7 +51,7 @@ class ScenePrompt(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     book_id: int = Field(foreign_key="book.id", index=True)
     chapter_num: int = Field(index=True)
-    scene_num: int = Field(index=True)
+    shot_num: int = Field(index=True)   # the image unit; renamed from scene_num
     prompt: str
     quote: str
     approved: bool = Field(default=False)
@@ -80,7 +80,7 @@ class CharacterTimelineEvent(SQLModel, table=True):
     # Null represents the absolute Base State (Initial Appearance)
     book_id: Optional[int] = Field(default=None, foreign_key="book.id", index=True)
     chapter_num: int = Field(default=0, index=True)
-    scene_num: int = Field(default=0, index=True)
+    shot_num: int = Field(default=0, index=True)   # the image unit; renamed from scene_num
     
     label: Optional[str] = Field(default="Base State")
     

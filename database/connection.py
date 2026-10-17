@@ -11,8 +11,16 @@ DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 engine = create_engine(DATABASE_URL, connect_args={"timeout": 15})
 
 def init_db():
-    """Initializes the SQLite database and creates the tables if they don't exist."""
+    """Initializes the SQLite database, creates missing tables, then migrates schema.
+
+    ``create_all()`` only creates tables that are absent -- it will not rename a
+    column on a database that already exists, which is the case for anyone
+    upgrading the app. Retired column names are renamed by ``apply_migrations``.
+    """
     SQLModel.metadata.create_all(engine)
+    from .migrations import apply_migrations
+    for change in apply_migrations(engine):
+        print(f"[Migrations] renamed column: {change}")
 
 def get_setting(key: str, default=None, session: Optional[Session] = None):
     """Retrieves a setting by key. Automatically parses JSON strings into Python dicts/lists."""

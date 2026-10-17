@@ -72,7 +72,7 @@ playground_results: List[Dict[str, Any]] = []  # [{"chunk": "", "quote": "", "pr
 # sentence structure on), so the getattr fallbacks at the call sites hold.
 
 # --- Dynamic Prompt Generation Task States ---
-recent_prompts: List[Dict[str, Any]] = []  # Stores last 5 generated prompts: [{"book": "", "chapter": 1, "scene": 1, "prompt": "", "quote": "", "status": ""}]
+recent_prompts: List[Dict[str, Any]] = []  # Stores last 5 generated prompts: [{"book": "", "chapter": 1, "shot": 1, "prompt": "", "quote": "", "status": ""}]
 prompt_gen_active: bool = False
 cancel_prompt_gen_flag: bool = False
 
@@ -141,7 +141,7 @@ style_chunk_count: int = 4
 style_has_source_material: bool = False
 
 # --- Live Rendered Images Feed States ---
-recent_rendered_images: List[Dict[str, Any]] = []  # [{"filename": "", "base64": "", "chapter": 1, "scene": 1, "quote": "", "prompt": ""}]
+recent_rendered_images: List[Dict[str, Any]] = []  # [{"filename": "", "base64": "", "chapter": 1, "shot": 1, "quote": "", "prompt": ""}]
 recent_images_refresh: Optional[Any] = None
 
 # --- Persistent Image Preview Dialog Bindings ---

@@ -7,6 +7,7 @@ from typing import Optional
 from sqlmodel import Session, select, delete
 from database.connection import engine, get_setting
 from database.models import Project, Book, Chapter, ScenePrompt
+from services import compat
 
 
 def sync_project_status(project_id: int, session: Session) -> None:
@@ -79,8 +80,9 @@ def sync_prompts_csv_to_db_cache(book_id: int, session: Session) -> None:
             if not reader.fieldnames:
                 return
             
-            # Normalize column headers to lowercase
-            reader.fieldnames = [name.strip().lower() if name else "" for name in reader.fieldnames]
+            # Normalize column headers to lowercase and map retired names
+            # (e.g. scene) onto the current ones.
+            reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
             
             # Clear existing scene cache for this book
             session.exec(delete(ScenePrompt).where(ScenePrompt.book_id == book_id))
@@ -90,7 +92,7 @@ def sync_prompts_csv_to_db_cache(book_id: int, session: Session) -> None:
                 cleaned_row = {k.strip().lower(): v.strip() if v else "" for k, v in row.items() if k}
                 try:
                     ch = int(float(cleaned_row.get("chapter", "1")))
-                    sc = int(float(cleaned_row.get("scene", "1")))
+                    sc = int(float(cleaned_row.get("shot", "1")))
                 except (ValueError, TypeError):
                     ch, sc = 1, 1
 
@@ -100,7 +102,7 @@ def sync_prompts_csv_to_db_cache(book_id: int, session: Session) -> None:
                 scene_prompt = ScenePrompt(
                     book_id=book_id,
                     chapter_num=ch,
-                    scene_num=sc,
+                    shot_num=sc,
                     prompt=cleaned_row.get("prompt", ""),
                     quote=cleaned_row.get("quote", ""),
                     approved=is_approved,
@@ -203,7 +205,7 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
 
             if rows:
                 header = rows[0]
-                header_clean = [h.strip().lower() for h in header]
+                header_clean = compat.normalize_fieldnames(header)
                 
                 # Dynamically resolve columns by name or index fallback
                 if "chapter" in header_clean or "prompt" in header_clean:
@@ -213,7 +215,7 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
                     except ValueError:
                         ch_idx = 0
                     try:
-                        sc_idx = header_clean.index("scene")
+                        sc_idx = header_clean.index("shot")
                     except ValueError:
                         sc_idx = 1
                     try:
@@ -240,11 +242,11 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
                     except (ValueError, TypeError):
                         chapter_num = 1
                     try:
-                        scene_num = int(float(row[sc_idx].strip()))
+                        shot_num = int(float(row[sc_idx].strip()))
                     except (ValueError, TypeError):
-                        scene_num = 1
+                        shot_num = 1
 
-                    scene_prefix = f"{chapter_num:02d}_{scene_num:02d}"
+                    scene_prefix = f"{chapter_num:02d}_{shot_num:02d}"
 
                     # Scan the high-speed set to see if this scene prefix is rendered
                     image_found = False
@@ -895,6 +897,7 @@ def get_book_stats(project_name: str, book_name: str) -> dict:
         try:
             with open(prompts_path, mode='r', encoding='utf-8') as f:
                 reader = csv.DictReader(f, delimiter='|')
+                reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
                 rows = list(reader)
                 stats["total_prompts"] = len(rows)
                 approved_count = 0

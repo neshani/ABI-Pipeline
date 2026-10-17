@@ -8,6 +8,7 @@ from sqlmodel import Session, select
 from database.connection import engine, get_setting
 from database.models import Project, Book, Character, CharacterAlias, CharacterBookLink, CharacterStateModifier, CharacterTimelineEvent
 from services.prompt_engine import smart_chunk_text, get_llm_response
+from services import compat
 
 def get_characters_json_path(project_id: int, session: Optional[Session] = None) -> Optional[Path]:
     """Retrieves the file-as-source-of-truth characters.json target path."""
@@ -119,7 +120,7 @@ def save_project_characters_to_json(project_id: int):
                 timeline_serialized.append({
                     "book_name": book_name,
                     "chapter_num": ev.chapter_num,
-                    "scene_num": ev.scene_num,
+                    "shot_num": ev.shot_num,
                     "label": ev.label,
                     "visual_description": ev.visual_description,
                     "profile": {
@@ -281,7 +282,7 @@ def sync_project_characters_from_json(project_id: int, session: Optional[Session
                     character_id=new_char.id,
                     book_id=None,
                     chapter_num=0,
-                    scene_num=0,
+                    shot_num=0,
                     label="Base State",
                     demographics=legacy_profile.get("demographics"),
                     physical_build=legacy_profile.get("physical_build"),
@@ -300,7 +301,11 @@ def sync_project_characters_from_json(project_id: int, session: Optional[Session
                         character_id=new_char.id,
                         book_id=b_id,
                         chapter_num=ev_data.get("chapter_num", 0),
-                        scene_num=ev_data.get("scene_num", 0),
+                        # characters.json is the declared source of truth and may
+                        # predate the scene->shot rename, so accept both spellings.
+                        # Reading only the new key would silently load every
+                        # existing timeline event as shot 0.
+                        shot_num=compat.get_shot(ev_data, 0),
                         label=ev_data.get("label", "Base State" if b_id is None else "Override State"),
                         demographics=prof.get("demographics"),
                         physical_build=prof.get("physical_build"),
@@ -635,7 +640,7 @@ async def run_stateful_character_profiling(
                     character_id=character_id,
                     book_id=None,
                     chapter_num=0,
-                    scene_num=0,
+                    shot_num=0,
                     label="Base State"
                 )
                 session.add(db_event)
@@ -993,13 +998,211 @@ def compile_character_description(char: Character, enabled_fields: Dict[str, boo
                 character_id=char.id,
                 book_id=None,
                 chapter_num=0,
-                scene_num=0,
+                shot_num=0,
                 label="Base State"
             )
             session.add(base_ev)
             session.commit()
             session.refresh(base_ev)
     return compile_character_description_from_event(char, base_ev, enabled_fields, use_sentence_structure)
+
+
+# --- automatic bracket repair ------------------------------------------------
+#
+# The prompt model names characters unprompted, but does not reliably wrap them
+# in the square brackets the renderer substitutes on - so a bare "Ewin" renders
+# as nothing at all. This puts those brackets back.
+#
+# It runs before tag resolution, which means prompts.csv files written before
+# this existed are repaired at render time without being regenerated.
+
+_AUTO_BRACKET_SETTING = "auto_bracket_character_names"
+_TAG_SPAN = re.compile(r"\[[^\[\]]*\]")
+_LOWERCASE_WORD = re.compile(r"\b[a-z][a-z'\-]*\b")
+_LEADING_ARTICLE = re.compile(r"^(?:a|an|the)\s+", re.IGNORECASE)
+
+# project_id -> every word that appears in lowercase somewhere in that project's
+# prompts. A name in this set is also an ordinary word ("Stone" vs "stone"), so a
+# capital letter cannot be trusted to mark it as a name. Built from the project's
+# own prompts, so nothing is hardcoded about any language or series.
+_LOWERCASE_WORDS_CACHE: Dict[int, Set[str]] = {}
+
+
+def auto_bracket_enabled(session: Optional[Session] = None) -> bool:
+    """Global toggle for bracket repair; on unless the setting says otherwise."""
+    value = str(get_setting(_AUTO_BRACKET_SETTING, "1", session)).strip().lower()
+    return value not in ("0", "false", "off", "no", "")
+
+
+def get_bracketable_names(project_id: int,
+                          session: Optional[Session] = None) -> List[str]:
+    """A project's character names and aliases, longest first."""
+    should_close = False
+    if session is None:
+        session = Session(engine)
+        should_close = True
+    try:
+        names: List[str] = []
+        for c in session.exec(
+            select(Character).where(Character.project_id == project_id)
+        ).all():
+            if c.name and len(c.name.strip()) >= 3:
+                names.append(c.name.strip())
+        for a in session.exec(
+            select(CharacterAlias)
+            .join(Character)
+            .where(Character.project_id == project_id)
+        ).all():
+            if a.alias and len(a.alias.strip()) >= 3:
+                names.append(a.alias.strip())
+        return sorted(set(names), key=len, reverse=True)
+    finally:
+        if should_close:
+            session.close()
+
+
+def project_lowercase_words(project_id: int) -> Set[str]:
+    """Words that appear lowercased in this project's prompts, cached.
+
+    Used to tell a name apart from an ordinary word. Empty when a project has no
+    prompts yet, in which case callers fall back to the conservative behaviour.
+    """
+    if project_id in _LOWERCASE_WORDS_CACHE:
+        return _LOWERCASE_WORDS_CACHE[project_id]
+
+    words: Set[str] = set()
+    try:
+        with Session(engine) as session:
+            project = session.get(Project, project_id)
+            base_dir = Path(get_setting("output_dir", "./output", session))
+        if project:
+            for csv_path in (base_dir / project.name).glob("*/prompts.csv"):
+                try:
+                    text = csv_path.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    continue
+                words.update(_LOWERCASE_WORD.findall(text))
+    except Exception:
+        pass
+
+    _LOWERCASE_WORDS_CACHE[project_id] = words
+    return words
+
+
+def _starts_sentence(text: str, pos: int) -> bool:
+    """True when pos opens a sentence, where a capital letter proves nothing."""
+    i = pos - 1
+    while i >= 0 and text[i] in " \t":
+        i -= 1
+    return i < 0 or text[i] in ".!?\n"
+
+
+# (project_id, count, hash) -> compiled (multi-word, single-word) matchers.
+# A large project carries over a thousand names, and rebuilding the alternations
+# for every prompt dominated the cost, so they are compiled once.
+_PATTERN_CACHE: Dict[tuple, tuple] = {}
+
+
+def _name_patterns(project_id: int, names: List[str]):
+    """Compiled matchers for a project's names, longest alternative first."""
+    key = (project_id, len(names), hash(tuple(names)))
+    cached = _PATTERN_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    multi: Set[str] = set()
+    single: List[str] = []
+    for name in names:
+        if " " in name:
+            multi.add(name)
+            stripped = _LEADING_ARTICLE.sub("", name)
+            # Only keep the article-stripped form if it is STILL a phrase. A
+            # single word would land in the case-insensitive pattern and bypass
+            # every guard ("The Captain" -> bare "captain").
+            if stripped != name and " " in stripped:
+                multi.add(stripped)
+        elif name != name.lower():
+            # An all-lowercase single word ("captain", "doctor") matches the
+            # ordinary noun it is spelled like, everywhere, so it is never
+            # bracketed automatically. Multi-word aliases are still allowed.
+            single.append(name)
+
+    def build(values, flags=0, extra=""):
+        if not values:
+            return None
+        alts = sorted(values, key=len, reverse=True)
+        return re.compile("|".join(
+            rf"(?<!\w){re.escape(v)}(?!\w){extra}" for v in alts), flags)
+
+    # A capitalised word immediately followed by another capitalised word is part
+    # of a longer proper noun that is not the character ("White District",
+    # "Mataro Sphinxes"), so it is left alone.
+    result = (build(multi, re.IGNORECASE), build(single, 0, r"(?!\s+[A-Z])"))
+    if len(_PATTERN_CACHE) > 4:
+        _PATTERN_CACHE.clear()
+    _PATTERN_CACHE[key] = result
+    return result
+
+
+def auto_bracket_character_names(prompt: str, project_id: int,
+                                 names: Optional[List[str]] = None) -> str:
+    """Wrap bare character names and aliases so the renderer can substitute them.
+
+    A single-word name is matched case-sensitively. Where the capital proves
+    nothing - the word is also an ordinary one, judged from the project's own
+    prompts, and the hit opens a sentence - it is left alone, so "Stone walls"
+    is never mistaken for the character Stone.
+
+    Multi-word aliases (epithets such as "tall man") match case-insensitively.
+    A phrase has too little false-positive surface to need that guard, and it is
+    how an unnamed character becomes resolvable at all, since the model will
+    write "a tall man" whether or not it can name him.
+
+    Idempotent: anything already inside brackets is left untouched. Brackets
+    that resolve to no character are stripped downstream, so a wrong guess here
+    degrades to plain text rather than to a wrong description.
+    """
+    if not prompt or not prompt.strip():
+        return prompt
+    if not project_id or not auto_bracket_enabled():
+        return prompt
+    if names is None:
+        names = get_bracketable_names(project_id)
+    if not names:
+        return prompt
+
+    lowercase_words = project_lowercase_words(project_id) if project_id else set()
+    spans: List[str] = []
+
+    def stash(text: str) -> str:
+        spans.append(text)
+        return f"\x00{len(spans) - 1}\x00"
+
+    # Pull existing tags out first, so repair can never nest brackets.
+    work = _TAG_SPAN.sub(lambda m: stash(m.group(0)), prompt)
+
+    multi_rx, single_rx = _name_patterns(project_id, names)
+    prompt_words = set(_LOWERCASE_WORD.findall(work))
+
+    if multi_rx is not None:
+        # Epithets resolve through the alias table, which matches
+        # case-insensitively, so the bracketed text is whatever was written.
+        work = multi_rx.sub(lambda m: stash(f"[{m.group(0)}]"), work)
+
+    if single_rx is not None:
+        def repl(m):
+            word = m.group(0)
+            ambiguous = (word.lower() in lowercase_words
+                         or word.lower() in prompt_words)
+            if ambiguous and _starts_sentence(work, m.start()):
+                return word
+            return stash(f"[{word}]")
+
+        work = single_rx.sub(repl, work)
+
+    for i, span in enumerate(spans):
+        work = work.replace(f"\x00{i}\x00", span)
+    return work
 
 
 def replace_character_tags_in_prompt(
@@ -1009,12 +1212,16 @@ def replace_character_tags_in_prompt(
     use_sentence_structure: bool,
     book_id: Optional[int] = None,
     chapter_num: Optional[int] = None,
-    scene_num: Optional[int] = None
+    shot_num: Optional[int] = None
 ) -> str:
     """
     Scans a prompt string for bracketed tags, resolves characters using book-aware linking and recency fallback,
     and returns a modified prompt string containing compiled physical descriptions.
+
+    Bare character names are bracketed first (see ``auto_bracket_character_names``),
+    so prompts generated before that existed still resolve.
     """
+    prompt = auto_bracket_character_names(prompt, project_id)
     bracket_regex = re.compile(r"\[(.*?)\]")
     matches = bracket_regex.findall(prompt)
     if not matches:
@@ -1131,12 +1338,12 @@ def replace_character_tags_in_prompt(
                         if chapter_num is not None and ev.chapter_num < chapter_num:
                             matched_evs.append((ev, ev_order))
                         elif chapter_num is not None and ev.chapter_num == chapter_num:
-                            if scene_num is not None and ev.scene_num <= scene_num:
+                            if shot_num is not None and ev.shot_num <= shot_num:
                                 matched_evs.append((ev, ev_order))
                 
                 resolved_ev = base_ev
                 if matched_evs:
-                    matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
+                    matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].shot_num))
                     resolved_ev = matched_evs[-1][0]
                 
                 if not resolved_ev:
@@ -1144,7 +1351,7 @@ def replace_character_tags_in_prompt(
                         character_id=char.id,
                         book_id=None,
                         chapter_num=0,
-                        scene_num=0,
+                        shot_num=0,
                         label="Base State"
                     )
                     session.add(resolved_ev)
@@ -1272,7 +1479,7 @@ def get_character_import_matches(tgt_project_id: int, src_project_id: int) -> Li
                 def tgt_sort_key(ev: CharacterTimelineEvent):
                     if ev.book_id is None:
                         return (-1, 0, 0, ev.id or 0)
-                    return (tgt_book_order_map.get(ev.book_id, 0), ev.chapter_num, ev.scene_num, ev.id or 0)
+                    return (tgt_book_order_map.get(ev.book_id, 0), ev.chapter_num, ev.shot_num, ev.id or 0)
                 tgt_latest_ev = sorted(tgt_evs, key=tgt_sort_key)[-1]
             
             mentions = get_mentions(tc, alias_texts)
@@ -1307,7 +1514,7 @@ def get_character_import_matches(tgt_project_id: int, src_project_id: int) -> Li
             def src_sort_key(ev: CharacterTimelineEvent):
                 if ev.book_id is None:
                     return (-1, 0, 0, ev.id or 0)
-                return (src_book_order_map.get(ev.book_id, 0), ev.chapter_num, ev.scene_num, ev.id or 0)
+                return (src_book_order_map.get(ev.book_id, 0), ev.chapter_num, ev.shot_num, ev.id or 0)
             
             latest_src_ev = sorted(src_evs, key=src_sort_key)[-1]
             
@@ -1460,7 +1667,7 @@ def execute_character_import(
                 def src_sort_key(ev: CharacterTimelineEvent):
                     if ev.book_id is None:
                         return (-1, 0, 0, ev.id or 0)
-                    return (src_book_order_map.get(ev.book_id, 0), ev.chapter_num, ev.scene_num, ev.id or 0)
+                    return (src_book_order_map.get(ev.book_id, 0), ev.chapter_num, ev.shot_num, ev.id or 0)
                 src_latest_ev = sorted(src_evs, key=src_sort_key)[-1]
             
             tgt_base_ev = session.exec(
@@ -1474,7 +1681,7 @@ def execute_character_import(
                     character_id=tgt_char_id,
                     book_id=None,
                     chapter_num=0,
-                    scene_num=0,
+                    shot_num=0,
                     label="Base State"
                 )
                 session.add(tgt_base_ev)
@@ -1786,7 +1993,7 @@ def detach_alias_to_character(
                 character_id=new_char.id,
                 book_id=None,
                 chapter_num=0,
-                scene_num=0,
+                shot_num=0,
                 label="Base State"
             )
             session.add(base_ev)

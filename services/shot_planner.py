@@ -9,7 +9,7 @@ row as an already-finished scene, so pre-writing rows there would make prompt
 generation skip the whole book.
 
 The chunk size used is recorded in the plan, and each scene carries a digest of
-its chunk, because ``(chapter, scene)`` only maps back to the same text while
+its chunk, because ``(chapter, shot)`` only maps back to the same text while
 the transcript and the chunk size are unchanged. ``scene_chunk`` re-derives a
 chunk on demand; ``verify_plan`` reports any scene whose text has drifted.
 
@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from database.connection import get_setting
+from services import compat
 from services.prompt_engine import get_llm_response, smart_chunk_text
 from services.prompt_library import SHOT_TYPES, planner_text
 
@@ -36,7 +37,7 @@ DEFAULT_WINDOW = 30
 DEFAULT_CHUNK_WORDS = 350
 
 PLAN_FILENAME = "shot_plan.csv"
-PLAN_COLUMNS = ("chapter", "scene", "shot_type", "chunk_words", "chunk_hash",
+PLAN_COLUMNS = ("chapter", "shot", "shot_type", "chunk_words", "chunk_hash",
                 "prompt_hash")
 
 _LINE = re.compile(r"^\s*(\d+)\s*[:.\)\-]\s*\**([A-Za-z]+)")
@@ -159,7 +160,7 @@ async def plan_book(
     log: Optional[Callable[[str], None]] = None,
     template: Optional[str] = None,
 ) -> List[Tuple[int, int, str, str]]:
-    """``[(chapter_num, scene_num, shot_type, chunk_hash)]`` for a whole book.
+    """``[(chapter_num, shot_num, shot_type, chunk_hash)]`` for a whole book.
 
     Chapter numbering matches prompt generation exactly: the transcript is
     split on ``==CHAPTER==`` and numbered from 1, so on these transcripts the
@@ -177,8 +178,8 @@ async def plan_book(
         if log:
             log(f"[Shot-Plan] Chapter {chapter_num}: {len(chunks)} scenes")
         shots = await plan_chunks(chunks, llm_url, model, window, log, template)
-        for scene_num, (shot, chunk) in enumerate(zip(shots, chunks), start=1):
-            plan.append((chapter_num, scene_num, shot, chunk_digest(chunk)))
+        for shot_num, (shot, chunk) in enumerate(zip(shots, chunks), start=1):
+            plan.append((chapter_num, shot_num, shot, chunk_digest(chunk)))
     return plan
 
 
@@ -212,8 +213,10 @@ def load_plan(
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="|")
+        reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
         return [{k.strip().lower(): (v or "").strip() for k, v in row.items() if k}
-                for row in csv.DictReader(f, delimiter="|")]
+                for row in reader]
 
 
 def plan_chunk_words(project_name: str, book_name: str,
@@ -244,14 +247,14 @@ def scene_chunk(
     project_name: str,
     book_name: str,
     chapter_num: int,
-    scene_num: int,
+    shot_num: int,
     chunk_words: Optional[int] = None,
     base: Optional[Path] = None,
 ) -> Optional[str]:
     """Re-derive one scene's chunk text.
 
     ``chunk_words`` defaults to the size pinned in the plan, so a stored
-    ``(chapter, scene)`` maps back to the same text it was planned from.
+    ``(chapter, shot)`` maps back to the same text it was planned from.
     """
     if chunk_words is None:
         chunk_words = plan_chunk_words(project_name, book_name, base) or DEFAULT_CHUNK_WORDS
@@ -260,7 +263,7 @@ def scene_chunk(
         return None
     for num, chunks in chunk_book_chapters(text, chunk_words):
         if num == int(chapter_num):
-            idx = int(scene_num) - 1
+            idx = int(shot_num) - 1
             return chunks[idx] if 0 <= idx < len(chunks) else None
     return None
 
@@ -268,7 +271,7 @@ def scene_chunk(
 def verify_plan(
     project_name: str, book_name: str, base: Optional[Path] = None
 ) -> List[Tuple[int, int, str, str]]:
-    """Re-derive every planned scene and return ``(chapter, scene, stored, actual)``
+    """Re-derive every planned scene and return ``(chapter, shot, stored, actual)``
     for those whose chunk text no longer matches the plan."""
     rows = load_plan(project_name, book_name, base)
     if not rows:
@@ -276,7 +279,7 @@ def verify_plan(
     words = plan_chunk_words(project_name, book_name, base)
     mismatches: List[Tuple[int, int, str, str]] = []
     for row in rows:
-        chapter, scene = int(row["chapter"]), int(row["scene"])
+        chapter, scene = int(row["chapter"]), int(row["shot"])
         chunk = scene_chunk(project_name, book_name, chapter, scene, words, base)
         actual = chunk_digest(chunk) if chunk is not None else ""
         if actual != row.get("chunk_hash", ""):
@@ -296,7 +299,7 @@ async def ensure_book_plan(
     log: Optional[Callable[[str], None]] = None,
     selection: Optional[Dict[str, str]] = None,
 ) -> Dict[Tuple[int, int], str]:
-    """``{(chapter, scene): shot_type}`` for a book.
+    """``{(chapter, shot): shot_type}`` for a book.
 
     Only consulted in ``auto`` mode. A stored plan is reused when it was built
     with the same chunk size *and* the same Shot Planner prompt; otherwise the
@@ -315,7 +318,7 @@ async def ensure_book_plan(
     if stored and stored_words == chunk_words and stored_digest == digest:
         if log:
             log(f"[Shot-Plan] reusing stored plan for '{book_name}' ({len(stored)} scenes)")
-        return {(int(r["chapter"]), int(r["scene"])): r["shot_type"] for r in stored}
+        return {(int(r["chapter"]), int(r["shot"])): r["shot_type"] for r in stored}
     if stored and log:
         if stored_words != chunk_words:
             log(f"[Shot-Plan] stored plan for '{book_name}' used {stored_words} words "

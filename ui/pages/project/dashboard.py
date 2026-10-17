@@ -850,10 +850,10 @@ def render_recent_images_feed():
             with ui.row().classes('w-full gap-4 items-start overflow-x-auto pb-2 flex-nowrap'):
                 for item in reversed(state.recent_rendered_images):
                     with ui.card().classes('w-44 border p-2 rounded-lg shadow-xs bg-slate-50 flex-shrink-0 cursor-pointer') \
-                            .on('click', lambda _, img=item['base64'], title=f"Ch {item['chapter']}, Scene {item['scene']}": open_large_image(img, title)):
+                            .on('click', lambda _, img=item['base64'], title=f"Ch {item['chapter']}, Scene {item['shot']}": open_large_image(img, title)):
                         ui.image(item['base64']).classes('w-full h-28 rounded object-cover border')
                         with ui.column().classes('gap-0 mt-1'):
-                            ui.label(f"Ch {item['chapter']}, Scene {item['scene']}").classes('text-[10px] font-bold text-slate-700')
+                            ui.label(f"Ch {item['chapter']}, Scene {item['shot']}").classes('text-[10px] font-bold text-slate-700')
                             ui.label(item['prompt'][:40] + "...").classes('text-[8px] text-slate-500 leading-tight')
 
     state.recent_images_refresh = render_recent_images_feed.refresh
@@ -885,7 +885,7 @@ def render_recent_prompts_feed():
                     
                     with ui.card().classes(f'w-full border p-3 rounded-lg shadow-xs {bg_color}'):
                         with ui.row().classes('w-full justify-between items-center'):
-                            ui.label(f"{item['book']} — Ch {item['chapter']}, Scene {item['scene']}").classes('text-[10px] font-bold text-slate-500 uppercase')
+                            ui.label(f"{item['book']} — Ch {item['chapter']}, Scene {item['shot']}").classes('text-[10px] font-bold text-slate-500 uppercase')
                             ui.badge(badge_label, color=badge_color).classes('text-[9px]')
                         ui.label(f'Quote: "{item["quote"][:220]}..."' if len(item["quote"]) > 220 else f'Quote: "{item["quote"]}"').classes('text-xs italic text-slate-600 leading-normal')
                         ui.label(f'Prompt: {item["prompt"]}').classes('text-xs font-semibold text-blue-700 leading-normal')

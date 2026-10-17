@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from database.connection import get_setting
 from services import vram_manager
+from services import compat
 from ui import state
 
 REFUSAL_KEYWORDS = [
@@ -321,11 +322,14 @@ async def generate_prompt_for_chunk_async(
         final_prompt = task["prompt"]
         raw_response = await get_llm_response(final_prompt, llm_url, model_name)
         parsed = parse_llm_response(raw_response)
+        # Local import: character_manager imports this module.
+        from services.character_manager import auto_bracket_character_names
         return {
             "chapter": task["chapter_num"],
-            "scene": task["scene_num"],
+            "shot": task["shot_num"],
             "quote": parsed["quote"],
-            "prompt": parsed["prompt"],
+            "prompt": auto_bracket_character_names(
+                parsed["prompt"], task.get("project_id") or 0),
             "status": parsed["status"],
             "raw": parsed["raw"]
         }
@@ -345,7 +349,7 @@ def ensure_shot_role_column(csv_path: Path) -> None:
     they were originally rendered.
 
     The position matters: the append paths write
-    ``chapter, scene, prompt, quote, shot_role`` positionally, so a header that
+    ``chapter, shot, prompt, quote, shot_role`` positionally, so a header that
     carries shot_role anywhere else (``sync_book_timing`` moves unknown columns
     to the end, for instance) would misalign every subsequently appended row.
     This rewrites the file so the column always lands after ``quote``.
@@ -360,7 +364,7 @@ def ensure_shot_role_column(csv_path: Path) -> None:
     if not rows:
         return
 
-    header = [h.strip().lower() for h in rows[0]]
+    header = compat.normalize_fieldnames(rows[0])
     current = header.index("shot_role") if "shot_role" in header else None
 
     if current is None:
@@ -391,7 +395,7 @@ def ensure_shot_role_column(csv_path: Path) -> None:
 
 
 def sort_csv_by_chapter_scene(csv_path: Path):
-    """Sorts the final prompts.csv file numerically by chapter and scene."""
+    """Sorts the final prompts.csv file numerically by chapter and shot."""
     if not csv_path.exists():
         return
     try:
@@ -404,7 +408,7 @@ def sort_csv_by_chapter_scene(csv_path: Path):
                 if len(row) >= 2:
                     rows.append(row)
         
-        # Sort rows numerically by chapter (index 0) and scene (index 1)
+        # Sort rows numerically by chapter (index 0) and shot (index 1)
         rows.sort(key=lambda r: (int(r[0]), int(r[1])))
         
         with open(csv_path, "w", encoding="utf-8", newline="") as f:
@@ -495,9 +499,10 @@ async def start_project_prompt_gen(project_id: int):
                 try:
                     with open(output_csv_path, "r", encoding="utf-8") as csv_f:
                         reader = csv.DictReader(csv_f, delimiter="|")
+                        reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
                         for row in reader:
-                            if "chapter" in row and "scene" in row:
-                                completed_scenes.add((int(row["chapter"]), int(row["scene"])))
+                            if "chapter" in row and "shot" in row:
+                                completed_scenes.add((int(row["chapter"]), int(row["shot"])))
                 except Exception as ex:
                     state.add_console_log(f"[Prompt-Gen] Warning reading existing prompts.csv: {str(ex)}")
 
@@ -541,17 +546,18 @@ async def start_project_prompt_gen(project_id: int):
             )
 
             tasks = []
-            for chapter_num, scene_num, chunk_text in pending:
+            for chapter_num, shot_num, chunk_text in pending:
                 # NONE is a valid plan outcome, but pacing is one image per
                 # chunk, so those scenes fall back to the single prompt.
                 role = prompt_lib.resolve_role(
-                    shot_map.get((chapter_num, scene_num)), shot_mode
+                    shot_map.get((chapter_num, shot_num)), shot_mode
                 ) or "single"
                 tasks.append({
                     "chunk": chunk_text,
                     "chapter_num": chapter_num,
-                    "scene_num": scene_num,
+                    "shot_num": shot_num,
                     "shot_role": role,
+                    "project_id": project_id,
                     "prompt": prompt_lib.render_with_selection(role, chunk_text, selection),
                 })
 
@@ -583,7 +589,7 @@ async def start_project_prompt_gen(project_id: int):
                 output_csv_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(output_csv_path, "w", encoding="utf-8", newline="") as csv_f:
                     writer = csv.writer(csv_f, delimiter="|")
-                    writer.writerow(["chapter", "scene", "prompt", "quote", "shot_role"])
+                    writer.writerow(["chapter", "shot", "prompt", "quote", "shot_role"])
 
             # Migrate legacy files that predate the shot_role column so appended
             # rows line up with the header.
@@ -591,7 +597,7 @@ async def start_project_prompt_gen(project_id: int):
 
             # 3. Warm-Up (First Prompt) Sequential Loading Phase
             first_task = tasks[0]
-            state.add_console_log(f"[Prompt-Gen] Sending sequential warm-up request to load the model into VRAM (Ch {first_task['chapter_num']}, Scene {first_task['scene_num']})...")
+            state.add_console_log(f"[Prompt-Gen] Sending sequential warm-up request to load the model into VRAM (Ch {first_task['chapter_num']}, Scene {first_task['shot_num']})...")
             
             warm_up_success = False
             warm_up_res = None
@@ -629,13 +635,13 @@ async def start_project_prompt_gen(project_id: int):
                     ref_log_path = base_output_dir / project_name / book_name / "refusals.log"
                     ref_log_path.parent.mkdir(parents=True, exist_ok=True)
                     with open(ref_log_path, "a", encoding="utf-8") as ref_f:
-                        ref_f.write(f"Chapter {warm_up_res['chapter']}, Scene {warm_up_res['scene']}:\n{warm_up_res['raw']}\n\n{'-'*40}\n\n")
+                        ref_f.write(f"Chapter {warm_up_res['chapter']}, Scene {warm_up_res['shot']}:\n{warm_up_res['raw']}\n\n{'-'*40}\n\n")
                     warm_up_res["prompt"] = "REFUSAL"
                     warm_up_res["quote"] = first_task["chunk"]
 
                 with open(output_csv_path, "a", encoding="utf-8", newline="") as csv_f:
                     writer = csv.writer(csv_f, delimiter="|")
-                    writer.writerow([warm_up_res["chapter"], warm_up_res["scene"], warm_up_res["prompt"], warm_up_res["quote"], first_task.get("shot_role", "character")])
+                    writer.writerow([warm_up_res["chapter"], warm_up_res["shot"], warm_up_res["prompt"], warm_up_res["quote"], first_task.get("shot_role", "character")])
 
                 with Session(engine) as session:
                     db_book = session.get(Book, book_id)
@@ -648,7 +654,7 @@ async def start_project_prompt_gen(project_id: int):
                 state.recent_prompts.append({
                     "book": book_name,
                     "chapter": warm_up_res["chapter"],
-                    "scene": warm_up_res["scene"],
+                    "shot": warm_up_res["shot"],
                     "prompt": warm_up_res["prompt"],
                     "quote": warm_up_res["quote"],
                     "status": warm_up_res["status"]
@@ -685,7 +691,7 @@ async def start_project_prompt_gen(project_id: int):
                         ref_log_path = base_output_dir / project_name / book_name / "refusals.log"
                         ref_log_path.parent.mkdir(parents=True, exist_ok=True)
                         with open(ref_log_path, "a", encoding="utf-8") as ref_f:
-                            ref_f.write(f"Chapter {res['chapter']}, Scene {res['scene']}:\n{res['raw']}\n\n{'-'*40}\n\n")
+                            ref_f.write(f"Chapter {res['chapter']}, Scene {res['shot']}:\n{res['raw']}\n\n{'-'*40}\n\n")
                         
                         # Store refusal in CSV with a placeholder for grid highlighting in Phase 5
                         res["prompt"] = "REFUSAL"
@@ -694,7 +700,7 @@ async def start_project_prompt_gen(project_id: int):
                     # Append results to prompts.csv immediately
                     with open(output_csv_path, "a", encoding="utf-8", newline="") as csv_f:
                         writer = csv.writer(csv_f, delimiter="|")
-                        writer.writerow([res["chapter"], res["scene"], res["prompt"], res["quote"], task_data.get("shot_role", "character")])
+                        writer.writerow([res["chapter"], res["shot"], res["prompt"], res["quote"], task_data.get("shot_role", "character")])
 
                     # Update database progress in-place
                     with Session(engine) as session:
@@ -709,7 +715,7 @@ async def start_project_prompt_gen(project_id: int):
                     ui_item = {
                         "book": book_name,
                         "chapter": res["chapter"],
-                        "scene": res["scene"],
+                        "shot": res["shot"],
                         "prompt": res["prompt"],
                         "quote": res["quote"],
                         "status": res["status"]
@@ -722,7 +728,7 @@ async def start_project_prompt_gen(project_id: int):
                 except asyncio.CancelledError:
                     raise
                 except Exception as ex:
-                    state.add_console_log(f"[Prompt-Gen] Chunk S{task_data['scene_num']} processing error: {str(ex)}")
+                    state.add_console_log(f"[Prompt-Gen] Chunk S{task_data['shot_num']} processing error: {str(ex)}")
                     return None
 
             # Wrap tasks as explicit task handles inside the event loop

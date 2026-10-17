@@ -11,6 +11,7 @@ from database.connection import engine, get_setting
 from database.models import Book, Project, Character, CharacterAlias, CharacterTimelineEvent
 from services.character_manager import compile_character_visual_prompt, save_project_characters_to_json, ensure_book_orders
 from services import style_library
+from services import compat
 from ui.pages.project.characters_tab import get_character_frequency_map
 from ui.components.prompt_editor_view import render_prompt_editor_view
 from ui.components.autocomplete import PromptAutocompleteManager
@@ -80,7 +81,7 @@ def load_prompts_csv(project_name: str, book_name: str) -> List[Dict[str, Any]]:
     try:
         with open(csv_path, mode='r', encoding='utf-8') as f:
             reader = csv.DictReader(f, delimiter='|')
-            fieldnames = [name.strip().lower() if name else "" for name in reader.fieldnames]
+            reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
             
             for row in reader:
                 cleaned_row = {}
@@ -98,18 +99,18 @@ def load_prompts_csv(project_name: str, book_name: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def _row_key(chapter, scene) -> str:
-    """Stable (chapter, scene) key, tolerant of ints, floats and strings."""
+def _row_key(chapter, shot) -> str:
+    """Stable (chapter, shot) key, tolerant of ints, floats and strings."""
     def norm(v):
         try:
             return str(int(float(v)))
         except (TypeError, ValueError):
             return str(v or "").strip()
-    return f"{norm(chapter)}|{norm(scene)}"
+    return f"{norm(chapter)}|{norm(shot)}"
 
 
 def _existing_prompt_columns(target_path: Path) -> tuple:
-    """The file's header order and its rows keyed by (chapter, scene).
+    """The file's header order and its rows keyed by (chapter, shot).
 
     Used by :func:`save_prompts_csv` to carry over columns the caller's rows do
     not know about. Returns ``([], {})`` when there is nothing readable yet.
@@ -119,12 +120,13 @@ def _existing_prompt_columns(target_path: Path) -> tuple:
     try:
         with open(target_path, mode='r', encoding='utf-8', newline='') as f:
             reader = csv.DictReader(f, delimiter='|')
-            header = [h.strip().lower() for h in (reader.fieldnames or []) if h]
+            reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
+            header = [h for h in (reader.fieldnames or []) if h]
             rows = {}
             for row in reader:
                 cleaned = {k.strip().lower(): (v.strip() if v else "")
                            for k, v in row.items() if k}
-                rows[_row_key(cleaned.get("chapter"), cleaned.get("scene"))] = cleaned
+                rows[_row_key(cleaned.get("chapter"), cleaned.get("shot"))] = cleaned
         return header, rows
     except Exception as e:
         print(f"[Proofreader-CSV] Error reading existing prompts for merge: {e}")
@@ -137,7 +139,7 @@ def save_prompts_csv(project_name: str, book_name: str, rows: List[Dict[str, Any
     ``prompts.csv`` is the master record, but the rows handed here are a partial
     view of it - they come from the ``ScenePrompt`` cache, whose schema has no
     ``shot_role``. So any column the file already carries that a row does not is
-    copied back over from the matching ``(chapter, scene)`` row. Without that,
+    copied back over from the matching ``(chapter, shot)`` row. Without that,
     every save silently deletes ``shot_role``, and image generation then renders
     the whole book with the base shot-role style.
     """
@@ -151,7 +153,7 @@ def save_prompts_csv(project_name: str, book_name: str, rows: List[Dict[str, Any
 
     # Keep the file's own column order; fall back to the canonical seed for a new
     # file, then append any column the caller introduces.
-    headers = list(existing_header) or ["chapter", "scene", "prompt", "quote", "approved"]
+    headers = list(existing_header) or ["chapter", "shot", "prompt", "quote", "approved"]
     for row in rows:
         for k in row.keys():
             if k and k.lower() not in headers:
@@ -160,7 +162,7 @@ def save_prompts_csv(project_name: str, book_name: str, rows: List[Dict[str, Any
     merged_rows = []
     for r in rows:
         row = {(k or "").strip().lower(): v for k, v in r.items() if k}
-        prior = existing_rows.get(_row_key(row.get("chapter"), row.get("scene")), {})
+        prior = existing_rows.get(_row_key(row.get("chapter"), row.get("shot")), {})
         merged = {h: prior.get(h, "") for h in headers}
         for h in headers:
             if h in row and row[h] is not None:
@@ -424,12 +426,12 @@ def render_book_tabs(book_id: int):
                         elif ev_order == target_book_order:
                             if ev.chapter_num < target_ch:
                                 matched_evs.append((ev, ev_order))
-                            elif ev.chapter_num == target_ch and ev.scene_num <= target_sc:
+                            elif ev.chapter_num == target_ch and ev.shot_num <= target_sc:
                                 matched_evs.append((ev, ev_order))
                                 
                     active_ev = base_ev
                     if matched_evs:
-                        matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
+                        matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].shot_num))
                         active_ev = matched_evs[-1][0]
                         
                     if not active_ev:
@@ -525,13 +527,13 @@ def render_book_tabs(book_id: int):
         """Loads and converts ScenePrompts from SQLite to standard dicts compatible with the workspace."""
         from database.models import ScenePrompt
         with Session(engine) as session:
-            query = select(ScenePrompt).where(ScenePrompt.book_id == book_id).order_by(ScenePrompt.chapter_num, ScenePrompt.scene_num)
+            query = select(ScenePrompt).where(ScenePrompt.book_id == book_id).order_by(ScenePrompt.chapter_num, ScenePrompt.shot_num)
             results = session.exec(query).all()
         
         return [
             {
                 "chapter": str(r.chapter_num),
-                "scene": str(r.scene_num),
+                "shot": str(r.shot_num),
                 "prompt": r.prompt,
                 "quote": r.quote,
                 "approved": "True" if r.approved else "False",
@@ -561,9 +563,9 @@ def render_book_tabs(book_id: int):
     # rendered with anyway.
     csv_role_by_key = {}
     for csv_row in load_prompts_csv(project_name, book_name):
-        csv_role_by_key[_row_key(csv_row.get("chapter"), csv_row.get("scene"))] = csv_row.get("shot_role", "")
+        csv_role_by_key[_row_key(csv_row.get("chapter"), csv_row.get("shot"))] = csv_row.get("shot_role", "")
     for p in prompts:
-        raw_role = csv_role_by_key.get(_row_key(p.get("chapter"), p.get("scene")), "")
+        raw_role = csv_role_by_key.get(_row_key(p.get("chapter"), p.get("shot")), "")
         p["shot_role"] = style_library.normalize_role(raw_role)
 
     if not hasattr(state, 'book_active_scene_idx'):
@@ -613,7 +615,7 @@ def render_book_tabs(book_id: int):
                 p_prompt = p.get("prompt", "").lower()
                 p_quote = p.get("quote", "").lower()
                 ch_str = f"ch {p.get('chapter', '')}"
-                sc_str = f"sc {p.get('scene', '')}"
+                sc_str = f"sc {p.get('shot', '')}"
                 
                 tags_in_prompt = re.findall(r"\[(.*?)\]", p_prompt)
                 scene_character_ids = set()
@@ -650,7 +652,7 @@ def render_book_tabs(book_id: int):
             is_approved = p.get("approved", "False").strip().lower() == "true"
             try:
                 ch = int(float(p.get("chapter", "1")))
-                sc = int(float(p.get("scene", "1")))
+                sc = int(float(p.get("shot", "1")))
             except ValueError:
                 ch, sc = 1, 1
             has_image = (ch, sc) in images_cache
@@ -678,7 +680,7 @@ def render_book_tabs(book_id: int):
         save_prompts_csv(project_name, book_name, prompts)
         try:
             ch = int(float(row_dict.get("chapter", "1")))
-            sc = int(float(row_dict.get("scene", "1")))
+            sc = int(float(row_dict.get("shot", "1")))
             if (ch, sc) in grid_card_references:
                 grid_card_references[(ch, sc)]["item"]["prompt"] = cleaned
         except ValueError:
@@ -694,7 +696,7 @@ def render_book_tabs(book_id: int):
         for idx, p in enumerate(filtered_list):
             try:
                 ch = int(float(p.get("chapter", "1")))
-                sc = int(float(p.get("scene", "1")))
+                sc = int(float(p.get("shot", "1")))
             except ValueError:
                 ch, sc = 1, 1
             if ch == state.book_active_chapter and sc == state.book_active_scene:
@@ -749,7 +751,7 @@ def render_book_tabs(book_id: int):
 
         try:
             ch = int(float(current_scene.get("chapter", "1")))
-            sc = int(float(current_scene.get("scene", "1")))
+            sc = int(float(current_scene.get("shot", "1")))
         except ValueError:
             ch, sc = 1, 1
 
@@ -771,7 +773,7 @@ def render_book_tabs(book_id: int):
             modal_placeholder.visible = not img_url
 
         if modal_title_el:
-            modal_title_el.set_text(f"Chapter {current_scene.get('chapter')}, Scene {current_scene.get('scene')}")
+            modal_title_el.set_text(f"Chapter {current_scene.get('chapter')}, Scene {current_scene.get('shot')}")
 
         if modal_subtitle_el:
             if is_history:
@@ -884,14 +886,14 @@ def render_book_tabs(book_id: int):
 
             try:
                 ch = int(float(row.get("chapter", "1")))
-                sc = int(float(row.get("scene", "1")))
+                sc = int(float(row.get("shot", "1")))
                 if (ch, sc) in grid_card_references:
                     grid_card_references[(ch, sc)]["item"]["approved"] = "True"
             except ValueError:
                 pass
 
             update_grid_views_in_place()
-            ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('scene')} Approved!", type="positive", timeout=1.0)
+            ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('shot')} Approved!", type="positive", timeout=1.0)
             next_scene()
             return
 
@@ -904,14 +906,14 @@ def render_book_tabs(book_id: int):
 
         try:
             ch = int(float(row.get("chapter", "1")))
-            sc = int(float(row.get("scene", "1")))
+            sc = int(float(row.get("shot", "1")))
             if (ch, sc) in grid_card_references:
                 grid_card_references[(ch, sc)]["item"]["approved"] = "True"
         except ValueError:
             pass
 
         update_grid_views_in_place()
-        ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('scene')} Approved!", type="positive", timeout=1.0)
+        ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('shot')} Approved!", type="positive", timeout=1.0)
 
         # Log into visited FIFO history
         history_stack.append(row)
@@ -936,11 +938,11 @@ def render_book_tabs(book_id: int):
             row["approved"] = "False"
             save_prompts_csv(project_name, book_name, prompts)
 
-            was_deleted = delete_scene_image_file(project_name, book_name, row.get("chapter", "1"), row.get("scene", "1"))
+            was_deleted = delete_scene_image_file(project_name, book_name, row.get("chapter", "1"), row.get("shot", "1"))
 
             try:
                 ch = int(float(row.get("chapter", "1")))
-                sc = int(float(row.get("scene", "1")))
+                sc = int(float(row.get("shot", "1")))
                 images_cache.pop((ch, sc), None)
                 if (ch, sc) in grid_card_references:
                     grid_card_references[(ch, sc)]["item"]["approved"] = "False"
@@ -949,9 +951,9 @@ def render_book_tabs(book_id: int):
 
             update_grid_views_in_place()
             if was_deleted:
-                ui.notify(f"Deleted image for Ch {row.get('chapter')}, Sc {row.get('scene')}!", type="warning", timeout=1.0)
+                ui.notify(f"Deleted image for Ch {row.get('chapter')}, Sc {row.get('shot')}!", type="warning", timeout=1.0)
             else:
-                ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('scene')} file was already missing.", type="info", timeout=1.0)
+                ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('shot')} file was already missing.", type="info", timeout=1.0)
 
             update_active_scene_ui()
             return
@@ -963,11 +965,11 @@ def render_book_tabs(book_id: int):
         row["approved"] = "False"
         save_prompts_csv(project_name, book_name, prompts)
 
-        was_deleted = delete_scene_image_file(project_name, book_name, row.get("chapter", "1"), row.get("scene", "1"))
+        was_deleted = delete_scene_image_file(project_name, book_name, row.get("chapter", "1"), row.get("shot", "1"))
 
         try:
             ch = int(float(row.get("chapter", "1")))
-            sc = int(float(row.get("scene", "1")))
+            sc = int(float(row.get("shot", "1")))
             images_cache.pop((ch, sc), None)
             if (ch, sc) in grid_card_references:
                 grid_card_references[(ch, sc)]["item"]["approved"] = "False"
@@ -977,9 +979,9 @@ def render_book_tabs(book_id: int):
         update_grid_views_in_place()
 
         if was_deleted:
-            ui.notify(f"Deleted image for Ch {row.get('chapter')}, Sc {row.get('scene')}!", type="warning", timeout=1.0)
+            ui.notify(f"Deleted image for Ch {row.get('chapter')}, Sc {row.get('shot')}!", type="warning", timeout=1.0)
         else:
-            ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('scene')} file was already missing.", type="info", timeout=1.0)
+            ui.notify(f"Ch {row.get('chapter')}, Sc {row.get('shot')} file was already missing.", type="info", timeout=1.0)
 
         # Log deleted scene into history so user can inspect, edit prompt, or undo if needed
         history_stack.append(row)
@@ -1085,7 +1087,7 @@ def render_book_tabs(book_id: int):
         row["shot_role"] = new_role
         try:
             ch = int(float(row.get("chapter", "1")))
-            sc = int(float(row.get("scene", "1")))
+            sc = int(float(row.get("shot", "1")))
             if (ch, sc) in grid_card_references:
                 grid_card_references[(ch, sc)]["item"]["shot_role"] = new_role
         except ValueError:
@@ -1120,7 +1122,7 @@ def render_book_tabs(book_id: int):
             return
         try:
             ch = int(float(row.get("chapter", "1")))
-            sc = int(float(row.get("scene", "1")))
+            sc = int(float(row.get("shot", "1")))
         except ValueError:
             ch, sc = 1, 1
 
@@ -1197,7 +1199,7 @@ def render_book_tabs(book_id: int):
         for idx, item in enumerate(theater_queue):
             try:
                 ch = int(float(item.get("chapter", "1")))
-                sc = int(float(item.get("scene", "1")))
+                sc = int(float(item.get("shot", "1")))
                 if ch == ch_val and sc == sc_val:
                     found_idx = idx
                     break
@@ -1753,7 +1755,7 @@ def render_book_tabs(book_id: int):
             
             try:
                 ch = int(float(item.get("chapter", "1")))
-                sc = int(float(item.get("scene", "1")))
+                sc = int(float(item.get("shot", "1")))
             except ValueError:
                 ch, sc = 1, 1
                 
@@ -1808,7 +1810,7 @@ def render_book_tabs(book_id: int):
                         ui.badge(f"+{len(deduped_tags)-4}", color='blue').classes('text-[8px] font-bold py-0 px-1 rounded-sm flex-shrink-0')
                         
                 with ui.row().classes('w-full justify-between items-center mt-1 px-1'):
-                    ui.label(f"Ch {item.get('chapter')}, Sc {item.get('scene')}").classes('text-[10px] font-bold text-slate-700')
+                    ui.label(f"Ch {item.get('chapter')}, Sc {item.get('shot')}").classes('text-[10px] font-bold text-slate-700')
                     dot_el = ui.element('div').classes(f'w-2 h-2 rounded-full {status_color}')
                     
             grid_card_references[(ch, sc)] = {

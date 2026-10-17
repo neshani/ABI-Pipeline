@@ -90,6 +90,7 @@ from sqlmodel import Session, select
 from database.connection import init_db, get_setting, set_setting, engine
 from database.models import Project, Book, Chapter
 from services.sync_engine import recover_from_temp_workspaces, get_book_stats, get_book_stats_cached
+from services import compat
 from services.transcription import (
     start_project_transcription, 
     cancel_project_transcription, 
@@ -535,8 +536,9 @@ def read_prompts_from_csv(csv_path: Path) -> List[Dict[str, Any]]:
     rows = []
     with open(csv_path, mode='r', encoding='utf-8') as f:
         reader = csv.DictReader(f, delimiter='|')
-        # Standardize column headers to lowercase
-        reader.fieldnames = [name.lower().strip() if name else "" for name in reader.fieldnames]
+        # Standardize column headers to lowercase and map retired names onto
+        # current ones, so a pre-rename file stays readable.
+        reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
         for row in reader:
             rows.append({k: v.strip() if v else "" for k, v in row.items()})
     return rows
@@ -712,7 +714,7 @@ async def async_run_project_image_gen_logic(project_id: int):
             prompt_text = row.get("prompt", "").strip()
             quote_text = row.get("quote", "").strip()
             chapter_str = row.get("chapter", "1")
-            scene_str = row.get("scene", str(idx + 1))
+            scene_str = row.get("shot", str(idx + 1))
             
             try:
                 chapter = int(float(chapter_str))
@@ -758,7 +760,7 @@ async def async_run_project_image_gen_logic(project_id: int):
                 use_sentence_structure=getattr(state, "style_use_sentence_structure", True),
                 book_id=book_id,
                 chapter_num=chapter,
-                scene_num=scene
+                shot_num=scene
             )
             if original_prompt != prompt_text:
                 state.add_console_log(f"[Image-Gen] Character tags replaced: '{original_prompt}' -> '{prompt_text}'")
@@ -832,7 +834,7 @@ async def async_run_project_image_gen_logic(project_id: int):
                         "filename": target_filename,
                         "base64": base64_str,
                         "chapter": chapter,
-                        "scene": scene,
+                        "shot": scene,
                         "quote": quote_text,
                         "prompt": prompt_text
                     })

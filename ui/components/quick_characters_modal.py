@@ -138,7 +138,7 @@ class QuickCharactersModal:
             if ev.book_id is None:
                 return (-1, -1, -1)  # Base state is always first
             order = book_order_map.get(ev.book_id, 9999)
-            return (order, ev.chapter_num or 0, ev.scene_num or 0)
+            return (order, ev.chapter_num or 0, ev.shot_num or 0)
             
         return sorted(events, key=event_sort_key)
 
@@ -163,7 +163,7 @@ class QuickCharactersModal:
             elif ev_order == target_book_order:
                 if ev.chapter_num < target_ch:
                     active_ev = ev
-                elif ev.chapter_num == target_ch and ev.scene_num <= target_sc:
+                elif ev.chapter_num == target_ch and ev.shot_num <= target_sc:
                     active_ev = ev
         return active_ev
 
@@ -336,7 +336,7 @@ class QuickCharactersModal:
                 if ev.book_id is None:
                     return "Base Character State"
                 b_name = next((b.name for b in self.books_list if b.id == ev.book_id), "Unknown Book")
-                return f"Ch {ev.chapter_num}, Sc {ev.scene_num} State Overide ({ev.label or 'State'})"
+                return f"Ch {ev.chapter_num}, Sc {ev.shot_num} State Overide ({ev.label or 'State'})"
                 
             opts = {ev.id: get_ev_label(ev) for ev in sorted_evs}
             
@@ -449,7 +449,7 @@ class QuickCharactersModal:
                             session.add(new_char)
                             session.commit()
                             
-                            b_ev = CharacterTimelineEvent(character_id=new_char.id, book_id=None, chapter_num=0, scene_num=0, label="Base State")
+                            b_ev = CharacterTimelineEvent(character_id=new_char.id, book_id=None, chapter_num=0, shot_num=0, label="Base State")
                             session.add(b_ev)
                             session.commit()
                             
@@ -665,12 +665,12 @@ class QuickCharactersModal:
                         elif ev_order == tgt_order:
                             if ev.chapter_num < tgt_ch:
                                 matched.append((ev, ev_order))
-                            elif ev.chapter_num == tgt_ch and ev.scene_num <= tgt_sc:
+                            elif ev.chapter_num == tgt_ch and ev.shot_num <= tgt_sc:
                                 matched.append((ev, ev_order))
                                 
                     resolved = base_ev
                     if matched:
-                        matched.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
+                        matched.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].shot_num))
                         resolved = matched[-1][0]
                     
                     if resolved:
@@ -697,7 +697,7 @@ class QuickCharactersModal:
                         .where(CharacterTimelineEvent.character_id == character_id)
                         .where(CharacterTimelineEvent.book_id == b_id)
                         .where(CharacterTimelineEvent.chapter_num == ch)
-                        .where(CharacterTimelineEvent.scene_num == sc)
+                        .where(CharacterTimelineEvent.shot_num == sc)
                     ).first()
                     
                     if dup:
@@ -708,7 +708,7 @@ class QuickCharactersModal:
                         character_id=character_id,
                         book_id=b_id,
                         chapter_num=ch,
-                        scene_num=sc,
+                        shot_num=sc,
                         label=lbl,
                         demographics=copied_traits.get("demographics"),
                         physical_build=copied_traits.get("physical_build"),
@@ -750,7 +750,7 @@ class QuickCharactersModal:
                     session.add(new_char)
                     session.commit()
                     
-                    base_ev = CharacterTimelineEvent(character_id=new_char.id, book_id=None, chapter_num=0, scene_num=0, label="Base State")
+                    base_ev = CharacterTimelineEvent(character_id=new_char.id, book_id=None, chapter_num=0, shot_num=0, label="Base State")
                     session.add(base_ev)
                     session.commit()
                     

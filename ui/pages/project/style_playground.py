@@ -15,6 +15,7 @@ from ui import state
 from ui.components.style_chooser_modal import StyleChooserModal
 from services.character_manager import replace_character_tags_in_prompt
 from services import style_library
+from services import compat
 
 # Module-level dialog and state holders
 contact_sheet_dialog_ref = None
@@ -739,7 +740,7 @@ def copy_style_settings_to_clipboard(project_name: str = "Active Project"):
     for idx, item in enumerate(state.style_test_prompts):
         is_dict = isinstance(item, dict)
         chap = item.get("chapter", 1) if is_dict else 1
-        sec = item.get("scene", idx + 1) if is_dict else idx + 1
+        sec = item.get("shot", idx + 1) if is_dict else idx + 1
         p_text = item.get("prompt", "") if is_dict else item
         quote = item.get("quote", "") if is_dict else ""
         seed = state.style_test_seeds[idx] if idx < len(state.style_test_seeds) else state.style_image_seed
@@ -779,7 +780,7 @@ def copy_style_primer_to_clipboard(project_name: str):
     for idx, item in enumerate(state.style_test_prompts):
         is_dict = isinstance(item, dict)
         chap = item.get("chapter", 1) if is_dict else 1
-        sec = item.get("scene", idx + 1) if is_dict else idx + 1
+        sec = item.get("shot", idx + 1) if is_dict else idx + 1
         p_text = item.get("prompt", "") if is_dict else item
         quote = item.get("quote", "") if is_dict else ""
         seed = state.style_test_seeds[idx] if idx < len(state.style_test_seeds) else state.style_image_seed
@@ -1583,6 +1584,7 @@ def fetch_real_prompts(project_name: str, book_name: str, count: int = 4,
             continue
         try:
             df = pd.read_csv(path, sep='|')
+            df.columns = compat.normalize_fieldnames(list(df.columns))
             if 'shot_role' not in df.columns:
                 # Legacy volume generated before shot roles were recorded.
                 df['shot_role'] = ''
@@ -1603,7 +1605,7 @@ def fetch_real_prompts(project_name: str, book_name: str, count: int = 4,
                 items.append({
                     "book": book_name,
                     "chapter": int(row.get('chapter', 1)),
-                    "scene": int(row.get('scene', 1)),
+                    "shot": int(row.get('shot', 1)),
                     "prompt": str(row['prompt']).strip(),
                     "quote": str(row.get('quote', '')).strip(),
                     "shot_role": role,
@@ -1621,7 +1623,7 @@ def fetch_real_prompts(project_name: str, book_name: str, count: int = 4,
                 items.append({
                     "book": book_name,
                     "chapter": 1,
-                    "scene": idx + 1,
+                    "shot": idx + 1,
                     "prompt": f"Generating from raw passage fallback: {chunk[:80]}...",
                     "quote": chunk,
                     "shot_role": fallback_role,
@@ -1864,7 +1866,7 @@ async def execute_style_freeform_batch(project_name: str):
     # Each entry gets a fresh random seed so batch runs explore variations.
     state.style_freeform_active = True
     state.style_test_prompts = [
-        {"prompt": prompt_text, "quote": "", "chapter": 0, "scene": i + 1}
+        {"prompt": prompt_text, "quote": "", "chapter": 0, "shot": i + 1}
         for i in range(count)
     ]
     state.style_test_seeds = [random.randint(100000, 999999) for _ in range(count)]
@@ -2521,7 +2523,7 @@ def render_style_playground_cards(project_name: str = ""):
             
             is_dict = isinstance(item, dict)
             chapter = item.get("chapter", 1) if is_dict else 1
-            scene_num = item.get("scene", idx + 1) if is_dict else idx + 1
+            shot_num = item.get("shot", idx + 1) if is_dict else idx + 1
             book_title = item.get("book", "Novel") if is_dict else "Novel"
             prompt_str = item.get("prompt", "") if is_dict else item
             quote = item.get("quote", "") if is_dict else ""
@@ -2536,7 +2538,7 @@ def render_style_playground_cards(project_name: str = ""):
                 card_title = "Custom Prompt"
                 full_title_header = f"Custom Prompt • Variant {idx + 1}"
             else:
-                card_title = f"Ch {chapter}, Scene {scene_num}"
+                card_title = f"Ch {chapter}, Scene {shot_num}"
                 full_title_header = f"{card_title} • {book_title}"
 
             with ui.card().classes('w-full border p-2.5 rounded-lg shadow-xs gap-2 bg-white'):

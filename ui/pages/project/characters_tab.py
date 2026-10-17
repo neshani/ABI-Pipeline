@@ -31,6 +31,7 @@ from services.character_organizer import (
     prune_unused_seeded_characters,
     get_suggested_alias_merges
 )
+from services import compat
 
 # Active state trackers
 selected_book_id: Optional[int] = None
@@ -207,12 +208,12 @@ def open_add_event_dialog(project_id: int, character_id: int, books: List[Book],
                     elif ev_order == tgt_order:
                         if ev.chapter_num < tgt_ch:
                             matched.append((ev, ev_order))
-                        elif ev.chapter_num == tgt_ch and ev.scene_num <= tgt_sc:
+                        elif ev.chapter_num == tgt_ch and ev.shot_num <= tgt_sc:
                             matched.append((ev, ev_order))
                             
                 resolved = base_ev
                 if matched:
-                    matched.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
+                    matched.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].shot_num))
                     resolved = matched[-1][0]
                 
                 if resolved:
@@ -239,7 +240,7 @@ def open_add_event_dialog(project_id: int, character_id: int, books: List[Book],
                     .where(CharacterTimelineEvent.character_id == character_id)
                     .where(CharacterTimelineEvent.book_id == b_id)
                     .where(CharacterTimelineEvent.chapter_num == ch)
-                    .where(CharacterTimelineEvent.scene_num == sc)
+                    .where(CharacterTimelineEvent.shot_num == sc)
                 ).first()
                 
                 if dup:
@@ -250,7 +251,7 @@ def open_add_event_dialog(project_id: int, character_id: int, books: List[Book],
                     character_id=character_id,
                     book_id=b_id,
                     chapter_num=ch,
-                    scene_num=sc,
+                    shot_num=sc,
                     label=lbl,
                     demographics=copied_traits.get("demographics"),
                     physical_build=copied_traits.get("physical_build"),
@@ -732,6 +733,7 @@ def get_character_prompt_occurrences(project_name: str, book_name: str, alias_te
     try:
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f, delimiter="|")
+            reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
             rows = list(reader)
     except Exception as e:
         print(f"[Map] Error reading prompts.csv: {e}")
@@ -750,7 +752,7 @@ def get_character_prompt_occurrences(project_name: str, book_name: str, alias_te
             occurrences.append({
                 "global_row_index": idx,
                 "chapter": row.get("chapter") or row.get("chapter_num") or row.get("Chapter") or "N/A",
-                "scene": row.get("scene") or row.get("scene_num") or row.get("Scene") or "N/A",
+                "shot": compat.get_shot(row, "N/A"),
                 "quote": row.get("quote") or row.get("Quote") or "",
                 "prompt": prompt_text
             })
@@ -768,7 +770,8 @@ def save_prompt_occurrence(project_name: str, book_name: str, global_row_index: 
     try:
         with open(csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f, delimiter="|")
-            fieldnames = reader.fieldnames or []
+            reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
+            fieldnames = list(reader.fieldnames or [])
             rows = list(reader)
             
         if 0 <= global_row_index < len(rows):
@@ -870,7 +873,7 @@ def open_appearance_prompt_modal(project: Project, character: Character, book_na
 
         def update_display():
             occ = occurrences[current_index]
-            coordinate_label.text = f"Coordinates: Chapter {occ['chapter']}, Scene {occ['scene']}"
+            coordinate_label.text = f"Coordinates: Chapter {occ['chapter']}, Scene {occ['shot']}"
             counter_label.text = f"{current_index + 1} of {len(occurrences)}"
             counter_label_nav.text = f"{current_index + 1} / {len(occurrences)}"
             status_label.text = f"Showing mentions in: {book_name}"
@@ -1044,7 +1047,7 @@ def open_add_character_dialog(project_id: int, default_book_id: Optional[int], r
                     character_id=new_char.id,
                     book_id=None,
                     chapter_num=0,
-                    scene_num=0,
+                    shot_num=0,
                     label="Base State"
                 )
                 session.add(base_ev)
@@ -1933,7 +1936,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         character_id=char.id,
                         book_id=None,
                         chapter_num=0,
-                        scene_num=0,
+                        shot_num=0,
                         label="Base State"
                     )
                     session.add(base_ev)
@@ -2332,7 +2335,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                 with Session(engine) as session:
                                     b = session.get(Book, ev.book_id)
                                     b_name = b.name if b else f"Book {ev.book_id}"
-                                dropdown_options[ev.id] = f"{b_name} - Ch {ev.chapter_num}, Sc {ev.scene_num} ('{ev.label or 'Override'}')"
+                                dropdown_options[ev.id] = f"{b_name} - Ch {ev.chapter_num}, Sc {ev.shot_num} ('{ev.label or 'Override'}')"
                         
                         def handle_event_change(e):
                             global selected_event_id

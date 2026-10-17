@@ -504,7 +504,7 @@ def render_chain_results() -> None:
         with ui.card().classes('w-full border p-3 shadow-sm bg-white gap-1'):
             with ui.row().classes('items-center gap-2'):
                 ui.badge(res["shot_type"], color='indigo').classes('text-[10px]')
-                ui.label(f"scene {res['scene']} · role {res['role']}").classes(
+                ui.label(f"scene {res['shot']} · role {res['role']}").classes(
                     'text-[10px] text-slate-400')
             ui.label(" ".join(res["chunk"].split())[:170] + "…").classes(
                 'text-[11px] text-slate-500 italic')
@@ -547,7 +547,7 @@ async def run_full_chain(project_name: str) -> None:
             extra_payload={"chat_template_kwargs": {"enable_thinking": False}})
         parsed = parse_llm_response(raw)
         _chain_results.append({
-            "scene": i, "shot_type": shot, "role": role,
+            "shot": i, "shot_type": shot, "role": role,
             "chunk": chunk, "quote": parsed["quote"], "prompt": parsed["prompt"],
         })
 

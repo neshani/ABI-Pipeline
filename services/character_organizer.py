@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Set, Optional
 from sqlmodel import Session, select
 from database.connection import engine, get_setting
 from database.models import Project, Book, Character, CharacterAlias, CharacterTimelineEvent, CharacterBookLink
+from services import compat
 from services.character_manager import (
     save_project_characters_to_json,
     compile_character_visual_prompt
@@ -82,6 +83,7 @@ def get_character_frequency_map_db(project_name: str, session: Session) -> Dict[
         try:
             with open(csv_path, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f, delimiter="|")
+                reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
                 for row in reader:
                     prompt_text = row.get("prompt", "")
                     for match in bracket_regex.findall(prompt_text):
@@ -109,6 +111,7 @@ def get_book_character_frequency_map(project_name: str, book_name: str, session:
         try:
             with open(csv_path, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f, delimiter="|")
+                reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
                 for row in reader:
                     prompt_text = row.get("prompt", "")
                     for match in bracket_regex.findall(prompt_text):
@@ -150,6 +153,7 @@ def extract_characters_from_prompts(project_id: int) -> Set[str]:
             try:
                 with open(csv_path, "r", encoding="utf-8") as f:
                     reader = csv.DictReader(f, delimiter="|")
+                    reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
                     for row in reader:
                         prompt_text = row.get("prompt", "")
                         for match in bracket_regex.findall(prompt_text):
@@ -213,7 +217,7 @@ def extract_characters_from_prompts(project_id: int) -> Set[str]:
                         character_id=char_id,
                         book_id=None,
                         chapter_num=0,
-                        scene_num=0,
+                        shot_num=0,
                         label="Base State"
                     )
                     session.add(base_ev)
@@ -312,7 +316,7 @@ def commit_raw_seeded_characters(project_id: int, book_id: Optional[int], raw_te
                     character_id=char_id,
                     book_id=None,
                     chapter_num=0,
-                    scene_num=0,
+                    shot_num=0,
                     label="Base State"
                 )
                 session.add(base_ev)

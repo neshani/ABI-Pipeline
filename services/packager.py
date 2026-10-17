@@ -10,6 +10,8 @@ from PIL import Image
 from typing import Optional, List, Dict, Any, Callable
 from concurrent.futures import ThreadPoolExecutor
 
+from services import compat
+
 # --- Ken Burns Animation Presets ---
 PORTRAIT_PRESETS = [
     # 21: MS Pan Left
@@ -285,7 +287,7 @@ def read_prompts_from_csv(csv_path: Path) -> List[Dict[str, Any]]:
         reader = csv.DictReader(f, delimiter="|")
         if not reader.fieldnames:
             return []
-        reader.fieldnames = [name.strip().lower() if name else "" for name in reader.fieldnames]
+        reader.fieldnames = compat.normalize_fieldnames(reader.fieldnames)
         for row in reader:
             cleaned_row = {k: v.strip() if v else "" for k, v in row.items() if k}
             rows.append(cleaned_row)
@@ -445,7 +447,7 @@ def build_illumination_pack(
 
     for idx, scene in enumerate(scenes):
         ch_str = scene.get("chapter", "1")
-        sc_str = scene.get("scene", str(idx + 1))
+        sc_str = scene.get("shot", str(idx + 1))
         
         try:
             ch = int(float(ch_str))

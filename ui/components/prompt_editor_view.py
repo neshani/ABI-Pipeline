@@ -62,7 +62,7 @@ def render_prompt_editor_view(
     elif prompts_list:
         try:
             active_coords[0] = int(float(prompts_list[0].get("chapter", "1")))
-            active_coords[1] = int(float(prompts_list[0].get("scene", "1")))
+            active_coords[1] = int(float(prompts_list[0].get("shot", "1")))
         except ValueError:
             pass
 
@@ -111,7 +111,7 @@ def render_prompt_editor_view(
             p_text = p.get("prompt", "").lower()
             q_text = p.get("quote", "").lower()
             ch_str = f"ch {p.get('chapter', '')}"
-            sc_str = f"sc {p.get('scene', '')}"
+            sc_str = f"sc {p.get('shot', '')}"
             if query in p_text or query in q_text or query in ch_str or query in sc_str:
                 filtered.append(p)
         return filtered
@@ -120,7 +120,7 @@ def render_prompt_editor_view(
         for p in prompts_list:
             try:
                 ch = int(float(p.get("chapter", "1")))
-                sc = int(float(p.get("scene", "1")))
+                sc = int(float(p.get("shot", "1")))
             except ValueError:
                 ch, sc = 1, 1
             if ch == active_coords[0] and sc == active_coords[1]:
@@ -564,7 +564,7 @@ def render_prompt_editor_view(
                     character_id=new_char.id,
                     book_id=None,
                     chapter_num=0,
-                    scene_num=0,
+                    shot_num=0,
                     label="Base State"
                 )
                 session.add(base_ev)
@@ -601,7 +601,7 @@ def render_prompt_editor_view(
         scene = get_active_scene_dict()
         try:
             ch = int(float(scene.get("chapter", "1"))) if scene else 1
-            sc = int(float(scene.get("scene", "1"))) if scene else 1
+            sc = int(float(scene.get("shot", "1"))) if scene else 1
         except ValueError:
             ch, sc = 1, 1
 
@@ -646,12 +646,12 @@ def render_prompt_editor_view(
                                 elif ev_order == target_book_order:
                                     if ev.chapter_num < ch:
                                         matched_evs.append((ev, ev_order))
-                                    elif ev.chapter_num == ch and ev.scene_num <= sc:
+                                    elif ev.chapter_num == ch and ev.shot_num <= sc:
                                         matched_evs.append((ev, ev_order))
                                         
                             active_ev = base_ev
                             if matched_evs:
-                                matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].scene_num))
+                                matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].shot_num))
                                 active_ev = matched_evs[-1][0]
                                 
                             if not active_ev:
@@ -680,7 +680,7 @@ def render_prompt_editor_view(
             
         try:
             ch = int(float(scene.get("chapter", "1")))
-            sc = int(float(scene.get("scene", "1")))
+            sc = int(float(scene.get("shot", "1")))
         except ValueError:
             ch, sc = 1, 1
             
@@ -766,7 +766,7 @@ def render_prompt_editor_view(
             for item in filtered:
                 try:
                     ch = int(float(item.get("chapter", "1")))
-                    sc = int(float(item.get("scene", "1")))
+                    sc = int(float(item.get("shot", "1")))
                 except ValueError:
                     ch, sc = 1, 1
                     
@@ -793,7 +793,7 @@ def render_prompt_editor_view(
                     card_el.on('click', lambda _, ch_val=ch, sc_val=sc: select_sidebar_scene(ch_val, sc_val))
                     
                     with ui.row().classes('w-full justify-between items-center'):
-                        ui.label(f"Ch {item.get('chapter')}, Sc {item.get('scene')}").classes('text-xs font-bold text-slate-800')
+                        ui.label(f"Ch {item.get('chapter')}, Sc {item.get('shot')}").classes('text-xs font-bold text-slate-800')
                         ui.element('div').classes(f'w-2 h-2 rounded-full {dot_color}')
                         
                     quote_prev = item.get("quote", "")
