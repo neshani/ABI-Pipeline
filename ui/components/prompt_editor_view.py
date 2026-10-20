@@ -657,9 +657,12 @@ def render_prompt_editor_view(
                             if not active_ev:
                                 active_ev = base_ev
 
-                            demo_text = active_ev.demographics or "unspecified demographics"
-                            build_text = active_ev.physical_build or "unspecified build"
-                            tooltip_desc = f"👤 {char.name} ({demo_text}, {build_text})"
+                            # The event may describe the character with the new
+                            # trait fields or the legacy quartet; the helper knows.
+                            desc = compile_character_visual_prompt(active_ev) if active_ev else ""
+                            if desc.startswith("a person named "):
+                                desc = ""
+                            tooltip_desc = f"👤 {char.name}" + (f" ({desc})" if desc else "")
                             
                             btn = ui.button(
                                 f"👤 {char.name}", 

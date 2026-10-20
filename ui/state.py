@@ -74,6 +74,7 @@ playground_results: List[Dict[str, Any]] = []  # [{"chunk": "", "quote": "", "pr
 # --- Dynamic Prompt Generation Task States ---
 recent_prompts: List[Dict[str, Any]] = []  # Stores last 5 generated prompts: [{"book": "", "chapter": 1, "shot": 1, "prompt": "", "quote": "", "status": ""}]
 prompt_gen_active: bool = False
+analysis_active: bool = False
 cancel_prompt_gen_flag: bool = False
 
 # --- Transcript cleanup options ---

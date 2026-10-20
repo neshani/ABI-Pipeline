@@ -28,6 +28,10 @@ class Book(SQLModel, table=True):
     prompts_mtime: Optional[float] = Field(default=None)  # Dynamic cache syncing timestamp
     duration: Optional[float] = Field(default=None)       # Cached audiobook total duration in seconds
     book_order: Optional[int] = Field(default=None, description="Chronological sorting index of the book within its project.")
+    # A side story is analysed where it sits in the order, inherits descriptions
+    # from earlier volumes, and passes nothing forward: later volumes skip it.
+    # That is what keeps a prequel's wardrobe out of the book that follows it.
+    is_side_story: bool = Field(default=False, description="Inherits descriptions but is not inherited from")
     
     # Secondary Metadata Fields
     author: Optional[str] = Field(default=None)
@@ -62,6 +66,10 @@ class Character(SQLModel, table=True):
     project_id: int = Field(foreign_key="project.id", index=True)
     name: str = Field(index=True)
     locked: bool = Field(default=False)     # True if manual curation should protect this profile from LLM extraction or compile overwrites
+    # JSON list of trait fields pinned to the Base event. The resolver uses the
+    # base value for those fields and ignores later changes; the timeline still
+    # shows what was ignored. NULL/empty means nothing is pinned.
+    pinned_traits: Optional[str] = Field(default=None)
     
     # Matching and Tracking Engine Additions
     origin: str = Field(default="Prompt Scan", description="e.g., 'Goodreads Seed' or 'Prompt Scan'")
@@ -85,10 +93,33 @@ class CharacterTimelineEvent(SQLModel, table=True):
     label: Optional[str] = Field(default="Base State")
     
     # Concrete physical traits (Only stored here now!)
+    #
+    # The legacy quartet below is kept, not deleted: a database upgraded from an
+    # older build carries real descriptions in these columns, and the compiler
+    # falls back to them when the new fields are empty. Nothing writes them for a
+    # new event; the characters tab shows them under "legacy fields".
     demographics: Optional[str] = Field(default=None)
     physical_build: Optional[str] = Field(default=None)
     hair_and_face: Optional[str] = Field(default=None)
     distinguishing_marks: Optional[str] = Field(default=None)
+
+    # The extracted trait set. Each field is one question, so a value cannot
+    # answer four at once, and the position it was found at is the event's
+    # (book, chapter, shot). Closed fields (sex/species/age) are grounded by the
+    # extractor; the rest are short noun phrases.
+    sex: Optional[str] = Field(default=None)            # male | female
+    species: Optional[str] = Field(default=None)        # human unless stated
+    age: Optional[str] = Field(default=None)            # young | adult | middle-aged | old
+    hair_color: Optional[str] = Field(default=None)
+    hair_style: Optional[str] = Field(default=None)
+    eye_color: Optional[str] = Field(default=None)
+    build: Optional[str] = Field(default=None)          # height / frame, not a face
+    attire: Optional[str] = Field(default=None)         # what they are wearing now
+    carried: Optional[str] = Field(default=None)        # an object held or worn
+    notes: Optional[str] = Field(default=None)          # extracted, never rendered
+    # "extraction" rows are replaced when a book is re-analysed; manual edits and
+    # legacy profiler rows are left alone.
+    source: Optional[str] = Field(default=None)
     
     # Compiled prompt text used during image rendering
     visual_description: Optional[str] = Field(default=None)

@@ -9,7 +9,14 @@ from nicegui import ui, app
 from sqlmodel import Session, select
 from database.connection import engine, get_setting
 from database.models import Book, Project, Character, CharacterAlias, CharacterTimelineEvent
-from services.character_manager import compile_character_visual_prompt, save_project_characters_to_json, ensure_book_orders
+from services.character_manager import (
+    compile_character_visual_prompt,
+    compile_character_description_from_event,
+    save_project_characters_to_json,
+    ensure_book_orders,
+    normalize_character_key,
+    clean_character_key,
+)
 from services import style_library
 from services import compat
 from ui.pages.project.characters_tab import get_character_frequency_map
@@ -404,10 +411,10 @@ def render_book_tabs(book_id: int):
             matched_chars = []
             for char in chars:
                 aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-                alias_texts = {a.alias.lower() for a in aliases}
-                alias_texts.add(char.name.lower())
-                
-                if any(t.lower() in alias_texts for t in tags):
+                alias_texts = {clean_character_key(a.alias) for a in aliases}
+                alias_texts.add(clean_character_key(char.name))
+
+                if any(clean_character_key(t) in alias_texts for t in tags):
                     # Query timeline events for this character
                     events = session.exec(
                         select(CharacterTimelineEvent)
@@ -444,13 +451,11 @@ def render_book_tabs(book_id: int):
                 with ui.row().classes('w-full items-center gap-1 bg-slate-50 p-2 rounded-lg border border-dashed mt-1 flex-wrap outline-none focus:outline-none'):
                     ui.label('Scene Characters:').classes('text-[9px] font-black text-slate-400 uppercase tracking-wider')
                     for char, active_ev in matched_chars:
-                        # Build description hover text
-                        demo_text = active_ev.demographics if active_ev else None
-                        build_text = active_ev.physical_build if active_ev else None
-                        
-                        demo_disp = demo_text or "unspecified demographics"
-                        build_disp = build_text or "unspecified build"
-                        tooltip_desc = f"👤 {char.name} ({demo_disp}, {build_disp})"
+                        # Build description hover text from whatever the event has:
+                        # the new fields when present, else the legacy quartet.
+                        tooltip_desc = (
+                            compile_character_description_from_event(char, active_ev, {}, True)
+                            if active_ev else f"{char.name} (no description yet)")
                         
                         chip = ui.chip(
                             f"👤 {char.name}",
@@ -550,7 +555,7 @@ def render_book_tabs(book_id: int):
         ).all()
         for char in book_characters:
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-            character_alias_map[char.id] = [a.alias.lower() for a in aliases] + [char.name.lower()]
+            character_alias_map[char.id] = [clean_character_key(a.alias) for a in aliases] + [clean_character_key(char.name)]
 
     prompts = get_all_prompts_as_dicts()
     images_cache = get_book_images_cache(project_name, book_name)
@@ -593,7 +598,7 @@ def render_book_tabs(book_id: int):
     def get_filtered_prompts():
         query = ""
         if search_filter_container[0] and search_filter_container[0].value:
-            query = search_filter_container[0].value.strip().lower()
+            query = normalize_character_key(search_filter_container[0].value)
 
         filtered = []
         
@@ -602,22 +607,23 @@ def render_book_tabs(book_id: int):
         if query:
             brackets = re.findall(r'\[(.*?)\]', query)
             if brackets:
-                terms = [b.strip().lower() for b in brackets if b.strip()]
+                terms = [normalize_character_key(b) for b in brackets if b.strip()]
             elif ',' in query:
-                terms = [t.strip().lower() for t in query.split(',') if t.strip()]
+                terms = [normalize_character_key(t) for t in query.split(',') if t.strip()]
             else:
-                terms = [t.strip().lower() for t in query.split(' ') if t.strip()]
+                terms = [normalize_character_key(t) for t in query.split(' ') if t.strip()]
                 if len(terms) > 1:
                     terms = [t for t in terms if t not in ('and', 'or', '&', 'with', 'in')]
 
         for p in prompts:
             if terms:
-                p_prompt = p.get("prompt", "").lower()
-                p_quote = p.get("quote", "").lower()
+                p_prompt = normalize_character_key(p.get("prompt", ""))
+                p_quote = normalize_character_key(p.get("quote", ""))
                 ch_str = f"ch {p.get('chapter', '')}"
                 sc_str = f"sc {p.get('shot', '')}"
                 
-                tags_in_prompt = re.findall(r"\[(.*?)\]", p_prompt)
+                tags_in_prompt = [clean_character_key(t)
+                                  for t in re.findall(r"\[(.*?)\]", p_prompt)]
                 scene_character_ids = set()
                 for tag in tags_in_prompt:
                     for char_id, aliases in character_alias_map.items():
@@ -1131,7 +1137,11 @@ def render_book_tabs(book_id: int):
         from services import shot_planner, prompt_library
         from services.prompt_engine import get_llm_response, parse_llm_response, REFUSAL_KEYWORDS
 
-        chunk = shot_planner.scene_chunk(project_name, book_name, ch, sc)
+        try:
+            chunk = shot_planner.scene_chunk(project_name, book_name, ch, sc)
+        except Exception as ex:
+            ui.notify(f"Could not re-derive this scene's passage: {ex}", type="negative")
+            return
         if not chunk:
             ui.notify("Could not re-derive this scene's passage from transcript.txt.", type="negative")
             return
@@ -1607,7 +1617,7 @@ def render_book_tabs(book_id: int):
         ).all()
         for char in book_characters_modal:
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-            character_alias_map_modal[char.id] = [a.alias.lower() for a in aliases] + [char.name.lower()]
+            character_alias_map_modal[char.id] = [clean_character_key(a.alias) for a in aliases] + [clean_character_key(char.name)]
 
 
     # --- High Performance Theater Modal ---
@@ -1787,8 +1797,9 @@ def render_book_tabs(book_id: int):
                 seen_tags = set()
                 deduped_tags = []
                 for t in tags:
-                    if t.lower() not in seen_tags:
-                        seen_tags.add(t.lower())
+                    key = clean_character_key(t)
+                    if key not in seen_tags:
+                        seen_tags.add(key)
                         deduped_tags.append(t)
 
                 role = style_library.normalize_role(item.get("shot_role"))

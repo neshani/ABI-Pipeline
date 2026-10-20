@@ -10,7 +10,11 @@ from database.models import Project, Book, Character, CharacterAlias, CharacterT
 from services import compat
 from services.character_manager import (
     save_project_characters_to_json,
-    compile_character_visual_prompt
+    compile_character_visual_prompt,
+    normalize_character_text,
+    normalize_character_key,
+    clean_character_tag,
+    clean_character_key,
 )
 
 MALE_HONORIFICS = {"mr", "sir", "gentleman", "father", "uncle", "brother", "lord", "lieutenant", "captain"}
@@ -24,7 +28,7 @@ TITLES = MALE_HONORIFICS.union(FEMALE_HONORIFICS).union({
 @functools.lru_cache(maxsize=8192)
 def extract_name_details(name_str: str) -> Dict[str, Any]:
     """Isolates core clean word tokens, sifting out honorific prefixes (cached)."""
-    val = name_str.lower().strip()
+    val = clean_character_key(name_str)
     if val.endswith("'s") or val.endswith("’s"):
         val = val[:-2].strip()
         
@@ -87,7 +91,7 @@ def get_character_frequency_map_db(project_name: str, session: Session) -> Dict[
                 for row in reader:
                     prompt_text = row.get("prompt", "")
                     for match in bracket_regex.findall(prompt_text):
-                        clean_tag = match.strip().lower()
+                        clean_tag = clean_character_key(match)
                         frequencies[clean_tag] = frequencies.get(clean_tag, 0) + 1
         except Exception:
             pass
@@ -115,7 +119,7 @@ def get_book_character_frequency_map(project_name: str, book_name: str, session:
                 for row in reader:
                     prompt_text = row.get("prompt", "")
                     for match in bracket_regex.findall(prompt_text):
-                        clean_tag = match.strip().lower()
+                        clean_tag = clean_character_key(match)
                         frequencies[clean_tag] = frequencies.get(clean_tag, 0) + 1
         except Exception:
             pass
@@ -157,7 +161,7 @@ def extract_characters_from_prompts(project_id: int) -> Set[str]:
                     for row in reader:
                         prompt_text = row.get("prompt", "")
                         for match in bracket_regex.findall(prompt_text):
-                            clean_tag = match.strip()
+                            clean_tag = clean_character_tag(match)
                             if clean_tag:
                                 discovered_tags.add(clean_tag)
                                 if clean_tag not in tag_to_books:
@@ -169,62 +173,62 @@ def extract_characters_from_prompts(project_id: int) -> Set[str]:
         if not tag_to_books:
             return discovered_tags
 
+        # Normalise every lookup key once. Typographic apostrophes in old data
+        # (and in the prompt tags) must resolve to the same character.
+        all_aliases = session.exec(
+            select(CharacterAlias).join(Character)
+            .where(Character.project_id == project_id)).all()
+        all_chars = session.exec(
+            select(Character).where(Character.project_id == project_id)).all()
+        alias_key_to_char: Dict[str, int] = {}
+        alias_keys_by_char: Dict[int, Set[str]] = {}
+        for a in all_aliases:
+            key = clean_character_key(a.alias)
+            alias_key_to_char.setdefault(key, a.character_id)
+            alias_keys_by_char.setdefault(a.character_id, set()).add(key)
+        name_key_to_char: Dict[str, int] = {
+            clean_character_key(c.name): c.id for c in all_chars
+        }
+
         for tag, book_ids in tag_to_books.items():
-            # 1. Check if this tag matches an existing CharacterAlias
-            existing_alias = session.exec(
-                select(CharacterAlias)
-                .join(Character)
-                .where(CharacterAlias.alias == tag)
-                .where(Character.project_id == project_id)
-            ).first()
+            tag_key = clean_character_key(tag)
+            char_id = alias_key_to_char.get(tag_key) or name_key_to_char.get(tag_key)
 
-            char_id = None
-            if existing_alias:
-                char_id = existing_alias.character_id
+            if char_id:
+                # Ensure the alias row exists under the canonical spelling.
+                if tag_key not in alias_keys_by_char.get(char_id, set()):
+                    session.add(CharacterAlias(character_id=char_id, alias=tag))
+                    alias_keys_by_char.setdefault(char_id, set()).add(tag_key)
+                    alias_key_to_char[tag_key] = char_id
             else:
-                # 2. Check if it matches canonical name of an existing Character
-                existing_char = session.exec(
-                    select(Character)
-                    .where(Character.project_id == project_id)
-                    .where(Character.name == tag)
-                ).first()
+                # Create a brand new Character entity.
+                new_char = Character(
+                    project_id=project_id,
+                    name=tag,
+                    origin="Prompt Scan",
+                    merge_checked=False,
+                    hit_count=0
+                )
+                session.add(new_char)
+                session.flush()
+                char_id = new_char.id
 
-                if existing_char:
-                    char_id = existing_char.id
-                    # Ensure alias row exists
-                    has_alias = session.exec(
-                        select(CharacterAlias)
-                        .where(CharacterAlias.character_id == char_id)
-                        .where(CharacterAlias.alias == tag)
-                    ).first()
-                    if not has_alias:
-                        session.add(CharacterAlias(character_id=char_id, alias=tag))
-                else:
-                    # 3. Create brand new Character entity
-                    new_char = Character(
-                        project_id=project_id,
-                        name=tag,
-                        origin="Prompt Scan",
-                        merge_checked=False,
-                        hit_count=0
-                    )
-                    session.add(new_char)
-                    session.flush()
-                    char_id = new_char.id
+                # Create Base State timeline event
+                base_ev = CharacterTimelineEvent(
+                    character_id=char_id,
+                    book_id=None,
+                    chapter_num=0,
+                    shot_num=0,
+                    label="Base State"
+                )
+                session.add(base_ev)
 
-                    # Create Base State timeline event
-                    base_ev = CharacterTimelineEvent(
-                        character_id=char_id,
-                        book_id=None,
-                        chapter_num=0,
-                        shot_num=0,
-                        label="Base State"
-                    )
-                    session.add(base_ev)
-
-                    # Add canonical name as alias
-                    new_alias = CharacterAlias(character_id=char_id, alias=tag)
-                    session.add(new_alias)
+                # Add canonical name as alias
+                new_alias = CharacterAlias(character_id=char_id, alias=tag)
+                session.add(new_alias)
+                alias_key_to_char[tag_key] = char_id
+                name_key_to_char[tag_key] = char_id
+                alias_keys_by_char[char_id] = {tag_key}
 
             # 4. Link character to all books where this tag was found
             if char_id:
@@ -284,19 +288,24 @@ def commit_raw_seeded_characters(project_id: int, book_id: Optional[int], raw_te
         parts = [p.strip() for p in line.split(",") if p.strip()]
         for p in parts:
             if len(p) <= 40 and not any(c in p for c in ["[", "]", "{", "}", "<", ">"]):
-                parsed_names.append(p)
+                parsed_names.append(clean_character_tag(p))
 
-    unique_names = list(dict.fromkeys(parsed_names))
+    names_by_key: Dict[str, str] = {}
+    for name in parsed_names:
+        names_by_key.setdefault(clean_character_key(name), name)
+    unique_names = list(names_by_key.values())
     if not unique_names:
         return
 
     with Session(engine) as session:
+        existing_by_key = {
+            clean_character_key(c.name): c
+            for c in session.exec(
+                select(Character).where(Character.project_id == project_id)).all()
+        }
         for name in unique_names:
-            existing_char = session.exec(
-                select(Character)
-                .where(Character.project_id == project_id)
-                .where(Character.name == name)
-            ).first()
+            key = clean_character_key(name)
+            existing_char = existing_by_key.get(key)
 
             if existing_char:
                 char_id = existing_char.id
@@ -311,6 +320,7 @@ def commit_raw_seeded_characters(project_id: int, book_id: Optional[int], raw_te
                 session.add(new_char)
                 session.flush()
                 char_id = new_char.id
+                existing_by_key[key] = new_char
 
                 base_ev = CharacterTimelineEvent(
                     character_id=char_id,
@@ -366,10 +376,10 @@ def recalculate_project_character_hits(project_id: int):
             aliases_list = char_aliases[char.id]
             total_hits = 0
             for a in aliases_list:
-                total_hits += freq_map.get(a.alias.lower().strip(), 0)
+                total_hits += freq_map.get(clean_character_key(a.alias), 0)
 
             if total_hits == 0:
-                total_hits = freq_map.get(char.name.lower().strip(), 0)
+                total_hits = freq_map.get(clean_character_key(char.name), 0)
 
             char.hit_count = total_hits
             session.add(char)
@@ -381,6 +391,9 @@ def prune_unused_seeded_characters(project_id: int):
     Silently deletes any unlocked character with hit_count == 0.
     Also prunes unused aliases (0 hits) that differ from the canonical name.
     """
+    # Recompute first: a restore from characters.json does not persist hit_count,
+    # and a stale zero would delete characters that do appear in prompts.
+    recalculate_project_character_hits(project_id)
     base_output_dir = Path(get_setting("output_dir", "./output")).resolve()
 
     with Session(engine) as session:
@@ -429,8 +442,8 @@ def prune_unused_seeded_characters(project_id: int):
         for ac in active_chars:
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == ac.id)).all()
             for alias in aliases:
-                alias_text = alias.alias.lower().strip()
-                canonical_text = ac.name.lower().strip()
+                alias_text = clean_character_key(alias.alias)
+                canonical_text = clean_character_key(ac.name)
 
                 if alias_text != canonical_text:
                     if freq_map.get(alias_text, 0) == 0:
@@ -530,7 +543,7 @@ def get_suggested_alias_merges(project_id: int, target_character_id: int, book_i
                     reason = f"Similar spelling ({int(best_similarity * 100)}% match)"
 
             if reason:
-                hits = sum(freq_map.get(cv.lower().strip(), 0) for cv in cand_variant_strings)
+                hits = sum(freq_map.get(clean_character_key(cv), 0) for cv in cand_variant_strings)
                 suggestions.append({
                     "character_id": cand.id,
                     "name": cand.name,

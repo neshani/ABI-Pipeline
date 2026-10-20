@@ -309,6 +309,32 @@ class SettingsModal:
                             on_click=self.refresh_llm_models
                         ).props('flat dense').classes('h-10 text-blue-600').tooltip('Scan Connection for Models')
 
+                    # How much text one analysis call may read. The word budget is
+                    # the measured value; the context is a hard cap, because users
+                    # bring their own model and a 12,000-word window does not fit
+                    # an 8k context.
+                    with ui.row().classes('w-full items-end gap-2'):
+                        ui.number(
+                            'Model Context (tokens)',
+                            value=int(self.settings.get('llm_context_tokens', 32768) or 32768),
+                            min=2048, max=1048576, step=1024
+                        ).bind_value(self.settings, 'llm_context_tokens').classes('flex-1').tooltip(
+                            'The context size your LLM server was started with. '
+                            'Used to cap how much text one analysis call may read.'
+                        )
+                        ui.number(
+                            'Analysis Window (words)',
+                            value=int(self.settings.get('analysis_window_words', 12000) or 12000),
+                            min=500, max=100000, step=500
+                        ).bind_value(self.settings, 'analysis_window_words').classes('flex-1').tooltip(
+                            'Scene and character analysis reads this many words per call, '
+                            'capped at 60% of the context above. Smaller means more calls.'
+                        )
+                    ui.label(
+                        'Effective window: the smaller of the two values. '
+                        '12,000 words is the measured default for a 32k-context model.'
+                    ).classes('text-[9px] text-slate-500 leading-tight')
+
                     ui.checkbox(
                         'Auto-release VRAM when switching between ComfyUI and the LLM',
                         value=self.settings.get('vram_auto_switch', True)

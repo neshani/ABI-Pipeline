@@ -295,7 +295,8 @@ def render_transcription_step_view(project, books, start_transcribe_cb, stop_tra
                 start_btn.bind_enabled_from(state, 'needs_restart', backward=lambda x: not x)
 
 
-def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb):
+def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb,
+                                start_analysis_cb=None):
     available_templates = list_stored_templates()
     
     # Check for unapproved transcripts across all books in the project
@@ -349,6 +350,104 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
                     icon='done_all', 
                     on_click=handle_approve_all
                 ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-3 py-1.5 rounded')
+
+        # --- Character analysis: scene map + cast ---
+        from services import scene_map as _scene_map
+        from database.connection import set_setting as _set_setting
+        from database.models import CharacterTimelineEvent as _TimelineEvent
+
+        analysis_mode = str(get_setting("pipeline_mode", "full") or "full")
+        mode_labels = {"full": "Full (scenes + characters)",
+                       "scenes": "Scenes only",
+                       "fast": "Fast (no analysis)"}
+
+        def handle_analysis_mode(val):
+            _set_setting("pipeline_mode", val or "full")
+            ui.notify(f"Analysis mode: {mode_labels.get(val, val)}", type="info")
+
+        def analyse(book_ids=None):
+            if start_analysis_cb:
+                start_analysis_cb(project.id, book_ids)
+
+        def update_book_order(book_id, value):
+            with Session(engine) as session:
+                db_book = session.get(Book, book_id)
+                if db_book:
+                    db_book.book_order = int(value or 0)
+                    session.add(db_book)
+                    session.commit()
+            ui.notify("Book order updated.", type="info")
+
+        def update_side_story(book_id, value):
+            with Session(engine) as session:
+                db_book = session.get(Book, book_id)
+                if db_book:
+                    db_book.is_side_story = bool(value)
+                    session.add(db_book)
+                    session.commit()
+            ui.notify("Side-story flag updated.", type="info")
+
+        with ui.column().classes('w-full bg-slate-50 p-3 rounded-lg border mt-1 gap-2'):
+            with ui.row().classes('w-full items-center gap-3'):
+                ui.icon('person_search', size='sm', color='indigo-500')
+                with ui.column().classes('gap-0 flex-1'):
+                    ui.label('Character Analysis').classes('text-xs font-bold text-slate-700')
+                    ui.label(
+                        'Scene boundaries and the cast that descriptions are compiled from. '
+                        'Fast mode makes no model calls.'
+                    ).classes('text-[9px] text-slate-500')
+                ui.select(
+                    options=mode_labels, value=analysis_mode,
+                    on_change=lambda e: handle_analysis_mode(e.value),
+                ).classes('w-56 bg-white').props('outlined dense')
+
+            if analysis_mode == "fast":
+                ui.label(
+                    'Fast mode: prompts use the linear chunker and no character '
+                    'descriptions are compiled.'
+                ).classes('text-[9px] text-slate-500')
+            else:
+                if getattr(state, "analysis_active", False):
+                    with ui.row().classes('w-full items-center gap-2'):
+                        ui.spinner(size='sm', color='indigo')
+                        ui.label('Analysis running... progress is in the console.')\
+                            .classes('text-xs font-semibold text-indigo-700 animate-pulse')
+                with ui.row().classes('w-full items-center justify-between'):
+                    ui.label('Books are analysed in reading order; a scene never crosses a chapter.')\
+                        .classes('text-[9px] text-slate-500')
+                    ui.button(
+                        'Analyse Project', icon='play_arrow',
+                        on_click=lambda: analyse(None),
+                    ).props('dense').classes('bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold')
+                with ui.column().classes('w-full gap-1'):
+                    for b in books:
+                        b_dir = (Path(get_setting("output_dir", "./output")).resolve()
+                                 / project.name / b.name)
+                        has_map = _scene_map.scene_map_path(b_dir).exists()
+                        with Session(engine) as session:
+                            n_events = len(session.exec(
+                                select(_TimelineEvent)
+                                .where(_TimelineEvent.book_id == b.id)
+                                .where(_TimelineEvent.source == "extraction")).all())
+                        with ui.row().classes('w-full items-center gap-2'):
+                            ui.number(
+                                value=b.book_order if b.book_order is not None else 0,
+                                min=0, max=999, step=1,
+                                on_change=lambda e, bid=b.id: update_book_order(bid, e.value),
+                            ).classes('w-14').props('dense outlined').tooltip(
+                                'Reading order. Descriptions carry forward from lower numbers.')
+                            ui.checkbox(
+                                'side', value=bool(getattr(b, "is_side_story", False)),
+                                on_change=lambda e, bid=b.id: update_side_story(bid, e.value),
+                            ).tooltip(
+                                'Inherits descriptions from earlier volumes; later volumes skip it.')
+                            ui.label(b.name).classes('text-[11px] flex-1 truncate')
+                            ui.label(('scenes ok' if has_map else 'scenes -')
+                                     + f'  |  {n_events} events').classes('text-[9px] text-slate-500')
+                            ui.button(
+                                'Analyse', icon='play_arrow',
+                                on_click=lambda _, bid=b.id: analyse([bid]),
+                            ).props('flat dense').classes('text-[10px] text-indigo-700')
 
         # --- Shot Planner mode ---
         # NB: NiceGUI select takes dict options as {value: label}.
@@ -900,7 +999,8 @@ def render_project_tabs(
     stop_transcribe_cb,
     start_prompt_gen_cb=None,
     start_image_gen_cb=None,
-    save_project_settings_cb=None
+    save_project_settings_cb=None,
+    start_analysis_cb=None
 ):
     # Safeguard selected template checks
     available_templates = list_stored_templates()
@@ -1049,7 +1149,7 @@ def render_project_tabs(
                     if status in ("Imported", "Transcribing"):
                         render_transcription_step_view(project, books, start_transcribe_cb, stop_transcribe_cb)
                     elif status in ("Transcribed", "Generating Prompts"):
-                        render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb)
+                        render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb, start_analysis_cb)
                     else:
                         render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb)
                         

@@ -242,8 +242,20 @@ def active_selection() -> Dict[str, str]:
     return {slot: get_active_variant(slot) for slot in EDIT_SLOTS}
 
 
-def render_with_selection(role: str, passage: str, selection: Dict[str, str]) -> str:
-    """Compose a scene prompt from a captured selection rather than live settings."""
+_FOCUS_FALLBACK = "the most memorable moment in the passage"
+
+
+def render_with_selection(role: str, passage: str, selection: Dict[str, str],
+                          focus: str = "") -> str:
+    """Compose a scene prompt from a captured selection rather than live settings.
+
+    ``focus`` is the Shot Planner's phrase for this shot - "Rand running", "a print in the
+    dirt", "the village square at dusk". The shared block asks for it ("The director has
+    chosen a focus for this shot: <focus>") and for a long time nothing filled it in, so the
+    instruction dangled and the prompt model had to work the subject out for itself. With no
+    focus the sentence still reads.
+    """
     shared = read_variant("shared", selection.get("shared", "shared"))
     fragment = read_variant(role, selection.get(role, role))
-    return assemble(shared, fragment).replace("<text>", passage)
+    text = assemble(shared, fragment).replace("<text>", passage)
+    return text.replace("<focus>", (focus or "").strip() or _FOCUS_FALLBACK)

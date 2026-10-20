@@ -10,6 +10,48 @@ from database.models import Project, Book, Character, CharacterAlias, CharacterB
 from services.prompt_engine import smart_chunk_text, get_llm_response
 from services import compat
 
+# Typographic single quotes look identical to a reader but are different bytes
+# to every exact-match query in this app. Canonicalise them at the boundary:
+# names, aliases, prompt tags, and search all use the ASCII apostrophe.
+_APOSTROPHE_MAP = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201b": "'", "\u2032": "'",
+    "\u02bc": "'", "\u02bb": "'", "\uff07": "'", "\u00b4": "'", "`": "'",
+})
+
+
+def normalize_character_text(text: str) -> str:
+    """Canonical single quotes and whitespace for a name, alias, or tag."""
+    if not text:
+        return ""
+    cleaned = str(text).translate(_APOSTROPHE_MAP).replace("\u00a0", " ")
+    return " ".join(cleaned.split())
+
+
+def normalize_character_key(text: str) -> str:
+    """The comparison key for a name or alias: canonical quotes, lowercased."""
+    return normalize_character_text(text).lower()
+
+
+_WRAPPING_QUOTES = "\"'“”‘’"
+
+
+def clean_character_tag(text: str) -> str:
+    """Normalise a prompt tag or imported name, removing wrapping quote marks.
+
+    ``["Ba'alzamon"]`` and ``'Ba’alzamon'`` both become ``Ba'alzamon``. Internal
+    apostrophes (``al'Vere``) are preserved; only a matching pair of outer quotes
+    is removed, repeatedly, so ``"'Name'"`` also cleans up.
+    """
+    cleaned = normalize_character_text(text)
+    while (len(cleaned) >= 2 and cleaned[0] in _WRAPPING_QUOTES
+           and cleaned[-1] in _WRAPPING_QUOTES):
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
+def clean_character_key(text: str) -> str:
+    return clean_character_tag(text).lower()
+
 def get_characters_json_path(project_id: int, session: Optional[Session] = None) -> Optional[Path]:
     """Retrieves the file-as-source-of-truth characters.json target path."""
     should_close = False
@@ -29,19 +71,25 @@ def get_characters_json_path(project_id: int, session: Optional[Session] = None)
 
 
 def ensure_book_orders(project_id: int):
-    """
-    Self-heals book_order fields for books within a project,
-    sorting alphabetically by name as the natural default order.
+    """Fill in a book_order for books that have none, and never renumber.
+
+    Renumbering alphabetically used to run on every characters-tab open, which
+    silently overwrote a manually chosen reading order. Order is the axis that
+    drives cross-book description inheritance, so only a missing value is
+    assigned here; existing values are the user's (or the importer's) decision.
     """
     with Session(engine) as session:
         books = session.exec(
             select(Book).where(Book.project_id == project_id).order_by(Book.name)
         ).all()
-        
+
+        known = [b.book_order for b in books if b.book_order is not None]
+        next_order = (max(known) + 1) if known else 0
         changed = False
-        for idx, book in enumerate(books):
-            if book.book_order is None or book.book_order != idx:
-                book.book_order = idx
+        for book in books:
+            if book.book_order is None:
+                book.book_order = next_order
+                next_order += 1
                 session.add(book)
                 changed = True
         if changed:
@@ -49,10 +97,18 @@ def ensure_book_orders(project_id: int):
 
 
 def compile_character_visual_prompt(obj) -> str:
+    """Assembles the inner description (no character name) from an event's fields.
+
+    Accepts either a CharacterTimelineEvent or a legacy Character object. A
+    new-field event uses the extracted trait set; a legacy event keeps the old
+    four-field comma list, so a project profiled by an older build produces the
+    same text it always did.
     """
-    Assembles a descriptive, natural language physical prompt from structured traits.
-    Optimized for single-stream text encoders. Accepts either CharacterTimelineEvent or a legacy Character object.
-    """
+    if has_new_traits(obj):
+        inner = compile_event_fields(obj, {}, True)
+        if inner:
+            return inner
+
     pieces = []
     
     if getattr(obj, "demographics", None) and str(obj.demographics).strip():
@@ -123,6 +179,12 @@ def save_project_characters_to_json(project_id: int):
                     "shot_num": ev.shot_num,
                     "label": ev.label,
                     "visual_description": ev.visual_description,
+                    "source": ev.source,
+                    # The extracted trait set. `profile` is the legacy quartet,
+                    # kept so an older build can still read the file and so a
+                    # database rebuilt from it loses nothing.
+                    "traits": {field: getattr(ev, field, None)
+                               for field in NEW_TRAIT_FIELDS},
                     "profile": {
                         "demographics": ev.demographics,
                         "physical_build": ev.physical_build,
@@ -136,6 +198,8 @@ def save_project_characters_to_json(project_id: int):
                 "locked": char.locked,
                 "origin": getattr(char, "origin", "Prompt Scan"),
                 "merge_checked": getattr(char, "merge_checked", False),
+                "hit_count": getattr(char, "hit_count", 0) or 0,
+                "pinned_traits": getattr(char, "pinned_traits", None),
                 "aliases": [alias.alias for alias in aliases],
                 "books": linked_book_names,
                 "timeline": timeline_serialized
@@ -256,7 +320,9 @@ def sync_project_characters_from_json(project_id: int, session: Optional[Session
                 name=char_data["name"],
                 locked=char_data.get("locked", False),
                 origin=char_data.get("origin", "Prompt Scan"),
-                merge_checked=char_data.get("merge_checked", False)
+                merge_checked=char_data.get("merge_checked", False),
+                hit_count=char_data.get("hit_count", 0) or 0,
+                pinned_traits=char_data.get("pinned_traits"),
             )
             session.add(new_char)
             session.flush()  # flush to acquire character ID
@@ -278,6 +344,7 @@ def sync_project_characters_from_json(project_id: int, session: Optional[Session
             if not timeline_list:
                 # Backward compatibility fallback
                 legacy_profile = char_data.get("profile") or {}
+                base_traits = char_data.get("traits") or {}
                 base_ev = CharacterTimelineEvent(
                     character_id=new_char.id,
                     book_id=None,
@@ -288,6 +355,10 @@ def sync_project_characters_from_json(project_id: int, session: Optional[Session
                     physical_build=legacy_profile.get("physical_build"),
                     hair_and_face=legacy_profile.get("hair_and_face"),
                     distinguishing_marks=legacy_profile.get("distinguishing_marks"),
+                    **{field: (base_traits.get(field)
+                               if base_traits.get(field) is not None
+                               else legacy_profile.get(field))
+                       for field in NEW_TRAIT_FIELDS},
                     visual_description=char_data.get("visual_description")
                 )
                 session.add(base_ev)
@@ -297,6 +368,7 @@ def sync_project_characters_from_json(project_id: int, session: Optional[Session
                     b_id = book_name_to_id.get(b_name) if b_name else None
                     
                     prof = ev_data.get("profile", {})
+                    traits = ev_data.get("traits", {}) or {}
                     new_ev = CharacterTimelineEvent(
                         character_id=new_char.id,
                         book_id=b_id,
@@ -311,7 +383,12 @@ def sync_project_characters_from_json(project_id: int, session: Optional[Session
                         physical_build=prof.get("physical_build"),
                         hair_and_face=prof.get("hair_and_face"),
                         distinguishing_marks=prof.get("distinguishing_marks"),
-                        visual_description=ev_data.get("visual_description")
+                        **{field: (traits.get(field)
+                                   if traits.get(field) is not None
+                                   else prof.get(field))
+                           for field in NEW_TRAIT_FIELDS},
+                        visual_description=ev_data.get("visual_description"),
+                        source=ev_data.get("source")
                     )
                     session.add(new_ev)
                     
@@ -892,6 +969,450 @@ def load_prompt_template_from_file(mode: str) -> str:
         return get_speculative_character_template()
 
 
+# --- the extracted trait set ------------------------------------------------
+#
+# The event's fields are one question each. Compilation is the only place that
+# turns them into the sentence an image model reads, and it is deliberately
+# mechanical: a bare colour gains the head noun it is missing ("gray" -> "gray
+# hair"), a build becomes "who is ...", attire becomes "wearing ...". Nothing
+# here invents a value; an empty field adds nothing.
+
+NEW_TRAIT_FIELDS = ("sex", "species", "age", "hair_color", "hair_style",
+                    "eye_color", "build", "attire", "carried", "notes")
+RENDERED_TRAIT_FIELDS = tuple(f for f in NEW_TRAIT_FIELDS if f != "notes")
+TRAIT_ORDER = ("hair_color", "hair_style", "eye_color", "build", "attire", "carried")
+
+_SEX_NOUN = {"male": "man", "female": "woman"}
+_VALID_AGES = {"young", "adult", "middle-aged", "old"}
+_BLANK_VALUES = {"", "null", "none", "unknown", "not stated", "n/a", "unstated",
+                 "blank", "blanks", "empty", "no value"}
+# An animal word that already carries a sex must not be given a second one
+# ("a female mare"). General English, not book vocabulary.
+_SEXED_ANIMAL = {"mare", "stallion", "gelding", "bull", "cow", "ewe", "ram",
+                 "sow", "boar", "buck", "doe", "hen", "cock", "queen", "drone",
+                 "filly", "colt"}
+_DETERMINERS = ("a ", "an ", "the ", "one ", "his ", "her ", "their ")
+_HUMAN_SPECIES = {"human", "person", "people", "man", "woman"}
+
+
+# --- pinned traits ----------------------------------------------------------
+#
+# A pin is deliberately narrower than Character.locked: it says "this field
+# always uses the Base value", not "do not re-analyse this character". The
+# timeline still shows the changes the extraction found; the resolver ignores
+# them for the pinned fields only.
+
+def get_pinned_fields(character: Optional[Character]) -> List[str]:
+    raw = getattr(character, "pinned_traits", None) if character else None
+    if not raw:
+        return []
+    try:
+        values = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        values = str(raw).split(",")
+    if not isinstance(values, (list, tuple, set)):
+        values = [values]
+    return [str(value).strip() for value in values
+            if str(value).strip() in NEW_TRAIT_FIELDS]
+
+
+def set_pinned_fields(session: Session, character: Character,
+                      fields: List[str]) -> None:
+    clean = sorted({field for field in fields if field in NEW_TRAIT_FIELDS})
+    character.pinned_traits = json.dumps(clean) if clean else None
+    session.add(character)
+
+
+def _effective_event(event: Optional[CharacterTimelineEvent],
+                     base: Optional[CharacterTimelineEvent],
+                     pinned: List[str]) -> Optional[CharacterTimelineEvent]:
+    """A transient copy with pinned fields replaced by the Base value.
+
+    Never added to the session: resolution must not write. An empty transient
+    event is returned when there is no row at all, which is the old code's
+    fallback without the empty Base row it used to persist.
+    """
+    if event is None:
+        event = CharacterTimelineEvent(
+            character_id=getattr(base, "character_id", None),
+            book_id=None, chapter_num=0, shot_num=0, label="Base State")
+    if not pinned or base is None:
+        return event
+    overrides = {}
+    for field in pinned:
+        value = getattr(base, field, None)
+        if value:
+            overrides[field] = value
+    if not overrides:
+        return event
+    data = {field: getattr(event, field, None) for field in NEW_TRAIT_FIELDS}
+    data.update(overrides)
+    return CharacterTimelineEvent(
+        id=event.id,
+        character_id=event.character_id,
+        book_id=event.book_id,
+        chapter_num=event.chapter_num,
+        shot_num=event.shot_num,
+        label=event.label,
+        demographics=event.demographics,
+        physical_build=event.physical_build,
+        hair_and_face=event.hair_and_face,
+        distinguishing_marks=event.distinguishing_marks,
+        source=event.source,
+        visual_description=event.visual_description,
+        **data,
+    )
+
+
+def resolve_event_at(session: Session, character: Character,
+                     book_id: Optional[int], chapter_num: Optional[int],
+                     shot_num: Optional[int], *,
+                     book_order_map: Optional[Dict[int, int]] = None,
+                     side_stories: Optional[set] = None,
+                     events: Optional[List[CharacterTimelineEvent]] = None
+                     ) -> tuple:
+    """The effective event and the Base event at one story position.
+
+    ``(effective, base)``. The effective event is transient and has pinned
+    fields replaced by the Base value. The same positional rule the render path
+    has always used: latest event at or before the position, across earlier
+    books; side stories are visible only inside themselves.
+    """
+    if book_order_map is None or side_stories is None:
+        books = session.exec(
+            select(Book).where(Book.project_id == character.project_id)).all()
+        book_order_map = {b.id: (b.book_order or 0) for b in books}
+        side_stories = {b.id for b in books
+                        if getattr(b, "is_side_story", False)}
+    if events is None:
+        events = session.exec(
+            select(CharacterTimelineEvent)
+            .where(CharacterTimelineEvent.character_id == character.id)).all()
+
+    base = None
+    matched = []
+    target_order = book_order_map.get(book_id, 0) if book_id else 0
+    for event in events:
+        if event.book_id is None:
+            base = event
+            continue
+        if event.book_id in side_stories and event.book_id != book_id:
+            continue
+        order = book_order_map.get(event.book_id, 0)
+        if order < target_order:
+            matched.append((event, order))
+        elif order == target_order and chapter_num is not None:
+            if event.chapter_num < chapter_num:
+                matched.append((event, order))
+            elif (event.chapter_num == chapter_num
+                  and shot_num is not None and event.shot_num <= shot_num):
+                matched.append((event, order))
+
+    resolved = base
+    if matched:
+        matched.sort(key=lambda pair: (pair[1], pair[0].chapter_num,
+                                       pair[0].shot_num, pair[0].id or 0))
+        resolved = matched[-1][0]
+    return _effective_event(resolved, base, get_pinned_fields(character)), base
+
+
+def project_known_counts(session: Session, project_id: int) -> Dict[int, int]:
+    """``{character_id: number of rendered fields known anywhere}``.
+
+    The character list asks "who has traits?" - that is the union of every
+    non-blank field across the base and all books, not the Base event's current
+    snapshot. One query for the whole project keeps the list cheap.
+    """
+    char_ids = list(session.exec(
+        select(Character.id).where(Character.project_id == project_id)).all())
+    known: Dict[int, set] = {char_id: set() for char_id in char_ids}
+    if not char_ids:
+        return {}
+    events = session.exec(
+        select(CharacterTimelineEvent)
+        .where(CharacterTimelineEvent.character_id.in_(char_ids))).all()
+    for event in events:
+        fields = known.setdefault(event.character_id, set())
+        for field in RENDERED_TRAIT_FIELDS:
+            if (getattr(event, field, None) or "").strip():
+                fields.add(field)
+    return {char_id: len(fields) for char_id, fields in known.items()}
+
+
+def changed_trait_fields(event: CharacterTimelineEvent,
+                         previous: Optional[CharacterTimelineEvent] = None
+                         ) -> List[str]:
+    """Rendered fields that differ from ``previous`` (or are populated)."""
+    current = {field: (getattr(event, field, None) or "").strip()
+               for field in RENDERED_TRAIT_FIELDS}
+    if previous is None:
+        return [field for field in RENDERED_TRAIT_FIELDS if current[field]]
+    before = {field: (getattr(previous, field, None) or "").strip()
+              for field in RENDERED_TRAIT_FIELDS}
+    return [field for field in RENDERED_TRAIT_FIELDS
+            if current[field] != before[field]]
+
+
+def character_field_stats(session: Session, character: Character,
+                          book_id: Optional[int] = None,
+                          order_map: Optional[Dict[int, int]] = None) -> Dict[str, dict]:
+    """Per-field "populated / stable / changes" statistics for one character.
+
+    ``book_id=None`` is the whole project; a book id restricts the value spans
+    to that book (the Base event is used only when the book has no events at
+    all, so an earlier book's base cannot make a later book look unstable).
+
+    Values are compared in reading order and blanks are skipped: a field that
+    is discovered halfway through the book is populated, not "changing".
+    A pinned field reports the Base value as the effective one and keeps the
+    raw change count as ``ignored_changes``.
+    """
+    events = session.exec(
+        select(CharacterTimelineEvent)
+        .where(CharacterTimelineEvent.character_id == character.id)).all()
+    base = next((event for event in events if event.book_id is None), None)
+    if book_id is None:
+        if order_map is None:
+            books = session.exec(
+                select(Book).where(Book.project_id == character.project_id)).all()
+            order_map = {b.id: (b.book_order or 0) for b in books}
+        ordered = sorted(events, key=lambda event: (
+            0 if event.book_id is None else 1,
+            order_map.get(event.book_id, 0),
+            event.chapter_num, event.shot_num, event.id or 0))
+    else:
+        ordered = [event for event in events if event.book_id == book_id]
+        ordered.sort(key=lambda event: (event.chapter_num, event.shot_num,
+                                        event.id or 0))
+        if not ordered and base is not None:
+            ordered = [base]
+
+    pinned = set(get_pinned_fields(character))
+    stats: Dict[str, dict] = {}
+    for field in RENDERED_TRAIT_FIELDS:
+        spans = []
+        coverage = 0
+        for event in ordered:
+            value = (getattr(event, field, None) or "").strip()
+            if not value:
+                continue
+            coverage += 1
+            if spans and spans[-1]["value"].lower() == value.lower():
+                spans[-1]["end_chapter"] = event.chapter_num
+                spans[-1]["end_shot"] = event.shot_num
+                continue
+            spans.append({
+                "value": value,
+                "book_id": event.book_id,
+                "start_chapter": event.chapter_num,
+                "start_shot": event.shot_num,
+                "end_chapter": event.chapter_num,
+                "end_shot": event.shot_num,
+                "event_id": event.id,
+                "source": event.source,
+            })
+        changes = max(0, len(spans) - 1)
+        within = across = 0
+        for previous, current in zip(spans, spans[1:]):
+            # The Base is the first appearance, not a separate book: a change
+            # from it into the first book is a within-book change.
+            if (previous["book_id"] is None or current["book_id"] is None
+                    or previous["book_id"] == current["book_id"]):
+                within += 1
+            else:
+                across += 1
+        stats[field] = {
+            "populated": bool(spans),
+            "stable": len(spans) <= 1,
+            "changes": changes,
+            "within_book_changes": within,
+            "across_book_changes": across,
+            "coverage": coverage,
+            "spans": spans,
+            "pinned": field in pinned,
+            "ignored_changes": changes if field in pinned else 0,
+        }
+        if field in pinned:
+            # The effective value is the Base value, so the field is stable by
+            # policy; keep the raw change count as "ignored".
+            stats[field]["stable"] = True
+            stats[field]["changes"] = 0
+            stats[field]["within_book_changes"] = 0
+            stats[field]["across_book_changes"] = 0
+    return stats
+
+
+
+# Which old settings checkbox governed each new field. A settings dict written
+# before the new fields existed still controls them through these groups.
+_TRAIT_LEGACY_GROUP = {
+    "sex": "demographics", "species": "demographics", "age": "demographics",
+    "hair_color": "hair_and_face", "hair_style": "hair_and_face",
+    "eye_color": "hair_and_face", "build": "physical_build",
+}
+
+
+def _trait_value(obj, key: str) -> str:
+    """The field's value, or "" when it is absent or a placeholder."""
+    value = getattr(obj, key, None)
+    if value is None:
+        return ""
+    text = str(value).strip().strip(",;")
+    return "" if text.lower() in _BLANK_VALUES else text
+
+
+def _trait_enabled(enabled_fields: Dict[str, bool], key: str,
+                   legacy_key: Optional[str] = None) -> bool:
+    """Is a field enabled for rendering?
+
+    New field names win. When a settings dict predates them, the old group it
+    belonged to is honoured instead, so the existing checkboxes keep working.
+    """
+    if key in enabled_fields:
+        return bool(enabled_fields[key])
+    if legacy_key and legacy_key in enabled_fields:
+        return bool(enabled_fields[legacy_key])
+    return True
+
+
+def has_new_traits(obj) -> bool:
+    """True when the event carries any renderable new-field value."""
+    return any(_trait_value(obj, key) for key in RENDERED_TRAIT_FIELDS)
+
+
+def _article(word: str) -> str:
+    return "an" if word[:1].lower() in "aeiou" else "a"
+
+
+def _base_noun(event) -> str:
+    """The noun phrase the sentence is built on, from sex/species/age.
+
+    Returns "" when none of them is stated. That is deliberate: "a person" adds
+    nothing to an image, and a missing base is visible in the tab as a field the
+    user can fill. A non-human species takes the slot instead of man/woman.
+    """
+    sex = _trait_value(event, "sex").lower()
+    species = _trait_value(event, "species")
+    age = _trait_value(event, "age").lower()
+    species_word = species.lower()
+    nonhuman = species_word not in _HUMAN_SPECIES and species_word != ""
+    species_tokens = set(re.findall(r"[a-z]+", species_word))
+    sex_word = ""
+    if sex in _SEX_NOUN and not (species_tokens & _SEXED_ANIMAL):
+        sex_word = sex if nonhuman else _SEX_NOUN[sex]
+    parts = []
+    if age in _VALID_AGES:
+        parts.append(age)
+    if sex_word:
+        parts.append(sex_word)
+    if nonhuman:
+        parts.append(species)
+    # An age with no noun ("a young") is not a base. Give it one.
+    if parts and not sex_word and not nonhuman:
+        parts.append("person")
+    return " ".join(p for p in parts if p)
+
+
+def _render_trait(field: str, value: str) -> str:
+    """Add the mechanical connective a bare value is missing."""
+    low = value.lower()
+    prepositional = low.startswith(("in ", "with ", "over ", "under ", "by ",
+                                    "to ", "on ", "at ", "a ", "an ", "the "))
+    if field == "hair_color" and "hair" not in low and not prepositional:
+        return f"{value} hair"
+    if field == "hair_style" and " " not in value and "hair" not in low:
+        return f"{value} hair"
+    if field == "eye_color" and "eye" not in low and not prepositional:
+        return f"{value} eyes"
+    if field == "build":
+        match = re.match(
+            r"^(.*?)\s+(chest|body|frame|physique|stature|build|girl|boy|man|"
+            r"woman|person|people|child)$", low)
+        if match:
+            stem = value[:match.start(2)].strip()
+            stem = re.sub(r"\s+\b(of|with|in|on|at|and|or|to|from|by)\b\s*$", "",
+                          stem, flags=re.I).strip()
+            if not stem:
+                return ""
+            if match.group(2) == "chest":
+                return f"who is {stem}-chested"
+            return f"who is {stem}"
+    if field == "build" and not low.startswith(("who is ", "is ")):
+        return f"who is {value}"
+    if field == "attire" and not low.startswith(("wearing ", "dressed ", "in ")):
+        return f"wearing {value}"
+    if field == "carried" and not low.startswith(("carrying ", "holding ", "with ")):
+        return f"carrying {value}"
+    return value
+
+
+def compile_event_fields(event, enabled_fields: Dict[str, bool],
+                         use_sentence_structure: bool) -> str:
+    """The parenthetical description of one event - no character name.
+
+    Sentence structure: ``a man, reddish hair, gray eyes, who is
+    broad-shouldered, wearing a cloak, and carrying a sword``. Flat structure is
+    the comma list the older non-sentence mode used.
+    """
+    base = _base_noun(event)
+    base_words = set(re.findall(r"[a-z]+", base.lower()))
+
+    values: List[tuple] = []
+    seen_values = set()
+    for field in TRAIT_ORDER:
+        if not _trait_enabled(enabled_fields, field,
+                              _TRAIT_LEGACY_GROUP.get(field)):
+            continue
+        value = _trait_value(event, field)
+        if not value:
+            continue
+        low = value.lower()
+        if low in seen_values:
+            continue
+        words = set(re.findall(r"[a-z]+", low))
+        if words and words <= base_words:
+            continue
+        seen_values.add(low)
+        values.append((field, value))
+
+    # With traits but no sex/species/age, a neutral noun beats a description that
+    # starts with a bare clause ("Name (gray hair, ...)"). It is also the honest
+    # one: the missing sex is a field the user can fill, not a guess to make.
+    if not base and values:
+        base = "person"
+        base_words = {base}
+
+    if not use_sentence_structure:
+        pieces = [base] + [value for _field, value in values]
+        seen, out = set(), []
+        for piece in pieces:
+            key = piece.lower()
+            if piece and key not in seen:
+                seen.add(key)
+                out.append(piece)
+        return ", ".join(out)
+
+    head = base
+    clauses = [_render_trait(field, value) for field, value in values]
+    if not head and not clauses:
+        return ""
+    if not head:
+        return clauses[0] if len(clauses) == 1 else (
+            ", ".join(clauses[:-1]) + ", and " + clauses[-1])
+    if head.lower().startswith(_DETERMINERS):
+        head_text = head
+    else:
+        head_text = f"{_article(head)} {head}"
+    parts = [head_text] + clauses
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        text = f"{parts[0]}, {parts[1]}"
+    else:
+        text = ", ".join(parts[:-1]) + ", and " + parts[-1]
+    return re.sub(r"\band\s+who is\b", "who is", text)
+
+
 def compile_character_description_from_event(
     char: Character,
     event: CharacterTimelineEvent,
@@ -909,6 +1430,16 @@ def compile_character_description_from_event(
             return f"{char.name} ({desc})"
         return desc
 
+    # The extracted trait set, when this event has one.
+    if has_new_traits(event):
+        inner = compile_event_fields(event, enabled_fields, use_sentence_structure)
+        if inner:
+            if use_sentence_structure:
+                return f"{char.name} ({inner})"
+            return inner
+
+    # Legacy: an event written by the old profiler, or one whose new fields are
+    # all disabled. Kept verbatim so every existing project renders as it did.
     demo = event.demographics if enabled_fields.get("demographics", True) else None
     build = event.physical_build if enabled_fields.get("physical_build", True) else None
     hair_face = event.hair_and_face if enabled_fields.get("hair_and_face", True) else None
@@ -1046,15 +1577,17 @@ def get_bracketable_names(project_id: int,
         for c in session.exec(
             select(Character).where(Character.project_id == project_id)
         ).all():
-            if c.name and len(c.name.strip()) >= 3:
-                names.append(c.name.strip())
+            name = clean_character_tag(c.name)
+            if name and len(name) >= 3:
+                names.append(name)
         for a in session.exec(
             select(CharacterAlias)
             .join(Character)
             .where(Character.project_id == project_id)
         ).all():
-            if a.alias and len(a.alias.strip()) >= 3:
-                names.append(a.alias.strip())
+            alias = clean_character_tag(a.alias)
+            if alias and len(alias) >= 3:
+                names.append(alias)
         return sorted(set(names), key=len, reverse=True)
     finally:
         if should_close:
@@ -1164,6 +1697,7 @@ def auto_bracket_character_names(prompt: str, project_id: int,
     """
     if not prompt or not prompt.strip():
         return prompt
+    prompt = normalize_character_text(prompt)
     if not project_id or not auto_bracket_enabled():
         return prompt
     if names is None:
@@ -1221,6 +1755,7 @@ def replace_character_tags_in_prompt(
     Bare character names are bracketed first (see ``auto_bracket_character_names``),
     so prompts generated before that existed still resolve.
     """
+    prompt = normalize_character_text(prompt)
     prompt = auto_bracket_character_names(prompt, project_id)
     bracket_regex = re.compile(r"\[(.*?)\]")
     matches = bracket_regex.findall(prompt)
@@ -1229,6 +1764,11 @@ def replace_character_tags_in_prompt(
 
     modified_prompt = prompt
     expanded_character_ids = set()
+    # A description is inserted ONCE per prompt. Repeating it for every mention bloats the
+    # request and gives the image model the same person three times - measured on 48 real
+    # prompts, 11 of them carried a repeated name and 20 of 64 insertions were redundant.
+    # The first mention carries the description; later mentions are the bare name.
+    described_tags: set = set()
     
     with Session(engine) as session:
         session.expire_all()
@@ -1236,10 +1776,19 @@ def replace_character_tags_in_prompt(
         books = session.exec(select(Book).where(Book.project_id == project_id)).all()
         book_order_map = {b.id: (b.book_order or 0) for b in books}
         target_book_order = book_order_map.get(book_id, 0) if book_id else 0
+        # A side story inherits from earlier volumes but passes nothing forward.
+        # When resolving for a DIFFERENT book, its events and links are invisible.
+        side_stories = {b.id for b in books if getattr(b, "is_side_story", False)}
 
         for match in matches:
-            tag = match.strip()
+            raw_tag = match.strip()
+            tag = clean_character_tag(raw_tag)
             tag_lower = tag.lower()
+
+            # Already given its full description earlier in this prompt: keep the bare name.
+            if tag_lower in described_tags:
+                modified_prompt = modified_prompt.replace(f"[{raw_tag}]", tag, 1)
+                continue
 
             # 1. Gather all candidate characters matching either alias or canonical name
             candidate_chars = []
@@ -1266,7 +1815,7 @@ def replace_character_tags_in_prompt(
 
             if not candidate_chars:
                 # No character entity found; strip brackets and keep raw tag text
-                modified_prompt = modified_prompt.replace(f"[{tag}]", tag, 1)
+                modified_prompt = modified_prompt.replace(f"[{raw_tag}]", tag, 1)
                 continue
 
             # 2. Book-Aware Disambiguation
@@ -1300,7 +1849,10 @@ def replace_character_tags_in_prompt(
                         links = session.exec(
                             select(CharacterBookLink).where(CharacterBookLink.character_id == cand.id)
                         ).all()
-                        cand_orders = [book_order_map.get(lk.book_id, 0) for lk in links if lk.book_id in book_order_map]
+                        cand_orders = [book_order_map.get(lk.book_id, 0) for lk in links
+                                       if lk.book_id in book_order_map
+                                       and not (lk.book_id in side_stories
+                                                and lk.book_id != book_id)]
                         cand_orders_before = [order for order in cand_orders if order < target_book_order]
                         best_order = max(cand_orders_before) if cand_orders_before else -1
                         scored_candidates.append((cand, best_order))
@@ -1322,49 +1874,18 @@ def replace_character_tags_in_prompt(
                     select(CharacterTimelineEvent)
                     .where(CharacterTimelineEvent.character_id == char.id)
                 ).all()
-                
-                base_ev = None
-                matched_evs = []
-                for ev in events:
-                    if ev.book_id is None:
-                        base_ev = ev
-                        continue
-                    
-                    ev_order = book_order_map.get(ev.book_id, 0)
-                    
-                    if ev_order < target_book_order:
-                        matched_evs.append((ev, ev_order))
-                    elif ev_order == target_book_order:
-                        if chapter_num is not None and ev.chapter_num < chapter_num:
-                            matched_evs.append((ev, ev_order))
-                        elif chapter_num is not None and ev.chapter_num == chapter_num:
-                            if shot_num is not None and ev.shot_num <= shot_num:
-                                matched_evs.append((ev, ev_order))
-                
-                resolved_ev = base_ev
-                if matched_evs:
-                    matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].shot_num))
-                    resolved_ev = matched_evs[-1][0]
-                
-                if not resolved_ev:
-                    resolved_ev = CharacterTimelineEvent(
-                        character_id=char.id,
-                        book_id=None,
-                        chapter_num=0,
-                        shot_num=0,
-                        label="Base State"
-                    )
-                    session.add(resolved_ev)
-                    session.commit()
-                    session.refresh(resolved_ev)
-                    
+                resolved_ev, _base_ev = resolve_event_at(
+                    session, char, book_id, chapter_num, shot_num,
+                    book_order_map=book_order_map, side_stories=side_stories,
+                    events=events)
                 replacement = compile_character_description_from_event(
                     char, resolved_ev, enabled_fields, use_sentence_structure
                 )
                 expanded_character_ids.add(char.id)
             
-            modified_prompt = modified_prompt.replace(f"[{tag}]", replacement, 1)
-                
+            modified_prompt = modified_prompt.replace(f"[{raw_tag}]", replacement, 1)
+            described_tags.add(tag_lower)
+
     return modified_prompt
 
 
@@ -1778,6 +2299,97 @@ def execute_character_import(
     save_project_characters_to_json(tgt_project_id)
 
 
+def merge_apostrophe_duplicates(project_id: int, log=None) -> Dict[str, int]:
+    """Merge characters whose names differ only by typographic single quotes.
+
+    A reader sees ``al’Vere`` and ``al'Vere`` as the same name; exact-match
+    queries do not. Import and matching now normalize at the boundary, and this
+    repairs data created before that. It also normalizes every remaining name
+    and alias, and removes aliases that collapse onto the canonical name.
+    """
+    say = log or (lambda *_a, **_k: None)
+    stats = {"groups": 0, "merged": 0, "names_normalized": 0,
+             "aliases_normalized": 0, "aliases_removed": 0}
+
+    with Session(engine) as session:
+        chars = session.exec(
+            select(Character).where(Character.project_id == project_id)).all()
+        event_counts = {}
+        for char in chars:
+            event_counts[char.id] = len(session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == char.id)).all())
+        groups: Dict[str, List[Character]] = {}
+        for char in chars:
+            groups.setdefault(clean_character_key(char.name), []).append(char)
+
+        pairs = []
+        for key, members in groups.items():
+            if len(members) < 2:
+                continue
+            stats["groups"] += 1
+            target = sorted(
+                members,
+                key=lambda char: (
+                    0 if clean_character_tag(char.name) == char.name else 1,
+                    -(char.hit_count or 0),
+                    -event_counts.get(char.id, 0),
+                    char.id or 0,
+                ))[0]
+            for source in members:
+                if source.id != target.id:
+                    pairs.append((source.id, target.id))
+
+    for source_id, target_id in pairs:
+        if merge_character_into_target(source_id, target_id):
+            stats["merged"] += 1
+
+    with Session(engine) as session:
+        chars = session.exec(
+            select(Character).where(Character.project_id == project_id)).all()
+        for char in chars:
+            clean = clean_character_tag(char.name)
+            if clean and clean != char.name:
+                char.name = clean
+                session.add(char)
+                stats["names_normalized"] += 1
+        aliases = session.exec(
+            select(CharacterAlias).join(Character)
+            .where(Character.project_id == project_id)).all()
+        seen: Dict[int, set] = {}
+        for alias in aliases:
+            clean = clean_character_tag(alias.alias)
+            key = clean_character_key(clean)
+            char_id = alias.character_id
+            if not clean:
+                session.delete(alias)
+                stats["aliases_removed"] += 1
+                continue
+            if key in seen.setdefault(char_id, set()):
+                session.delete(alias)
+                stats["aliases_removed"] += 1
+                continue
+            seen[char_id].add(key)
+            if clean != alias.alias:
+                alias.alias = clean
+                session.add(alias)
+                stats["aliases_normalized"] += 1
+        session.commit()
+
+    save_project_characters_to_json(project_id)
+    try:
+        # Keep the cached hit_count consistent with the merged aliases.
+        from services.character_organizer import recalculate_project_character_hits
+        recalculate_project_character_hits(project_id)
+    except Exception:
+        pass
+    say(f"[Characters] merged {stats['merged']} apostrophe duplicate(s); "
+        f"normalized {stats['names_normalized']} names, "
+        f"{stats['aliases_normalized']} aliases; removed "
+        f"{stats['aliases_removed']} duplicate aliases")
+    return stats
+
+
 def reset_project_characters(project_id: int):
     """
     Completely wipes all characters, aliases, book links, and timeline events for a project.
@@ -1835,6 +2447,141 @@ def link_character_to_book(character_id: int, book_id: int, session: Optional[Se
             session.close()
 
 
+def _merge_timeline_events(session: Session, src: Character, tgt: Character,
+                           target_base: Optional[CharacterTimelineEvent],
+                           source_base: Optional[CharacterTimelineEvent]) -> None:
+    """Merge source book events into target with target-wins conflicts.
+
+    The target's snapshot wins at a shared position; source fields fill only the
+    gaps there. At positions the target does not describe, the source's *changes*
+    relative to its own previous state are applied on top of the target's current
+    state. That gives "additional traits and changes from the source, target wins
+    conflicts" without letting the source's base identity overwrite the target's.
+    """
+    books = session.exec(
+        select(Book).where(Book.project_id == tgt.project_id)).all()
+    order_map = {book.id: (book.book_order or 0) for book in books}
+
+    source_events = session.exec(
+        select(CharacterTimelineEvent)
+        .where(CharacterTimelineEvent.character_id == src.id)
+        .where(CharacterTimelineEvent.book_id.is_not(None))).all()
+    target_events = session.exec(
+        select(CharacterTimelineEvent)
+        .where(CharacterTimelineEvent.character_id == tgt.id)
+        .where(CharacterTimelineEvent.book_id.is_not(None))).all()
+
+    def snapshot(event):
+        if event is None:
+            return {field: None for field in NEW_TRAIT_FIELDS}
+        return {field: getattr(event, field, None) for field in NEW_TRAIT_FIELDS}
+
+    def position(event):
+        return (event.book_id, event.chapter_num, event.shot_num)
+
+    def sort_key(pos):
+        return (order_map.get(pos[0], 0), pos[1], pos[2])
+
+    source_by_pos = {}
+    for event in source_events:
+        source_by_pos[position(event)] = event
+    target_by_pos = {}
+    for event in target_events:
+        target_by_pos[position(event)] = event
+
+    positions = sorted(set(source_by_pos) | set(target_by_pos), key=sort_key)
+    target_state = snapshot(target_base)
+    source_state = snapshot(source_base)
+
+    for pos in positions:
+        source_event = source_by_pos.get(pos)
+        target_event = target_by_pos.get(pos)
+
+        delta = {}
+        if source_event is not None:
+            event_state = snapshot(source_event)
+            for field in NEW_TRAIT_FIELDS:
+                value = (event_state.get(field) or "").strip()
+                previous = (source_state.get(field) or "").strip()
+                if value and value != previous:
+                    delta[field] = event_state[field]
+            source_state = event_state
+
+        if target_event is not None:
+            # Both describe this position: the target wins every conflict.
+            changed = False
+            if source_event is not None:
+                for field in NEW_TRAIT_FIELDS:
+                    if (not (getattr(target_event, field, None) or "").strip()
+                            and (getattr(source_event, field, None) or "").strip()):
+                        setattr(target_event, field, getattr(source_event, field))
+                        changed = True
+            if changed:
+                session.add(target_event)
+            target_state = snapshot(target_event)
+            continue
+
+        if source_event is None:
+            continue
+
+        # The target has no event here: apply the source's changes, and fill
+        # fields the target still knows nothing about.
+        merged = dict(target_state)
+        for field in NEW_TRAIT_FIELDS:
+            if field in delta:
+                merged[field] = delta[field]
+            elif not (merged.get(field) or "").strip():
+                value = getattr(source_event, field, None)
+                if value:
+                    merged[field] = value
+        if merged == target_state:
+            continue
+
+        session.add(CharacterTimelineEvent(
+            character_id=tgt.id,
+            book_id=pos[0], chapter_num=pos[1], shot_num=pos[2],
+            label=source_event.label,
+            source=source_event.source,
+            demographics=source_event.demographics,
+            physical_build=source_event.physical_build,
+            hair_and_face=source_event.hair_and_face,
+            distinguishing_marks=source_event.distinguishing_marks,
+            **{field: merged.get(field) for field in NEW_TRAIT_FIELDS}))
+        target_state = merged
+
+    for event in source_events:
+        session.delete(event)
+
+
+def character_trait_summary(session: Session, character: Character,
+                            book_id: Optional[int] = None
+                            ) -> Dict[str, Dict[str, Any]]:
+    """Base -> latest values per rendered field, for merge comparison.
+
+    ``base`` is the canonical first-appearance value; ``latest`` is the last
+    non-blank value in the chosen scope. ``changes`` is the span count minus one.
+    """
+    stats = character_field_stats(session, character, book_id=book_id)
+    base_event = session.exec(
+        select(CharacterTimelineEvent)
+        .where(CharacterTimelineEvent.character_id == character.id)
+        .where(CharacterTimelineEvent.book_id == None)
+    ).first()
+    out: Dict[str, Dict[str, Any]] = {}
+    for field in RENDERED_TRAIT_FIELDS:
+        base_value = ((getattr(base_event, field, None) or "").strip()
+                      if base_event else "")
+        spans = stats.get(field, {}).get("spans", [])
+        latest_value = spans[-1]["value"] if spans else ""
+        out[field] = {
+            "base": base_value,
+            "latest": latest_value,
+            "populated": bool(spans),
+            "changes": stats.get(field, {}).get("changes", 0),
+        }
+    return out
+
+
 def merge_character_into_target(
     source_char_id: int,
     target_char_id: int,
@@ -1857,24 +2604,30 @@ def merge_character_into_target(
             return False
 
         project_id = tgt.project_id
+        src_pins = set(get_pinned_fields(src))
+        tgt_pins = set(get_pinned_fields(tgt))
+        if src_pins - tgt_pins:
+            set_pinned_fields(session, tgt, sorted(tgt_pins | src_pins))
 
         # 1. Transfer source canonical name as an alias on target
         existing_tgt_aliases = {
-            a.alias.lower().strip()
+            clean_character_key(a.alias)
             for a in session.exec(select(CharacterAlias).where(CharacterAlias.character_id == tgt.id)).all()
         }
-        existing_tgt_aliases.add(tgt.name.lower().strip())
+        existing_tgt_aliases.add(clean_character_key(tgt.name))
 
-        if src.name.lower().strip() not in existing_tgt_aliases:
-            session.add(CharacterAlias(character_id=tgt.id, alias=src.name.strip()))
-            existing_tgt_aliases.add(src.name.lower().strip())
+        if clean_character_key(src.name) not in existing_tgt_aliases:
+            session.add(CharacterAlias(character_id=tgt.id,
+                                       alias=clean_character_tag(src.name)))
+            existing_tgt_aliases.add(clean_character_key(src.name))
 
         # 2. Transfer source aliases to target
         src_aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == src.id)).all()
         for sa in src_aliases:
-            if sa.alias.lower().strip() not in existing_tgt_aliases:
-                session.add(CharacterAlias(character_id=tgt.id, alias=sa.alias.strip()))
-                existing_tgt_aliases.add(sa.alias.lower().strip())
+            alias_text = clean_character_tag(sa.alias)
+            if clean_character_key(alias_text) not in existing_tgt_aliases:
+                session.add(CharacterAlias(character_id=tgt.id, alias=alias_text))
+                existing_tgt_aliases.add(clean_character_key(alias_text))
             session.delete(sa)
 
         # 3. Transfer and consolidate book links
@@ -1894,33 +2647,58 @@ def merge_character_into_target(
         if book_id and book_id not in existing_tgt_links:
             session.add(CharacterBookLink(character_id=tgt.id, book_id=book_id))
 
-        # 4. Migrate timeline events (fill empty target base traits from source base, reparent overrides)
-        src_events = session.exec(select(CharacterTimelineEvent).where(CharacterTimelineEvent.character_id == src.id)).all()
+        # 4. Merge the Base and the timeline. The target's Base wins conflicts;
+        # the source only fills empty fields. Book events then merge position by
+        # position (target wins at a shared position; source changes apply where
+        # the target has no event).
+        src_events = session.exec(
+            select(CharacterTimelineEvent)
+            .where(CharacterTimelineEvent.character_id == src.id)).all()
+        source_base = next((ev for ev in src_events if ev.book_id is None), None)
+        target_events = session.exec(
+            select(CharacterTimelineEvent)
+            .where(CharacterTimelineEvent.character_id == tgt.id)
+            .where(CharacterTimelineEvent.book_id.is_not(None))).all()
         target_base = session.exec(
             select(CharacterTimelineEvent)
             .where(CharacterTimelineEvent.character_id == tgt.id)
             .where(CharacterTimelineEvent.book_id == None)
         ).first()
 
-        for ev in src_events:
-            if ev.book_id is None:
-                if target_base:
-                    if not target_base.demographics and ev.demographics: target_base.demographics = ev.demographics
-                    if not target_base.physical_build and ev.physical_build: target_base.physical_build = ev.physical_build
-                    if not target_base.hair_and_face and ev.hair_and_face: target_base.hair_and_face = ev.hair_and_face
-                    if not target_base.distinguishing_marks and ev.distinguishing_marks: target_base.distinguishing_marks = ev.distinguishing_marks
-                    session.add(target_base)
-                session.delete(ev)
-            else:
-                ev.character_id = tgt.id
-                session.add(ev)
+        if target_base is None and source_base is not None:
+            # Reparent the source Base rather than deleting the only canonical
+            # description.
+            source_base.character_id = tgt.id
+            session.add(source_base)
+            target_base = source_base
+        elif target_base is not None and source_base is not None:
+            for field in NEW_TRAIT_FIELDS:
+                if (not getattr(target_base, field, None)
+                        and getattr(source_base, field, None)):
+                    setattr(target_base, field, getattr(source_base, field))
+            if not target_base.demographics and source_base.demographics:
+                target_base.demographics = source_base.demographics
+            if not target_base.physical_build and source_base.physical_build:
+                target_base.physical_build = source_base.physical_build
+            if not target_base.hair_and_face and source_base.hair_and_face:
+                target_base.hair_and_face = source_base.hair_and_face
+            if (not target_base.distinguishing_marks
+                    and source_base.distinguishing_marks):
+                target_base.distinguishing_marks = source_base.distinguishing_marks
+            if (not target_base.visual_description
+                    and source_base.visual_description):
+                target_base.visual_description = source_base.visual_description
+            session.add(target_base)
+            session.delete(source_base)
+
+        _merge_timeline_events(session, src, tgt, target_base, source_base)
 
         # 5. Delete source character
         session.delete(src)
         session.commit()
 
         if tgt and not tgt.locked:
-            if target_base:
+            if target_base and not target_base.visual_description:
                 target_base.visual_description = compile_character_visual_prompt(target_base)
                 session.add(target_base)
                 session.commit()

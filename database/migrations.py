@@ -7,9 +7,9 @@ The project's Files-as-Source-of-Truth pattern heals *data*: delete
 never renames a column that already exists. So every column rename gets an
 entry here, and every entry must be safe to run on every startup.
 
-This module is the one place that knows about retired column names. Anything
-that reads *files* written before a rename is handled separately by
-``services/compat.py``.
+This module is the one place that knows about retired column names and columns
+added after a table first shipped. Anything that reads *files* written before a
+rename is handled separately by ``services/compat.py``.
 
 Vocabulary (do not blur these):
     shot  -- the image unit. One chunk of text renders to one image. -> shot_num
@@ -39,6 +39,26 @@ INDEX_RENAMES = [
 ]
 
 
+# (table, column, SQL type) added when missing. SQLite's ADD COLUMN is instant
+# and lossless; it is how a database upgraded from an older build gains a field
+# without a rebuild. A column is never dropped here: old values stay readable.
+COLUMN_ADDS = [
+    ("charactertimelineevent", "sex", "TEXT"),
+    ("charactertimelineevent", "species", "TEXT"),
+    ("charactertimelineevent", "age", "TEXT"),
+    ("charactertimelineevent", "hair_color", "TEXT"),
+    ("charactertimelineevent", "hair_style", "TEXT"),
+    ("charactertimelineevent", "eye_color", "TEXT"),
+    ("charactertimelineevent", "build", "TEXT"),
+    ("charactertimelineevent", "attire", "TEXT"),
+    ("charactertimelineevent", "carried", "TEXT"),
+    ("charactertimelineevent", "notes", "TEXT"),
+    ("charactertimelineevent", "source", "TEXT"),
+    ("character", "pinned_traits", "TEXT"),
+    ("book", "is_side_story", "BOOLEAN DEFAULT 0"),
+]
+
+
 def _table_exists(conn, table: str) -> bool:
     row = conn.exec_driver_sql(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (table,)
@@ -49,6 +69,20 @@ def _table_exists(conn, table: str) -> bool:
 def _columns(conn, table: str) -> set:
     rows = conn.exec_driver_sql(f'PRAGMA table_info("{table}")').fetchall()
     return {r[1] for r in rows}
+
+
+def _add_columns(conn) -> list:
+    """Add missing columns, leaving existing data untouched."""
+    applied = []
+    for table, column, sql_type in COLUMN_ADDS:
+        if not _table_exists(conn, table):
+            continue
+        if column in _columns(conn, table):
+            continue
+        conn.exec_driver_sql(
+            f'ALTER TABLE "{table}" ADD COLUMN "{column}" {sql_type}')
+        applied.append(f"{table}.{column} added")
+    return applied
 
 
 def _rename_indexes(conn) -> list:
@@ -71,11 +105,12 @@ def _rename_indexes(conn) -> list:
 
 
 def apply_migrations(engine) -> list:
-    """Rename retired columns in place. Returns a list of human-readable changes.
+    """Add missing columns and rename retired ones. Returns a list of changes.
 
     Safe to call on every startup:
-      * a fresh database already has the current column, so nothing matches;
-      * an already-migrated database has no retired column, so nothing matches;
+      * a fresh database already has the current schema, so nothing matches;
+      * an already-migrated database has no retired column and every new column
+        present, so nothing matches;
       * a half-migrated table (both columns present) is left alone rather than
         guessed at.
 
@@ -95,6 +130,7 @@ def apply_migrations(engine) -> list:
                     f'ALTER TABLE "{table}" RENAME COLUMN "{retired}" TO "{current}"'
                 )
                 applied.append(f"{table}.{retired} -> {current}")
+            applied.extend(_add_columns(conn))
             applied.extend(_rename_indexes(conn))
     except SQLAlchemyError as exc:  # pragma: no cover - defensive
         print(f"[Migrations] column rename failed, continuing: {exc}")

@@ -9,6 +9,21 @@ from typing import List, Dict, Any, Optional
 from database.connection import get_setting
 from services import vram_manager
 from services import compat
+from services import scene_map
+# The paragraph chunker is the fast path of the scene-map module and lives
+# there now. It is re-exported here because prompt generation, the shot planner
+# and the character manager have always imported it from this module.
+from services.scene_map import (
+    PARA_SLACK,
+    SENT_SLACK,
+    SEG_VERSION,
+    StaleSceneMap,
+    book_chunks,
+    scene_map_signature,
+    smart_chunk_text,
+    transcript_digest,
+)
+from services import pipeline_manifest
 from ui import state
 
 REFUSAL_KEYWORDS = [
@@ -70,94 +85,20 @@ def save_template_by_name(name: str, content: str) -> None:
     target.write_text(content, encoding="utf-8")
 
 
-# Soft-window chunking. Whole paragraphs are packed until the running total
-# enters the window; a chunk therefore ends on a line break rather than at the
-# exact target. Only a paragraph *larger* than the window falls back to
-# sentence splits, and it uses a tighter window so we don't shave off
-# near-target chunks. Keep these as constants (not settings): shot_plan.csv
-# records only `chunk_words` and re-derives scenes from it, so the chunker must
-# stay a pure function of the target size.
-PARA_SLACK = 0.15   # paragraph window: target +/- 15%  (350 -> 298..402)
-SENT_SLACK = 0.05   # sentence window:  target +/- 5%   (350 -> 333..367)
-
-
-def smart_chunk_text(text: str, max_chunk_words: int,
-                     para_slack: float = PARA_SLACK,
-                     sent_slack: float = SENT_SLACK) -> List[str]:
-    """Paragraph-aware text chunking with a soft word window.
-
-    Boundaries land on line breaks (``\\n\\n``) wherever possible: a whole
-    paragraph is packed as long as it fits inside the paragraph window. Only a
-    paragraph that alone exceeds that window is split by sentences. Pass
-    ``para_slack=sent_slack=0`` for the old strict behaviour.
-    """
-    if not text.strip() or max_chunk_words <= 0:
-        return []
-
-    target = float(max_chunk_words)
-    para_hi = target * (1 + para_slack)
-    sent_lo, sent_hi = target * (1 - sent_slack), target * (1 + sent_slack)
-
-    def split_into_sentences(paragraph_text: str) -> List[str]:
-        # Split after sentence-ending punctuation + whitespace. Lossless: no
-        # characters are dropped and a closing quote stays attached to its
-        # sentence. (The previous regex detached trailing quotes - inserting a
-        # stray space - and silently dropped runs like "..." or "?!".)
-        if not paragraph_text:
-            return []
-        return [s for s in re.split(r'(?<=[.!?])\s+', paragraph_text) if s]
-
-    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-    chunks: List[str] = []
-    current_chunk_words: List[str] = []
-
-    def flush() -> None:
-        if current_chunk_words:
-            chunks.append(" ".join(current_chunk_words))
-            current_chunk_words.clear()
-
-    def pack_sentences(sentences: List[str]) -> None:
-        for sentence in sentences:
-            sentence_words = sentence.split()
-            if not sentence_words:
-                continue
-            if (current_chunk_words
-                    and len(current_chunk_words) + len(sentence_words) > sent_hi
-                    and len(current_chunk_words) >= sent_lo):
-                flush()
-            current_chunk_words.extend(sentence_words)
-
-    for paragraph in paragraphs:
-        paragraph_words = paragraph.split()
-        if not paragraph_words:
-            continue
-        if len(paragraph_words) > para_hi:
-            # A single oversized paragraph: start a fresh chunk and split it by
-            # sentences inside the tighter window.
-            flush()
-            pack_sentences(split_into_sentences(paragraph))
-            continue
-        if current_chunk_words and len(current_chunk_words) + len(paragraph_words) > para_hi:
-            flush()
-        current_chunk_words.extend(paragraph_words)
-
-    flush()
-    return chunks
-
-    return chunks
-
-
 async def get_llm_response(
     prompt: str,
     llm_url: str,
     model_name: str,
     temperature: float = 0.7,
-    extra_payload: Optional[Dict[str, Any]] = None
+    extra_payload: Optional[Dict[str, Any]] = None,
+    timeout: float = 60.0,
 ) -> str:
     """Dispatches asynchronous request to local Ollama or LM Studio OpenAI-compatible endpoints.
 
     ``extra_payload`` merges into the request body, e.g. to disable a model's
     thinking mode: ``{"chat_template_kwargs": {"enable_thinking": False}}``.
+    ``timeout`` is per request: scene segmentation reads a whole chapter and can
+    take minutes, while a one-shot prompt is expected in under a minute.
     """
     # Loading the LLM will evict ComfyUI if it is the one holding the GPU.
     await vram_manager.ensure_llm_async()
@@ -184,7 +125,7 @@ async def get_llm_response(
     
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.post(endpoint, json=payload, headers=headers, timeout=60.0)
+            response = await client.post(endpoint, json=payload, headers=headers, timeout=timeout)
             response.raise_for_status()
             data = response.json()
             return data['choices'][0]['message']['content']
@@ -199,7 +140,7 @@ async def get_llm_response(
                         "stream": False,
                         "options": {"temperature": temperature}
                     }
-                    resp = await client.post(direct_endpoint, json=direct_payload, timeout=60.0)
+                    resp = await client.post(direct_endpoint, json=direct_payload, timeout=timeout)
                     resp.raise_for_status()
                     return resp.json().get("response", "")
                 except Exception as inner_e:
@@ -419,6 +360,67 @@ def sort_csv_by_chapter_scene(csv_path: Path):
         print(f"Error sorting prompts.csv: {str(ex)}")
 
 
+def prepare_book_chunks(book_dir, chunk_words: int, full_text: str,
+                        completed_scenes: set):
+    """``(chunks, source, problem)`` for one book, enforcing the coordinate guard.
+
+    The chunks come from the chunking the book is bound to: its manifest, else
+    the legacy linear rule when it already has prompt rows, else its scene map
+    when it has one. A stale map, or a ``prompts.csv`` built under a different
+    chunking, comes back as ``problem`` instead of raising or silently switching
+    coordinate systems; the caller logs it and skips the book. On success the
+    pipeline manifest records which chunking owns the book from now on.
+    """
+    prompts_exist = bool(completed_scenes) or scene_map.prompts_have_rows(book_dir)
+    # In Full/Scenes mode a book without a scene map has not been analysed yet.
+    # Generating it linearly would bind it to the old chunking and lock the new
+    # pipeline out, so skip it with an actionable message instead. Fast mode is
+    # the explicit request for linear, and a legacy book with rows keeps its
+    # existing coordinates.
+    try:
+        mode = str(get_setting("pipeline_mode", "full") or "full")
+    except Exception:
+        mode = "full"
+    if (mode in ("scenes", "full") and not prompts_exist
+            and not scene_map.scene_map_path(book_dir).exists()):
+        return None, "", (
+            f"no scene map yet; the project is in '{mode}' mode. Run character "
+            f"analysis for this book first, or switch the project to Fast.")
+    try:
+        source = scene_map.book_source(book_dir, prompts_exist=prompts_exist)
+        chunks, source = book_chunks(book_dir, chunk_words, text=full_text,
+                                     source=source)
+    except StaleSceneMap as ex:
+        return None, "", str(ex)
+
+    sha = transcript_digest(full_text)
+    map_sha = scene_map_signature(book_dir) if source == "scene_map" else ""
+
+    # The characters' event positions are the first chunk of their group at the
+    # chunk size analysis ran with. A different size would put every description
+    # a few shots off, so refuse rather than write subtly wrong prompts.
+    recorded_analysis_words = pipeline_manifest.read(book_dir).get("analysis_chunk_words")
+    if source == "scene_map" and recorded_analysis_words is not None:
+        try:
+            if int(recorded_analysis_words) != int(chunk_words):
+                return None, source, (
+                    f"character analysis was run at {recorded_analysis_words} words "
+                    f"per shot, but the current setting is {chunk_words}; restore "
+                    f"that setting or re-run analysis for this book.")
+        except (TypeError, ValueError):
+            pass
+
+    allowed, reason = pipeline_manifest.check(
+        book_dir, source, chunk_words, transcript_sha=sha, scene_map_sha=map_sha,
+        prompts_exist=prompts_exist)
+    if not allowed:
+        return None, source, reason
+    pipeline_manifest.record_chunking(
+        book_dir, source, chunk_words, seg_version=SEG_VERSION,
+        transcript_sha=sha, scene_map_sha=map_sha)
+    return chunks, source, ""
+
+
 async def start_project_prompt_gen(project_id: int):
     """
     Orchestrates sequential resumable prompt generation for all books in a project.
@@ -437,6 +439,8 @@ async def start_project_prompt_gen(project_id: int):
     state.prompt_gen_active = True
     state.cancel_prompt_gen_flag = False
     state.recent_prompts.clear()
+    skipped_books = 0
+    completed_books = 0
     
     with Session(engine) as session:
         project = session.get(Project, project_id)
@@ -491,6 +495,7 @@ async def start_project_prompt_gen(project_id: int):
 
             if not transcript_path.exists():
                 state.add_console_log(f"[Prompt-Gen] Missing transcript for {book_name}. Skipping.")
+                skipped_books += 1
                 continue
 
             # 1. Load Existing Progress for Resuming
@@ -509,19 +514,47 @@ async def start_project_prompt_gen(project_id: int):
             if completed_scenes:
                 state.add_console_log(f"[Prompt-Gen] Found {len(completed_scenes)} existing prompts. Resuming where left off...")
 
-            # 2. Segment transcript into chapters & chunks
             with open(transcript_path, "r", encoding="utf-8") as f:
                 full_text = f.read()
 
-            chapters = [ch for ch in full_text.split("==CHAPTER==") if ch.strip()]
-            
+            # 2. Chunk the book. A scene map owns the coordinates when the book has
+            # one; otherwise the linear chunker reproduces the legacy numbering.
+            book_dir = output_csv_path.parent
+            chunks, chunk_source, problem = prepare_book_chunks(
+                book_dir, chunk_size_words, full_text, completed_scenes)
+            if problem:
+                state.add_console_log(
+                    f"[Prompt-Gen] {book_name}: {problem} Skipping this book.")
+                skipped_books += 1
+                # Do not leave a skipped book stuck in "Generating Prompts" for the
+                # finally block to downgrade: rows that exist are still renderable.
+                with Session(engine) as session:
+                    db_book = session.get(Book, book_id)
+                    if db_book:
+                        db_book.status = ("Prompts Created" if completed_scenes
+                                          else "Transcribed")
+                        session.add(db_book)
+                        session.commit()
+                continue
+            source_label = "scene map" if chunk_source == "scene_map" else "linear chunker"
+            state.add_console_log(
+                f"[Prompt-Gen] Chunking '{book_name}' with the {source_label}: "
+                f"{len(chunks)} chunks")
+            if chunk_source == "linear" and scene_map.scene_map_path(book_dir).exists():
+                state.add_console_log(
+                    f"[Prompt-Gen] Note: '{book_name}' has a scene map, but its "
+                    f"prompts were generated linearly; rebuild the book to use the map.")
+            current_keys = {(chunk.chapter, chunk.shot) for chunk in chunks}
+            orphans = completed_scenes - current_keys
+            if orphans:
+                state.add_console_log(
+                    f"[Prompt-Gen] Warning: {len(orphans)} existing row(s) for "
+                    f"'{book_name}' do not match any current chunk and are left in "
+                    f"place; the transcript may have changed since they were generated.")
+
             # Enumerate every scene once. Planning is skipped when nothing is
             # pending, so re-running on a finished book costs no LLM time.
-            all_scenes = []
-            for i, chapter_text in enumerate(chapters):
-                chunks = smart_chunk_text(chapter_text, chunk_size_words)
-                all_scenes.extend((i + 1, j + 1, chunk_text)
-                                  for j, chunk_text in enumerate(chunks))
+            all_scenes = [(chunk.chapter, chunk.shot, chunk.text) for chunk in chunks]
             pending = [(c, s, t) for (c, s, t) in all_scenes
                        if (c, s) not in completed_scenes]
 
@@ -532,12 +565,17 @@ async def start_project_prompt_gen(project_id: int):
             shot_mode = prompt_lib.get_shot_mode(project_name, book_name)
             selection = prompt_lib.active_selection()
             shot_map = {}
+            focus_map = {}
             if pending:
                 shot_map = await shot_planner.ensure_book_plan(
                     project_name, book_name, llm_url, model_name,
                     chunk_words=chunk_size_words, mode=shot_mode,
                     log=state.add_console_log, selection=selection,
                 )
+                # The focus the planner chose for each shot, read back from the stored plan.
+                # Without it the shared block's "the director has chosen a focus" line has
+                # nothing to point at, and the prompt model has to infer the subject.
+                focus_map = shot_planner.load_focus_map(project_name, book_name)
             state.add_console_log(
                 f"[Prompt-Gen] Shot mode for '{book_name}': {shot_mode}"
                 + f" - planner {selection.get('shot_direction', '?')}"
@@ -558,7 +596,9 @@ async def start_project_prompt_gen(project_id: int):
                     "shot_num": shot_num,
                     "shot_role": role,
                     "project_id": project_id,
-                    "prompt": prompt_lib.render_with_selection(role, chunk_text, selection),
+                    "prompt": prompt_lib.render_with_selection(
+                        role, chunk_text, selection,
+                        focus=focus_map.get((chapter_num, shot_num), "")),
                 })
 
             total_chunks = len(completed_scenes) + len(tasks)
@@ -576,6 +616,7 @@ async def start_project_prompt_gen(project_id: int):
 
             if not tasks:
                 state.add_console_log(f"[Prompt-Gen] All scenes for {book_name} are already generated.")
+                completed_books += 1
                 with Session(engine) as session:
                     db_book = session.get(Book, book_id)
                     if db_book:
@@ -665,6 +706,7 @@ async def start_project_prompt_gen(project_id: int):
             if not remaining_tasks:
                 # If there were no other tasks, sort the completed CSV
                 sort_csv_by_chapter_scene(output_csv_path)
+                completed_books += 1
                 with Session(engine) as session:
                     db_book = session.get(Book, book_id)
                     if db_book:
@@ -762,16 +804,25 @@ async def start_project_prompt_gen(project_id: int):
                         db_book.status = "Prompts Created"
                         session.add(db_book)
                         session.commit()
+                completed_books += 1
 
-        # Update Project Status upon completing loop
+        # Update Project Status upon completing loop. A project with skipped books
+        # stays in the prompt phase so the analysis card is still available for
+        # the rest of the series.
         if not state.cancel_prompt_gen_flag:
             with Session(engine) as session:
                 db_project = session.get(Project, project_id)
                 if db_project:
-                    db_project.status = "Prompts Created"
+                    db_project.status = ("Prompts Created" if skipped_books == 0
+                                         else "Transcribed")
                     session.add(db_project)
                     session.commit()
-            state.add_console_log("[Prompt-Gen] Success! All prompts generated and synced with timestamps.")
+            if skipped_books:
+                state.add_console_log(
+                    f"[Prompt-Gen] {completed_books} book(s) complete, "
+                    f"{skipped_books} skipped; the project stays in the prompt phase.")
+            else:
+                state.add_console_log("[Prompt-Gen] Success! All prompts generated and synced with timestamps.")
         else:
             state.add_console_log("[Prompt-Gen] Prompt generation suspended successfully.")
 

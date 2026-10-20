@@ -8,14 +8,16 @@ def render_project_tabs(
     stop_transcribe_cb,
     start_prompt_gen_cb=None,
     start_image_gen_cb=None,
-    save_project_settings_cb=None
+    save_project_settings_cb=None,
+    start_analysis_cb=None
 ):
     render_dashboard_tabs(
         project, 
         books, 
         start_transcribe_cb, 
         stop_transcribe_cb,
-        start_prompt_gen_cb,
-        start_image_gen_cb,
-        save_project_settings_cb
+        start_prompt_gen_cb, 
+        start_image_gen_cb, 
+        save_project_settings_cb,
+        start_analysis_cb
     )

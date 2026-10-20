@@ -12,6 +12,7 @@ from services.character_manager import (
     save_project_characters_to_json,
     run_stateful_character_profiling,
     get_alias_occurrences,
+    NEW_TRAIT_FIELDS,
 )
 from ui.pages.project.characters_tab import get_character_frequency_map
 
@@ -678,6 +679,8 @@ class QuickCharactersModal:
                         copied_traits["physical_build"] = resolved.physical_build
                         copied_traits["hair_and_face"] = resolved.hair_and_face
                         copied_traits["distinguishing_marks"] = resolved.distinguishing_marks
+                        for field in NEW_TRAIT_FIELDS:
+                            copied_traits[field] = getattr(resolved, field, None)
                         copied_traits["visual_description"] = resolved.visual_description
                         copied_status.text = f"Cloned traits from existing: '{resolved.label or 'Base State'}'!"
                     else:
@@ -710,10 +713,12 @@ class QuickCharactersModal:
                         chapter_num=ch,
                         shot_num=sc,
                         label=lbl,
+                        source="manual",
                         demographics=copied_traits.get("demographics"),
                         physical_build=copied_traits.get("physical_build"),
                         hair_and_face=copied_traits.get("hair_and_face"),
                         distinguishing_marks=copied_traits.get("distinguishing_marks"),
+                        **{field: copied_traits.get(field) for field in NEW_TRAIT_FIELDS},
                         visual_description=copied_traits.get("visual_description")
                     )
                     session.add(new_ev)

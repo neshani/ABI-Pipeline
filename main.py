@@ -203,6 +203,12 @@ DEFAULT_SETTINGS = {
     "llm_model": "unsloth/gemma-4-e4b-it",
     "llm_launch_path": "",
     "llm_launch_args": "",
+    # How much text one analysis call may read. The word budget is the measured
+    # value; the context setting caps it so a smaller model cannot be overrun.
+    "llm_context_tokens": 32768,
+    "analysis_window_words": 12000,
+    # fast = current pipeline, scenes = scene map + planner, full = + characters.
+    "pipeline_mode": "full",
     "vram_auto_switch": True,
     "stt_engine": "ABI-Subtitles",
     "stt_device": "GPU/CUDA",
@@ -497,6 +503,79 @@ def start_prompt_generation(project_id: int):
     if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
         state.action_buttons_refresh()
     header_controls.refresh()
+
+
+async def _run_character_analysis(project_id: int, book_ids: Optional[List[int]],
+                                  mode: str):
+    """Build scene maps and, in full mode, the cast, book by book in reading order."""
+    from services import scene_map
+    from services import character_analysis
+
+    try:
+        with Session(engine) as session:
+            project = session.get(Project, project_id)
+            if not project:
+                state.add_console_log("[Analysis] Error: project not found.")
+                return
+            project_name = project.name
+            books = session.exec(
+                select(Book).where(Book.project_id == project_id)
+                .order_by(Book.book_order)).all()
+            wanted = [(b.id, b.name) for b in books
+                      if not book_ids or b.id in book_ids]
+        if not wanted:
+            state.add_console_log("[Analysis] Nothing selected.")
+            return
+        llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
+        model_name = get_setting("llm_model", "local-model")
+        chunk_words = getattr(state, "playground_chunk_size", 350) or 350
+        base_dir = Path(get_setting("output_dir", "./output")).resolve()
+
+        for book_id, book_name in wanted:
+            if getattr(state, "cancel_prompt_gen_flag", False):
+                state.add_console_log("[Analysis] Cancelled.")
+                break
+            # Book.path is the imported SOURCE folder. The transcript and all
+            # pipeline artifacts live under the app's output directory.
+            book_dir = base_dir / project_name / book_name
+            state.add_console_log(f"[Analysis] === {book_name} ===")
+            try:
+                await scene_map.build_book_map(
+                    book_dir, llm_url, model_name,
+                    log=state.add_console_log)
+                if mode == "full":
+                    stats = await character_analysis.run_book_analysis(
+                        project_id, book_id, llm_url, model_name,
+                        chunk_words=chunk_words, log=state.add_console_log)
+                    state.add_console_log(f"[Analysis] {book_name}: {stats}")
+                elif mode == "scenes":
+                    state.add_console_log(f"[Analysis] {book_name}: scene map ready.")
+            except Exception as ex:
+                state.add_console_log(f"[Analysis] {book_name} failed: {ex}")
+        state.add_console_log("[Analysis] Finished.")
+    except Exception as ex:
+        state.add_console_log(f"[Analysis] Critical error: {ex}")
+    finally:
+        state.analysis_active = False
+
+
+def start_character_analysis(project_id: int, book_ids: Optional[List[int]] = None):
+    """Launch scene segmentation and character extraction for one or all books."""
+    from database.connection import get_setting as _get_setting
+
+    mode = str(_get_setting("pipeline_mode", "full") or "full")
+    if mode == "fast":
+        ui.notify("Fast mode: no scene map or character analysis is needed.",
+                  type="info")
+        return
+    if getattr(state, "analysis_active", False):
+        ui.notify("An analysis run is already active.", type="warning")
+        return
+    state.analysis_active = True
+    state.cancel_prompt_gen_flag = False
+    asyncio.create_task(_run_character_analysis(project_id, book_ids, mode))
+    ui.notify("Background analysis initiated. Progress is in the console.",
+              type="positive")
 
 
 # --- Image Generation Pipeline & Metadata Baker Utilities ---
@@ -1355,7 +1434,8 @@ def render_split_panel_shell(project_id: int):
                     stop_transcribing,
                     start_prompt_generation,
                     start_image_generation,
-                    save_project_settings_to_disk
+                    save_project_settings_to_disk,
+                    start_character_analysis
                 )
             else:
                 render_book_tabs(state.active_book_id)
