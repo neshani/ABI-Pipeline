@@ -3,6 +3,7 @@ import asyncio
 import httpx
 import sys
 from database.connection import set_setting
+from services import llm_config
 from services.installer import (
     check_dependencies, 
     check_model_downloaded, 
@@ -308,6 +309,23 @@ class SettingsModal:
                             icon='refresh', 
                             on_click=self.refresh_llm_models
                         ).props('flat dense').classes('h-10 text-blue-600').tooltip('Scan Connection for Models')
+
+                    with ui.expansion('Per-stage model overrides', icon='tune')\
+                            .classes('w-full border rounded-lg'):
+                        with ui.column().classes('w-full p-2 gap-2'):
+                            ui.label(
+                                'Leave a stage blank to use the Target LLM Model above. '
+                                'Point the expensive stages at a larger or remote model '
+                                'and keep the rest local.'
+                            ).classes('text-[11px] text-slate-500 leading-normal')
+                            overrides = self.settings.setdefault('llm_stage_models', {})
+                            if not isinstance(overrides, dict):
+                                overrides = {}
+                                self.settings['llm_stage_models'] = overrides
+                            for stage, stage_label in llm_config.STAGES:
+                                overrides.setdefault(stage, '')
+                                ui.input(stage_label).bind_value(overrides, stage)\
+                                    .classes('w-full')
 
                     # How much text one analysis call may read. The word budget is
                     # the measured value; the context is a hard cap, because users

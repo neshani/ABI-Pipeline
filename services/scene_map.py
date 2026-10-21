@@ -864,6 +864,20 @@ async def build_book_map(book_dir, llm_url: str, model: str, *, log=None,
 
     window = configured_window_words() if window_words is None else int(window_words)
     cache_path = scene_map_path(book_dir)
+
+    def record_segment():
+        # Local import: scene_map is imported by pipeline_manifest's callers.
+        from services import pipeline_manifest
+        try:
+            pipeline_manifest.record_stage(
+                book_dir, "segment", version=SEG_VERSION,
+                inputs={"transcript_sha": transcript_digest(text),
+                        "window_words": window,
+                        "seg_version": SEG_VERSION},
+                model=model)
+        except Exception:
+            pass  # provenance must never block a map
+
     if not force:
         cached = load_scene_map(cache_path, sentences, transcript=text,
                                 window_words=window)
@@ -871,6 +885,7 @@ async def build_book_map(book_dir, llm_url: str, model: str, *, log=None,
             words = sum(len(s.split()) for s in sentences)
             say(f"[Scene-Map] reusing the cached map for '{book_dir.name}' "
                 f"({len(cached)} scenes, {words} words)")
+            record_segment()
             return cached
 
     hard_breaks = chapter_breaks(sentences)
@@ -885,6 +900,7 @@ async def build_book_map(book_dir, llm_url: str, model: str, *, log=None,
     validate_scene_map(scenes, sentences)
     save_scene_map(cache_path, sentences, scenes, pre_floor, transcript=text,
                    model=model, window_words=window, floor_words=floor_words)
+    record_segment()
     say(f"[Scene-Map] '{book_dir.name}': {len(raw)} onsets -> "
         f"{len(pre_floor)} after merge -> {len(scenes)} scenes "
         f"({stats['windows']} windows, {stats['still_empty']} empty, "

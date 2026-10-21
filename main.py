@@ -201,6 +201,9 @@ DEFAULT_SETTINGS = {
     "llm_url": "http://127.0.0.1:11434",
     "llm_api_key": "",
     "llm_model": "unsloth/gemma-4-e4b-it",
+    # Per-stage model overrides: {stage: model}. A blank or missing stage uses
+    # llm_model, so an install with no overrides behaves exactly as before.
+    "llm_stage_models": {},
     "llm_launch_path": "",
     "llm_launch_args": "",
     # How much text one analysis call may read. The word budget is the measured
@@ -506,10 +509,19 @@ def start_prompt_generation(project_id: int):
 
 
 async def _run_character_analysis(project_id: int, book_ids: Optional[List[int]],
-                                  mode: str):
-    """Build scene maps and, in full mode, the cast, book by book in reading order."""
+                                  mode: str, stages: Optional[List[str]] = None):
+    """Build scene maps and, in full mode, the cast, book by book in reading order.
+
+    ``stages`` selects what to run for the selected books: ``"segment"`` rebuilds
+    the scene map, and the character stages are ``"gather"``, ``"refname"`` and
+    ``"extract"``. ``None`` means the previous behaviour - scene map plus the
+    whole character pass.
+    """
     from services import scene_map
     from services import character_analysis
+    from services import llm_config
+
+    stages = set(stages) if stages else None
 
     try:
         with Session(engine) as session:
@@ -539,15 +551,25 @@ async def _run_character_analysis(project_id: int, book_ids: Optional[List[int]]
             # pipeline artifacts live under the app's output directory.
             book_dir = base_dir / project_name / book_name
             state.add_console_log(f"[Analysis] === {book_name} ===")
+            run_stages = stages or {"segment", "gather", "refname", "extract"}
             try:
-                await scene_map.build_book_map(
-                    book_dir, llm_url, model_name,
-                    log=state.add_console_log)
-                if mode == "full":
+                if "segment" in run_stages:
+                    await scene_map.build_book_map(
+                        book_dir, llm_url, llm_config.stage_model("segment"),
+                        log=state.add_console_log)
+                else:
+                    state.add_console_log(
+                        "[Analysis] scene map reused")
+                char_stages = sorted(run_stages - {"segment"})
+                if mode == "full" and char_stages:
                     stats = await character_analysis.run_book_analysis(
                         project_id, book_id, llm_url, model_name,
-                        chunk_words=chunk_words, log=state.add_console_log)
+                        chunk_words=chunk_words, log=state.add_console_log,
+                        stages=char_stages)
                     state.add_console_log(f"[Analysis] {book_name}: {stats}")
+                elif mode == "full":
+                    state.add_console_log(
+                        f"[Analysis] {book_name}: scene map only; the cast was not touched.")
                 elif mode == "scenes":
                     state.add_console_log(f"[Analysis] {book_name}: scene map ready.")
             except Exception as ex:
@@ -559,8 +581,13 @@ async def _run_character_analysis(project_id: int, book_ids: Optional[List[int]]
         state.analysis_active = False
 
 
-def start_character_analysis(project_id: int, book_ids: Optional[List[int]] = None):
-    """Launch scene segmentation and character extraction for one or all books."""
+def start_character_analysis(project_id: int, book_ids: Optional[List[int]] = None,
+                             stages: Optional[List[str]] = None):
+    """Launch scene segmentation and character extraction for one or all books.
+
+    ``stages`` narrows the run - e.g. only ``["extract"]`` re-sorts existing
+    quotes and rewrites the cast without touching the scene map or the quotes.
+    """
     from database.connection import get_setting as _get_setting
 
     mode = str(_get_setting("pipeline_mode", "full") or "full")
@@ -573,8 +600,9 @@ def start_character_analysis(project_id: int, book_ids: Optional[List[int]] = No
         return
     state.analysis_active = True
     state.cancel_prompt_gen_flag = False
-    asyncio.create_task(_run_character_analysis(project_id, book_ids, mode))
-    ui.notify("Background analysis initiated. Progress is in the console.",
+    asyncio.create_task(_run_character_analysis(project_id, book_ids, mode, stages))
+    scope = ", ".join(stages) if stages else "all stages"
+    ui.notify(f"Background analysis initiated ({scope}). Progress is in the console.",
               type="positive")
 
 

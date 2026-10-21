@@ -12,9 +12,14 @@ while also inventing a field and a value:
    references ("the white-haired man"), with the window visible. ``unnamed`` is an
    allowed answer, and an animal reference is never attached to a person - the
    measured failure was 'the sleek white mare' -> the rider.
-3. **extract** reads only one character's gathered quotes for the whole book and
-   sorts them into the field set. Evidence must be a fragment of one of that
-   character's own quotes, which is what makes re-attribution impossible.
+3. **extract** reads only one character's gathered quotes, in slices of about 120,
+   and sorts them into the field set. Evidence must be a fragment of one of that
+   character's own quotes, which is what makes re-attribution impossible. A slice
+   whose reply is cut off at ``max_tokens`` is halved and re-asked, because a
+   truncated reply parses as a shorter one.
+4. **sex** is a short follow-up question per character whose sex the pronoun vote
+   could not settle, answered from that character's own quotes. It is separate from
+   pass 3 on purpose: `sex` inside the field set competes with the body traits.
 
 Positions are ``(chapter, group-index-within-chapter)``. The group is the
 extraction unit and the prompt numbers the groups it can see, so a long chapter
@@ -45,17 +50,30 @@ from database.models import (Book, Character, CharacterAlias, CharacterBookLink,
                              CharacterTimelineEvent, Project)
 from services import scene_map
 from services import pipeline_manifest
+from services import llm_config
 from services.character_manager import (NEW_TRAIT_FIELDS, RENDERED_TRAIT_FIELDS,
                                         normalize_character_text,
                                         save_project_characters_to_json)
 
-ANALYSIS_VERSION = 1
+ANALYSIS_VERSION = 2
 GATHER_TIMEOUT = 900.0
 REFNAME_TIMEOUT = 900.0
 EXTRACT_TIMEOUT = 900.0
 GATHER_MAX_TOKENS = 4096
 REFNAME_MAX_TOKENS = 1500
 EXTRACT_MAX_TOKENS = 3000
+# Quotes per pass-2 call. Reply length tracks how many quotes a call is given, so
+# this bounds the reply as much as the prompt; the measured 3,000-token cap was
+# cutting the biggest characters off mid-book. Even slices, never a greedy fill:
+# 130 quotes become 65 + 65, not 120 + 10.
+EXTRACT_QUOTE_CAP = 120
+# Below this a truncated slice is accepted rather than divided again.
+EXTRACT_MIN_SLICE = 20
+# A sex question is one short answer, so the reply is a handful of tokens and the
+# call costs a fraction of a second. Quotes are sampled evenly across the book.
+SEX_MAX_TOKENS = 24
+SEX_QUOTE_CAP = 100
+SEX_TIMEOUT = 300.0
 
 ANALYSIS_FIELDS = tuple(f for f in NEW_TRAIT_FIELDS
                         if f in ("sex", "species", "age", "hair_color", "hair_style",
@@ -146,6 +164,26 @@ into a field. It is a scratch pad - stored, never shown to anyone, never used in
 image - so a body detail put here is LOST. Do not go looking for something to put in
 it: when nothing fits, report nothing, which is the expected answer.
 """
+
+SEX_PROMPT = """You are indexing a novel for an illustrated edition.
+
+Below are sentences that mention one character, in the order they appear. Decide
+the character's sex.
+
+Rules:
+- Use how the sentences refer to this character: pronouns and gendered words.
+- Other people are mentioned in the same sentences. A pronoun that belongs to one
+  of them is not evidence about this character.
+- A gendered title is evidence.
+- Answer "unknown" only when the sentences carry no usable evidence.
+
+Output one JSON object and nothing else:
+{{"sex": "male"}} or {{"sex": "female"}} or {{"sex": "unknown"}}
+
+CHARACTER: {name}
+
+SENTENCES:
+{lines}"""
 
 EXTRACT_PROMPT = """You are preparing an illustrated edition of {book}.
 
@@ -810,16 +848,81 @@ def parse_facts(raw: str) -> List[dict]:
     return out
 
 
+def even_sample(items: Sequence, cap: int) -> List:
+    """At most ``cap`` items, spread evenly, keeping their order.
+
+    Sampling matters for a character who is described early and late: the first
+    100 quotes of a 554-quote character are all from the first half of the book.
+    """
+    items = list(items)
+    if len(items) <= cap:
+        return items
+    step = len(items) / cap
+    return [items[int(i * step)] for i in range(cap)]
+
+
+def parse_sex(raw: str) -> str:
+    """``"male"`` / ``"female"`` / ``""`` from a short reply."""
+    raw = raw or ""
+    match = re.search(r'"sex"\s*:\s*"(male|female)"', raw, re.I)
+    if match:
+        return match.group(1).lower()
+    match = re.search(r"\b(male|female)\b", raw, re.I)
+    return match.group(1).lower() if match else ""
+
+
+async def resolve_sex_llm(candidates: Sequence[str], by_subject: Dict[str, List[dict]],
+                          llm_url: str, model: str, counts=None) -> Dict[str, str]:
+    """Ask the model directly for the sex of characters the pronoun vote could not settle.
+
+    The vote is a good guard and a poor decider: it abstains unless one sex leads
+    the other 2:1 in sentences that name exactly one character, and a sentence
+    naming one character still has pronouns for everybody else in it. Measured on
+    the test book it returned one `female` in 112 subjects while getting no answer
+    wrong. One short call per unresolved character costs ~0.3 s and is right on
+    every character with three or more quotes.
+
+    ``unknown`` is passed through as no answer, not as a value: a wrong sex is
+    worse than a blank one.
+    """
+    counts = counts if counts is not None else collections.Counter()
+    out: Dict[str, str] = {}
+    for name in candidates:
+        quotes = by_subject.get(name) or []
+        if not quotes:
+            continue
+        lines = "\n".join(f'- "{q["quote"]}"'
+                          for q in even_sample(quotes, SEX_QUOTE_CAP))
+        prompt = SEX_PROMPT.format(name=name, lines=lines)
+        raw, finish = await _llm(prompt, llm_url, model, SEX_MAX_TOKENS, SEX_TIMEOUT)
+        if finish == "error":
+            counts["sex-llm-error"] += 1
+            continue
+        sex = parse_sex(raw)
+        if sex in ("male", "female"):
+            out[name] = sex
+            counts["sex-llm"] += 1
+        else:
+            counts["sex-llm-abstained"] += 1
+    return out
+
+
 # --- LLM ---------------------------------------------------------------------
 
 async def _llm(prompt: str, llm_url: str, model: str, max_tokens: int,
-               timeout: float) -> str:
+               timeout: float) -> Tuple[str, str]:
+    """``(text, finish_reason)``.
+
+    ``finish_reason`` is what makes a truncation visible. The stage parsers can
+    only recover complete JSON objects, so a reply cut off at ``max_tokens``
+    looks exactly like a model with less to say - the tail is simply absent.
+    """
     from services.prompt_engine import get_llm_response
     return await get_llm_response(
         prompt, llm_url, model, temperature=0.0,
         extra_payload={"max_tokens": max_tokens,
                        "chat_template_kwargs": {"enable_thinking": False}},
-        timeout=timeout)
+        timeout=timeout, with_meta=True)
 
 
 # --- stage 1: windows and gather ---------------------------------------------
@@ -903,7 +1006,10 @@ async def gather_book(book_name: str, sentences: Sequence[str],
     for wi, window in enumerate(windows, 1):
         text = _window_text(groups, window, scenes, sentences)
         prompt = (GATHER_PROMPT.format(book=title) + "\n\nPASSAGES:\n" + text)
-        raw = await _llm(prompt, llm_url, model, GATHER_MAX_TOKENS, GATHER_TIMEOUT)
+        raw, finish = await _llm(prompt, llm_url, model, GATHER_MAX_TOKENS,
+                                 GATHER_TIMEOUT)
+        if finish == "length":
+            counts["gather-truncated"] += 1
         got = parse_quotes(raw)
         if not got:
             counts["unparsed-window"] += 1
@@ -988,7 +1094,8 @@ async def resolve_references(book_name: str, gather: dict, groups,
                         if sentences[i - 1].strip() != scene_map.CHAPTER_MARKER)
         prompt = REFNAME_PROMPT.format(
             book=title, text=text, refs="\n".join(f"- {r}" for r in refs))
-        raw = await _llm(prompt, llm_url, model, REFNAME_MAX_TOKENS, REFNAME_TIMEOUT)
+        raw, _finish = await _llm(prompt, llm_url, model, REFNAME_MAX_TOKENS,
+                                  REFNAME_TIMEOUT)
         answers = {ref.lower(): name for ref, name in parse_names(raw) if ref}
         for row in rows:
             if ANIMAL_REF.search(row["subject"]):
@@ -1019,10 +1126,28 @@ ANIMAL_REF = re.compile(
 
 # --- stage 3: extract --------------------------------------------------------
 
+def extract_slices(quotes: Sequence[dict],
+                   cap: int = EXTRACT_QUOTE_CAP) -> List[List[dict]]:
+    """Even, contiguous, reading-order slices of at most ``cap`` quotes.
+
+    Even rather than greedy: 130 quotes become 65 + 65, never 120 + 10. The short
+    tail is the slice most likely to come back thin, and a full first slice buys
+    nothing. Order is preserved because pass 2 reports positions per quote line
+    and the resolver applies facts in reading order.
+    """
+    if not quotes:
+        return []
+    cap = max(1, cap)
+    chunks = -(-len(quotes) // cap)             # ceil
+    size = -(-len(quotes) // chunks)            # ceil, so size <= cap
+    return [list(quotes[i:i + size]) for i in range(0, len(quotes), size)]
+
+
 async def extract_book(book_name: str, gather: dict, groups,
                        chapters: Sequence[int], sentences: Sequence[str],
-                       llm_url: str, model: str, log=None) -> Dict[str, Any]:
-    """Stage 3. Sort each character's quotes into fields, one call per character."""
+                       llm_url: str, model: str, log=None,
+                       sex_model: Optional[str] = None) -> Dict[str, Any]:
+    """Stage 3. Sort each character's quotes into fields, one call per quote slice."""
     say = log or (lambda *_a, **_k: None)
     quotes = gather.get("quotes", [])
     names = sorted({q["subject"] for q in quotes})
@@ -1052,7 +1177,7 @@ async def extract_book(book_name: str, gather: dict, groups,
     for ci, subject in enumerate(subjects, 1):
         own = by_subject[subject]
 
-        async def ask(quote_subset):
+        async def ask_raw(quote_subset):
             lines = [subject]
             for quote in quote_subset:
                 chapter, group = position[quote["group_global"]]
@@ -1060,20 +1185,48 @@ async def extract_book(book_name: str, gather: dict, groups,
             prompt = EXTRACT_PROMPT.format(
                 book=title, fields=FIELDS_BLOCK, sink=SINK_BLOCK.strip("\n"),
                 characters="\n".join(lines))
-            raw = await _llm(prompt, llm_url, model, EXTRACT_MAX_TOKENS,
-                             EXTRACT_TIMEOUT)
-            return parse_facts(raw)
+            raw, finish = await _llm(prompt, llm_url, model, EXTRACT_MAX_TOKENS,
+                                     EXTRACT_TIMEOUT)
+            if finish == "error":
+                counts["llm-error"] += 1
+            return parse_facts(raw), finish
+
+        async def ask(quote_subset):
+            return (await ask_raw(quote_subset))[0]
+
+        async def ask_slice(quote_subset):
+            """One call for a slice, divided in half if the reply was truncated.
+
+            Halving keeps the positional contract: each half is still contiguous
+            in reading order, and every line carries its own ``(chapter, scene)``.
+            It is the only recovery that does not silently lose the end of a
+            character's book, because a truncated reply parses as a shorter one.
+            """
+            got, finish = await ask_raw(quote_subset)
+            if finish != "length":
+                return got
+            if len(quote_subset) <= EXTRACT_MIN_SLICE:
+                # Not worth dividing further; count it so the loss is visible.
+                counts["extract-truncated-accepted"] += 1
+                return got
+            mid = len(quote_subset) // 2
+            counts["extract-truncation-split"] += 1
+            return (await ask_slice(quote_subset[:mid])
+                    + await ask_slice(quote_subset[mid:]))
 
         def has_evidence(objects):
             return any(str(o.get("evidence", "")).strip() for o in objects)
 
-        got = await ask(own)
+        slices = extract_slices(own)
+        got: List[dict] = []
+        for part in slices:
+            got += await ask_slice(part)
+        if len(slices) > 1:
+            counts["extract-characters-sliced"] += 1
+
         # A mid-sized quote set can come back with facts whose evidence is
         # missing (the model loses the field in a long reply) or with nothing at
         # all. Halving it is a smaller ask and keeps the positional contract.
-        # Very large sets are left as one call: the whole-book pass measured that
-        # as the better unit, and splitting a 500-quote character would cost far
-        # more than it buys.
         if (not got or not has_evidence(got)) and 2 <= len(own) <= 48:
             mid = len(own) // 2
             second = (await ask(own[:mid])) + (await ask(own[mid:]))
@@ -1157,6 +1310,20 @@ async def extract_book(book_name: str, gather: dict, groups,
         if guess:
             sex_guess[subject] = guess
 
+    # The vote only decides the clear cases. For everything else - which on the
+    # test book includes most of the women - ask the model directly, one short
+    # call each, using only that character's own quotes. Subjects that already
+    # carry a pass-2 sex fact are skipped: the fact is applied later anyway.
+    settled = set(sex_guess) | {f["subject"] for f in facts if f["field"] == "sex"}
+    unresolved = [s for s in subjects
+                  if s not in settled and not bad_subject(s) and by_subject.get(s)]
+    if unresolved:
+        asked = await resolve_sex_llm(unresolved, by_subject, llm_url,
+                                      sex_model or model, counts=counts)
+        sex_guess.update(asked)
+        say(f"  [extract] sex pass: {len(asked)}/{len(unresolved)} resolved "
+            f"by the model")
+
     subject_meta = {}
     for subject in subjects:
         subject_meta[subject] = {
@@ -1175,33 +1342,59 @@ async def extract_book(book_name: str, gather: dict, groups,
 async def analyse_book_text(book_name: str, sentences: Sequence[str],
                             para_breaks: Sequence[bool], scenes, chunks,
                             llm_url: str, model: str, window_words: int,
-                            log=None) -> Dict[str, Any]:
-    """Run gather -> reference names -> extract. No database access."""
+                            log=None, stages=None,
+                            gather: Optional[dict] = None) -> Dict[str, Any]:
+    """Run gather -> reference names -> extract, or only the stages asked for.
+
+    ``stages`` defaults to all three. Passing a ``gather`` payload with
+    ``"gather"`` omitted reuses the existing quotes, which is what makes a
+    re-extract cheap - and, more importantly, keeps the quotes the new facts are
+    allowed to cite the same ones the old facts cited.
+
+    Per-stage model overrides (``llm_config``) apply on top of ``model``, which
+    stays the fallback so a caller can still pin one model for everything.
+    """
     say = log or (lambda *_a, **_k: None)
+    stages = set(stages) if stages is not None else {"gather", "refname", "extract"}
+    chosen = llm_config.overrides()
+
+    def model_for(stage: str) -> str:
+        return chosen.get(stage) or model
+
     chapters = scene_map.chapter_of_unit(sentences)
     groups = scene_map.group_scenes(scenes, sentences, chapters=chapters)
     say(f"[Analysis] '{book_name}': {len(sentences)} sentences, {len(scenes)} scenes, "
         f"{len(groups)} groups")
 
-    gather = await gather_book(book_name, sentences, scenes, groups, chapters,
-                               llm_url, model, window_words, log)
-    gather = await resolve_references(book_name, gather, groups, sentences, chapters,
-                                      llm_url, model, log)
-    extracted = await extract_book(book_name, gather, groups, chapters, sentences,
-                                   llm_url, model, log)
-    return {
+    if gather is None or "gather" in stages:
+        gather = await gather_book(book_name, sentences, scenes, groups, chapters,
+                                   llm_url, model_for("gather"), window_words, log)
+    if "refname" in stages:
+        gather = await resolve_references(book_name, gather, groups, sentences,
+                                          chapters, llm_url, model_for("refname"), log)
+
+    result = {
         "book": book_name,
         "version": ANALYSIS_VERSION,
         "windows": gather.get("window_count", 0),
         "quotes": gather.get("quotes", []),
         "dropped": gather.get("dropped", []),
+        "counts": dict(gather.get("counts", {})),
+        "groups": groups,
+    }
+    if "extract" not in stages:
+        return result
+    extracted = await extract_book(book_name, gather, groups, chapters, sentences,
+                                   llm_url, model_for("extract"), log,
+                                   sex_model=model_for("sex"))
+    result.update({
         "counts": {**gather.get("counts", {}), **extracted.get("counts", {})},
         "facts": extracted["facts"],
         "rejects": extracted["rejects"],
         "subjects": extracted["subjects"],
         "canonical": extracted["canonical"],
-        "groups": groups,
-    }
+    })
+    return result
 
 
 # --- the cast writer ---------------------------------------------------------
@@ -1645,6 +1838,33 @@ def write_book_analysis(project_id: int, book_id: int, payload: Dict[str, Any],
             if _sync_base_event(session, char, order_map, side_stories):
                 stats["base_updated"] += 1
 
+        # A subject with no facts is skipped above, so a resolved sex would be
+        # dropped with it. Sex is identity, not a described change, so it belongs
+        # on the Base event, which has no position and therefore nothing to get
+        # wrong. Fill an empty value only - an existing one is never overruled.
+        for subject, char in resolved.items():
+            if char.locked or by_position.get(subject):
+                continue
+            sex = (subjects.get(subject) or {}).get("sex")
+            if not sex:
+                continue
+            base = session.exec(
+                select(CharacterTimelineEvent)
+                .where(CharacterTimelineEvent.character_id == char.id)
+                .where(CharacterTimelineEvent.book_id == None)  # noqa: E711
+            ).first()
+            if base is not None and base.sex:
+                continue
+            if base is None:
+                base = CharacterTimelineEvent(
+                    character_id=char.id, book_id=None, chapter_num=0, shot_num=0,
+                    label="Base State", source="extraction")
+            base.sex = sex
+            if not base.species:
+                base.species = "human"
+            session.add(base)
+            stats["base_sex_filled"] += 1
+
         # The events' shot numbers are the first chunk of their group at THIS
         # chunk size. Prompt generation must not run at a different size without
         # re-analysing, or every description lands a few shots off.
@@ -1781,12 +2001,71 @@ def _head_noun(value: str) -> str:
     return words[-1] if words else ""
 
 
+def analysis_stage_status(book_dir) -> Dict[str, Dict]:
+    """Per-stage provenance and whether each stage is still current.
+
+    Answers the question the rollback dialog could not: *which* part of a book is
+    out of date, and why. Digests only - nothing here needs a model call, so the
+    dashboard can call it while rendering.
+    """
+    book_dir = Path(book_dir)
+    transcript = book_dir / scene_map.TRANSCRIPT_FILENAME
+    text = ""
+    if transcript.exists():
+        text = transcript.read_text(encoding="utf-8", errors="ignore")
+    map_path = scene_map.scene_map_path(book_dir)
+    gather_path = book_dir / "gather.json"
+
+    checks: Dict[str, Dict] = {
+        "segment": {"version": scene_map.SEG_VERSION,
+                    "inputs": {"transcript_sha": scene_map.transcript_digest(text),
+                               "window_words": scene_map.configured_window_words()}},
+        "gather": {"version": 1,
+                   "inputs": {"scene_map_sha": pipeline_manifest.digest(
+                       map_path.read_text(encoding="utf-8"))
+                       if map_path.exists() else ""}},
+        "extract": {"version": ANALYSIS_VERSION,
+                    "inputs": {"gather_sha": pipeline_manifest.digest(
+                        (json.loads(gather_path.read_text(encoding="utf-8")) or {})
+                        .get("quotes", [])) if gather_path.exists() else "",
+                        "quote_cap": EXTRACT_QUOTE_CAP}},
+    }
+    status: Dict[str, Dict] = {}
+    artifacts = {
+        "segment": map_path.exists(),
+        "gather": gather_path.exists(),
+        "extract": (book_dir / "extract.json").exists(),
+    }
+    for stage, expected in checks.items():
+        record = pipeline_manifest.stage_record(book_dir, stage)
+        current, reasons = pipeline_manifest.stage_current(book_dir, stage, **expected)
+        status[stage] = {"record": record, "current": current, "reasons": reasons,
+                         "artifact": artifacts.get(stage, False)}
+    return status
+
+
 async def run_book_analysis(project_id: int, book_id: int, llm_url: str,
                             model: str, chunk_words: int = 350,
                             window_words: Optional[int] = None,
-                            log=None) -> Dict[str, Any]:
-    """Load the book's scene map and chunks, analyse it, and write the cast."""
+                            log=None, stages=None) -> Dict[str, Any]:
+    """Load or build the book's stage artifacts, then write the cast.
+
+    ``stages`` selects what to re-run, from ``"gather"`` / ``"refname"`` /
+    ``"extract"``. A stage that is not selected is loaded from its artifact, so
+    re-extracting reuses the quotes the previous gather produced. The cast is
+    written only when ``"extract"`` ran - a gather-only run must not touch the
+    database, because it has no facts to write.
+
+    Each stage records what it was built from in ``pipeline.json``, so the next
+    run can tell what is stale instead of guessing.
+    """
     say = log or (lambda *_a, **_k: None)
+    stages = set(stages) if stages is not None else {"gather", "refname", "extract"}
+    chosen = llm_config.overrides()
+
+    def model_for(stage: str) -> str:
+        return chosen.get(stage) or model
+
     with Session(engine) as session:
         project = session.get(Project, project_id)
         book = session.get(Book, book_id)
@@ -1810,18 +2089,97 @@ async def run_book_analysis(project_id: int, book_id: int, llm_url: str,
         raise ValueError(f"'{book_name}' is bound to the {source} chunker; "
                          f"analysis requires a scene map")
     window = window_words or scene_map.configured_window_words()
+
+    gather_path = book_path / "gather.json"
+    existing_gather = None
+    if "gather" not in stages:
+        if not gather_path.exists():
+            raise ValueError(
+                f"'{book_name}' has no gather.json; run quote gathering first")
+        saved = json.loads(gather_path.read_text(encoding="utf-8"))
+        # ``windows`` in the file is the window COUNT, not the plan itself (the
+        # plan is what the gather stage produced and is not needed to re-sort
+        # quotes). Older files are the only shape that exists, but accept either.
+        saved_windows = saved.get("windows")
+        window_count = (len(saved_windows) if isinstance(saved_windows, list)
+                        else int(saved_windows or 0))
+        existing_gather = {
+            "quotes": saved.get("quotes", []),
+            "dropped": saved.get("dropped", []),
+            "counts": saved.get("counts", {}),
+            "windows": [],
+            "window_count": window_count,
+        }
+        say(f"[Analysis] {book_name}: reusing {len(existing_gather['quotes'])} "
+            f"gathered quotes")
+
     payload = await analyse_book_text(book_name, sentences, para, scenes, chunks,
-                                      llm_url, model, window, log=log)
+                                      llm_url, model, window, log=log,
+                                      stages=stages, gather=existing_gather)
+
     # Artifacts for inspection and for the next stages.
-    (book_path / "gather.json").write_text(json.dumps({
-        "quotes": payload["quotes"], "dropped": payload["dropped"],
-        "counts": payload["counts"], "windows": payload["windows"],
-        "book": book_name}, indent=2, ensure_ascii=False), encoding="utf-8")
+    if "gather" in stages or "refname" in stages or existing_gather is None:
+        gather_path.write_text(json.dumps({
+            "quotes": payload["quotes"], "dropped": payload["dropped"],
+            "counts": payload["counts"], "windows": payload["windows"],
+            "book": book_name}, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Provenance. Digests, not timestamps: "did the input change" is the question
+    # a later run needs to answer. Recorded before the early return below, so a
+    # quotes-only run still leaves a usable record of what it produced.
+    try:
+        transcript_sha = scene_map.transcript_digest(text)
+        scene_map_sha = pipeline_manifest.digest(
+            scene_map.scene_map_path(book_path).read_text(encoding="utf-8")) \
+            if scene_map.scene_map_path(book_path).exists() else ""
+        gather_sha = pipeline_manifest.digest(payload["quotes"])
+        if "gather" in stages:
+            pipeline_manifest.record_stage(
+                book_path, "gather", version=1,
+                inputs={"transcript_sha": transcript_sha,
+                        "scene_map_sha": scene_map_sha,
+                        "window_words": window},
+                model=model_for("gather"),
+                prompt_sha=pipeline_manifest.digest(GATHER_PROMPT))
+        if "refname" in stages:
+            pipeline_manifest.record_stage(
+                book_path, "refname", version=1,
+                inputs={"gather_sha": gather_sha},
+                model=model_for("refname"),
+                prompt_sha=pipeline_manifest.digest(REFNAME_PROMPT))
+    except Exception as ex:  # provenance must never fail a run
+        say(f"[Analysis] {book_name}: provenance not recorded ({ex})")
+
+    if "extract" not in stages:
+        say(f"[Analysis] {book_name}: quotes only; the cast was not rewritten.")
+        return {"quotes": len(payload["quotes"]), "facts": 0, "characters": 0,
+                "gather_only": True}
+
     (book_path / "extract.json").write_text(json.dumps({
         "facts": payload["facts"], "rejects": payload["rejects"],
         "subjects": payload["subjects"], "canonical": payload["canonical"],
         "counts": payload["counts"]}, indent=2, ensure_ascii=False),
         encoding="utf-8")
+
+    try:
+        pipeline_manifest.record_stage(
+            book_path, "extract", version=ANALYSIS_VERSION,
+            inputs={"gather_sha": gather_sha,
+                    "scene_map_sha": scene_map_sha,
+                    "quote_cap": EXTRACT_QUOTE_CAP},
+            model=model_for("extract"),
+            prompt_sha=pipeline_manifest.digest(
+                EXTRACT_PROMPT + FIELDS_BLOCK + SINK_BLOCK))
+        if (payload.get("counts", {}).get("sex-llm")
+                or payload.get("counts", {}).get("sex-llm-abstained")):
+            pipeline_manifest.record_stage(
+                book_path, "sex", version=1,
+                inputs={"gather_sha": gather_sha},
+                model=model_for("sex"),
+                prompt_sha=pipeline_manifest.digest(SEX_PROMPT))
+    except Exception as ex:
+        say(f"[Analysis] {book_name}: provenance not recorded ({ex})")
+
     stats = write_book_analysis(project_id, book_id, payload, chunks, log=log,
                                 chunk_words=chunk_words)
     return {"quotes": len(payload["quotes"]), "facts": len(payload["facts"]),

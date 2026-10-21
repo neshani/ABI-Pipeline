@@ -92,13 +92,18 @@ async def get_llm_response(
     temperature: float = 0.7,
     extra_payload: Optional[Dict[str, Any]] = None,
     timeout: float = 60.0,
-) -> str:
+    with_meta: bool = False,
+):
     """Dispatches asynchronous request to local Ollama or LM Studio OpenAI-compatible endpoints.
 
     ``extra_payload`` merges into the request body, e.g. to disable a model's
     thinking mode: ``{"chat_template_kwargs": {"enable_thinking": False}}``.
     ``timeout`` is per request: scene segmentation reads a whole chapter and can
     take minutes, while a one-shot prompt is expected in under a minute.
+    ``with_meta`` returns ``(content, finish_reason)`` instead of the bare string.
+    ``finish_reason == "length"`` is the only signal that the model was cut off at
+    ``max_tokens``; callers that parse structured output need it to tell "nothing
+    to report" from "the rest of the reply was never written".
     """
     # Loading the LLM will evict ComfyUI if it is the one holding the GPU.
     await vram_manager.ensure_llm_async()
@@ -128,7 +133,11 @@ async def get_llm_response(
             response = await client.post(endpoint, json=payload, headers=headers, timeout=timeout)
             response.raise_for_status()
             data = response.json()
-            return data['choices'][0]['message']['content']
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
+            if with_meta:
+                return content, choice.get("finish_reason") or ""
+            return content
         except Exception as e:
             # Fallback to direct Ollama generate endpoint if connection fails and endpoint targets port 11434
             if "11434" in endpoint or "ollama" in endpoint.lower():
@@ -142,10 +151,13 @@ async def get_llm_response(
                     }
                     resp = await client.post(direct_endpoint, json=direct_payload, timeout=timeout)
                     resp.raise_for_status()
-                    return resp.json().get("response", "")
+                    text = resp.json().get("response", "")
+                    return (text, "") if with_meta else text
                 except Exception as inner_e:
-                    return f"API Connection Failed: {e} (Direct API Fallback failed: {inner_e})"
-            return f"API Connection Failed: {e}"
+                    msg = f"API Connection Failed: {e} (Direct API Fallback failed: {inner_e})"
+                    return (msg, "error") if with_meta else msg
+            msg = f"API Connection Failed: {e}"
+            return (msg, "error") if with_meta else msg
 
 
 def parse_llm_response(raw_response: str) -> Dict[str, str]:
@@ -471,7 +483,8 @@ async def start_project_prompt_gen(project_id: int):
     try:
         # Load LLM connection configurations
         llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
-        model_name = get_setting("llm_model", "local-model")
+        from services import llm_config
+        model_name = llm_config.stage_model("prompt")
         
         # Load dynamic chunk size setting
         chunk_size_words = getattr(state, "playground_chunk_size", 350)
@@ -568,7 +581,8 @@ async def start_project_prompt_gen(project_id: int):
             focus_map = {}
             if pending:
                 shot_map = await shot_planner.ensure_book_plan(
-                    project_name, book_name, llm_url, model_name,
+                    project_name, book_name, llm_url,
+                    llm_config.stage_model("plan"),
                     chunk_words=chunk_size_words, mode=shot_mode,
                     log=state.add_console_log, selection=selection,
                 )

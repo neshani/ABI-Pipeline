@@ -45,6 +45,73 @@ def get_active_stage_idx(status: str) -> int:
     return mapping.get(status, 0)
 
 
+# --- stage-scoped re-run ----------------------------------------------------
+# The dialog is built in render_project_tabs (which is not a refresh path) but
+# opened from the analysis card, which is refreshable. Module state is the bridge:
+# a closure would capture the first render's dialog, and a dialog built inside the
+# card would be duplicated on every refresh.
+_rerun_dialog = None
+_rerun_body = None
+_rerun_checks: dict = {}
+_rerun_book_id = None
+_rerun_start_cb = None
+_rerun_project_id = None
+
+STAGE_ROWS = (
+    ("segment", "Scene map",
+     "Re-segments the book; invalidates every position after it."),
+    ("gather", "Quotes",
+     "Finds and attributes the descriptions. Needs a current scene map."),
+    ("extract", "Traits and cast",
+     "Re-sorts the existing quotes and rewrites the timeline events."),
+)
+
+
+def open_stage_rerun(book_id: int, book_dir) -> None:
+    """Populate the stage picker for one book and open it."""
+    global _rerun_book_id, _rerun_checks
+    from services import character_analysis
+
+    if _rerun_dialog is None or _rerun_body is None:
+        # The dialog is built at page load, before this card renders, so this is
+        # defensive only: return rather than raise from an event handler.
+        return
+    status = character_analysis.analysis_stage_status(book_dir)
+    _rerun_book_id = book_id
+    _rerun_checks = {}
+    _rerun_body.clear()
+    with _rerun_body:
+        for stage, label, hint in STAGE_ROWS:
+            info = status.get(stage, {})
+            record = info.get("record") or {}
+            if info.get("current"):
+                detail = "up to date"
+            elif not record and info.get("artifact"):
+                detail = "exists, but built before stage records"
+            elif not record:
+                detail = "never run"
+            else:
+                detail = "stale: " + ", ".join(info.get("reasons") or ["changed"])
+            box = ui.checkbox(label, value=not info.get("current"))
+            box.classes('text-xs').tooltip(hint)
+            _rerun_checks[stage] = box
+            ui.label(detail).classes('text-[9px] text-slate-500 pl-6 -mt-1')
+    _rerun_dialog.open()
+
+
+def confirm_stage_rerun() -> None:
+    """Launch the selected stages for the book the picker is pointing at."""
+    chosen = [stage for stage, box in _rerun_checks.items()
+              if getattr(box, "value", False)]
+    if not chosen:
+        ui.notify("Pick at least one stage to re-run.", type="warning")
+        return
+    if _rerun_start_cb and _rerun_book_id is not None:
+        _rerun_start_cb(_rerun_project_id, [_rerun_book_id], chosen)
+    if _rerun_dialog is not None:
+        _rerun_dialog.close()
+
+
 def execute_project_rollback_io(project_id: int, choice: str) -> None:
     """Safely renames and archives files on disk depending on the user's rollback selection."""
     import datetime
@@ -365,9 +432,9 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
             _set_setting("pipeline_mode", val or "full")
             ui.notify(f"Analysis mode: {mode_labels.get(val, val)}", type="info")
 
-        def analyse(book_ids=None):
+        def analyse(book_ids=None, stages=None):
             if start_analysis_cb:
-                start_analysis_cb(project.id, book_ids)
+                start_analysis_cb(project.id, book_ids, stages)
 
         def update_book_order(book_id, value):
             with Session(engine) as session:
@@ -448,6 +515,12 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
                                 'Analyse', icon='play_arrow',
                                 on_click=lambda _, bid=b.id: analyse([bid]),
                             ).props('flat dense').classes('text-[10px] text-indigo-700')
+                            ui.button(
+                                'Re-run', icon='replay',
+                                on_click=lambda _, bid=b.id, bdir=b_dir:
+                                    open_stage_rerun(bid, bdir),
+                            ).props('flat dense').classes('text-[10px] text-slate-600').tooltip(
+                                'Re-run only the stages you pick; the rest are reused.')
 
         # --- Shot Planner mode ---
         # NB: NiceGUI select takes dict options as {value: label}.
@@ -1024,6 +1097,31 @@ def render_project_tabs(
     state.global_preview_dialog = global_preview_dialog
 
     # Reusable Rollback Configuration Radio Modal
+    # --- Stage-scoped re-run -------------------------------------------------
+    # Separate from the rollback dialog below: rollback archives files to force a
+    # rebuild, while this re-runs *named stages* and reuses every artifact that is
+    # still current. The two coexist because re-importing a transcript or
+    # re-rendering images is not an analysis stage.
+    #
+    # The button lives in render_prompt_gen_step_view, which runs inside a
+    # @ui.refreshable, so the dialog cannot be built there (it would be rebuilt on
+    # every refresh). It is built once here and driven through module state.
+    global _rerun_dialog, _rerun_body, _rerun_checks, _rerun_start_cb, _rerun_project_id
+    _rerun_start_cb = start_analysis_cb
+    _rerun_project_id = project.id
+    _rerun_checks = {}
+
+    with ui.dialog() as _rerun_dialog, ui.card().classes('w-full max-w-md p-6 rounded-xl gap-3'):
+        ui.label('Re-run selected stages').classes('text-lg font-bold text-slate-800')
+        ui.label('Only the stages you pick make model calls. Everything else is '
+                 'reused from disk.').classes('text-xs text-slate-500 leading-normal')
+        _rerun_body = ui.column().classes('w-full gap-1')
+        with ui.row().classes('w-full justify-end gap-3 mt-2'):
+            ui.button('Cancel', on_click=_rerun_dialog.close)\
+                .props('flat color=slate').classes('text-xs font-semibold')
+            ui.button('Re-run', on_click=confirm_stage_rerun)\
+                .classes('bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold')
+
     with ui.dialog() as rollback_dialog, ui.card().classes('w-full max-w-md p-6 rounded-xl gap-4'):
         ui.label('Confirm State Rollback').classes('text-lg font-bold text-slate-800')
         ui.label('Select how far back you want to roll this project. Your existing files will be safely archived on disk.').classes('text-xs text-slate-500 leading-normal')
