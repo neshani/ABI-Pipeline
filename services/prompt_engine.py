@@ -433,9 +433,16 @@ def prepare_book_chunks(book_dir, chunk_words: int, full_text: str,
     return chunks, source, ""
 
 
-async def start_project_prompt_gen(project_id: int):
+async def start_project_prompt_gen(project_id: int,
+                                   book_ids: Optional[List[int]] = None):
     """
     Orchestrates sequential resumable prompt generation for all books in a project.
+
+    ``book_ids`` narrows the run to those volumes; ``None`` means the whole
+    project. The dashboard's per-volume Run needs this, and so does a single
+    stale volume in an otherwise finished series: the alternative was re-running
+    fifteen books to regenerate one.
+
     Processes chapters and chunks in parallel using asyncio Semaphores.
     """
     import csv
@@ -465,6 +472,9 @@ async def start_project_prompt_gen(project_id: int):
         session.add(project)
         
         books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+        if book_ids is not None:
+            wanted = set(book_ids)
+            books = [b for b in books if b.id in wanted]
         
         # Extract properties to standard types before commit to avoid DetachedInstanceError
         project_name = project.name
@@ -585,6 +595,7 @@ async def start_project_prompt_gen(project_id: int):
                     llm_config.stage_model("plan"),
                     chunk_words=chunk_size_words, mode=shot_mode,
                     log=state.add_console_log, selection=selection,
+                    should_cancel=lambda: state.cancel_prompt_gen_flag,
                 )
                 # The focus the planner chose for each shot, read back from the stored plan.
                 # Without it the shared block's "the director has chosen a focus" line has

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from database.connection import get_setting
+from services import checkpoints
 from services import compat
 from services import scene_map
 from services.prompt_engine import get_llm_response, smart_chunk_text
@@ -215,6 +216,7 @@ async def plan_book(
     log: Optional[Callable[[str], None]] = None,
     template: Optional[str] = None,
     chunks: Optional[Sequence[scene_map.Chunk]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> List[Tuple[int, int, str, str, str]]:
     """``[(chapter_num, shot_num, shot_type, chunk_hash, focus)]`` for a whole book.
 
@@ -237,6 +239,10 @@ async def plan_book(
             scene_map.chunks_by_chapter(chunks).items()):
         if not chapter_chunks:
             continue
+        # Per chapter, not per window: a plan is saved for the whole book or not
+        # at all, so the useful stop point is between books, and one chapter is
+        # a few seconds of calls.
+        checkpoints.stopped(should_cancel)
         if log:
             log(f"[Shot-Plan] Chapter {chapter_num}: {len(chapter_chunks)} scenes")
         detail = await plan_chunks_detail(
@@ -393,6 +399,7 @@ async def ensure_book_plan(
     base: Optional[Path] = None,
     log: Optional[Callable[[str], None]] = None,
     selection: Optional[Dict[str, str]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Dict[Tuple[int, int], str]:
     """``{(chapter, shot): shot_type}`` for a book.
 
@@ -435,7 +442,8 @@ async def ensure_book_plan(
 
     plan = await plan_book(project_name, book_name, llm_url, model,
                            chunk_words=chunk_words, window=window, base=base, log=log,
-                           template=template, chunks=chunks)
+                           template=template, chunks=chunks,
+                           should_cancel=should_cancel)
     if plan and all(shot == "NONE" for _chapter, _scene, shot, _digest, _focus in plan):
         # A dead or misconfigured LLM produces an all-NONE plan. Don't persist
         # that - fall back to the single prompt instead of poisoning the plan.

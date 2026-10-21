@@ -49,6 +49,7 @@ from database.connection import engine, get_setting
 from database.models import (Book, Character, CharacterAlias, CharacterBookLink,
                              CharacterTimelineEvent, Project)
 from services import scene_map
+from services import checkpoints
 from services import pipeline_manifest
 from services import llm_config
 from services.character_manager import (NEW_TRAIT_FIELDS, RENDERED_TRAIT_FIELDS,
@@ -993,8 +994,15 @@ def _locate_group(quote: str, groups, window: Sequence[int],
 async def gather_book(book_name: str, sentences: Sequence[str],
                       scenes, groups, chapters: Sequence[int],
                       llm_url: str, model: str, window_words: int,
-                      log=None) -> Dict[str, Any]:
-    """Stage 1. Returns quotes, dropped references, counts and windows."""
+                      log=None, book_dir=None, checkpoint_sha: str = "",
+                      should_cancel=None) -> Dict[str, Any]:
+    """Stage 1. Returns quotes, dropped references, counts and windows.
+
+    One checkpoint per window: this stage is the longest single run in the
+    pipeline (~22 min, ~55 model calls), and a window is the smallest unit whose
+    answer is worth keeping - its quotes are absolute (chapter + global group),
+    so they slot straight back in on resume.
+    """
     say = log or (lambda *_a, **_k: None)
     windows = plan_group_windows(groups, sentences, window_words, chapters)
 
@@ -1002,8 +1010,30 @@ async def gather_book(book_name: str, sentences: Sequence[str],
     dropped: List[dict] = []
     counts: collections.Counter = collections.Counter()
     title = _book_title(book_name)
+    done = (checkpoints.load(book_dir, "gather", checkpoint_sha)
+            if book_dir and checkpoint_sha else {})
+    reused = 0
 
     for wi, window in enumerate(windows, 1):
+        if str(wi) in done:
+            row = done[str(wi)] or {}
+            quotes.extend(row.get("quotes") or [])
+            dropped.extend(row.get("dropped") or [])
+            counts.update(row.get("counts") or {})
+            reused += 1
+            continue
+        checkpoints.stopped(should_cancel)
+        n_quotes, n_dropped = len(quotes), len(dropped)
+        before = collections.Counter(counts)
+
+        def save_window() -> None:
+            if book_dir and checkpoint_sha:
+                checkpoints.add(book_dir, "gather", checkpoint_sha, str(wi), {
+                    "quotes": quotes[n_quotes:],
+                    "dropped": dropped[n_dropped:],
+                    "counts": dict(counts - before),
+                })
+
         text = _window_text(groups, window, scenes, sentences)
         prompt = (GATHER_PROMPT.format(book=title) + "\n\nPASSAGES:\n" + text)
         raw, finish = await _llm(prompt, llm_url, model, GATHER_MAX_TOKENS,
@@ -1015,6 +1045,7 @@ async def gather_book(book_name: str, sentences: Sequence[str],
             counts["unparsed-window"] += 1
             say(f"  [gather] window {wi}/{len(windows)}: no quotes parsed "
                 f"({len(raw)} chars)")
+            save_window()
             continue
         win_norm = normalise_for_grounding(" ".join(
             sentences[i - 1] for gi in window
@@ -1059,8 +1090,11 @@ async def gather_book(book_name: str, sentences: Sequence[str],
             quotes.append({"window": wi, "chapter": chapter, "group_global": gi,
                            "subject": subject, "quote": quote})
             kept += 1
+        save_window()
         say(f"  [gather] window {wi}/{len(windows)}: {len(window)} groups, "
             f"{kept} quotes, {len(got) - kept} dropped")
+    if reused:
+        say(f"  [gather] resumed: {reused} window(s) reused from the checkpoint")
     say(f"  [gather] {len(quotes)} quotes, {len(dropped)} dropped {dict(counts)}")
     return {"quotes": quotes, "dropped": dropped, "counts": dict(counts),
             "windows": windows, "window_count": len(windows)}
@@ -1068,8 +1102,14 @@ async def gather_book(book_name: str, sentences: Sequence[str],
 
 async def resolve_references(book_name: str, gather: dict, groups,
                               sentences: Sequence[str], chapters: Sequence[int],
-                              llm_url: str, model: str, log=None) -> Dict[str, Any]:
-    """Stage 2. Name the unnamed-subject references, one narrow call per window."""
+                              llm_url: str, model: str, log=None,
+                              book_dir=None, checkpoint_sha: str = "",
+                              should_cancel=None) -> Dict[str, Any]:
+    """Stage 2. Name the unnamed-subject references, one narrow call per window.
+
+    Checkpointed per window like stage 1: the recovered quotes are absolute, so
+    a window that was answered does not need asking again.
+    """
     say = log or (lambda *_a, **_k: None)
     by_window: Dict[int, List[dict]] = collections.defaultdict(list)
     for row in gather.get("dropped", []):
@@ -1080,8 +1120,19 @@ async def resolve_references(book_name: str, gather: dict, groups,
 
     title = _book_title(book_name)
     counts = collections.Counter(gather.get("counts", {}))
+    done = (checkpoints.load(book_dir, "refname", checkpoint_sha)
+            if book_dir and checkpoint_sha else {})
     added = 0
     for wi in sorted(by_window):
+        if str(wi) in done:
+            row = done[str(wi)] or {}
+            gather["quotes"].extend(row.get("quotes") or [])
+            counts.update(row.get("counts") or {})
+            added += len(row.get("quotes") or [])
+            continue
+        checkpoints.stopped(should_cancel)
+        n_quotes = len(gather["quotes"])
+        before = collections.Counter(counts)
         rows = by_window[wi]
         refs = []
         for row in rows:
@@ -1112,6 +1163,11 @@ async def resolve_references(book_name: str, gather: dict, groups,
                 "quote": row["quote"], "from_reference": row["subject"]})
             counts["reference-recovered"] += 1
             added += 1
+        if book_dir and checkpoint_sha:
+            checkpoints.add(book_dir, "refname", checkpoint_sha, str(wi), {
+                "quotes": gather["quotes"][n_quotes:],
+                "counts": dict(counts - before),
+            })
     say(f"  [refnames] {added} recovered from references")
     gather = dict(gather)
     gather["counts"] = dict(counts)
@@ -1146,8 +1202,19 @@ def extract_slices(quotes: Sequence[dict],
 async def extract_book(book_name: str, gather: dict, groups,
                        chapters: Sequence[int], sentences: Sequence[str],
                        llm_url: str, model: str, log=None,
-                       sex_model: Optional[str] = None) -> Dict[str, Any]:
-    """Stage 3. Sort each character's quotes into fields, one call per quote slice."""
+                       sex_model: Optional[str] = None,
+                       book_dir=None, checkpoint_sha: str = "",
+                       should_cancel=None) -> Dict[str, Any]:
+    """Stage 3. Sort each character's quotes into fields, one call per quote slice.
+
+    One checkpoint per character. Characters are independent - each is asked
+    only about its own quotes and the subject list is rebuilt from the quotes on
+    resume - so a run stopped on character 60 of 118 keeps the 60.
+
+    The sex follow-up is not checkpointed: it is one short call per remaining
+    character (~0.3 s each), and a partial answer here would have to be merged
+    into a subject record whose shape the writer depends on.
+    """
     say = log or (lambda *_a, **_k: None)
     quotes = gather.get("quotes", [])
     names = sorted({q["subject"] for q in quotes})
@@ -1174,7 +1241,27 @@ async def extract_book(book_name: str, gather: dict, groups,
     title = _book_title(book_name)
     facts: List[dict] = []
     rejects: List[dict] = []
+    done = (checkpoints.load(book_dir, "extract", checkpoint_sha)
+            if book_dir and checkpoint_sha else {})
     for ci, subject in enumerate(subjects, 1):
+        if subject in done:
+            row = done[subject] or {}
+            facts.extend(row.get("facts") or [])
+            rejects.extend(row.get("rejects") or [])
+            counts.update(row.get("counts") or {})
+            continue
+        checkpoints.stopped(should_cancel)
+        n_facts, n_rejects = len(facts), len(rejects)
+        before = collections.Counter(counts)
+
+        def save_subject() -> None:
+            if book_dir and checkpoint_sha:
+                checkpoints.add(book_dir, "extract", checkpoint_sha, subject, {
+                    "facts": facts[n_facts:],
+                    "rejects": rejects[n_rejects:],
+                    "counts": dict(counts - before),
+                })
+
         own = by_subject[subject]
 
         async def ask_raw(quote_subset):
@@ -1238,6 +1325,7 @@ async def extract_book(book_name: str, gather: dict, groups,
         if not got:
             counts["unparsed-window"] += 1
             say(f"  [extract] {ci}/{len(subjects)} {subject}: no facts parsed")
+            save_subject()
             continue
         allowed_positions = {position[q["group_global"]]: q for q in own}
         own_norm = [normalise_for_grounding(q["quote"]) for q in own]
@@ -1292,6 +1380,7 @@ async def extract_book(book_name: str, gather: dict, groups,
                 continue
             facts.append(fact)
             kept += 1
+        save_subject()
         say(f"  [extract] {ci}/{len(subjects)} {subject}: {kept} facts kept")
 
     # Sex is not reliably in pass 2. Vote from the pronouns of sentences that can
@@ -1343,7 +1432,9 @@ async def analyse_book_text(book_name: str, sentences: Sequence[str],
                             para_breaks: Sequence[bool], scenes, chunks,
                             llm_url: str, model: str, window_words: int,
                             log=None, stages=None,
-                            gather: Optional[dict] = None) -> Dict[str, Any]:
+                            gather: Optional[dict] = None,
+                            book_dir=None, scene_map_sha: str = "",
+                            should_cancel=None) -> Dict[str, Any]:
     """Run gather -> reference names -> extract, or only the stages asked for.
 
     ``stages`` defaults to all three. Passing a ``gather`` payload with
@@ -1367,11 +1458,20 @@ async def analyse_book_text(book_name: str, sentences: Sequence[str],
         f"{len(groups)} groups")
 
     if gather is None or "gather" in stages:
+        if book_dir and scene_map_sha:
+            checkpoints.reset_if_stale(book_dir, "gather", scene_map_sha)
         gather = await gather_book(book_name, sentences, scenes, groups, chapters,
-                                   llm_url, model_for("gather"), window_words, log)
+                                   llm_url, model_for("gather"), window_words, log,
+                                   book_dir=book_dir, checkpoint_sha=scene_map_sha,
+                                   should_cancel=should_cancel)
     if "refname" in stages:
+        if book_dir and scene_map_sha:
+            checkpoints.reset_if_stale(book_dir, "refname", scene_map_sha)
         gather = await resolve_references(book_name, gather, groups, sentences,
-                                          chapters, llm_url, model_for("refname"), log)
+                                          chapters, llm_url, model_for("refname"), log,
+                                          book_dir=book_dir,
+                                          checkpoint_sha=scene_map_sha,
+                                          should_cancel=should_cancel)
 
     result = {
         "book": book_name,
@@ -1384,9 +1484,14 @@ async def analyse_book_text(book_name: str, sentences: Sequence[str],
     }
     if "extract" not in stages:
         return result
+    gather_sha = pipeline_manifest.digest(result.get("quotes", []))
+    if book_dir:
+        checkpoints.reset_if_stale(book_dir, "extract", gather_sha)
     extracted = await extract_book(book_name, gather, groups, chapters, sentences,
                                    llm_url, model_for("extract"), log,
-                                   sex_model=model_for("sex"))
+                                   sex_model=model_for("sex"),
+                                   book_dir=book_dir, checkpoint_sha=gather_sha,
+                                   should_cancel=should_cancel)
     result.update({
         "counts": {**gather.get("counts", {}), **extracted.get("counts", {})},
         "facts": extracted["facts"],
@@ -2036,18 +2141,32 @@ def analysis_stage_status(book_dir) -> Dict[str, Dict]:
         "gather": gather_path.exists(),
         "extract": (book_dir / "extract.json").exists(),
     }
+    # Partial progress, so the re-run dialog can say "32 windows saved" rather
+    # than looking identical to a stage that never started.
+    partial = {
+        "segment": pipeline_manifest.digest({
+            "transcript_sha": scene_map.transcript_digest(text),
+            "window_words": scene_map.configured_window_words(),
+            "seg_version": scene_map.SEG_VERSION}),
+        "gather": checks["gather"]["inputs"]["scene_map_sha"],
+        "refname": checks["gather"]["inputs"]["scene_map_sha"],
+        "extract": checks["extract"]["inputs"]["gather_sha"],
+    }
     for stage, expected in checks.items():
         record = pipeline_manifest.stage_record(book_dir, stage)
         current, reasons = pipeline_manifest.stage_current(book_dir, stage, **expected)
         status[stage] = {"record": record, "current": current, "reasons": reasons,
-                         "artifact": artifacts.get(stage, False)}
+                         "artifact": artifacts.get(stage, False),
+                         "partial": checkpoints.summary(
+                             book_dir, stage, partial.get(stage, ""))["done"]}
     return status
 
 
 async def run_book_analysis(project_id: int, book_id: int, llm_url: str,
                             model: str, chunk_words: int = 350,
                             window_words: Optional[int] = None,
-                            log=None, stages=None) -> Dict[str, Any]:
+                            log=None, stages=None,
+                            should_cancel=None) -> Dict[str, Any]:
     """Load or build the book's stage artifacts, then write the cast.
 
     ``stages`` selects what to re-run, from ``"gather"`` / ``"refname"`` /
@@ -2057,7 +2176,9 @@ async def run_book_analysis(project_id: int, book_id: int, llm_url: str,
     database, because it has no facts to write.
 
     Each stage records what it was built from in ``pipeline.json``, so the next
-    run can tell what is stale instead of guessing.
+    run can tell what is stale instead of guessing. ``should_cancel`` is polled
+    between units; a stop raises ``checkpoints.Cancelled``, which leaves the
+    partials on disk and the database untouched.
     """
     say = log or (lambda *_a, **_k: None)
     stages = set(stages) if stages is not None else {"gather", "refname", "extract"}
@@ -2089,6 +2210,8 @@ async def run_book_analysis(project_id: int, book_id: int, llm_url: str,
         raise ValueError(f"'{book_name}' is bound to the {source} chunker; "
                          f"analysis requires a scene map")
     window = window_words or scene_map.configured_window_words()
+    scene_map_sha = pipeline_manifest.digest(
+        scene_map.scene_map_path(book_path).read_text(encoding="utf-8"))
 
     gather_path = book_path / "gather.json"
     existing_gather = None
@@ -2115,7 +2238,10 @@ async def run_book_analysis(project_id: int, book_id: int, llm_url: str,
 
     payload = await analyse_book_text(book_name, sentences, para, scenes, chunks,
                                       llm_url, model, window, log=log,
-                                      stages=stages, gather=existing_gather)
+                                      stages=stages, gather=existing_gather,
+                                      book_dir=book_path,
+                                      scene_map_sha=scene_map_sha,
+                                      should_cancel=should_cancel)
 
     # Artifacts for inspection and for the next stages.
     if "gather" in stages or "refname" in stages or existing_gather is None:
@@ -2123,6 +2249,9 @@ async def run_book_analysis(project_id: int, book_id: int, llm_url: str,
             "quotes": payload["quotes"], "dropped": payload["dropped"],
             "counts": payload["counts"], "windows": payload["windows"],
             "book": book_name}, indent=2, ensure_ascii=False), encoding="utf-8")
+        # The artifact supersedes the partials that built it.
+        checkpoints.discard(book_path, "gather")
+        checkpoints.discard(book_path, "refname")
 
     # Provenance. Digests, not timestamps: "did the input change" is the question
     # a later run needs to answer. Recorded before the early return below, so a
@@ -2160,6 +2289,7 @@ async def run_book_analysis(project_id: int, book_id: int, llm_url: str,
         "subjects": payload["subjects"], "canonical": payload["canonical"],
         "counts": payload["counts"]}, indent=2, ensure_ascii=False),
         encoding="utf-8")
+    checkpoints.discard(book_path, "extract")
 
     try:
         pipeline_manifest.record_stage(

@@ -77,6 +77,28 @@ prompt_gen_active: bool = False
 analysis_active: bool = False
 cancel_prompt_gen_flag: bool = False
 
+# --- Dashboard run model (2026-10) -------------------------------------------
+# One task runs map -> cast -> prompts for a chosen set of volumes, so there is
+# one Stop and one progress line. ``cancel_pipeline_flag`` is the stop signal the
+# stages poll between units; it is separate from ``cancel_prompt_gen_flag``
+# because the prompt phase already owns that one.
+pipeline_active: bool = False
+cancel_pipeline_flag: bool = False
+# Whether this project builds character descriptions at all. Per project, saved
+# in project_settings.json; off means the cast stages are skipped, not deleted -
+# prompts are unaffected either way because tags compile at render time.
+cast_enabled: bool = True
+# Volume ids ticked in the dashboard table. Ticked volumes narrow the run; an
+# empty list means the whole project.
+pipeline_selected_books: List[int] = []
+# Run bar state. Both survive a refresh (the table re-renders every 3 s), which a
+# widget's own value does not.
+pipeline_run_force: bool = False
+pipeline_run_stages: List[str] = ["map", "cast", "prompts"]
+# Cached per-book pipeline snapshots, keyed by output dir (see
+# services/pipeline_status.py). Entries are (signature, snapshot).
+_pipeline_cache: Dict[str, Any] = {}
+
 # --- Transcript cleanup options ---
 # When set, "Clean Up Transcripts" also repairs volumes that have no EPUB
 # source, using the spelling corrections learned from the volumes that do.

@@ -9,7 +9,8 @@ def render_project_tabs(
     start_prompt_gen_cb=None,
     start_image_gen_cb=None,
     save_project_settings_cb=None,
-    start_analysis_cb=None
+    start_analysis_cb=None,
+    start_pipeline_cb=None
 ):
     render_dashboard_tabs(
         project, 
@@ -19,5 +20,6 @@ def render_project_tabs(
         start_prompt_gen_cb, 
         start_image_gen_cb, 
         save_project_settings_cb,
-        start_analysis_cb
+        start_analysis_cb,
+        start_pipeline_cb
     )

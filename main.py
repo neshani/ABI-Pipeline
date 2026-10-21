@@ -455,6 +455,19 @@ def stop_transcribing(project_id: int):
     # Set the cancellation tracking status
     state.was_manually_cancelled = True
 
+    # One dashboard run covers analysis and prompts, so it is checked before the
+    # per-phase status branch below: during an analysis the project status is
+    # whatever it was before, and the old chain silently did nothing.
+    if getattr(state, "pipeline_active", False):
+        state.cancel_pipeline_flag = True
+        state.cancel_prompt_gen_flag = True
+        ui.notify("Stopping after the current step - finished work is kept.",
+                  type="warning")
+        if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
+            state.action_buttons_refresh()
+        header_controls.refresh()
+        return
+
     if state.project_status == "Transcribing":
         cancel_project_transcription(project_id)
         ui.notify("Stopping transcription process...", type="warning")
@@ -475,110 +488,295 @@ def stop_transcribing(project_id: int):
     header_controls.refresh()
 
 
-def start_prompt_generation(project_id: int):
-    """Launches the asynchronous, interruptible, and resumable prompt generation process."""
-    from services.prompt_engine import start_project_prompt_gen
+def start_prompt_generation(project_id: int, book_ids: Optional[List[int]] = None):
+    """Launches the asynchronous, interruptible, and resumable prompt generation process.
+
+    ``book_ids`` narrows it to those volumes; ``None`` keeps the old
+    project-wide behaviour.
+    """
     import time
-    
+    from services.prompt_engine import start_project_prompt_gen
+
     # Clear cancellation tracking status
     state.was_manually_cancelled = False
     state.active_task_type = "prompt_gen"
 
-    # Reset all books to start prompt generation at 0% progress
+    # Reset progress for the books this run will actually touch.
     with Session(engine) as session:
         project = session.get(Project, project_id)
         if project:
             project.status = "Generating Prompts"
             project.modified_at = time.time()  # Touch modification timestamp directly inside the session
             session.add(project)
-            
+
             books = session.exec(select(Book).where(Book.project_id == project_id)).all()
+            if book_ids:
+                wanted = set(book_ids)
+                books = [b for b in books if b.id in wanted]
             for b in books:
                 b.status = "Generating Prompts"
                 b.progress = 0.0
                 session.add(b)
             session.commit()
-            
-    asyncio.create_task(start_project_prompt_gen(project_id))
+
+    asyncio.create_task(start_project_prompt_gen(project_id, book_ids))
     ui.notify("Background prompt generation sequences initiated!", type="positive")
-    
+
     state.project_status = "Generating Prompts"
     if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
         state.action_buttons_refresh()
     header_controls.refresh()
 
 
-async def _run_character_analysis(project_id: int, book_ids: Optional[List[int]],
-                                  mode: str, stages: Optional[List[str]] = None):
-    """Build scene maps and, in full mode, the cast, book by book in reading order.
+def _pipeline_stopped() -> bool:
+    """The one stop signal, polled between units by every stage."""
+    return bool(getattr(state, "cancel_pipeline_flag", False))
 
-    ``stages`` selects what to run for the selected books: ``"segment"`` rebuilds
-    the scene map, and the character stages are ``"gather"``, ``"refname"`` and
-    ``"extract"``. ``None`` means the previous behaviour - scene map plus the
-    whole character pass.
+
+def _book_dirs(project_id: int, book_ids):
+    """Selected books in reading order, as ``(id, name, dir)``."""
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if not project:
+            return None, []
+        project_name = project.name
+        books = session.exec(
+            select(Book).where(Book.project_id == project_id)
+            .order_by(Book.book_order, Book.name)).all()
+        wanted = [(b.id, b.name) for b in books
+                  if not book_ids or b.id in set(book_ids)]
+    base_dir = Path(get_setting("output_dir", "./output")).resolve()
+    return project_name, [(bid, name, base_dir / project_name / name)
+                          for bid, name in wanted]
+
+
+
+async def _analyse_books(project_id: int, book_ids, stages) -> bool:
+    """Scene maps and the cast for the selected books, in reading order.
+
+    Returns ``False`` when the user stopped the run. ``stages`` is the raw
+    analysis vocabulary (``segment`` / ``gather`` / ``refname`` / ``extract``),
+    so the Re-run dialog can ask for any subset and the pipeline can ask for all
+    of them.
     """
     from services import scene_map
     from services import character_analysis
     from services import llm_config
+    from services import checkpoints
 
-    stages = set(stages) if stages else None
+    run_stages = set(stages) if stages else {"segment", "gather", "refname",
+                                             "extract"}
+    mode = str(get_setting("pipeline_mode", "full") or "full")
+    if mode == "fast":
+        state.add_console_log(
+            "[Analysis] This project is on the legacy linear chunker; there is no "
+            "scene map or cast to build.")
+        return True
 
+    project_name, wanted = _book_dirs(project_id, book_ids)
+    if not wanted:
+        state.add_console_log("[Analysis] Nothing selected.")
+        return True
+    llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
+    model_name = get_setting("llm_model", "local-model")
+    chunk_words = getattr(state, "playground_chunk_size", 350) or 350
+
+    for book_id, book_name, book_dir in wanted:
+        if _pipeline_stopped():
+            state.add_console_log("[Analysis] Stopped. Finished work is on disk.")
+            return False
+        state.add_console_log(f"[Analysis] === {book_name} ===")
+        try:
+            if "segment" in run_stages:
+                await scene_map.build_book_map(
+                    book_dir, llm_url, llm_config.stage_model("segment"),
+                    log=state.add_console_log, should_cancel=_pipeline_stopped)
+            else:
+                state.add_console_log("[Analysis] scene map reused")
+            char_stages = sorted(run_stages - {"segment"})
+            if mode == "full" and char_stages:
+                stats = await character_analysis.run_book_analysis(
+                    project_id, book_id, llm_url, model_name,
+                    chunk_words=chunk_words, log=state.add_console_log,
+                    stages=char_stages, should_cancel=_pipeline_stopped)
+                state.add_console_log(f"[Analysis] {book_name}: {stats}")
+            elif mode == "full":
+                state.add_console_log(
+                    f"[Analysis] {book_name}: scene map only; the cast was not touched.")
+            else:
+                state.add_console_log(f"[Analysis] {book_name}: scene map ready.")
+        except checkpoints.Cancelled:
+            state.add_console_log(
+                f"[Analysis] {book_name}: stopped mid-stage. The checkpoint is on "
+                f"disk; Run resumes from there.")
+            return False
+        except Exception as ex:
+            state.add_console_log(f"[Analysis] {book_name} failed: {ex}")
+    state.add_console_log("[Analysis] Finished.")
+    return True
+
+
+async def _run_character_analysis(project_id: int, book_ids: Optional[List[int]],
+                                  mode: str, stages: Optional[List[str]] = None):
+    """Run the analysis stages for the selected books (the Re-run dialog path)."""
     try:
-        with Session(engine) as session:
-            project = session.get(Project, project_id)
-            if not project:
-                state.add_console_log("[Analysis] Error: project not found.")
-                return
-            project_name = project.name
-            books = session.exec(
-                select(Book).where(Book.project_id == project_id)
-                .order_by(Book.book_order)).all()
-            wanted = [(b.id, b.name) for b in books
-                      if not book_ids or b.id in book_ids]
-        if not wanted:
-            state.add_console_log("[Analysis] Nothing selected.")
-            return
-        llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
-        model_name = get_setting("llm_model", "local-model")
-        chunk_words = getattr(state, "playground_chunk_size", 350) or 350
-        base_dir = Path(get_setting("output_dir", "./output")).resolve()
-
-        for book_id, book_name in wanted:
-            if getattr(state, "cancel_prompt_gen_flag", False):
-                state.add_console_log("[Analysis] Cancelled.")
-                break
-            # Book.path is the imported SOURCE folder. The transcript and all
-            # pipeline artifacts live under the app's output directory.
-            book_dir = base_dir / project_name / book_name
-            state.add_console_log(f"[Analysis] === {book_name} ===")
-            run_stages = stages or {"segment", "gather", "refname", "extract"}
-            try:
-                if "segment" in run_stages:
-                    await scene_map.build_book_map(
-                        book_dir, llm_url, llm_config.stage_model("segment"),
-                        log=state.add_console_log)
-                else:
-                    state.add_console_log(
-                        "[Analysis] scene map reused")
-                char_stages = sorted(run_stages - {"segment"})
-                if mode == "full" and char_stages:
-                    stats = await character_analysis.run_book_analysis(
-                        project_id, book_id, llm_url, model_name,
-                        chunk_words=chunk_words, log=state.add_console_log,
-                        stages=char_stages)
-                    state.add_console_log(f"[Analysis] {book_name}: {stats}")
-                elif mode == "full":
-                    state.add_console_log(
-                        f"[Analysis] {book_name}: scene map only; the cast was not touched.")
-                elif mode == "scenes":
-                    state.add_console_log(f"[Analysis] {book_name}: scene map ready.")
-            except Exception as ex:
-                state.add_console_log(f"[Analysis] {book_name} failed: {ex}")
-        state.add_console_log("[Analysis] Finished.")
+        await _analyse_books(project_id, book_ids, stages)
     except Exception as ex:
         state.add_console_log(f"[Analysis] Critical error: {ex}")
     finally:
         state.analysis_active = False
+
+
+async def _prompt_phase(project_id: int, book_ids):
+    """Generate prompts for the selected books, resuming any half-written file."""
+    from services.prompt_engine import start_project_prompt_gen
+
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if not project:
+            return
+        books = session.exec(
+            select(Book).where(Book.project_id == project_id)).all()
+        if book_ids:
+            wanted = set(book_ids)
+            books = [b for b in books if b.id in wanted]
+        for b in books:
+            b.status = "Generating Prompts"
+            b.progress = 0.0
+            session.add(b)
+        project.status = "Generating Prompts"
+        session.add(project)
+        session.commit()
+
+    state.active_task_type = "prompt_gen"
+    state.cancel_prompt_gen_flag = False
+    await start_project_prompt_gen(project_id, book_ids)
+
+
+def _events_by_book(book_ids) -> dict:
+    from sqlalchemy import func
+    from database.models import CharacterTimelineEvent
+    ids = list(book_ids)
+    if not ids:
+        return {}
+    with Session(engine) as session:
+        rows = session.exec(
+            select(CharacterTimelineEvent.book_id, func.count())
+            .where(CharacterTimelineEvent.book_id.in_(ids))
+            .group_by(CharacterTimelineEvent.book_id)).all()
+    return {bid: count for bid, count in rows}
+
+
+def _stage_targets(project_id: int, scope_ids, stage: str) -> list:
+    """Book ids that need ``stage`` right now, from what is on disk.
+
+    Recomputed between phases on purpose: a scene map written a minute ago is
+    what makes the cast runnable, so a plan fixed at click time would have every
+    second stage in a fresh project doing nothing.
+    """
+    from services import pipeline_status
+
+    _project_name, wanted = _book_dirs(project_id, scope_ids)
+    if not wanted:
+        return []
+    cast_enabled = bool(getattr(state, "cast_enabled", True))
+    if stage == "cast" and not cast_enabled:
+        return []
+    events = _events_by_book([book[0] for book in wanted])
+    plan, _rows = pipeline_status.plan(
+        wanted,
+        chunk_words=getattr(state, "playground_chunk_size", 350) or 350,
+        cast_enabled=cast_enabled,
+        events_by_id=events,
+        stages=(stage,))
+    return plan.get(stage, [])
+
+
+async def _run_pipeline(project_id: int, scope_ids, stages):
+    """Map -> cast -> prompts for whatever needs each one, in that order.
+
+    ``scope_ids`` limits the run to those volumes (None = the project). Each
+    phase recomputes its own target list, so one press does everything that is
+    outstanding and never re-runs a stage that is already current.
+
+    One task rather than three chained buttons: it gives one Stop, one progress
+    line, and an order that cannot be got wrong by pressing the buttons in the
+    wrong sequence.
+    """
+    order = [s for s in ("map", "cast", "prompts") if s in set(stages or ())]
+    if not getattr(state, "cast_enabled", True):
+        order = [s for s in order if s != "cast"]
+    try:
+        for stage in order:
+            if _pipeline_stopped():
+                state.add_console_log(
+                    "[Pipeline] Stopped between stages. Finished work is on disk; "
+                    "Run picks up from here.")
+                return
+            ids = _stage_targets(project_id, scope_ids, stage)
+            if not ids:
+                state.add_console_log(
+                    f"[Pipeline] {stage}: nothing to do.")
+                continue
+            if stage == "map":
+                ok = await _analyse_books(project_id, ids, {"segment"})
+            elif stage == "cast":
+                ok = await _analyse_books(project_id, ids,
+                                          {"gather", "refname", "extract"})
+            else:
+                await _prompt_phase(project_id, ids)
+                ok = True
+            if not ok:
+                return
+    except Exception as ex:
+        state.add_console_log(f"[Pipeline] Critical error: {ex}")
+    finally:
+        state.pipeline_active = False
+        if getattr(state, "active_task_type", None) == "pipeline":
+            state.active_task_type = None
+        _refresh_after_run()
+
+
+def _refresh_after_run() -> None:
+    try:
+        from services.pipeline_status import clear_cache
+        clear_cache()
+    except Exception:
+        pass
+    if hasattr(state, "action_buttons_refresh") and state.action_buttons_refresh:
+        try:
+            state.action_buttons_refresh()
+        except Exception:
+            pass
+
+
+def start_pipeline(project_id: int, scope_ids: Optional[List[int]] = None,
+                   stages: Optional[List[str]] = None) -> None:
+    """Launch one dashboard run.
+
+    ``scope_ids`` limits it to those volumes (``None`` = the whole project) and
+    ``stages`` is the subset of ``map`` / ``cast`` / ``prompts`` to consider;
+    which volumes actually run each stage is recomputed as the run progresses.
+    """
+    if getattr(state, "pipeline_active", False):
+        ui.notify("A pipeline run is already active.", type="warning")
+        return
+    if getattr(state, "prompt_gen_active", False) or getattr(state, "analysis_active", False):
+        ui.notify("Another pipeline task is already running.", type="warning")
+        return
+    chosen = [s for s in ("map", "cast", "prompts")
+              if s in set(stages or ("map", "cast", "prompts"))]
+    if not chosen:
+        ui.notify("Pick at least one stage to run.", type="warning")
+        return
+    state.pipeline_active = True
+    state.active_task_type = "pipeline"
+    state.cancel_pipeline_flag = False
+    state.cancel_prompt_gen_flag = False
+    asyncio.create_task(_run_pipeline(project_id, scope_ids, chosen))
+    ui.notify(f"Started: {', '.join(chosen)}. Progress is in the console.",
+              type="positive")
+    _refresh_after_run()
 
 
 def start_character_analysis(project_id: int, book_ids: Optional[List[int]] = None,
@@ -588,9 +786,7 @@ def start_character_analysis(project_id: int, book_ids: Optional[List[int]] = No
     ``stages`` narrows the run - e.g. only ``["extract"]`` re-sorts existing
     quotes and rewrites the cast without touching the scene map or the quotes.
     """
-    from database.connection import get_setting as _get_setting
-
-    mode = str(_get_setting("pipeline_mode", "full") or "full")
+    mode = str(get_setting("pipeline_mode", "full") or "full")
     if mode == "fast":
         ui.notify("Fast mode: no scene map or character analysis is needed.",
                   type="info")
@@ -598,7 +794,11 @@ def start_character_analysis(project_id: int, book_ids: Optional[List[int]] = No
     if getattr(state, "analysis_active", False):
         ui.notify("An analysis run is already active.", type="warning")
         return
+    if getattr(state, "pipeline_active", False):
+        ui.notify("A pipeline run is already active.", type="warning")
+        return
     state.analysis_active = True
+    state.cancel_pipeline_flag = False
     state.cancel_prompt_gen_flag = False
     asyncio.create_task(_run_character_analysis(project_id, book_ids, mode, stages))
     scope = ", ".join(stages) if stages else "all stages"
@@ -1463,7 +1663,8 @@ def render_split_panel_shell(project_id: int):
                     start_prompt_generation,
                     start_image_generation,
                     save_project_settings_to_disk,
-                    start_character_analysis
+                    start_character_analysis,
+                    start_pipeline
                 )
             else:
                 render_book_tabs(state.active_book_id)

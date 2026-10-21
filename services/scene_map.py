@@ -37,6 +37,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from services import checkpoints
+
 # --- defaults ---------------------------------------------------------------
 #
 # The chunk target is user-settable (it is how a user asks for more or fewer
@@ -636,7 +638,9 @@ async def segment(sentences: Sequence[str], hard_breaks: Optional[set] = None,
                   log=None, budget: Optional[int] = None,
                   para_breaks: Optional[Sequence[bool]] = None,
                   llm_url: str = "", model: str = "",
-                  timeout: float = SEG_TIMEOUT
+                  timeout: float = SEG_TIMEOUT,
+                  book_dir=None, checkpoint_sha: str = "",
+                  should_cancel=None
                   ) -> Tuple[List[tuple], dict]:
     """``(scenes, stats)`` - ``[(first_sentence, last_sentence, setting)]``.
 
@@ -648,18 +652,26 @@ async def segment(sentences: Sequence[str], hard_breaks: Optional[set] = None,
 
     ``para_breaks[i]`` True prints a <BR> after that sentence - a hint, never a
     requirement (many transcripts have no paragraphs at all).
+
+    ``book_dir`` + ``checkpoint_sha`` turn on per-window checkpoints, so a run
+    that is stopped or killed resumes at the next window instead of re-asking
+    for 20 minutes of them. ``should_cancel`` is polled between windows and
+    raises ``checkpoints.Cancelled``.
     """
     say = log or (lambda *_a, **_k: None)
     hard_breaks = set(hard_breaks or ())
     para_breaks = list(para_breaks or [False] * len(sentences))
     n_total = len(sentences)
     windows = window_plan(sentences, hard_breaks, budget)
+    done = (checkpoints.load(book_dir, "segment", checkpoint_sha)
+            if book_dir and checkpoint_sha else {})
 
     starts: List[Tuple[int, str]] = []
     stats = {"windows": len(windows), "asked": 0, "unparsed": 0, "relative": 0,
              "quote_agreed": 0, "quote_moved": 0, "quote_missed": 0,
              "over_cap": 0, "retried": 0, "retry_helped": 0,
-             "still_empty": 0, "split_windows": 0, "onsets": 0, "scenes": 0}
+             "still_empty": 0, "split_windows": 0, "onsets": 0, "scenes": 0,
+             "reused": 0, "stopped_after": 0}
 
     async def ask(offset: int, idx: List[int]) -> Tuple[List[Tuple[int, str]], bool]:
         """One window -> its onsets. Returns ``(onsets, parsed_ok)``."""
@@ -733,6 +745,11 @@ async def segment(sentences: Sequence[str], hard_breaks: Optional[set] = None,
 
     for w_i, (offset, idx) in enumerate(windows, 1):
         lo, hi = idx[0] + 1, idx[-1] + 1
+        if str(w_i) in done:
+            starts += done[str(w_i)]
+            stats["reused"] += 1
+            continue
+        checkpoints.stopped(should_cancel)
         say(f"  [segment] window {w_i}/{len(windows)}  sentences {lo}-{hi}")
 
         async def try_window(part: List[int], depth: int) -> List[Tuple[int, str]]:
@@ -761,6 +778,8 @@ async def segment(sentences: Sequence[str], hard_breaks: Optional[set] = None,
                 f"this stretch will carry a single label")
         starts += onsets
         stats["onsets"] += len(onsets)
+        if book_dir and checkpoint_sha:
+            checkpoints.add(book_dir, "segment", checkpoint_sha, str(w_i), onsets)
 
     # Onsets only: strictly increasing, in range. Deliberately NOT sorted - the
     # model's list is in narrative order, so an entry that is not greater than the
@@ -840,7 +859,7 @@ TRANSCRIPT_FILENAME = "transcript.txt"
 async def build_book_map(book_dir, llm_url: str, model: str, *, log=None,
                          window_words: Optional[int] = None,
                          floor_words: int = MIN_SCENE_WORDS,
-                         force: bool = False) -> List[tuple]:
+                         force: bool = False, should_cancel=None) -> List[tuple]:
     """The book's scene map, from cache when it is current, otherwise segmented.
 
     Writes ``scene_map.json`` next to the transcript. The cache is keyed on the
@@ -850,8 +869,14 @@ async def build_book_map(book_dir, llm_url: str, model: str, *, log=None,
     A scene never crosses a chapter and the map always tiles the text; an
     invalid reply is repaired by halving the window, and a chapter that still
     yields nothing becomes one scene rather than a hole.
+
+    Per-window checkpoints live beside the map, so a stopped run resumes at the
+    next window. They are dropped once the map is written: the map supersedes
+    them, and a stale partial next to a current map only invites confusion.
     """
     say = log or (lambda *_a, **_k: None)
+    from services import pipeline_manifest
+
     book_dir = Path(book_dir)
     transcript_path = book_dir / TRANSCRIPT_FILENAME
     if not transcript_path.exists():
@@ -864,6 +889,15 @@ async def build_book_map(book_dir, llm_url: str, model: str, *, log=None,
 
     window = configured_window_words() if window_words is None else int(window_words)
     cache_path = scene_map_path(book_dir)
+    # The checkpoint identity carries everything the window plan depends on, so
+    # a partial can never be resumed into a changed transcript or budget.
+    segment_sha = pipeline_manifest.digest({
+        "transcript_sha": transcript_digest(text),
+        "window_words": window,
+        "seg_version": SEG_VERSION,
+    })
+    checkpoints.reset_if_stale(book_dir, "segment", segment_sha)
+    checkpoints.stopped(should_cancel)
 
     def record_segment():
         # Local import: scene_map is imported by pipeline_manifest's callers.
@@ -885,6 +919,7 @@ async def build_book_map(book_dir, llm_url: str, model: str, *, log=None,
             words = sum(len(s.split()) for s in sentences)
             say(f"[Scene-Map] reusing the cached map for '{book_dir.name}' "
                 f"({len(cached)} scenes, {words} words)")
+            checkpoints.discard(book_dir, "segment")
             record_segment()
             return cached
 
@@ -893,13 +928,16 @@ async def build_book_map(book_dir, llm_url: str, model: str, *, log=None,
         f"{len(hard_breaks) + 1} chapters, {window}-word windows")
     raw, stats = await segment(sentences, hard_breaks=hard_breaks, log=log,
                                budget=window, para_breaks=para_breaks,
-                               llm_url=llm_url, model=model)
+                               llm_url=llm_url, model=model,
+                               book_dir=book_dir, checkpoint_sha=segment_sha,
+                               should_cancel=should_cancel)
     pre_floor = merge_scenes(raw, hard_breaks=hard_breaks)
     scenes = merge_short(pre_floor, sentences, min_words=floor_words,
                          hard_breaks=hard_breaks)
     validate_scene_map(scenes, sentences)
     save_scene_map(cache_path, sentences, scenes, pre_floor, transcript=text,
                    model=model, window_words=window, floor_words=floor_words)
+    checkpoints.discard(book_dir, "segment")
     record_segment()
     say(f"[Scene-Map] '{book_dir.name}': {len(raw)} onsets -> "
         f"{len(pre_floor)} after merge -> {len(scenes)} scenes "

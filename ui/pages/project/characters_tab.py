@@ -9,6 +9,7 @@ from sqlmodel import Session, select
 from sqlalchemy import func
 from database.connection import engine, get_setting
 from database.models import Project, Book, Character, CharacterAlias, CharacterTimelineEvent, CharacterBookLink, ScenePrompt
+from ui import state
 from services.character_manager import (
     save_project_characters_to_json,
     run_stateful_character_profiling,
@@ -3049,4 +3050,57 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 draw_details_panel()
 
     draw_header_toolbar()
+    def render_analysis_entry():
+        """One line pointing at the analysis pass, since this is where the gaps show.
+
+        The dashboard owns the run controls; this is the door from "this character
+        has 0/9 fields" to "re-extract the book". It is deliberately a banner and
+        not a second copy of the control panel.
+        """
+        def turn_on(value: bool):
+            state.cast_enabled = bool(value)
+            from services.project_settings import save_project_settings_to_disk
+            save_project_settings_to_disk(project.id)
+            if hasattr(state, "action_buttons_refresh") and state.action_buttons_refresh:
+                state.action_buttons_refresh()
+            draw_workspace_layout.refresh()
+
+        def open_rerun():
+            from ui.pages.project.dashboard import open_stage_rerun
+            target = selected_book_id or (books[0].id if books else None)
+            if target is None:
+                ui.notify("No volume to analyse.", type="info")
+                return
+            book = next((b for b in books if b.id == target), None)
+            if book is None:
+                return
+            from database.connection import get_setting
+            from pathlib import Path
+            book_dir = (Path(get_setting("output_dir", "./output")).resolve()
+                        / project.name / book.name)
+            open_stage_rerun(target, book_dir)
+
+        with ui.row().classes('w-full items-center gap-3 bg-blue-50/60 border border-blue-100 '
+                              'rounded-lg px-3 py-1.5'):
+            if not state.cast_enabled:
+                ui.icon('face', size='16px', color='blue-400')
+                ui.label('Character descriptions are off for this project. Existing data is '
+                         'kept but nothing here is being updated.').classes(
+                    'text-[10px] text-slate-600 flex-1')
+                ui.button('Turn on', icon='toggle_on', on_click=lambda: turn_on(True)) \
+                    .props('flat dense').classes('text-[10px] text-blue-700 font-bold')
+            else:
+                ui.icon('person_search', size='16px', color='blue-400')
+                ui.label('Names and descriptions come from the analysis pass over the book. '
+                         'It can run before or after prompts - tags compile at render time.').classes(
+                    'text-[10px] text-slate-600 flex-1')
+                target_name = next(
+                    (b.name for b in books
+                     if b.id == (selected_book_id or (books[0].id if books else None))), "")
+                btn = ui.button('Analyse cast...', icon='replay', on_click=open_rerun) \
+                    .props('flat dense').classes('text-[10px] text-blue-700 font-bold')
+                if target_name:
+                    btn.tooltip(f"Pick the stages for {target_name}")
+
+    render_analysis_entry()
     draw_workspace_layout()

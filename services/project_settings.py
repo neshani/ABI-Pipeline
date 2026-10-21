@@ -33,7 +33,8 @@ def save_project_settings_to_disk(project_id: int) -> None:
         "active_style_preset": state.style_selected_preset,
         "style_use_random_image_seed": state.style_use_random_image_seed,
         "style_image_seed": state.style_image_seed,
-        "playground_chunk_size": state.playground_chunk_size
+        "playground_chunk_size": state.playground_chunk_size,
+        "cast_enabled": bool(state.cast_enabled),
     }
     
     try:
@@ -66,6 +67,7 @@ def load_project_settings_from_disk(project_id: int) -> None:
         state.style_use_random_image_seed = True
         state.style_image_seed = 42
         state.playground_chunk_size = 350
+        state.cast_enabled = True
         load_style_preset_by_name(state.style_selected_preset)
         return
 
@@ -84,6 +86,7 @@ def load_project_settings_from_disk(project_id: int) -> None:
         state.style_use_random_image_seed = data.get("style_use_random_image_seed", True)
         state.style_image_seed = data.get("style_image_seed", 42)
         state.playground_chunk_size = data.get("playground_chunk_size", 350)
+        state.cast_enabled = bool(data.get("cast_enabled", True))
 
         # Loads the Character base + role deltas, the workflow, and the node overrides.
         load_style_preset_by_name(preset_name)

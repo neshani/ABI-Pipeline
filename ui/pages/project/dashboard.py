@@ -84,8 +84,11 @@ def open_stage_rerun(book_id: int, book_dir) -> None:
         for stage, label, hint in STAGE_ROWS:
             info = status.get(stage, {})
             record = info.get("record") or {}
+            partial = int(info.get("partial") or 0)
             if info.get("current"):
                 detail = "up to date"
+            elif partial:
+                detail = f"{partial} unit(s) saved - resumes where it stopped"
             elif not record and info.get("artifact"):
                 detail = "exists, but built before stage records"
             elif not record:
@@ -362,222 +365,465 @@ def render_transcription_step_view(project, books, start_transcribe_cb, stop_tra
                 start_btn.bind_enabled_from(state, 'needs_restart', backward=lambda x: not x)
 
 
-def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb,
-                                start_analysis_cb=None):
-    available_templates = list_stored_templates()
-    
-    # Check for unapproved transcripts across all books in the project
-    unapproved_books = []
-    for b in books:
-        t_path = Path(f"./output/{project.name}/{b.name}/transcript.txt")
-        app_path = Path(f"./output/{project.name}/{b.name}/.transcript_approved")
-        if t_path.exists() and not app_path.exists():
-            unapproved_books.append(b.name)
-            
-    with ui.card().classes('w-full border p-5 shadow-sm bg-white gap-3'):
-        with ui.row().classes('items-center gap-2'):
-            ui.icon('psychology', size='sm', color='purple-500')
-            ui.label('Phase 2: LLM Prompt Generation & Extraction').classes('text-sm font-bold text-slate-800')
-            
-        ui.label('Transcription passages are processed through a local LLM to extract key quotes and generate visual rendering prompts.').classes('text-xs text-slate-500')
-        
-        # Unapproved Warning Banner
-        if unapproved_books:
-            with ui.row().classes('w-full items-center justify-between gap-3 bg-amber-50 p-3 rounded-lg border border-amber-200 mt-1'):
-                with ui.row().classes('items-center gap-3 flex-1 min-w-0'):
-                    ui.icon('warning', color='amber', size='sm')
-                    with ui.column().classes('gap-0 flex-1 min-w-0'):
-                        ui.label('Review Required').classes('text-xs font-bold text-amber-800')
-                        ui.label(f'The following volume(s) have unapproved transcripts: {", ".join(unapproved_books)}. Please approve them inside the book workspace before generating prompts.').classes('text-[10px] text-amber-700 leading-normal')
-                
-                def handle_approve_all():
-                    output_base = Path(get_setting("output_dir", "./output")).resolve()
-                    approved_count = 0
-                    for b in books:
-                        t_path = output_base / project.name / b.name / "transcript.txt"
-                        app_path = output_base / project.name / b.name / ".transcript_approved"
-                        if t_path.exists() and not app_path.exists():
-                            try:
-                                app_path.touch()
-                                approved_count += 1
-                            except Exception as ex:
-                                state.add_console_log(f"[Dashboard] Error approving transcript for {b.name}: {str(ex)}")
-                    
-                    if approved_count > 0:
-                        ui.notify(f"Approved {approved_count} volume transcripts!", type="positive")
-                        rescan_project_database_state(project.id)
-                        render_dynamic_step_dashboard.refresh()
-                        if hasattr(state, 'active_header_refresh') and state.active_header_refresh:
-                            state.active_header_refresh()
-                    else:
-                        ui.notify("No transcripts were eligible for approval.", type="info")
+PIPELINE_STAGES = ("map", "cast", "prompts")
 
-                ui.button(
-                    'Approve All', 
-                    icon='done_all', 
-                    on_click=handle_approve_all
-                ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-3 py-1.5 rounded')
+_STAGE_TITLE = {
+    "map": "Scene map",
+    "cast": "Cast",
+    "prompts": "Prompts",
+}
 
-        # --- Character analysis: scene map + cast ---
-        from services import scene_map as _scene_map
-        from database.connection import set_setting as _set_setting
-        from database.models import CharacterTimelineEvent as _TimelineEvent
+_STAGE_HINT = {
+    "map": "Splits the book into scenes and shots. Prompts are numbered from it.",
+    "cast": "Finds descriptions, attributes them, and builds the cast timeline. "
+            "Optional - prompts store [Name] tags and the description is compiled at render.",
+    "prompts": "One prompt per shot, planned and written in one pass. Resumes at the first "
+               "shot that has no row yet.",
+}
 
-        analysis_mode = str(get_setting("pipeline_mode", "full") or "full")
-        mode_labels = {"full": "Full (scenes + characters)",
-                       "scenes": "Scenes only",
-                       "fast": "Fast (no analysis)"}
 
-        def handle_analysis_mode(val):
-            _set_setting("pipeline_mode", val or "full")
-            ui.notify(f"Analysis mode: {mode_labels.get(val, val)}", type="info")
+def _fmt_minutes(total: float) -> str:
+    """``~1h 40m`` for an estimate. Always approximate, always prefixed."""
+    if not total or total <= 0:
+        return "-"
+    if total < 55:
+        return f"~{int(round(total))}m"
+    return f"~{int(total // 60)}h {int(round(total % 60)):02d}m"
 
-        def analyse(book_ids=None, stages=None):
-            if start_analysis_cb:
-                start_analysis_cb(project.id, book_ids, stages)
 
-        def update_book_order(book_id, value):
-            with Session(engine) as session:
-                db_book = session.get(Book, book_id)
+# Cell presentation. `ok` is the only state that needs no work; everything else
+# is unfinished (missing/partial), out of date (stale) or cannot run (blocked).
+# The colour carries that, the tooltip carries the reason.
+_CELL_STYLE = {
+    "ok": ("check_circle", "text-emerald-500"),
+    "unrecorded": ("help", "text-amber-500"),
+    "stale": ("warning", "text-amber-500"),
+    "partial": ("incomplete_circle", "text-amber-500"),
+    "missing": ("radio_button_unchecked", "text-slate-300"),
+    "blocked": ("block", "text-rose-400"),
+    "off": ("remove", "text-slate-300"),
+}
+
+
+def _cell_text(stage: str, row: dict) -> str:
+    """The few characters a status cell shows. The reason lives in the tooltip."""
+    info = row.get(stage) or {}
+    kind = info.get("state", "missing")
+    if stage == "cast" and kind in ("ok", "unrecorded"):
+        return f"{info.get('events', 0)}"
+    if stage == "prompts" and kind in ("ok", "partial"):
+        total = info.get("total") or 0
+        return f"{info.get('rows', 0)}/{total}" if total else str(info.get("rows", 0))
+    if kind == "blocked" and info.get("short"):
+        return info["short"]
+    if stage == "images":
+        done, expected = info.get("done", 0), info.get("expected", 0)
+        return f"{done}/{expected}" if expected else str(done)
+    return {
+        "ok": "ready", "unrecorded": "no record", "stale": "stale",
+        "partial": "in progress", "missing": "-", "blocked": "blocked",
+        "off": "off",
+    }.get(kind, "-")
+
+
+def render_transcript_approval_banner(project, ordered_books, output_base, refresh):
+    """Warn about transcripts nobody has approved, and offer to approve them.
+
+    Kept from the old Phase 2 card: an unapproved transcript may still contain
+    boilerplate or a table of contents, and prompt generation would read it as
+    narrative.
+    """
+    unapproved = [b for b in ordered_books
+                  if (output_base / project.name / b.name / "transcript.txt").exists()
+                  and not (output_base / project.name / b.name / ".transcript_approved").exists()]
+    if not unapproved:
+        return
+
+    def approve_all():
+        count = 0
+        for b in unapproved:
+            marker = output_base / project.name / b.name / ".transcript_approved"
+            try:
+                marker.touch()
+                count += 1
+            except Exception as ex:
+                state.add_console_log(f"[Dashboard] Could not approve {b.name}: {ex}")
+        if count:
+            ui.notify(f"Approved {count} volume transcript(s).", type="positive")
+            rescan_project_database_state(project.id)
+            refresh()
+        else:
+            ui.notify("Nothing could be approved.", type="info")
+
+    with ui.row().classes('w-full items-center gap-3 bg-amber-50 p-2 rounded-lg border border-amber-200'):
+        ui.icon('warning', color='amber', size='sm')
+        with ui.column().classes('gap-0 flex-1 min-w-0'):
+            ui.label('Unapproved transcripts').classes('text-[11px] font-bold text-amber-800')
+            ui.label(', '.join(b.name for b in unapproved)).classes(
+                'text-[10px] text-amber-700 truncate')
+        ui.button('Approve All', icon='done_all', on_click=approve_all) \
+            .classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-[10px] px-3 py-1 rounded')
+
+
+def render_pipeline_table(project, ordered_books, rows_by_id, dirs_by_id,
+                          *, start_pipeline_cb, start_analysis_cb, refresh):
+    """One row per volume: reading order, side flag, and the four stages.
+
+    This replaces the old status-gated cards, which chose between phases on
+    ``Project.status``. A status word cannot represent "15 books, each at its own
+    point", and the old cards hid the cast controls exactly when re-running them
+    was most useful.
+    """
+    from services import pipeline_status
+
+    def move_book(book_id: int, delta: int) -> None:
+        ids = [b.id for b in ordered_books]
+        index = ids.index(book_id)
+        target = index + delta
+        if target < 0 or target >= len(ids):
+            return
+        ids[index], ids[target] = ids[target], ids[index]
+        # Renumber contiguously: reading order is the axis that drives cross-book
+        # description inheritance, and a duplicate or a zero is a silent bug there.
+        with Session(engine) as session:
+            for position, bid in enumerate(ids, start=1):
+                db_book = session.get(Book, bid)
                 if db_book:
-                    db_book.book_order = int(value or 0)
+                    db_book.book_order = position
                     session.add(db_book)
-                    session.commit()
-            ui.notify("Book order updated.", type="info")
+            session.commit()
+        refresh()
 
-        def update_side_story(book_id, value):
-            with Session(engine) as session:
-                db_book = session.get(Book, book_id)
-                if db_book:
-                    db_book.is_side_story = bool(value)
-                    session.add(db_book)
-                    session.commit()
-            ui.notify("Side-story flag updated.", type="info")
+    def toggle_side(book_id: int, value: bool) -> None:
+        with Session(engine) as session:
+            db_book = session.get(Book, book_id)
+            if db_book:
+                db_book.is_side_story = bool(value)
+                session.add(db_book)
+                session.commit()
+        ui.notify("Side-story flag updated.", type="info")
 
-        with ui.column().classes('w-full bg-slate-50 p-3 rounded-lg border mt-1 gap-2'):
-            with ui.row().classes('w-full items-center gap-3'):
-                ui.icon('person_search', size='sm', color='indigo-500')
-                with ui.column().classes('gap-0 flex-1'):
-                    ui.label('Character Analysis').classes('text-xs font-bold text-slate-700')
-                    ui.label(
-                        'Scene boundaries and the cast that descriptions are compiled from. '
-                        'Fast mode makes no model calls.'
-                    ).classes('text-[9px] text-slate-500')
-                ui.select(
-                    options=mode_labels, value=analysis_mode,
-                    on_change=lambda e: handle_analysis_mode(e.value),
-                ).classes('w-56 bg-white').props('outlined dense')
+    def toggle_selected(book_id: int, value: bool) -> None:
+        selected = set(state.pipeline_selected_books or [])
+        if value:
+            selected.add(book_id)
+        else:
+            selected.discard(book_id)
+        state.pipeline_selected_books = sorted(selected)
+        refresh()
 
-            if analysis_mode == "fast":
-                ui.label(
-                    'Fast mode: prompts use the linear chunker and no character '
-                    'descriptions are compiled.'
-                ).classes('text-[9px] text-slate-500')
-            else:
-                if getattr(state, "analysis_active", False):
-                    with ui.row().classes('w-full items-center gap-2'):
-                        ui.spinner(size='sm', color='indigo')
-                        ui.label('Analysis running... progress is in the console.')\
-                            .classes('text-xs font-semibold text-indigo-700 animate-pulse')
-                with ui.row().classes('w-full items-center justify-between'):
-                    ui.label('Books are analysed in reading order; a scene never crosses a chapter.')\
-                        .classes('text-[9px] text-slate-500')
-                    ui.button(
-                        'Analyse Project', icon='play_arrow',
-                        on_click=lambda: analyse(None),
-                    ).props('dense').classes('bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold')
-                with ui.column().classes('w-full gap-1'):
-                    for b in books:
-                        b_dir = (Path(get_setting("output_dir", "./output")).resolve()
-                                 / project.name / b.name)
-                        has_map = _scene_map.scene_map_path(b_dir).exists()
-                        with Session(engine) as session:
-                            n_events = len(session.exec(
-                                select(_TimelineEvent)
-                                .where(_TimelineEvent.book_id == b.id)
-                                .where(_TimelineEvent.source == "extraction")).all())
-                        with ui.row().classes('w-full items-center gap-2'):
-                            ui.number(
-                                value=b.book_order if b.book_order is not None else 0,
-                                min=0, max=999, step=1,
-                                on_change=lambda e, bid=b.id: update_book_order(bid, e.value),
-                            ).classes('w-14').props('dense outlined').tooltip(
-                                'Reading order. Descriptions carry forward from lower numbers.')
-                            ui.checkbox(
-                                'side', value=bool(getattr(b, "is_side_story", False)),
-                                on_change=lambda e, bid=b.id: update_side_story(bid, e.value),
-                            ).tooltip(
-                                'Inherits descriptions from earlier volumes; later volumes skip it.')
-                            ui.label(b.name).classes('text-[11px] flex-1 truncate')
-                            ui.label(('scenes ok' if has_map else 'scenes -')
-                                     + f'  |  {n_events} events').classes('text-[9px] text-slate-500')
+    def toggle_all(value: bool) -> None:
+        state.pipeline_selected_books = [b.id for b in ordered_books] if value else []
+        refresh()
+
+    all_selected = bool(ordered_books) and all(
+        b.id in (state.pipeline_selected_books or []) for b in ordered_books)
+
+    with ui.card().classes('w-full border shadow-sm bg-white gap-0 p-0 overflow-x-auto'):
+        with ui.row().classes('w-full items-center gap-2 px-3 py-1.5 bg-slate-50 border-b'):
+            ui.checkbox(value=all_selected, on_change=lambda e: toggle_all(bool(e.value))) \
+                .props('dense size=sm').classes('w-5').tooltip(
+                'Tick volumes to narrow Run to just those; tick none to run the '
+                'whole project.')
+            ui.label('').classes('w-5')
+            ui.label('Volume').classes(
+                'flex-1 text-[9px] font-bold uppercase tracking-wider text-slate-400')
+            ui.label('Map').classes(
+                'w-20 text-[9px] font-bold uppercase tracking-wider text-slate-400')
+            if state.cast_enabled:
+                ui.label('Cast').classes(
+                    'w-20 text-[9px] font-bold uppercase tracking-wider text-slate-400')
+            ui.label('Prompts').classes(
+                'w-20 text-[9px] font-bold uppercase tracking-wider text-slate-400')
+            ui.label('Images').classes(
+                'w-20 text-[9px] font-bold uppercase tracking-wider text-slate-400')
+            ui.label('').classes('w-16')
+
+        for position, b in enumerate(ordered_books, start=1):
+            row = rows_by_id[b.id]
+            b_dir = dirs_by_id[b.id]
+            with ui.row().classes('w-full items-center gap-2 px-3 py-1 border-b '
+                                  'border-slate-100 hover:bg-slate-50/60'):
+                ui.checkbox(
+                    value=b.id in (state.pipeline_selected_books or []),
+                    on_change=lambda e, bid=b.id: toggle_selected(bid, bool(e.value)),
+                ).props('dense size=sm').classes('w-5').tooltip(
+                    'Include this volume in Run')
+
+                with ui.column().classes('gap-0 w-5'):
+                    ui.button(icon='keyboard_arrow_up',
+                              on_click=lambda _, bid=b.id: move_book(bid, -1)) \
+                        .props('flat dense round size=xs').classes(
+                            'text-slate-300 hover:text-slate-700 h-3')
+                    ui.button(icon='keyboard_arrow_down',
+                              on_click=lambda _, bid=b.id: move_book(bid, 1)) \
+                        .props('flat dense round size=xs').classes(
+                            'text-slate-300 hover:text-slate-700 h-3')
+
+                with ui.row().classes('flex-1 items-center gap-2 min-w-0'):
+                    ui.label(f"{position}.").classes('text-[9px] text-slate-400 w-4 text-right')
+                    ui.label(b.name).classes('text-[11px] font-medium text-slate-700 truncate')
+                    if getattr(b, "is_side_story", False):
+                        ui.label('side').classes(
+                            'text-[8px] font-bold uppercase tracking-wide bg-violet-100 '
+                            'text-violet-700 px-1.5 py-0.5 rounded').tooltip(
+                            'Side story: inherits descriptions from earlier volumes and is '
+                            'skipped by later ones. Click to clear.').on(
+                            'click', lambda _=None, bid=b.id: toggle_side(bid, False))
+                    if row.get("chunking") == "linear":
+                        ui.label('linear').classes(
+                            'text-[8px] font-bold uppercase tracking-wide bg-slate-200 '
+                            'text-slate-600 px-1.5 py-0.5 rounded').tooltip(
+                            'Generated with the legacy linear chunker. Its prompts can only '
+                            'be extended linearly until they are archived and rebuilt.')
+
+                for stage in ("map", "cast", "prompts", "images"):
+                    if stage == "cast" and not state.cast_enabled:
+                        continue
+                    info = row.get(stage) or {}
+                    kind = info.get("state", "missing")
+                    icon, colour = _CELL_STYLE.get(kind, _CELL_STYLE["missing"])
+                    with ui.row().classes('w-20 items-center gap-1').tooltip(
+                            info.get("detail") or _STAGE_TITLE.get(stage, stage.title())):
+                        ui.icon(icon, size='14px').classes(colour)
+                        ui.label(_cell_text(stage, row)).classes(
+                            'text-[10px] '
+                            + ('text-slate-400' if kind in ('missing', 'off') else 'text-slate-600'))
+
+                with ui.row().classes('w-16 items-center justify-end gap-0'):
+                    missing_stages = [
+                        stage for stage in PIPELINE_STAGES
+                        if (stage != "cast" or state.cast_enabled)
+                        and pipeline_status.needs_work(row, stage)
+                    ]
+                    run_btn = ui.button(
+                        icon='play_arrow',
+                        on_click=lambda _, bid=b.id, stages=missing_stages:
+                            start_pipeline_cb(project.id, [bid], stages),
+                    ).props('flat dense round size=sm').classes('text-blue-600')
+                    run_btn.tooltip(f"Run {', '.join(_STAGE_TITLE[s].lower() for s in missing_stages)}"
+                                    if missing_stages else 'This volume is up to date')
+                    if not missing_stages:
+                        run_btn.disable()
+
+                    with ui.button(icon='more_horiz').props('flat dense round size=sm') \
+                            .classes('text-slate-400'):
+                        with ui.menu().classes('p-1 w-64 shadow-lg rounded-xl border'):
                             ui.button(
-                                'Analyse', icon='play_arrow',
-                                on_click=lambda _, bid=b.id: analyse([bid]),
-                            ).props('flat dense').classes('text-[10px] text-indigo-700')
+                                'Analyse cast (this volume)',
+                                icon='person_search',
+                                on_click=lambda _=None, bid=b.id:
+                                    start_analysis_cb(project.id, [bid]),
+                            ).props('flat dense align=left').classes(
+                                'text-xs text-slate-700 w-full justify-start').tooltip(
+                                'Re-runs quotes, reference names and traits for this volume.')
                             ui.button(
-                                'Re-run', icon='replay',
-                                on_click=lambda _, bid=b.id, bdir=b_dir:
+                                'Re-run stages...',
+                                icon='replay',
+                                on_click=lambda _=None, bid=b.id, bdir=b_dir:
                                     open_stage_rerun(bid, bdir),
-                            ).props('flat dense').classes('text-[10px] text-slate-600').tooltip(
-                                'Re-run only the stages you pick; the rest are reused.')
+                            ).props('flat dense align=left').classes(
+                                'text-xs text-slate-700 w-full justify-start').tooltip(
+                                'Pick individual stages; everything else is reused.')
+                            if not getattr(b, "is_side_story", False):
+                                ui.button(
+                                    'Mark as side story',
+                                    icon='call_split',
+                                    on_click=lambda _=None, bid=b.id: toggle_side(bid, True),
+                                ).props('flat dense align=left').classes(
+                                    'text-xs text-slate-700 w-full justify-start').tooltip(
+                                    'Inherits descriptions from earlier volumes; later '
+                                    'volumes skip it.')
 
-        # --- Shot Planner mode ---
-        # NB: NiceGUI select takes dict options as {value: label}.
-        shot_mode_options = {
-            "auto": "Plan shots (auto)",
-            "wide": "All WIDE",
-            "character": "All CHARACTER",
-            "insert": "All INSERT",
-            "off": "Custom single prompt",
-        }
 
-        def handle_default_shot_mode(val: str):
-            from services import prompt_library as prompt_lib
-            prompt_lib.set_default_shot_mode(val)
-            ui.notify(f"Shot Planner: {shot_mode_options.get(val, val)}", type="info")
+def render_run_bar(project, ordered_books, rows_by_id, *, start_pipeline_cb,
+                   stop_cb, refresh):
+    """The one action: what to run, for which volumes, and roughly how long.
 
-        def handle_book_shot_mode(book_name: str, val: str):
-            from services import prompt_library as prompt_lib
-            if not val:
-                prompt_lib.clear_shot_mode(project.name, book_name)
-                ui.notify(f"{book_name}: inherits the project default", type="info")
+    Scope is the checkbox column and nothing else: ticked volumes narrow the run,
+    nothing ticked means the whole project. An earlier version also had a
+    "selected volumes" dropdown, which meant ticking a box changed nothing until
+    you noticed the second control - the same two-controls-one-decision mistake
+    as the old mode select.
+    """
+    from services import pipeline_status
+
+    running = bool(getattr(state, "pipeline_active", False)
+                   or getattr(state, "prompt_gen_active", False)
+                   or getattr(state, "analysis_active", False))
+    selected_ids = set(state.pipeline_selected_books or [])
+
+    def clear_selection():
+        state.pipeline_selected_books = []
+        refresh()
+
+    with ui.card().classes('w-full border shadow-sm bg-white p-3 gap-2'):
+        with ui.row().classes('w-full items-center gap-3 flex-wrap min-w-0'):
+            ui.icon('play_circle', size='sm', color='blue-500')
+            ui.label('Run').classes('text-xs font-bold text-slate-700')
+            if selected_ids:
+                ui.label(f'{len(selected_ids)} of {len(ordered_books)} volumes selected') \
+                    .classes('text-[10px] font-semibold text-blue-700')
+                ui.button('Clear', icon='close', on_click=lambda: clear_selection()) \
+                    .props('flat dense').classes('text-[10px] text-slate-500 -ml-1')
             else:
-                prompt_lib.set_shot_mode(project.name, book_name, val)
-                ui.notify(f"{book_name}: {shot_mode_options.get(val, val)}", type="info")
+                ui.label(f'all {len(ordered_books)} volumes').classes(
+                    'text-[10px] text-slate-500')
 
-        from services import prompt_library as _pl
+            def toggle_force(value):
+                state.pipeline_run_force = bool(value)
 
-        with ui.row().classes('w-full items-center gap-3 bg-slate-50 p-3 rounded-lg border mt-1'):
-            ui.icon('movie_filter', size='sm', color='slate-500')
-            with ui.column().classes('gap-0 flex-1'):
-                ui.label('Shot Planner').classes('text-xs font-bold text-slate-700')
-                ui.label('How each scene decides its prompt. Prompts themselves are edited in the Prompt-Gen Playground.').classes('text-[9px] text-slate-500')
+            ui.checkbox('Even if current', value=bool(getattr(state, "pipeline_run_force", False)),
+                        on_change=lambda e: toggle_force(e.value)) \
+                .props('dense').classes('text-[10px] text-slate-600').tooltip(
+                'Re-run stages that are already up to date. Off (the default) only '
+                'does outstanding work.')
 
-            ui.select(
-                options=shot_mode_options,
-                value=_pl.get_default_shot_mode(),
-                on_change=lambda e: handle_default_shot_mode(e.value),
-            ).classes('w-56 bg-white').props('outlined dense')
+            ui.label().classes('flex-1 min-w-2')
+            if running:
+                ui.spinner(size='sm', color='blue')
+                ui.label('Working - progress is in the console.').classes(
+                    'text-[10px] font-semibold text-blue-700 animate-pulse')
+                ui.button('Stop', icon='stop', on_click=lambda: stop_cb(project.id)) \
+                    .classes('bg-rose-600 text-white text-xs font-bold px-4')
 
-        with ui.expansion('Per-volume overrides (optional)').classes('w-full border rounded bg-slate-50 text-xs'):
-            for b in books:
-                override = _pl.get_shot_mode_override(project.name, b.name)
-                with ui.row().classes('w-full items-center gap-3 px-2 py-1'):
-                    ui.label(b.name).classes('text-[11px] flex-1 truncate')
-                    ui.select(
-                        options={"": "Inherit project default", **shot_mode_options},
-                        value=override or "",
-                        on_change=lambda e, bn=b.name: handle_book_shot_mode(bn, e.value),
-                    ).classes('w-60').props('dense outlined')
+        pool = ([b for b in ordered_books if b.id in selected_ids]
+                if selected_ids else list(ordered_books))
+        force = bool(getattr(state, "pipeline_run_force", False))
 
-        # --- Dynamic Scene Chunk Size Setting ---
-        with ui.row().classes('w-full items-center gap-3 bg-slate-50 p-3 rounded-lg border mt-1'):
-            ui.icon('wrap_text', size='sm', color='slate-500')
-            with ui.column().classes('gap-0 flex-1'):
-                ui.label('Scene Chunk Size (Words per Image)').classes('text-xs font-bold text-slate-700')
-                ui.label('Defines the text volume analyzed for each scene. Smaller = more images.').classes('text-[9px] text-slate-500')
-            
+        plan = {}
+        waiting = {}
+        needed = {}
+        for stage in PIPELINE_STAGES:
+            if stage == "cast" and not state.cast_enabled:
+                continue
+            # ``needed`` includes volumes that cannot start yet: pressing Run
+            # chains the stages, so their work is part of what the button promises.
+            needed[stage] = [b for b in pool
+                             if force or pipeline_status.needs_work(rows_by_id[b.id], stage)]
+            waiting[stage] = [b for b in needed[stage]
+                              if not pipeline_status.can_run(rows_by_id[b.id], stage)]
+
+        # Unticking a stage here is about this run only; the cast switch in the
+        # header is the project-wide policy. Keeping those in one place was the
+        # old mode dropdown's mistake.
+        wanted = [s for s in (state.pipeline_run_stages or list(PIPELINE_STAGES))
+                  if s in needed]
+
+        def toggle_stage(stage: str, value: bool) -> None:
+            chosen = set(state.pipeline_run_stages or PIPELINE_STAGES)
+            if value:
+                chosen.add(stage)
+            else:
+                chosen.discard(stage)
+            state.pipeline_run_stages = [s for s in PIPELINE_STAGES if s in chosen]
+            refresh()
+
+        with ui.row().classes('w-full items-center gap-3 flex-wrap min-w-0'):
+            for stage in PIPELINE_STAGES:
+                if stage == "cast" and not state.cast_enabled:
+                    continue
+                group = needed.get(stage, [])
+                minutes = sum(pipeline_status.estimate_minutes(
+                    stage, rows_by_id[b.id]["words"]) for b in group)
+                behind = len(waiting.get(stage, []))
+                box = ui.checkbox(_STAGE_TITLE[stage], value=(stage in wanted),
+                                  on_change=lambda e, s=stage: toggle_stage(s, bool(e.value)))
+                box.classes('text-[11px] text-slate-700').props('dense')
+                box.tooltip(_STAGE_HINT[stage])
+                if group:
+                    text = f"{len(group)} · {_fmt_minutes(minutes)}"
+                    if behind == len(group):
+                        text = f"{len(group)} after the map"
+                    ui.label(text).classes('text-[9px] -ml-2 text-slate-500')
+                else:
+                    ui.label("up to date").classes('text-[9px] -ml-2 text-emerald-600')
+
+            ui.label().classes('flex-1 min-w-2')
+
+            total = sum(pipeline_status.estimate_minutes(
+                stage, rows_by_id[b.id]["words"])
+                for stage in wanted for b in needed.get(stage, []))
+            volume_count = len({b.id for stage in wanted
+                                for b in needed.get(stage, [])})
+            resuming = any(
+                (rows_by_id[b.id].get(stage) or {}).get("state") == "partial"
+                for stage in wanted for b in needed.get(stage, []))
+
+            def start_chosen():
+                if not volume_count:
+                    ui.notify("Nothing in scope needs running.", type="info")
+                    return
+                # The selection *is* the scope, so it is always passed explicitly
+                # when non-empty; None means "the whole project".
+                scope_ids = [b.id for b in pool] if selected_ids else None
+                start_pipeline_cb(project.id, scope_ids, wanted)
+
+            label = ('Resume' if resuming else 'Run')
+            if volume_count:
+                label += f" · {volume_count} volume{'s' if volume_count != 1 else ''} · {_fmt_minutes(total)}"
+            button = ui.button(label, icon='play_arrow', on_click=start_chosen)
+            button.classes('bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3')
+            if running or not wanted or volume_count == 0:
+                button.disable()
+
+        if selected_ids and not volume_count:
+            ui.label('The selected volumes have nothing outstanding. Tick "Even if '
+                     'current" to re-run a stage anyway.').classes(
+                'text-[9px] text-amber-600')
+
+
+def render_pipeline_settings(project, ordered_books, refresh):
+    """Overrides: the shot planner, the chunk size, and their blast radius."""
+    from services import pipeline_manifest
+    from services import pipeline_status
+    from services import prompt_library as _pl
+
+    shot_mode_options = {
+        "auto": "Plan shots (auto)",
+        "wide": "All WIDE",
+        "character": "All CHARACTER",
+        "insert": "All INSERT",
+        "off": "Custom single prompt",
+    }
+
+    def handle_default_shot_mode(val: str):
+        _pl.set_default_shot_mode(val)
+        ui.notify(f"Shot Planner: {shot_mode_options.get(val, val)}", type="info")
+
+    def handle_book_shot_mode(book_name: str, val: str):
+        if not val:
+            _pl.clear_shot_mode(project.name, book_name)
+            ui.notify(f"{book_name}: inherits the project default", type="info")
+        else:
+            _pl.set_shot_mode(project.name, book_name, val)
+            ui.notify(f"{book_name}: {shot_mode_options.get(val, val)}", type="info")
+
+    with ui.expansion('Overrides').classes('w-full border rounded bg-white text-xs'):
+        with ui.column().classes('w-full p-3 gap-3'):
+            with ui.row().classes('w-full items-center gap-3'):
+                ui.icon('movie_filter', size='sm', color='slate-400')
+                with ui.column().classes('gap-0 flex-1'):
+                    ui.label('Shot Planner').classes('text-xs font-bold text-slate-700')
+                    ui.label('How each shot chooses its prompt. The prompts themselves are '
+                             'edited in the Prompt-Gen Playground.').classes(
+                        'text-[9px] text-slate-500')
+                ui.select(shot_mode_options, value=_pl.get_default_shot_mode(),
+                          on_change=lambda e: handle_default_shot_mode(e.value)) \
+                    .classes('w-56 bg-white').props('outlined dense')
+
+            with ui.expansion('Per-volume shot modes').classes(
+                    'w-full border rounded bg-slate-50 text-xs').props('dense'):
+                for b in ordered_books:
+                    override = _pl.get_shot_mode_override(project.name, b.name)
+                    with ui.row().classes('w-full items-center gap-3 px-2 py-1'):
+                        ui.label(b.name).classes('text-[11px] flex-1 truncate')
+                        ui.select({"": "Inherit project default", **shot_mode_options},
+                                  value=override or "",
+                                  on_change=lambda e, bn=b.name:
+                                      handle_book_shot_mode(bn, e.value)) \
+                            .classes('w-60').props('dense outlined')
+
             def handle_chunk_size_change(val: int):
                 if not val or val < 50:
                     val = 50
@@ -585,57 +831,183 @@ def render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transc
                 from services.project_settings import save_project_settings_to_disk
                 if state.active_project_id:
                     save_project_settings_to_disk(state.active_project_id)
-                
-                # Clear stats cache and call registered update handler safely
                 state._stats_cache.clear()
+                pipeline_status.clear_cache()
                 if hasattr(state, "stats_refresh_callback") and state.stats_refresh_callback:
                     try:
                         state.stats_refresh_callback()
                     except Exception as ex:
-                        state.add_console_log(f"[Dashboard] Error refreshing stats callback: {str(ex)}")
-                
-                ui.notify(f"Scene chunk size updated to {val} words.", type="info")
+                        state.add_console_log(f"[Dashboard] Error refreshing stats: {ex}")
+                refresh()
+                ui.notify(f"Words per shot: {val}.", type="info")
 
-            ui.number(
-                value=state.playground_chunk_size,
-                min=50, max=2000, step=50,
-                on_change=lambda e: handle_chunk_size_change(e.value)
-            ).classes('w-48 bg-white').props('outlined dense suffix="words"')
+            # The blast radius is real (pipeline_manifest.check refuses a mismatch
+            # rather than mixing two coordinate systems), so it is stated here
+            # instead of being discovered as a red cell later.
+            affected = 0
+            for b in ordered_books:
+                manifest = pipeline_manifest.read(
+                    Path(get_setting("output_dir", "./output")).resolve()
+                    / project.name / b.name)
+                if manifest.get("chunk_words") not in (None, state.playground_chunk_size):
+                    affected += 1
 
-        with ui.row().classes('w-full justify-between items-center mt-2 pt-2 border-t border-slate-100'):
-            if state.project_status == "Generating Prompts":
-                with ui.row().classes('items-center gap-2'):
-                    ui.spinner(size='sm', color='purple')
-                    ui.label('Generating prompts in background...').classes('text-xs font-semibold text-purple-700 animate-pulse')
-                ui.button(
-                    'Stop Prompt Gen', 
-                    icon='stop', 
-                    color='red', 
-                    on_click=lambda: stop_transcribe_cb(project.id)
-                ).classes('px-4 font-semibold text-xs')
-            else:
-                ui.label('Guidelines configured. Ready to run local prompt generation.').classes('text-xs font-semibold text-slate-400')
-                
-                # Intercept logic to display confirmation dialog if unapproved transcripts exist
-                def confirm_and_generate_prompts():
-                    if unapproved_books:
-                        with ui.dialog() as confirm_dialog, ui.card().classes('w-full max-w-sm p-5 rounded-xl gap-4'):
-                            ui.label('Unapproved Transcripts Detected').classes('text-base font-bold text-slate-800')
-                            ui.label(f'Some volumes have not been approved yet: {", ".join(unapproved_books)}. Generating prompts now might analyze boilerplate or TOC headers.').classes('text-xs text-slate-500 leading-relaxed')
-                            with ui.row().classes('w-full justify-end gap-2 mt-2'):
-                                ui.button('Cancel', on_click=confirm_dialog.close).props('flat').classes('text-xs text-slate-600')
-                                ui.button('Proceed Anyway', on_click=lambda: (confirm_dialog.close(), start_prompt_gen_cb(project.id) if start_prompt_gen_cb else None)).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-4')
-                        confirm_dialog.open()
-                    else:
-                        if start_prompt_gen_cb:
-                            start_prompt_gen_cb(project.id)
+            with ui.row().classes('w-full items-center gap-3'):
+                ui.icon('wrap_text', size='sm', color='slate-400')
+                with ui.column().classes('gap-0 flex-1'):
+                    ui.label('Words per shot').classes('text-xs font-bold text-slate-700')
+                    detail = ('How much text one image covers. Smaller means more images.')
+                    if affected:
+                        detail += (f' Changing it invalidates the cast, the shot plan and the '
+                                   f'prompts for {affected} volume(s).')
+                    ui.label(detail).classes('text-[9px] text-slate-500 leading-normal')
+                ui.number(value=state.playground_chunk_size, min=50, max=2000, step=50,
+                          on_change=lambda e: handle_chunk_size_change(e.value)) \
+                    .classes('w-48 bg-white').props('outlined dense suffix="words"')
 
-                ui.button(
-                    'Generate Prompts', 
-                    icon='bolt', 
-                    color='positive',
-                    on_click=confirm_and_generate_prompts
-                ).classes('text-white font-bold text-xs px-5')
+
+def render_legacy_chunker_notice(project, refresh):
+    """A project on the linear chunker needs a way back that is not a mode select."""
+    from database.connection import set_setting as _set_setting
+
+    mode = str(get_setting("pipeline_mode", "full") or "full")
+
+    def use_scene_maps():
+        _set_setting("pipeline_mode", "full")
+        ui.notify("This project will build scene maps and character descriptions.",
+                  type="positive")
+        refresh()
+
+    with ui.row().classes('w-full items-center gap-3 bg-slate-50 border border-dashed '
+                          'rounded-lg p-2'):
+        ui.icon('info', size='16px', color='slate-400')
+        if mode == "fast":
+            ui.label('This project uses the fast/linear path: prompts are chunked by '
+                     'paragraph and no cast is built.').classes('text-[10px] text-slate-500 flex-1')
+            ui.button('Use scene maps', icon='auto_awesome', on_click=use_scene_maps) \
+                .props('flat dense').classes('text-[10px] text-blue-700 font-bold')
+        else:
+            ui.label('Volumes tagged "linear" were generated before scene maps existed. '
+                     'Their prompts can only be extended linearly until they are archived '
+                     'and rebuilt (Rollback Project, above).').classes(
+                'text-[10px] text-slate-500 flex-1')
+
+
+def render_dashboard_view(project, books, *, start_transcribe_cb, stop_cb,
+                          start_analysis_cb, start_pipeline_cb, start_image_gen_cb):
+    """The Dashboard tab: transcripts, the volume table, the run bar, overrides."""
+    from services import pipeline_status
+    from services.character_manager import ensure_book_orders
+    from database.models import CharacterTimelineEvent
+
+    ensure_book_orders(project.id)
+
+    output_base = Path(get_setting("output_dir", "./output")).resolve()
+    ordered_books = sorted(
+        books,
+        key=lambda b: (b.book_order if b.book_order is not None else 10 ** 6, b.name))
+
+    def build_rows():
+        ids = [b.id for b in ordered_books]
+        events = {}
+        if ids:
+            from sqlalchemy import func
+            with Session(engine) as session:
+                rows = session.exec(
+                    select(CharacterTimelineEvent.book_id, func.count())
+                    .where(CharacterTimelineEvent.book_id.in_(ids))
+                    .group_by(CharacterTimelineEvent.book_id)).all()
+            for bid, count in rows:
+                events[bid] = count
+        rows_by_id, dirs_by_id = {}, {}
+        for b in ordered_books:
+            b_dir = output_base / project.name / b.name
+            dirs_by_id[b.id] = b_dir
+            rows_by_id[b.id] = pipeline_status.snapshot(
+                b_dir,
+                chunk_words=state.playground_chunk_size,
+                cast_enabled=state.cast_enabled,
+                events=events.get(b.id, 0),
+                expected_prompts=getattr(b, "total_images", 0) or 0,
+            )
+        return rows_by_id, dirs_by_id
+
+    missing = [b for b in ordered_books
+               if not (output_base / project.name / b.name / "transcript.txt").exists()]
+    if missing or state.project_status == "Transcribing":
+        render_transcription_step_view(project, ordered_books, start_transcribe_cb, stop_cb)
+    else:
+        with ui.row().classes('w-full items-center gap-2 px-1'):
+            ui.icon('check_circle', size='14px', color='emerald-500')
+            ui.label(f'{len(ordered_books)} volumes transcribed.').classes(
+                'text-[10px] text-slate-500')
+
+    @ui.refreshable
+    def dashboard_body():
+        rows_by_id, dirs_by_id = build_rows()
+
+        total_words = sum(rows_by_id[b.id]["words"] for b in ordered_books)
+        # Same sum the Run button promises: every stage, for every volume that
+        # still needs it - including the ones queued behind the scene map.
+        outstanding = sum(
+            pipeline_status.estimate_minutes(stage, rows_by_id[b.id]["words"])
+            for stage in PIPELINE_STAGES
+            if not (stage == "cast" and not state.cast_enabled)
+            for b in ordered_books
+            if pipeline_status.needs_work(rows_by_id[b.id], stage))
+
+        with ui.row().classes('w-full items-center gap-3 flex-wrap min-w-0'):
+            with ui.column().classes('gap-0 flex-1 min-w-0'):
+                ui.label(f'{len(ordered_books)} volumes · {total_words:,} words').classes(
+                    'text-sm font-bold text-slate-800')
+                ui.label(_fmt_minutes(outstanding) + ' of work outstanding'
+                         if outstanding else 'Everything is generated.').classes(
+                    'text-[10px] ' + ('text-amber-600 font-semibold' if outstanding
+                                      else 'text-emerald-600'))
+
+            def handle_cast_toggle(value):
+                state.cast_enabled = bool(value)
+                from services.project_settings import save_project_settings_to_disk
+                save_project_settings_to_disk(project.id)
+                pipeline_status.clear_cache()
+                dashboard_body.refresh()
+
+            with ui.row().classes('items-center gap-2 shrink-0'):
+                ui.icon('face', size='16px', color='blue-400')
+                ui.switch('Cast', value=bool(state.cast_enabled),
+                          on_change=lambda e: handle_cast_toggle(e.value)) \
+                    .props('dense').classes('text-[10px] text-slate-600') \
+                    .tooltip('Character descriptions. Optional - off skips the quote and '
+                             'trait passes entirely. Prompts are unaffected, because '
+                             '[Name] tags are compiled at render time, and existing cast '
+                             'data is kept.')
+
+        render_transcript_approval_banner(project, ordered_books, output_base,
+                                          dashboard_body.refresh)
+
+        # The action sits above the table: with a long series the table runs past
+        # the fold, and a Run button nobody can see is the problem this dashboard
+        # is replacing.
+        render_run_bar(project, ordered_books, rows_by_id,
+                       start_pipeline_cb=start_pipeline_cb, stop_cb=stop_cb,
+                       refresh=dashboard_body.refresh)
+
+        render_pipeline_table(project, ordered_books, rows_by_id, dirs_by_id,
+                              start_pipeline_cb=start_pipeline_cb,
+                              start_analysis_cb=start_analysis_cb,
+                              refresh=dashboard_body.refresh)
+
+        if (any(r["chunking"] == "linear" for r in rows_by_id.values())
+                or str(get_setting("pipeline_mode", "full")) == "fast"):
+            render_legacy_chunker_notice(project, dashboard_body.refresh)
+
+        render_pipeline_settings(project, ordered_books, dashboard_body.refresh)
+
+    dashboard_body()
+
+    # Phase 3: rendering. Always present - it is a thing to do, not a phase to
+    # arrive at, and the resume behaviour lives in the filenames.
+    render_image_gen_step_view(project, ordered_books, start_image_gen_cb, stop_cb)
 
 
 def render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb):
@@ -681,20 +1053,6 @@ def render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcri
                     on_click=lambda: start_image_gen_cb(project.id) if start_image_gen_cb else None
                 ).classes('text-white font-bold text-xs px-5')
 
-
-def render_completed_step_view(project, books):
-    with ui.card().classes('w-full border p-5 shadow-sm bg-emerald-50/10 gap-3'):
-        with ui.row().classes('items-center gap-2'):
-            ui.icon('task_alt', size='sm', color='emerald-500')
-            ui.label('Automatic Execution Phases Completed!').classes('text-sm font-bold text-slate-800')
-            
-        ui.label('All automatic generation steps have completed. You can now proofread chapters, tune image prompts, and bake description metadata.').classes('text-xs text-slate-500')
-        
-        with ui.row().classes('w-full gap-4 items-center bg-white p-4 rounded-lg border mt-2'):
-            ui.icon('info', color='emerald')
-            with ui.column().classes('gap-0 flex-1'):
-                ui.label('Next Step: Workspace Proofreader').classes('text-xs font-bold text-slate-700')
-                ui.label('Select a specific book in the left sidebar to open the Proofreader & Interactive Editor Grid.').classes('text-[10px] text-slate-500')
 
 def render_source_text_tab(project, books):
     """Optional repair step: match volumes to EPUB source files and rewrite
@@ -1073,7 +1431,8 @@ def render_project_tabs(
     start_prompt_gen_cb=None,
     start_image_gen_cb=None,
     save_project_settings_cb=None,
-    start_analysis_cb=None
+    start_analysis_cb=None,
+    start_pipeline_cb=None
 ):
     # Safeguard selected template checks
     available_templates = list_stored_templates()
@@ -1103,9 +1462,9 @@ def render_project_tabs(
     # still current. The two coexist because re-importing a transcript or
     # re-rendering images is not an analysis stage.
     #
-    # The button lives in render_prompt_gen_step_view, which runs inside a
-    # @ui.refreshable, so the dialog cannot be built there (it would be rebuilt on
-    # every refresh). It is built once here and driven through module state.
+    # The button lives in the dashboard table, which runs inside a @ui.refreshable,
+    # so the dialog cannot be built there (it would be rebuilt on every refresh).
+    # It is built once here and driven through module state.
     global _rerun_dialog, _rerun_body, _rerun_checks, _rerun_start_cb, _rerun_project_id
     _rerun_start_cb = start_analysis_cb
     _rerun_project_id = project.id
@@ -1120,7 +1479,7 @@ def render_project_tabs(
             ui.button('Cancel', on_click=_rerun_dialog.close)\
                 .props('flat color=slate').classes('text-xs font-semibold')
             ui.button('Re-run', on_click=confirm_stage_rerun)\
-                .classes('bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold')
+                .classes('bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold')
 
     with ui.dialog() as rollback_dialog, ui.card().classes('w-full max-w-md p-6 rounded-xl gap-4'):
         ui.label('Confirm State Rollback').classes('text-lg font-bold text-slate-800')
@@ -1239,18 +1598,20 @@ def render_project_tabs(
     def render_active_panel():
         active = state.active_project_tab
         if active == 'Dashboard':
-            with ui.column().classes('w-full gap-4'):
+            with ui.column().classes('w-full gap-4 min-w-0'):
                 global render_dynamic_step_dashboard
                 @ui.refreshable
                 def render_dynamic_step_dashboard_local():
-                    status = state.project_status
-                    if status in ("Imported", "Transcribing"):
-                        render_transcription_step_view(project, books, start_transcribe_cb, stop_transcribe_cb)
-                    elif status in ("Transcribed", "Generating Prompts"):
-                        render_prompt_gen_step_view(project, books, start_prompt_gen_cb, stop_transcribe_cb, start_analysis_cb)
-                    else:
-                        render_image_gen_step_view(project, books, start_image_gen_cb, stop_transcribe_cb)
-                        
+                    render_dashboard_view(
+                        project, books,
+                        start_transcribe_cb=start_transcribe_cb,
+                        stop_cb=stop_transcribe_cb,
+                        start_analysis_cb=start_analysis_cb,
+                        start_pipeline_cb=start_pipeline_cb or (
+                            lambda pid, plan: None),
+                        start_image_gen_cb=start_image_gen_cb,
+                    )
+
                 render_dynamic_step_dashboard = render_dynamic_step_dashboard_local
                 render_dynamic_step_dashboard()
 
