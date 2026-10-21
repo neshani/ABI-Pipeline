@@ -27,6 +27,7 @@ from services.character_manager import (
     character_field_stats,
     project_known_counts,
     changed_trait_fields,
+    propagate_trait_change,
     character_trait_summary,
     normalize_character_text,
     normalize_character_key,
@@ -1545,6 +1546,40 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
         draw_character_list.refresh()
         await restore_scroll_position()
 
+    async def refresh_after_trait_save():
+        """Re-render the panels without losing your place in the profile.
+
+        The trait grid lives in its own scrollable column. A plain refresh
+        rebuilds it at scrollTop 0, which throws you back to the top of a long
+        profile after every field edit - so the offset is read before the
+        rebuild and put back after it lands.
+        """
+        try:
+            top = await ui.run_javascript(
+                "(() => { const el = document.querySelector('.char-details-scroll');"
+                " return el ? el.scrollTop : 0; })()", timeout=1.0)
+        except Exception:
+            top = 0
+        draw_stats_bar.refresh()
+        draw_character_list.refresh()
+        draw_details_panel.refresh()
+        try:
+            # The rebuilt column arrives over the socket, so the offset has to be
+            # re-applied for a few frames rather than once.
+            await ui.run_javascript(
+                "(() => {"
+                f"  const target = {int(top or 0)}; let tries = 0;"
+                "  const put = () => {"
+                "    const el = document.querySelector('.char-details-scroll');"
+                "    if (el) el.scrollTop = target;"
+                "    if (tries++ < 10) setTimeout(put, 30);"
+                "  };"
+                "  put();"
+                "})()", timeout=1.0)
+        except Exception:
+            pass
+        await restore_scroll_position()
+
     def select_char(c_id):
         global selected_character_id, selected_event_id, timeline_book_id
         old_id = selected_character_id
@@ -1648,7 +1683,41 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         .classes(f'text-xs px-3 py-1 rounded-md transition-all {prof_style}')\
                         .tooltip("Edit physical traits, craft visual prompts, and manage timeline overrides")
 
-                # 3. Action Buttons & Overflow Menu
+                # 3. Project-wide rendering policy for the `carried` trait. It is a
+                # setting, not a per-character decision, because the problem is the
+                # trait itself: a prop the author mentions once decorates every later
+                # image, and there is no sentence saying it was put down.
+                carried_options = {
+                    "scene": "Scene only",
+                    "off": "Never rendered",
+                    "always": "Carry forward",
+                }
+
+                def set_carried_mode(value):
+                    mode = value if value in carried_options else "scene"
+                    state.carried_mode = mode
+                    from services.project_settings import save_project_settings_to_disk
+                    save_project_settings_to_disk(project.id)
+                    ui.notify(f"Carried props: {carried_options[mode]}", type="info")
+                    draw_header_toolbar.refresh()
+                    draw_details_panel.refresh()
+
+                with ui.row().classes('items-center gap-1 bg-white border px-2 py-0.5 rounded-lg'):
+                    ui.icon('backpack', size='14px', color='slate-400')
+                    ui.label('Carried').classes(
+                        'text-[9px] font-bold text-slate-400 uppercase tracking-wide')
+                    ui.select(carried_options,
+                              value=state.carried_mode if state.carried_mode in carried_options
+                              else "scene",
+                              on_change=lambda e: set_carried_mode(e.value))\
+                        .classes('w-32 text-[10px]').props('dense borderless')\
+                        .tooltip('Scene only: a carried prop appears only where the text '
+                                 'recorded it. Never rendered: stored and editable, but '
+                                 'left out of prompts like notes. Carry forward: the old '
+                                 'behaviour - it persists until something changes it. '
+                                 'Pinning a character\'s carried field overrides this.')
+
+                # 4. Action Buttons & Overflow Menu
                 with ui.row().classes('items-center gap-2'):
                     if not is_profiling_all:
                         ui.button(
@@ -2451,7 +2520,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
         # WORKFLOW MODE 2: VISUAL PROFILES (Creative Prompting & Trait Curation)
         # =========================================================================
         else:
-            with ui.column().classes('w-full flex-1 overflow-y-auto gap-3.5 pr-1'):
+            with ui.column().classes('w-full flex-1 overflow-y-auto gap-3.5 pr-1 '
+                                      'char-details-scroll'):
                 
                 # Research / Vibe Dedication Row
                 with ui.row().classes('w-full items-center justify-between bg-purple-50/40 border border-purple-100 p-3 rounded-xl gap-2'):
@@ -2732,11 +2802,12 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
 
                 # Physical Parameters Grid
                 def make_update_handler(ev_id, key, text_area_el):
-                    def handler(e):
+                    async def handler(e):
                         val = e.sender.value.strip()
                         with Session(engine) as session:
                             db_ev = session.get(CharacterTimelineEvent, ev_id)
                             if db_ev:
+                                old_val = getattr(db_ev, key, None)
                                 setattr(db_ev, key, val if val != "" else None)
                                 if db_ev.source == "extraction":
                                     db_ev.source = "manual"  # protect the edit from re-analysis
@@ -2755,6 +2826,18 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                             other.source = "manual"
                                         session.add(other)
                                 char_obj = session.get(Character, db_ev.character_id)
+                                if char_obj and key not in ("sex", "species"):
+                                    # Everything else is scene-level, but the user means
+                                    # "from here on": carry it through the events that
+                                    # still repeat the old value and stop where the book
+                                    # changes it. Without this, a Base edit never reaches
+                                    # a position that already has an event.
+                                    propagate_trait_change(
+                                        session, char_obj, key, val, old_val,
+                                        book_id=db_ev.book_id,
+                                        chapter_num=db_ev.chapter_num,
+                                        shot_num=db_ev.shot_num,
+                                        log=state.add_console_log)
                                 if char_obj and not char_obj.locked:
                                     if event_trait_count(db_ev):
                                         new_prompt = compile_character_visual_prompt(db_ev)
@@ -2769,6 +2852,11 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                 session.add(db_ev)
                                 session.commit()
                         save_project_characters_to_json(project.id)
+                        # The status beside each field ("missing" / "1 change") is
+                        # computed at render time, so it has to be re-rendered or it
+                        # keeps describing the state before the edit - and the
+                        # re-render must not move the scroll position.
+                        await refresh_after_trait_save()
                         ui.notify("Trait saved.", type="positive", position="bottom-right", timeout=1000)
                     return handler
 

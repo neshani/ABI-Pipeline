@@ -590,8 +590,13 @@ def create_contact_sheet(base64_list: list, overlay_text: str = "") -> Optional[
     grid_img.save(out_buf, format="PNG")
     return out_buf.getvalue()
 
-def open_playground_image_modal(img_src: str, title: str, prompt: str, quote: str = ""):
-    """Safely mutates the persistent dialog elements in-place and triggers the overlay."""
+def open_playground_image_modal(img_src: str, title: str, prompt: str, quote: str = "",
+                                item: Any = None):
+    """Safely mutates the persistent dialog elements in-place and triggers the overlay.
+
+    ``item`` is the card this prompt came from; it carries the story position, so
+    the "rendered" preview shows the description that shot would actually use.
+    """
     global playground_image_dialog_ref, modal_title_label, modal_image_el, modal_no_image_placeholder
     global modal_prompt_label, modal_rendered_prompt_label, modal_quote_container, modal_quote_label, modal_download_btn
     
@@ -604,17 +609,8 @@ def open_playground_image_modal(img_src: str, title: str, prompt: str, quote: st
     if modal_prompt_label:
         modal_prompt_label.set_text(prompt)
         
-    # Resolve rendered prompt
-    project_id = state.active_project_id
-    if project_id:
-        rendered_prompt = replace_character_tags_in_prompt(
-            prompt,
-            project_id,
-            getattr(state, "style_enabled_character_traits", {}),
-            getattr(state, "style_use_sentence_structure", True)
-        )
-    else:
-        rendered_prompt = prompt
+    # Resolve rendered prompt at the card's position (Base when it has none).
+    rendered_prompt = render_prompt_at_position(item, prompt=prompt)
 
     if modal_rendered_prompt_label:
         modal_rendered_prompt_label.set_text(rendered_prompt)
@@ -753,14 +749,8 @@ def copy_style_settings_to_clipboard(project_name: str = "Active Project"):
         lines.append(f"  - *Extracted Prompt*: {p_text}")
         
         # Append expanded Rendered Prompt
-        if project_id:
-            rendered_p = replace_character_tags_in_prompt(
-                p_text,
-                project_id,
-                getattr(state, "style_enabled_character_traits", {}),
-                getattr(state, "style_use_sentence_structure", True)
-            )
-            lines.append(f"  - *Rendered Prompt*: {rendered_p}")
+        rendered_p = render_prompt_at_position(item, project_id, p_text)
+        lines.append(f"  - *Rendered Prompt*: {rendered_p}")
 
     full_text = "\n".join(lines)
     ui.clipboard.write(full_text)
@@ -793,14 +783,8 @@ def copy_style_primer_to_clipboard(project_name: str):
         scenes_lines.append(f"  - *Visual Prompt (Extracted)*: {p_text}")
         
         # Append expanded Rendered Prompt
-        if project_id:
-            rendered_p = replace_character_tags_in_prompt(
-                p_text,
-                project_id,
-                getattr(state, "style_enabled_character_traits", {}),
-                getattr(state, "style_use_sentence_structure", True)
-            )
-            scenes_lines.append(f"  - *Visual Prompt (Rendered)*: {rendered_p}")
+        rendered_p = render_prompt_at_position(item, project_id, p_text)
+        scenes_lines.append(f"  - *Visual Prompt (Rendered)*: {rendered_p}")
     
     scenes_str = "\n".join(scenes_lines) if scenes_lines else "*No test scenes generated yet.*"
 
@@ -927,16 +911,9 @@ async def regenerate_single_card(project_name: str, idx: int):
         project_obj = session.exec(select(Project).where(Project.name == project_name)).first()
         project_id = project_obj.id if project_obj else None
 
-    # Replace bracketed character tags
-    if project_id:
-        prompt_text = replace_character_tags_in_prompt(
-            raw_prompt,
-            project_id,
-            getattr(state, "style_enabled_character_traits", {}),
-            getattr(state, "style_use_sentence_structure", True)
-        )
-    else:
-        prompt_text = raw_prompt
+    # Replace bracketed character tags at this card's own position, so the
+    # sample matches what the renderer would draw for that shot.
+    prompt_text = render_prompt_at_position(item, project_id, raw_prompt)
 
     # Render with the style of the shot role this card was sampled for.
     role = item.get("shot_role") if isinstance(item, dict) else None
@@ -1562,9 +1539,26 @@ def fetch_real_prompts(project_name: str, book_name: str, count: int = 4,
     """Samples scenes from the volume's prompts.csv for the style tester.
 
     Each item carries the ``shot_role`` it should be rendered with, so the tester
-    previews the same per-role style the batch renderer will apply.
+    previews the same per-role style the batch renderer will apply, and the
+    ``book_id`` / ``chapter`` / ``shot`` position, so character descriptions
+    resolve at the point in the story the shot came from rather than at the
+    character's Base event.
     """
     import pandas as pd
+
+    # Resolve the position keys once; the items carry them so no card render has
+    # to look them up again.
+    project_id = book_id = None
+    with Session(engine) as session:
+        project = session.exec(
+            select(Project).where(Project.name == project_name)).first()
+        if project:
+            project_id = project.id
+            book = session.exec(
+                select(Book)
+                .where(Book.project_id == project.id)
+                .where(Book.name == book_name)).first()
+            book_id = book.id if book else None
     
     csv_paths = [
         Path(f"./output/{project_name}/{book_name}/prompts.csv"),
@@ -1604,6 +1598,8 @@ def fetch_real_prompts(project_name: str, book_name: str, count: int = 4,
                 role = style_library.normalize_role(row.get('shot_role')) if mode == "variety" else mode
                 items.append({
                     "book": book_name,
+                    "book_id": book_id,
+                    "project_id": project_id,
                     "chapter": int(row.get('chapter', 1)),
                     "shot": int(row.get('shot', 1)),
                     "prompt": str(row['prompt']).strip(),
@@ -1622,6 +1618,8 @@ def fetch_real_prompts(project_name: str, book_name: str, count: int = 4,
             for idx, chunk in enumerate(chunks):
                 items.append({
                     "book": book_name,
+                    "book_id": book_id,
+                    "project_id": project_id,
                     "chapter": 1,
                     "shot": idx + 1,
                     "prompt": f"Generating from raw passage fallback: {chunk[:80]}...",
@@ -1630,6 +1628,53 @@ def fetch_real_prompts(project_name: str, book_name: str, count: int = 4,
                 })
                 
     return items
+
+
+def _character_state_args(item: Any) -> Dict[str, Any]:
+    """``book_id`` / ``chapter`` / ``shot`` for resolving a character's state.
+
+    Empty for an item with no real story position (a hand-written freeform
+    prompt), which leaves the compiler on the Base event - the only position such
+    a prompt has.
+    """
+    if not isinstance(item, dict):
+        return {}
+    book_id = item.get("book_id")
+    chapter = item.get("chapter")
+    shot = item.get("shot")
+    if not book_id or not chapter:
+        return {}
+    args = {"book_id": int(book_id), "chapter_num": int(chapter)}
+    if shot:
+        args["shot_num"] = int(shot)
+    return args
+
+
+def render_prompt_at_position(item: Any, project_id: Optional[int] = None,
+                              prompt: Optional[str] = None) -> str:
+    """Compile ``[Name]`` tags for one card, at that card's own story position.
+
+    The renderer resolves a description positionally: the latest event at or
+    before ``(book, chapter, shot)``. The playground called the same compiler
+    without a position, so every sample resolved to the character's Base event -
+    the first description in the first volume - which is why a character kept
+    being drawn with whatever they carried at the start of the series no matter
+    which scene was sampled.
+    """
+    if prompt is None:
+        prompt = item.get("prompt", "") if isinstance(item, dict) else str(item)
+    if not project_id and isinstance(item, dict):
+        project_id = item.get("project_id")
+    if not project_id:
+        project_id = state.active_project_id
+    if not project_id:
+        return prompt
+    return replace_character_tags_in_prompt(
+        prompt, project_id,
+        getattr(state, "style_enabled_character_traits", {}),
+        getattr(state, "style_use_sentence_structure", True),
+        **_character_state_args(item),
+    )
 
 
 def draw_style_test_sample(project_name: str, book_name: str):
@@ -1754,16 +1799,8 @@ async def execute_style_playground_batch(project_name: str):
             
         raw_prompt = item["prompt"] if isinstance(item, dict) else item
 
-        # Replace bracketed character tags
-        if project_id:
-            prompt_text = replace_character_tags_in_prompt(
-                raw_prompt,
-                project_id,
-                getattr(state, "style_enabled_character_traits", {}),
-                getattr(state, "style_use_sentence_structure", True)
-            )
-        else:
-            prompt_text = raw_prompt
+        # Replace bracketed character tags at this card's own position.
+        prompt_text = render_prompt_at_position(item, project_id, raw_prompt)
 
         # Each card renders with the style of the shot role it was sampled for.
         role = item.get("shot_role") if isinstance(item, dict) else None
@@ -2565,7 +2602,7 @@ def render_style_playground_cards(project_name: str = ""):
                         ui.label("Rendering...").classes('text-[8px] text-slate-400 mt-1')
                 elif img_data:
                     ui.image(img_data).props('fit=contain').classes('w-full h-40 bg-slate-50 rounded border shadow-sm cursor-zoom-in hover:brightness-95 transition-all') \
-                        .on('click', lambda _, img=img_data, title=full_title_header, p=prompt_str, q=quote: open_playground_image_modal(img, title, p, q)) \
+                        .on('click', lambda _, img=img_data, title=full_title_header, p=prompt_str, q=quote, it=item: open_playground_image_modal(img, title, p, q, it)) \
                         .tooltip(prompt_str)
                 elif state.style_playground_loading:
                     with ui.column().classes('w-full h-40 items-center justify-center bg-slate-50 rounded border border-dashed') \
@@ -2575,7 +2612,7 @@ def render_style_playground_cards(project_name: str = ""):
                 else:
                     # Allow clicking the empty placeholder to inspect the queued prompt before generation
                     with ui.column().classes('w-full h-40 items-center justify-center bg-slate-50 rounded border border-dashed text-slate-400 cursor-pointer') \
-                            .on('click', lambda _, p=prompt_str, q=quote: open_playground_image_modal("", full_title_header, p, q)) \
+                            .on('click', lambda _, p=prompt_str, q=quote, it=item: open_playground_image_modal("", full_title_header, p, q, it)) \
                             .tooltip(prompt_str):
                         ui.icon('photo_library', size='sm', color='slate-300')
                         ui.label("Awaiting Style Gen").classes('text-[9px] font-semibold text-slate-500 mt-1')

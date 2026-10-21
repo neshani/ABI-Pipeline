@@ -3,7 +3,7 @@ import json
 import csv
 import asyncio
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Callable
 from sqlmodel import Session, select
 from database.connection import engine, get_setting
 from database.models import Project, Book, Character, CharacterAlias, CharacterBookLink, CharacterStateModifier, CharacterTimelineEvent
@@ -1002,6 +1002,80 @@ _HUMAN_SPECIES = {"human", "person", "people", "man", "woman"}
 # timeline still shows the changes the extraction found; the resolver ignores
 # them for the pinned fields only.
 
+def _clone_event(event: CharacterTimelineEvent, **overrides) -> CharacterTimelineEvent:
+    """A transient copy of a timeline event. Never added to the session."""
+    data = {field: getattr(event, field, None) for field in NEW_TRAIT_FIELDS}
+    data.update(overrides)
+    return CharacterTimelineEvent(
+        id=event.id,
+        character_id=event.character_id,
+        book_id=event.book_id,
+        chapter_num=event.chapter_num,
+        shot_num=event.shot_num,
+        label=event.label,
+        demographics=event.demographics,
+        physical_build=event.physical_build,
+        hair_and_face=event.hair_and_face,
+        distinguishing_marks=event.distinguishing_marks,
+        source=event.source,
+        visual_description=event.visual_description,
+        **data,
+    )
+
+
+def carried_scope_mode() -> str:
+    """``scene`` (default) / ``off`` / ``always`` for the ``carried`` trait.
+
+    ``carried`` is the one trait whose persistence is wrong more often than not:
+    an author says a character picks something up, and never says they put it
+    down, so a snapshot that carries it forward decorates every later image with
+    a prop the text stopped mentioning. Attire does not have this problem -
+    clothes are re-described and genuinely persist.
+
+    The setting is per project and lives in ``project_settings.json``. ``off``
+    keeps the data and only drops it from rendered prompts (like ``notes``);
+    ``scene`` shows it where the text actually said it; ``always`` is the old
+    carry-forward behaviour. A pinned ``carried`` field always wins, which is the
+    per-character way to say "this one really does carry the same thing".
+    """
+    try:
+        from ui import state
+        mode = str(getattr(state, "carried_mode", "scene") or "scene")
+    except Exception:
+        return "scene"
+    return mode if mode in ("scene", "off", "always") else "scene"
+
+
+def apply_carried_scope(event: Optional[CharacterTimelineEvent],
+                        character: Optional[Character],
+                        book_id: Optional[int], chapter_num: Optional[int],
+                        shot_num: Optional[int]
+                        ) -> Optional[CharacterTimelineEvent]:
+    """Drop ``carried`` from a resolved event unless the project wants it.
+
+    Returns the event itself when nothing changes, otherwise a transient copy -
+    the row in the session must never be mutated by a render.
+    """
+    if event is None:
+        return event
+    mode = carried_scope_mode()
+    if mode == "always":
+        return event
+    if character is not None and "carried" in get_pinned_fields(character):
+        return event
+    if mode == "scene":
+        # The trait is valid at the position the description was recorded at.
+        # Groups are one or two chunks, so this is "this scene" to within a
+        # shot - and it cannot leak into a later scene, which is the point.
+        query = (book_id, int(chapter_num or 0), int(shot_num or 0))
+        here = (event.book_id, int(event.chapter_num or 0), int(event.shot_num or 0))
+        if query == here:
+            return event
+    if not (getattr(event, "carried", None) or "").strip():
+        return event
+    return _clone_event(event, carried=None)
+
+
 def get_pinned_fields(character: Optional[Character]) -> List[str]:
     raw = getattr(character, "pinned_traits", None) if character else None
     if not raw:
@@ -1151,6 +1225,111 @@ def changed_trait_fields(event: CharacterTimelineEvent,
               for field in RENDERED_TRAIT_FIELDS}
     return [field for field in RENDERED_TRAIT_FIELDS
             if current[field] != before[field]]
+
+
+def propagate_trait_change(session: Session, character: Character, field: str,
+                           new_value: Optional[str], old_value: Optional[str], *,
+                           book_id: Optional[int], chapter_num: int = 0,
+                           shot_num: int = 0, force: bool = False,
+                           log: Optional[Callable[[str], None]] = None) -> int:
+    """Carry an edited trait forward through the events that repeat the old value.
+
+    Events hold complete snapshots, so "this character wears a cloak at shot 40"
+    and "the extractor said cloak at shot 3 and nothing has changed since" are
+    stored identically. A manual edit therefore cannot rely on the renderer to
+    inherit it - every later snapshot keeps asserting the extracted value - which
+    is why filling in a Base trait did nothing visible and why the only way to
+    make an edit stick was to pin it.
+
+    This makes the edit mean what the user means by it: *this value from here
+    on, until the book says otherwise*. Every snapshot that still holds the old
+    value (or holds nothing) is rewritten; the first snapshot that holds a
+    different value is a real change in the book, and propagation stops there.
+
+    Re-saving an unchanged Base value re-asserts it, which is how an edit made
+    before this existed is pushed through: with no new value to compare against,
+    the change points are inferred from the book's own chain - the first event
+    whose value differs from the one before it ends the run.
+
+    Clearing a field is not propagated: blanking a Base value should not erase
+    what each volume actually observed.
+
+    ``force`` is not reachable from the UI. It exists for one-off repairs, where
+    a value has to be imposed on events that already disagree.
+
+    Returns the number of events rewritten.
+    """
+    say = log or (lambda *_a, **_k: None)
+    new_text = (new_value or "").strip()
+    new_norm = new_text.lower()
+    old_norm = (old_value or "").strip().lower()
+    if field not in RENDERED_TRAIT_FIELDS or not new_text:
+        return 0
+    if not force and new_norm == old_norm:
+        # Same value saved again: only meaningful on the Base, and only as a
+        # re-assertion of the whole series.
+        if book_id is not None:
+            return 0
+    reassert = (not force) and new_norm == old_norm
+
+    books = session.exec(
+        select(Book).where(Book.project_id == character.project_id)).all()
+    order_map = {b.id: (b.book_order if b.book_order is not None else 10 ** 6)
+                 for b in books}
+    side_stories = {b.id for b in books if getattr(b, "is_side_story", False)}
+
+    def sort_key(event: CharacterTimelineEvent):
+        if event.book_id is None:
+            return (0, 0, 0, event.chapter_num, event.shot_num, event.id or 0)
+        return (1, order_map.get(event.book_id, 10 ** 6), 0,
+                event.chapter_num, event.shot_num, event.id or 0)
+
+    # Everything at or after the edited position, in reading order.
+    edit_key = ((0, 0, 0, 0, 0, 0) if book_id is None
+                else (1, order_map.get(book_id, 10 ** 6), 0,
+                      chapter_num, shot_num, 10 ** 9))
+
+    events = session.exec(
+        select(CharacterTimelineEvent)
+        .where(CharacterTimelineEvent.character_id == character.id)).all()
+    changed = 0
+    previous_norm = None
+    for event in sorted(events, key=sort_key):
+        if sort_key(event) < edit_key:
+            continue
+        if event.book_id == book_id and event.chapter_num == chapter_num \
+                and event.shot_num == shot_num:
+            continue  # the edited row itself was already written by the caller
+        # A side story is invisible to later volumes, so it must not take part in
+        # - or interrupt - a change that carries forward.
+        if event.book_id in side_stories and event.book_id != book_id:
+            continue
+        current = (getattr(event, field, None) or "").strip()
+        current_norm = current.lower()
+        if not force:
+            if reassert:
+                # No recorded old value: a change point is where the book's own
+                # chain moves on from what the previous event said.
+                if previous_norm and current_norm and current_norm != previous_norm:
+                    break
+            elif current and current_norm != old_norm:
+                break  # the book changes it here; from this point it is the book's
+        if current_norm:
+            previous_norm = current_norm
+        if current_norm == new_norm:
+            continue  # already correct
+        setattr(event, field, new_text)
+        if event.source == "extraction":
+            event.source = "manual"  # a re-analysis must not undo it
+        if event.visual_description:
+            # A stored override would otherwise keep the old wording.
+            event.visual_description = compile_character_visual_prompt(event)
+        session.add(event)
+        changed += 1
+    if changed:
+        say(f"[Characters] '{character.name}': {field} applied to {changed} "
+            f"later event(s) until the book changes it.")
+    return changed
 
 
 def character_field_stats(session: Session, character: Character,
@@ -1878,6 +2057,8 @@ def replace_character_tags_in_prompt(
                     session, char, book_id, chapter_num, shot_num,
                     book_order_map=book_order_map, side_stories=side_stories,
                     events=events)
+                resolved_ev = apply_carried_scope(resolved_ev, char, book_id,
+                                                  chapter_num, shot_num)
                 replacement = compile_character_description_from_event(
                     char, resolved_ev, enabled_fields, use_sentence_structure
                 )

@@ -35,6 +35,7 @@ def save_project_settings_to_disk(project_id: int) -> None:
         "style_image_seed": state.style_image_seed,
         "playground_chunk_size": state.playground_chunk_size,
         "cast_enabled": bool(state.cast_enabled),
+        "carried_mode": str(state.carried_mode or "scene"),
     }
     
     try:
@@ -68,6 +69,7 @@ def load_project_settings_from_disk(project_id: int) -> None:
         state.style_image_seed = 42
         state.playground_chunk_size = 350
         state.cast_enabled = True
+        state.carried_mode = "scene"
         load_style_preset_by_name(state.style_selected_preset)
         return
 
@@ -87,6 +89,8 @@ def load_project_settings_from_disk(project_id: int) -> None:
         state.style_image_seed = data.get("style_image_seed", 42)
         state.playground_chunk_size = data.get("playground_chunk_size", 350)
         state.cast_enabled = bool(data.get("cast_enabled", True))
+        mode = str(data.get("carried_mode") or "scene")
+        state.carried_mode = mode if mode in ("scene", "off", "always") else "scene"
 
         # Loads the Character base + role deltas, the workflow, and the node overrides.
         load_style_preset_by_name(preset_name)

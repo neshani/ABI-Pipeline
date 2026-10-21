@@ -88,6 +88,10 @@ cancel_pipeline_flag: bool = False
 # in project_settings.json; off means the cast stages are skipped, not deleted -
 # prompts are unaffected either way because tags compile at render time.
 cast_enabled: bool = True
+# How the `carried` trait reaches rendered prompts: "scene" (only where the text
+# recorded it), "off" (never rendered, still stored) or "always" (carried
+# forward, the old behaviour). Per project, saved in project_settings.json.
+carried_mode: str = "scene"
 # Volume ids ticked in the dashboard table. Ticked volumes narrow the run; an
 # empty list means the whole project.
 pipeline_selected_books: List[int] = []
