@@ -78,7 +78,8 @@ SEX_TIMEOUT = 300.0
 
 ANALYSIS_FIELDS = tuple(f for f in NEW_TRAIT_FIELDS
                         if f in ("sex", "species", "age", "hair_color", "hair_style",
-                                 "eye_color", "build", "attire", "carried", "notes"))
+                                 "eye_color", "face", "build", "attire", "carried",
+                                 "notes"))
 
 
 # --- prompts ----------------------------------------------------------------
@@ -539,7 +540,15 @@ FIELD_ALIASES = {
     "accessory": "carried", "item": "carried", "weapon": "carried",
     "signature_object": "carried", "held": "carried",
     "age_range": "age",
-    # Fields the new schema does not render. Keep the observation in the sink
+    # Facial hair is hair: for most characters it *is* the hairstyle, and the
+    # composer renders it either in the hair phrase ("long white hair and a
+    # bushy beard") or as its own clause ("white hair, bushy white brows"). The
+    # model reaches for hair_style for it unaided, so no extra question is asked
+    # and the value is not moved out of the field it was written to.
+    "facial_hair": "hair_style", "beard": "hair_style", "beards": "hair_style",
+    "moustache": "hair_style", "mustache": "hair_style", "whiskers": "hair_style",
+    "sideburns": "hair_style", "eyebrows": "hair_style",
+    # Fields the schema does not render. Keep the observation in the sink
     # rather than forcing it into a body field or throwing it away.
     "skin": "notes", "complexion": "notes", "skin_tone": "notes",
     "face": "notes", "features": "notes", "expression": "notes", "mood": "notes",
@@ -1695,8 +1704,8 @@ def _is_synthetic_book_start(event: CharacterTimelineEvent) -> bool:
     if event.chapter_num != 1 or event.shot_num != 1:
         return False
     return not any(getattr(event, field, None) for field in
-                   ("age", "hair_color", "hair_style", "eye_color", "build",
-                    "attire", "carried"))
+                   ("age", "hair_color", "hair_style", "eye_color", "face",
+                    "build", "attire", "carried"))
 
 
 def _sync_base_event(session: Session, char: Character,

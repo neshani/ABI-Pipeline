@@ -978,9 +978,11 @@ def load_prompt_template_from_file(mode: str) -> str:
 # here invents a value; an empty field adds nothing.
 
 NEW_TRAIT_FIELDS = ("sex", "species", "age", "hair_color", "hair_style",
-                    "eye_color", "build", "attire", "carried", "notes")
+                    "eye_color", "face", "build", "attire", "carried", "notes")
 RENDERED_TRAIT_FIELDS = tuple(f for f in NEW_TRAIT_FIELDS if f != "notes")
-TRAIT_ORDER = ("hair_color", "hair_style", "eye_color", "build", "attire", "carried")
+# Build order for the compiled phrase. Hair is not in this list: it is one
+# clause composed from two fields, so it is added before the loop.
+TRAIT_ORDER = ("eye_color", "face", "build", "attire", "carried")
 
 _SEX_NOUN = {"male": "man", "female": "woman"}
 _VALID_AGES = {"young", "adult", "middle-aged", "old"}
@@ -1427,7 +1429,8 @@ def character_field_stats(session: Session, character: Character,
 _TRAIT_LEGACY_GROUP = {
     "sex": "demographics", "species": "demographics", "age": "demographics",
     "hair_color": "hair_and_face", "hair_style": "hair_and_face",
-    "eye_color": "hair_and_face", "build": "physical_build",
+    "eye_color": "hair_and_face", "face": "hair_and_face",
+    "build": "physical_build",
 }
 
 
@@ -1492,15 +1495,335 @@ def _base_noun(event) -> str:
     return " ".join(p for p in parts if p)
 
 
+# --- hair: two fields, one clause -------------------------------------------
+#
+# hair_color and hair_style are separate fields because prose mentions one at a
+# time ("her braid", "his grey hair"); they are one clause because a comma
+# cannot join them ("brown hair, cut short"). The join is decided by the shape
+# of the STYLE value, not by substring guessing at render time:
+#
+#   head noun present  -> the colour goes immediately before that noun
+#                         "long curls" + "blond"       -> "long blond curls"
+#   bare adjective     -> the colour takes the hair noun
+#                         "cut short" + "dark"         -> "dark hair cut short"
+#   prepositional      -> the hair noun leads, the arrangement follows
+#                         "in a long braid" + "dark"   -> "dark hair in a long braid"
+#   no hair at all     -> the colour is dropped; it contradicts the style
+#                         "shaven head" + "white"      -> "shaven head"
+#   animal noun        -> the mane/coat/tail is the noun
+#                         "shaggy mane" + "black"      -> "shaggy black mane"
+#
+# Anything unrecognised falls back to the two comma items this code produced
+# before, so a value the vocabulary does not know is never rendered as
+# nonsense. The vocabulary is general English; a book's own coinages belong in
+# the project's data, not here.
+#
+# A facial-hair value in hair_style ("long beard", "bushy white brows") is the
+# extractor picking the wrong slot. `character_analysis._canonical_field` files
+# it under `face` instead; the composer never has to know about beards.
+
+_HAIR_HEAD_NOUNS = {
+    "hair", "braid", "braids", "plait", "plaits", "curl", "curls", "ringlet",
+    "ringlets", "wave", "waves", "fringe", "pigtail", "pigtails", "topknot",
+    "topknots", "ponytail", "ponytails", "bun", "buns", "queue", "queues",
+    "bangs", "crest", "tuft", "tufts", "crop", "mop", "shock", "lock", "locks",
+    "wisp", "wisps", "strand", "strands", "mane", "manes", "tail", "tails",
+    "coat", "coats",
+}
+_HAIR_ANIMAL_HEADS = {"mane", "manes", "tail", "tails", "coat", "coats"}
+# Adjectives that premodify the hair noun: "shaggy dark hair", "long white hair".
+_HAIR_PURE_ADJECTIVES = {
+    "long", "short", "shoulder-length", "waist-length", "hip-length",
+    "chin-length", "cropped", "curly", "wavy", "straight", "shaggy", "thick",
+    "thin", "fine", "wispy", "sparse", "tousled", "tangled", "unkempt",
+    "matted", "knotty", "lank", "smooth", "silky", "glossy", "neat", "braided",
+    "plaited", "parted", "greying", "graying", "silvered", "thinning", "frizzy",
+    "kinky", "coily", "wiry", "soft", "balding", "loose",
+}
+_HAIR_PREPOSITIONS = {"in", "with", "over", "under", "by", "to", "on", "at",
+                      "across", "down", "from", "around", "behind", "past",
+                      "back"}
+# A participle only reads as a description when something completable follows it:
+# "cut short" / "hanging to her waist", but not "shaved sides" (a stray noun).
+_HAIR_PARTICIPLES = {
+    "cut", "cropped", "shaved", "shorn", "parted", "tied", "pulled", "combed",
+    "drawn", "clipped", "trimmed", "styled", "bleached", "dyed", "curled",
+    "waved", "brushed", "hanging", "hung", "falling", "fell", "touching",
+    "touches", "curling", "spilling", "swept", "braided", "plaited", "clubbed",
+    "pinned", "knotted", "twisted", "slicked", "windblown",
+}
+_HAIR_PARTICIPLE_COMPLEMENT = _HAIR_PURE_ADJECTIVES | {
+    "close", "back", "down", "up", "aside", "open", "properly", "neatly",
+    "at", "to", "in", "on", "over", "under", "with", "by", "around", "across",
+}
+# A finite verb becomes a participle so the clause does not turn into a sentence.
+_HAIR_PARTICIPLE_OF = {"fell": "falling", "hung": "hanging",
+                       "touches": "touching", "touched": "touching",
+                       "ran": "running", "runs": "running",
+                       "spilled": "spilling", "circled": "circling",
+                       "curled": "curling", "danced": "dancing",
+                       "lay": "lying"}
+_HAIR_NO_STYLE = re.compile(r"\b(bald|shaven|shaved|shorn)\b", re.I)
+_HAIR_PARTIAL_HEAD = re.compile(
+    r"\b(sides?|front|topknot|crest|fringe|patch|spot|braid|plaits?|"
+    r"pattern|part|stripe|except)\b", re.I)
+
+# Species we know to be animals: these lose the *invented* word "hair". Kept
+# deliberately small and general - anything invented (a daemon, an ogier, a
+# nameless apparition) is assumed to be haired, because a spurious "hair" reads
+# far better than "a daemon, long black". Shape/plural variants are listed
+# explicitly rather than stemmed, so an ordinary word is never matched by
+# accident.
+_ANIMAL_SPECIES = {
+    "horse", "horses", "mare", "mares", "stallion", "stallions", "pony",
+    "ponies", "donkey", "donkeys", "mule", "mules", "steed", "steeds", "ox",
+    "oxen", "bull", "bulls", "cow", "cows", "calf", "calves", "goat", "goats",
+    "sheep", "ewe", "ewes", "ram", "rams", "pig", "pigs", "boar", "boars",
+    "sow", "sows", "dog", "dogs", "hound", "hounds", "cat", "cats", "kitten",
+    "kittens", "wolf", "wolves", "cub", "cubs", "bear", "bears", "fox",
+    "foxes", "deer", "stag", "stags", "doe", "does", "hare", "hares",
+    "rabbit", "rabbits", "rat", "rats", "mouse", "mice", "bird", "birds",
+    "crow", "crows", "raven", "ravens", "hawk", "hawks", "eagle", "eagles",
+    "owl", "owls", "goose", "geese", "duck", "ducks", "hen", "hens",
+    "chicken", "chickens", "snake", "snakes", "serpent", "serpents",
+    "lizard", "lizards", "dragon", "dragons", "fish", "fishes",
+}
+
+
+def _hair_clean_colour(value: str) -> str:
+    """A bare colour: 'dark hair' -> 'dark', 'silky hair' -> ''."""
+    v = " ".join(str(value or "").split()).strip(" ,;.")
+    if not v:
+        return ""
+    v = re.sub(r"\s+(head of )?hair$", "", v, flags=re.I)
+    v = re.sub(r"\s+colou?ring$", "", v, flags=re.I)
+    v = re.sub(r"\s+colou?red$", "", v, flags=re.I)
+    v = v.strip(" ,")
+    # A "colour" carrying a hair head noun is a style by mistake. Drop it
+    # rather than splice it in ("thick curls hair").
+    if _hair_head(v)[0]:
+        return ""
+    return v
+
+
+def _hair_clean_style(value: str) -> str:
+    v = " ".join(str(value or "").split()).strip(" ,;.")
+    if not v:
+        return ""
+    v = re.sub(r"\s+", " ", v)
+    return re.sub(r"^(is|was)\s+", "", v, flags=re.I)
+
+
+def _hair_is_animal(species: str) -> bool:
+    """Is the species one we know to be an animal?
+
+    General-English nouns only; a book's invented kinds are not listed. The
+    default for anything else - including an invented species and an empty
+    species - is "haired", because most invented species are humanoid and a
+    spurious "hair" is a smaller error than a bare adjective ("a daemon, long
+    black"). A species we recognise as an animal loses the invented noun only;
+    a noun the value already contains is always kept.
+    """
+    tokens = set(re.findall(r"[a-z]+", str(species or "").lower()))
+    return bool(tokens & _ANIMAL_SPECIES)
+
+
+def _hair_head(style: str):
+    """The first hair head noun in a style value, and its token index."""
+    for index, token in enumerate(re.findall(r"[a-z][a-z-]*", style.lower())):
+        if token in _HAIR_HEAD_NOUNS:
+            return token, index
+    return "", -1
+
+
+def _hair_split_colour(colour: str):
+    """'black with gray at the temples' -> ('black', 'with', 'gray at the temples')."""
+    match = re.match(
+        r"^(.+?)\s+(with|flecked with|streaked with|shot with|turning|"
+        r"graying|greying)\b\s*(.+)$", colour, re.I)
+    if match:
+        return (match.group(1).strip(), match.group(2).lower(),
+                match.group(3).strip())
+    return colour, "", ""
+
+
+def _hair_colour_noun(colour: str, noun: str = "hair") -> str:
+    """The colour as a mass noun: 'dark hair', or 'dark' with no noun (animals)."""
+    main, joiner, rest = _hair_split_colour(colour)
+    if joiner:
+        return f"{main} {noun} {joiner} {rest}" if noun else f"{main} {joiner} {rest}"
+    return f"{main} {noun}".strip() if noun else main
+
+
+def _hair_insert(colour: str, style: str, head: str) -> str:
+    match = re.search(rf"\b{re.escape(head)}\b", style, re.I)
+    if not match:
+        return ""
+    return f"{style[:match.start()]}{colour} {style[match.start():]}".strip()
+
+
+def _hair_value_after_participle(value: str) -> str:
+    first = re.findall(r"[A-Za-z][A-Za-z-]*", value)
+    if not first:
+        return value
+    bridged = _HAIR_PARTICIPLE_OF.get(first[0].lower(), first[0])
+    return bridged + value[len(first[0]):]
+
+
+_FACIAL_HAIR = re.compile(
+    r"\b(beards?|bearded|moustaches?|mustaches?|whiskers|sideburns|stubble|"
+    r"goatee|muttonchops|eyebrows?|brows?|lashes|eyelashes)\b", re.I)
+
+
+def is_facial_hair(value: str) -> bool:
+    """Is this value about a beard, moustache or brow?
+
+    Used by the probes and available to a validator. It is **not** a write-path
+    rule: facial hair stays in `hair_style`, because for most characters it is
+    the hairstyle, and the composer renders it from there. A value that names
+    both ("long hair and a bushy beard") is not a facial-hair-only value.
+    """
+    text = str(value or "")
+    if not _FACIAL_HAIR.search(text):
+        return False
+    return not _hair_head(text)[0]
+
+
+def _hair_hyphenated(value: str) -> str:
+    """'clean cut' -> 'clean-cut': a premodifier, not a clause."""
+    match = re.match(
+        r"^(clean|close|neat|straight|thick|thin|fine|long|short)\s+"
+        r"(cut|cropped|shaved|trimmed|parted)$", value, re.I)
+    return f"{match.group(1).lower()}-{match.group(2).lower()}" if match else ""
+
+
+def _hair_bucket(style: str):
+    """(bucket, head noun) for a hair_style value.
+
+    Order matters: a prepositional or participial opening means the value is a
+    clause about the hair, not a noun phrase with the hair as its head.
+    """
+    if not style:
+        return "", ""
+    low = style.lower()
+    words = re.findall(r"[A-Za-z][A-Za-z-]*", style)
+    first = words[0].lower() if words else ""
+    head, _index = _hair_head(style)
+    if _HAIR_NO_STYLE.search(low) and not _HAIR_PARTIAL_HEAD.search(low):
+        return "no-hair", ""
+    if first in _HAIR_PREPOSITIONS:
+        return "prepositional", ""
+    if first in _HAIR_PARTICIPLES:
+        second = words[1].strip(",;").lower() if len(words) > 1 else ""
+        return ("trailing", "") if second in _HAIR_PARTICIPLE_COMPLEMENT \
+            else ("fallback", "")
+    if head in _HAIR_ANIMAL_HEADS:
+        return "animal", head
+    if _hair_hyphenated(style):
+        return "adjective", ""
+    if head:
+        return "head-noun", head
+    tokens = re.findall(r"[a-z][a-z-]*", low)
+    if tokens and all(token in _HAIR_PURE_ADJECTIVES for token in tokens):
+        return "adjective", ""
+    if (len(words) > 1 and first in _HAIR_PURE_ADJECTIVES
+            and words[1].lower() in _HAIR_PREPOSITIONS):
+        return "adjective-then-prep", ""
+    return "fallback", ""
+
+
+def _hair_style_only(style: str, bucket: str, head: str, noun: str = "hair"):
+    if bucket == "prepositional":
+        return [f"{noun} {style}".strip() if noun else style]
+    if bucket == "trailing":
+        return [f"{noun} {_hair_value_after_participle(style)}".strip()
+                if noun else style]
+    if bucket in ("adjective", "adjective-then-prep"):
+        prefix = _hair_hyphenated(style) or style
+        return [f"{prefix} {noun}".strip() if noun else prefix]
+    return [style]
+
+
+def compose_hair(colour: str, style: str, species: str = "") -> List[str]:
+    """The hair as comma-list clauses: usually one, sometimes two, never none.
+
+    A species we recognise as an animal never has the word "hair" *invented* for
+    it: a horse has a coat, and an adjective with no head noun ("shaggy") still
+    reads as a description of the base noun that precedes it ("a horse,
+    shaggy"). Anything else - human, an invented species, an empty species - is
+    assumed to be haired.
+
+    A noun that is already there is never removed. If either field names hair -
+    "long hair", "black hair", "hair in a pigtail" - the value wins for every
+    species, because the user typed it. Only the invented noun is suppressed.
+    """
+    # Read this before cleaning: the cleaner strips a redundant head noun
+    # ("black hair" -> "black") precisely because the composer will put it back.
+    # For a non-human that re-add is skipped, so a user-typed noun must be
+    # honoured up front or it is deleted.
+    named_hair = bool(re.search(r"\bhair\b", f"{colour or ''} {style or ''}", re.I))
+    colour = _hair_clean_colour(colour)
+    style = _hair_clean_style(style)
+    if not colour and not style:
+        return []
+    noun = "hair" if (named_hair or not _hair_is_animal(species)) else ""
+    if not style:
+        return [_hair_colour_noun(colour, noun)]
+    bucket, head = _hair_bucket(style)
+    if not colour:
+        return _hair_style_only(style, bucket, head, noun)
+    if bucket == "no-hair":
+        # A hairless head contradicts a colour; the style wins.
+        return [style]
+    if bucket == "animal":
+        return [_hair_insert(colour, style, head)] if head else [style]
+    main, joiner, rest = _hair_split_colour(colour)
+    if bucket == "head-noun":
+        # A multi-part colour ("black with grey at the temples") cannot go in
+        # front of the noun; when that noun is "hair", the style's own
+        # premodifier stays in front and the colour becomes the head.
+        if rest and head == "hair":
+            match = re.search(r"\bhair\b", style, re.I)
+            pre = style[:match.start()].strip()
+            post = style[match.end():]
+            phrase = f"{main} {noun} {joiner} {rest}".strip() if noun \
+                else f"{main} {joiner} {rest}"
+            return [(f"{pre} {phrase}{post}").strip()]
+        if rest:
+            return [_hair_colour_noun(colour, noun), style]
+        merged = _hair_insert(colour, style, head)
+        return [merged]
+    if bucket == "prepositional":
+        if not noun:
+            return [style]
+        return [f"{_hair_colour_noun(colour, noun)} {style}"]
+    if bucket == "adjective":
+        return [f"{_hair_hyphenated(style) or style} "
+                f"{_hair_colour_noun(colour, noun)}"]
+    if bucket == "adjective-then-prep":
+        first = re.findall(r"[A-Za-z][A-Za-z-]*", style)[0]
+        remainder = style[len(style.split()[0]):].strip()
+        return [f"{first} {_hair_colour_noun(colour, noun)} {remainder}".strip()]
+    if bucket == "trailing":
+        if not noun:
+            # "black cut short" has no subject to hang the participle on.
+            return [style]
+        if " and " in style or " or " in style:
+            return [_hair_colour_noun(colour, noun), style]
+        return [f"{_hair_colour_noun(colour, noun)} "
+                f"{_hair_value_after_participle(style)}"]
+    return [_hair_colour_noun(colour, noun), style]
+
+
 def _render_trait(field: str, value: str) -> str:
-    """Add the mechanical connective a bare value is missing."""
+    """Add the mechanical connective a bare value is missing.
+
+    Hair is not handled here: two fields become one clause, so
+    ``compose_hair`` does that before the loop runs.
+    """
     low = value.lower()
     prepositional = low.startswith(("in ", "with ", "over ", "under ", "by ",
                                     "to ", "on ", "at ", "a ", "an ", "the "))
-    if field == "hair_color" and "hair" not in low and not prepositional:
-        return f"{value} hair"
-    if field == "hair_style" and " " not in value and "hair" not in low:
-        return f"{value} hair"
     if field == "eye_color" and "eye" not in low and not prepositional:
         return f"{value} eyes"
     if field == "build":
@@ -1538,21 +1861,36 @@ def compile_event_fields(event, enabled_fields: Dict[str, bool],
 
     values: List[tuple] = []
     seen_values = set()
+
+    def add(field: str, value: str) -> None:
+        if not value:
+            return
+        low = value.lower()
+        if low in seen_values:
+            return
+        words = set(re.findall(r"[a-z]+", low))
+        if words and words <= base_words:
+            return
+        seen_values.add(low)
+        values.append((field, value))
+
+    # Hair is one clause built from two fields, so it goes in before the loop.
+    # Whichever half is enabled contributes; a settings dict that still uses the
+    # old `hair_and_face` checkbox turns both off together.
+    colour_on = _trait_enabled(enabled_fields, "hair_color", "hair_and_face")
+    style_on = _trait_enabled(enabled_fields, "hair_style", "hair_and_face")
+    colour = _trait_value(event, "hair_color") if colour_on else ""
+    style = _trait_value(event, "hair_style") if style_on else ""
+
+    if colour or style:
+        for part in compose_hair(colour, style, _trait_value(event, "species")):
+            add("hair", part)
+
     for field in TRAIT_ORDER:
         if not _trait_enabled(enabled_fields, field,
                               _TRAIT_LEGACY_GROUP.get(field)):
             continue
-        value = _trait_value(event, field)
-        if not value:
-            continue
-        low = value.lower()
-        if low in seen_values:
-            continue
-        words = set(re.findall(r"[a-z]+", low))
-        if words and words <= base_words:
-            continue
-        seen_values.add(low)
-        values.append((field, value))
+        add(field, _trait_value(event, field))
 
     # With traits but no sex/species/age, a neutral noun beats a description that
     # starts with a bare clause ("Name (gray hair, ...)"). It is also the honest

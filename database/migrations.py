@@ -49,6 +49,7 @@ COLUMN_ADDS = [
     ("charactertimelineevent", "hair_color", "TEXT"),
     ("charactertimelineevent", "hair_style", "TEXT"),
     ("charactertimelineevent", "eye_color", "TEXT"),
+    ("charactertimelineevent", "face", "TEXT"),
     ("charactertimelineevent", "build", "TEXT"),
     ("charactertimelineevent", "attire", "TEXT"),
     ("charactertimelineevent", "carried", "TEXT"),

@@ -11,7 +11,7 @@ from database.connection import engine, get_setting
 from database.models import Book, Project, Character, CharacterAlias, CharacterTimelineEvent
 from services.character_manager import (
     compile_character_visual_prompt,
-    compile_character_description_from_event,
+    replace_character_tags_in_prompt,
     save_project_characters_to_json,
     ensure_book_orders,
     normalize_character_key,
@@ -397,73 +397,63 @@ def render_book_tabs(book_id: int):
         tags = extract_prompt_character_tags(prompt_text)
         if not tags:
             return
-        
+
+        # The theater's cursor IS a (chapter, shot) position: ``book_active_scene``
+        # is the row's ``shot``, not a narrative scene. Pass it through so every
+        # description is resolved where the image will actually be rendered.
+        target_ch = int(float(getattr(state, 'book_active_chapter', 1)))
+        target_sc = int(float(getattr(state, 'book_active_scene', 1)))
+
+        matched_chars: List[Character] = []
         with Session(engine) as session:
             chars = session.exec(select(Character).where(Character.project_id == project.id)).all()
-            books_list = session.exec(select(Book).where(Book.project_id == project.id)).all()
-            book_order_map = {b.id: (b.book_order or 0) for b in books_list}
-            target_book_order = book_order_map.get(book_id, 0)
-            
-            # Fetch active theater scene coordinates
-            target_ch = int(float(getattr(state, 'book_active_chapter', 1)))
-            target_sc = int(float(getattr(state, 'book_active_scene', 1)))
-
-            matched_chars = []
             for char in chars:
                 aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
                 alias_texts = {clean_character_key(a.alias) for a in aliases}
                 alias_texts.add(clean_character_key(char.name))
-
                 if any(clean_character_key(t) in alias_texts for t in tags):
-                    # Query timeline events for this character
-                    events = session.exec(
-                        select(CharacterTimelineEvent)
-                        .where(CharacterTimelineEvent.character_id == char.id)
-                    ).all()
-                    
-                    matched_evs = []
-                    base_ev = None
-                    for ev in events:
-                        if ev.book_id is None:
-                            base_ev = ev
-                            continue
-                        ev_order = book_order_map.get(ev.book_id, 0)
-                        if ev_order < target_book_order:
-                            matched_evs.append((ev, ev_order))
-                        elif ev_order == target_book_order:
-                            if ev.chapter_num < target_ch:
-                                matched_evs.append((ev, ev_order))
-                            elif ev.chapter_num == target_ch and ev.shot_num <= target_sc:
-                                matched_evs.append((ev, ev_order))
-                                
-                    active_ev = base_ev
-                    if matched_evs:
-                        matched_evs.sort(key=lambda x: (x[1], x[0].chapter_num, x[0].shot_num))
-                        active_ev = matched_evs[-1][0]
-                        
-                    if not active_ev:
-                        active_ev = base_ev
-                        
-                    matched_chars.append((char, active_ev))
+                    matched_chars.append(char)
+
+        # The hover text is whatever the renderer would inject at this scene, so it
+        # is produced by ``replace_character_tags_in_prompt`` rather than by
+        # resolving an event here. That is what keeps the chip honest: pins, the
+        # ``carried`` scope and the bracket rules all live in that path. The old
+        # inline call applied none of them and compiled every trait.
+        enabled_fields = getattr(state, "style_enabled_character_traits", {})
+        use_sentence = getattr(state, "style_use_sentence_structure", True)
+
+        def chip_tooltip(char: Character) -> str:
+            try:
+                text = replace_character_tags_in_prompt(
+                    f"[{char.name}]",
+                    project.id,
+                    enabled_fields,
+                    use_sentence,
+                    book_id=book_id,
+                    chapter_num=target_ch,
+                    shot_num=target_sc,
+                )
+            except Exception as exc:
+                print(f"[Proofreader-Chips] Could not compile '{char.name}': {exc}")
+                return f"{char.name} (description unavailable)"
+            text = (text or "").strip()
+            # With no traits and no override the compiler hands the name back bare.
+            if not text or text == char.name:
+                return f"{char.name} (no description yet)"
+            return text
 
         if matched_chars:
             with scene_chips_container:
                 with ui.row().classes('w-full items-center gap-1 bg-slate-50 p-2 rounded-lg border border-dashed mt-1 flex-wrap outline-none focus:outline-none'):
                     ui.label('Scene Characters:').classes('text-[9px] font-black text-slate-400 uppercase tracking-wider')
-                    for char, active_ev in matched_chars:
-                        # Build description hover text from whatever the event has:
-                        # the new fields when present, else the legacy quartet.
-                        tooltip_desc = (
-                            compile_character_description_from_event(char, active_ev, {}, True)
-                            if active_ev else f"{char.name} (no description yet)")
-                        
+                    for char in matched_chars:
                         chip = ui.chip(
                             f"👤 {char.name}",
                             on_click=lambda _, cid=char.id: open_character_edit_dialog(cid)
                         ).classes('text-[11px] bg-white hover:bg-blue-50 hover:text-blue-700 cursor-pointer border py-0.5 px-2.5 rounded-md outline-none focus:outline-none')
                         with chip:
-                            ui.tooltip(tooltip_desc).classes('bg-slate-800 text-white text-[10px] p-2.5 rounded-md')
-                            
+                            ui.tooltip(chip_tooltip(char)).classes('bg-slate-800 text-white text-[10px] p-2.5 rounded-md')
+
     if getattr(state, 'book_scroll_timer', None):
         try:
             state.book_scroll_timer.cancel()

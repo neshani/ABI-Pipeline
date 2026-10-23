@@ -2708,7 +2708,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             if any(f in ("sex", "species") for f in fields):
                                 marker_class = 'text-red-500 bg-red-50 border-red-300'
                             elif any(f in ("age", "hair_color", "hair_style",
-                                           "eye_color", "build") for f in fields):
+                                           "eye_color", "face", "build")
+                                     for f in fields):
                                 marker_class = 'text-amber-500 bg-amber-50 border-amber-300'
                             else:
                                 marker_class = 'text-blue-500 bg-blue-50 border-blue-300'
@@ -2946,6 +2947,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     ("hair_color", "Hair Colour"),
                     ("hair_style", "Hair Style"),
                     ("eye_color", "Eye Colour"),
+                    ("face", "Face (manual entry)"),
                     ("build", "Build (Height / Frame)"),
                     ("attire", "Attire (Wearing Now)"),
                     ("carried", "Carried (Held or Worn)"),
@@ -3113,7 +3115,9 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         options={
                             "all": "All",
                             "needs_description": "Needs Description (0–2)",
-                            "fully_known": "Fully Known (9/9)"
+                            "fully_known": (
+                                f"Fully Known ({len(RENDERED_TRAIT_FIELDS)}"
+                                f"/{len(RENDERED_TRAIT_FIELDS)})")
                         },
                         value=filter_status,
                         on_change=on_filter_change
@@ -3142,7 +3146,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
         """One line pointing at the analysis pass, since this is where the gaps show.
 
         The dashboard owns the run controls; this is the door from "this character
-        has 0/9 fields" to "re-extract the book". It is deliberately a banner and
+        has no known fields" to "re-extract the book". It is deliberately a banner and
         not a second copy of the control panel.
         """
         def turn_on(value: bool):

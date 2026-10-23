@@ -127,12 +127,26 @@ def _snapshot_uncached(book_dir: Path, *, chunk_words: int,
         except Exception:
             pass
     transcript_sha = scene_map.transcript_digest(text) if text else ""
+    # Two different map identities, and they are not interchangeable:
+    #
+    # * ``map_sha`` digests the whole file and is the *checkpoint* identity. It is
+    #   what ``character_analysis`` records as a stage input and keys the gather /
+    #   extract partials on, so it must be computed the same way here.
+    # * ``map_signature`` digests only the sentence ranges and is the *coordinate*
+    #   identity. ``prompt_engine`` records it as ``scene_map_sha`` in the
+    #   manifest and ``pipeline_manifest.check`` compares it, because a map
+    #   rewritten with the same ranges is still the same set of shots.
+    #
+    # Passing the file digest to ``check`` made every scene-mapped book compare
+    # one hash against the other and report "map changed" forever.
     map_sha = ""
+    map_signature = ""
     if map_path.exists():
         try:
             map_sha = pipeline_manifest.digest(map_path.read_text(encoding="utf-8"))
         except Exception:
             map_sha = ""
+        map_signature = scene_map.scene_map_signature(book_dir)
 
     # --- transcript -------------------------------------------------------
     transcript = (_state("ok", f"{words:,} words") if text
@@ -222,13 +236,16 @@ def _snapshot_uncached(book_dir: Path, *, chunk_words: int,
     if rows:
         allowed, reason = pipeline_manifest.check(
             book_dir, chunking or "linear", chunk_words,
-            transcript_sha=transcript_sha, scene_map_sha=map_sha,
+            transcript_sha=transcript_sha, scene_map_sha=map_signature,
             prompts_exist=True)
         if not allowed:
             blocked = reason
     if rows and blocked:
         # The guard's sentence is precise but long; the cell needs a two-word
-        # version of it, the tooltip keeps the whole thing.
+        # version of it, the tooltip keeps the whole thing. Every one of these is
+        # "the rows on disk belong to different text or a different shot grid",
+        # so the cell reads as out of date, not as a failure: the images already
+        # rendered from these prompts are still the right images.
         if "scene map has been rebuilt" in blocked:
             short = "map changed"
         elif "generated at" in blocked and "words per shot" in blocked:
@@ -238,10 +255,14 @@ def _snapshot_uncached(book_dir: Path, *, chunk_words: int,
         elif "transcript has changed" in blocked:
             short = "text changed"
         else:
-            short = "blocked"
-        prompts = _state("blocked", blocked, rows=rows, short=short)
+            short = "out of date"
+        prompts = _state("stale", blocked, rows=rows, short=short)
     elif rows:
-        total = expected_prompts if expected_prompts >= rows else 0
+        # ``expected_prompts`` is a chunk count recorded by a previous run, and a
+        # re-map can leave it one or two off the real total. Only a larger
+        # expectation means rows are still missing; equal or fewer means done, and
+        # "720 of 720" must not render as work in progress.
+        total = expected_prompts if expected_prompts > rows else 0
         prompts = (_state("partial", f"{rows} of {total}", rows=rows, total=total)
                    if total else _state("ok", f"{rows} prompts", rows=rows))
     else:

@@ -414,7 +414,9 @@ def _cell_text(stage: str, row: dict) -> str:
     if stage == "prompts" and kind in ("ok", "partial"):
         total = info.get("total") or 0
         return f"{info.get('rows', 0)}/{total}" if total else str(info.get("rows", 0))
-    if kind == "blocked" and info.get("short"):
+    if info.get("short"):
+        # A blocked/stale stage with a two-word reason ("map changed", "size
+        # changed"): the cell says why, the tooltip says the whole sentence.
         return info["short"]
     if stage == "images":
         done, expected = info.get("done", 0), info.get("expected", 0)
