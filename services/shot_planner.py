@@ -43,7 +43,7 @@ DEFAULT_CHUNK_WORDS = 350
 
 PLAN_FILENAME = "shot_plan.csv"
 PLAN_COLUMNS = ("chapter", "shot", "shot_type", "chunk_words", "chunk_hash",
-                "prompt_hash", "focus", "chunking")
+                "prompt_hash", "focus", "chunking", "place")
 
 _LINE = re.compile(r"^\s*(\d+)\s*[:.\)\-]\s*\**([A-Za-z]+)\**\s*(?:\|\s*(.*))?")
 _ALIASES = {
@@ -53,17 +53,24 @@ _ALIASES = {
     "CHARACTERS": "CHARACTER", "PEOPLE": "CHARACTER", "FIGURE": "CHARACTER",
 }
 
+# What a planner writes when the passage has not moved. Resolved to the previous
+# chunk's place in code, so the model never has to repeat a phrase it cannot see
+# in full and the stored plan always carries a concrete place.
+_CARRY = {"same", "unchanged", "continues", "as above", "-", "--", "..."}
+
 
 # --- parsing and planning --------------------------------------------------
 
-def parse_shot_plan(raw: str, count: int) -> Dict[int, Tuple[str, str]]:
-    """``{1-based index: (shot type, focus)}``.
+def parse_shot_plan(raw: str, count: int) -> Dict[int, Tuple[str, str, str]]:
+    """``{1-based index: (shot type, focus, place)}``.
 
-    The planner prompt requires ``<n>: <SHOT> | <focus>`` and the focus names exactly what
-    the plate shows - the place, the people, or the object. It used to be parsed away, so
-    the object of every INSERT was generated on every call and thrown out.
+    The planner prompt requires ``<n>: <SHOT> | <focus> | <place>`` and the focus names
+    exactly what the plate shows - the place, the people, or the object. It used to be
+    parsed away, so the object of every INSERT was generated on every call and thrown out.
+    The place arrives as a third field; a plan written by an older prompt has no
+    third field and yields "", which callers treat as "no place".
     """
-    found: Dict[int, Tuple[str, str]] = {}
+    found: Dict[int, Tuple[str, str, str]] = {}
     for line in (raw or "").splitlines():
         m = _LINE.match(line)
         if not m:
@@ -76,14 +83,36 @@ def parse_shot_plan(raw: str, count: int) -> Dict[int, Tuple[str, str]]:
             label = _ALIASES.get(label, "")
             if not label:
                 continue
-        focus = (m.group(3) or "").strip().strip("*").strip()
-        found[idx] = (label, focus)
+        rest = (m.group(3) or "").strip().strip("*").strip()
+        focus, _sep, place = rest.partition("|")
+        focus = focus.strip().strip("*").strip()
+        place = place.strip().strip("*").strip()
+        found[idx] = (label, focus, place)
     return found
 
 
 def parse_shot_lines(raw: str, count: int) -> Dict[int, str]:
-    """``<n>: <SHOT>`` lines into ``{1-based index: shot type}`` (focus discarded)."""
-    return {i: label for i, (label, _focus) in parse_shot_plan(raw, count).items()}
+    """``<n>: <SHOT>`` lines into ``{1-based index: shot type}`` (focus, place discarded)."""
+    return {i: label for i, (label, _focus, _place) in parse_shot_plan(raw, count).items()}
+
+
+def carry_places(raw: Sequence[str], previous: str = "") -> List[str]:
+    """Resolve ``same``/empty place answers into the place actually in force.
+
+    A place is only ever carried FORWARD, so an unresolved leading ``same`` has
+    nothing to inherit and becomes "" - the prompt then says nothing about a
+    setting rather than inventing one.
+    """
+    out: List[str] = []
+    current = (previous or "").strip()
+    for value in raw:
+        text = (value or "").strip()
+        if not text or text.lower().strip(" .") in _CARRY:
+            out.append(current)
+            continue
+        current = text
+        out.append(current)
+    return out
 
 
 # What a consecutive INSERT is demoted to. Kept as a constant because the choice is
@@ -109,10 +138,18 @@ def enforce_insert_spacing(labels: List[str]) -> List[str]:
     return out
 
 
-def plan_prompt(chunks: List[str], template: str) -> str:
-    """The full shot-direction request for one window of chunks."""
+def plan_prompt(chunks: List[str], template: str, previous_place: str = "") -> str:
+    """The full shot-direction request for one window of chunks.
+
+    ``previous_place`` is the place the text was in when this window opened, so a
+    window that starts mid-scene can say "same" instead of guessing.
+    """
     body = "\n".join(f"{i + 1}: {c}" for i, c in enumerate(chunks))
-    return (f"{template.rstrip()}\n\nPASSAGES:\n{body}\n\n"
+    lead = ""
+    if (previous_place or "").strip():
+        lead = (f"\n\nThese passages open in: {previous_place.strip()}.\n"
+                f"Write \"same\" for a passage that has not moved from there.")
+    return (f"{template.rstrip()}{lead}\n\nPASSAGES:\n{body}\n\n"
             f"Answer with {len(chunks)} lines.")
 
 
@@ -123,10 +160,12 @@ async def plan_chunks(
     window: int = DEFAULT_WINDOW,
     log: Optional[Callable[[str], None]] = None,
     template: Optional[str] = None,
+    previous_place: str = "",
 ) -> List[str]:
     """Shot type per chunk, in order. Anything unparsed falls back to NONE."""
-    detail = await plan_chunks_detail(chunks, llm_url, model, window, log, template)
-    return [label for label, _focus in detail]
+    detail = await plan_chunks_detail(chunks, llm_url, model, window, log, template,
+                                      previous_place)
+    return [label for label, _focus, _place in detail]
 
 
 async def plan_chunks_detail(
@@ -136,25 +175,34 @@ async def plan_chunks_detail(
     window: int = DEFAULT_WINDOW,
     log: Optional[Callable[[str], None]] = None,
     template: Optional[str] = None,
-) -> List[Tuple[str, str]]:
-    """``[(shot_type, focus)]`` per chunk, in order. Unparsed falls back to ``NONE``.
+    previous_place: str = "",
+) -> List[Tuple[str, str, str]]:
+    """``[(shot_type, focus, place)]`` per chunk, in order. Unparsed falls back to ``NONE``.
 
     ``template`` pins the Shot Planner prompt; when omitted the active variant
-    is read live, which is what the Prompt Lab test bench wants.
+    is read live, which is what the Prompt Lab test bench wants. Places are
+    resolved across the whole window chain, so "same" inherits the place of the
+    passage before it rather than the start of the window.
     """
     template = template if template is not None else planner_text()
-    out: List[Tuple[str, str]] = []
+    out: List[Tuple[str, str, str]] = []
+    carry = previous_place
     for start in range(0, len(chunks), window):
         window_chunks = chunks[start:start + window]
         if log:
             log(f"[Shot-Plan] classifying scenes {start + 1}-{start + len(window_chunks)}")
         raw = await get_llm_response(
-            plan_prompt(window_chunks, template), llm_url, model,
+            plan_prompt(window_chunks, template, carry), llm_url, model,
             temperature=0.0,
             extra_payload={"chat_template_kwargs": {"enable_thinking": False}},
         )
         got = parse_shot_plan(raw, len(window_chunks))
-        out.extend(got.get(i + 1, ("NONE", "")) for i in range(len(window_chunks)))
+        rows = [got.get(i + 1, ("NONE", "", "")) for i in range(len(window_chunks))]
+        places = carry_places([place for _label, _focus, place in rows], carry)
+        out.extend((label, focus, place)
+                   for (label, focus, _raw), place in zip(rows, places))
+        if places:
+            carry = places[-1]
     return out
 
 
@@ -217,24 +265,28 @@ async def plan_book(
     template: Optional[str] = None,
     chunks: Optional[Sequence[scene_map.Chunk]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
-) -> List[Tuple[int, int, str, str, str]]:
-    """``[(chapter_num, shot_num, shot_type, chunk_hash, focus)]`` for a whole book.
+) -> List[Tuple[int, int, str, str, str, str]]:
+    """``[(chapter_num, shot_num, shot_type, chunk_hash, focus, place)]`` per chunk.
 
-    The chunks come from ``scene_map.book_chunks``, which honors the chunking the
-    book is bound to: its scene map, or the linear chunker for a legacy book. That
-    is the same list prompt generation numbers, which is what makes
-    ``(chapter, shot)`` mean the same text in the plan and in ``prompts.csv``.
+    The chunks come from ``scene_map.book_chunks``, which is always the linear
+    packer now, at the version the book is bound to. That is the same list prompt
+    generation numbers, which is what makes ``(chapter, shot)`` mean the same text
+    in the plan and in ``prompts.csv``.
 
     ``focus`` is what the plate shows - the place, the people, or the object - and
-    it is the only place an INSERT's subject is ever named.
+    it is the only place an INSERT's subject is ever named. ``place`` is where the
+    passage stands, carried across chunks and chapters so the prompt model never
+    has to invent a room for a passage that does not name one.
     ``enforce_insert_spacing`` corrects consecutive INSERTs per chapter, which the
     prompt forbids and the model does anyway.
     """
     if chunks is None:
         chunks, _source = scene_map.book_chunks(
-            book_dir(project_name, book_name, base), chunk_words, log)
+            book_dir(project_name, book_name, base), chunk_words, log,
+            source="linear")
 
-    plan: List[Tuple[int, int, str, str, str]] = []
+    plan: List[Tuple[int, int, str, str, str, str]] = []
+    carry = ""
     for chapter_num, chapter_chunks in sorted(
             scene_map.chunks_by_chapter(chunks).items()):
         if not chapter_chunks:
@@ -247,11 +299,13 @@ async def plan_book(
             log(f"[Shot-Plan] Chapter {chapter_num}: {len(chapter_chunks)} scenes")
         detail = await plan_chunks_detail(
             [chunk.text for chunk in chapter_chunks], llm_url, model, window, log,
-            template)
-        labels = enforce_insert_spacing([label for label, _focus in detail])
-        for chunk, label, (_raw_label, focus) in zip(chapter_chunks, labels, detail):
+            template, previous_place=carry)
+        labels = enforce_insert_spacing([label for label, _focus, _place in detail])
+        for chunk, label, (_raw_label, focus, place) in zip(chapter_chunks, labels, detail):
             plan.append((chunk.chapter, chunk.shot, label,
-                         chunk_digest(chunk.text), focus))
+                         chunk_digest(chunk.text), focus, place))
+        if detail and detail[-1][2]:
+            carry = detail[-1][2]
     return plan
 
 
@@ -260,7 +314,7 @@ async def plan_book(
 def save_plan(
     project_name: str,
     book_name: str,
-    plan: List[Tuple[int, int, str, str, str]],
+    plan: List[Tuple[int, int, str, str, str, str]],
     chunk_words: int = DEFAULT_CHUNK_WORDS,
     base: Optional[Path] = None,
     prompt_hash: str = "",
@@ -274,10 +328,17 @@ def save_plan(
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, delimiter="|")
         writer.writerow(PLAN_COLUMNS)
-        for chapter, scene, shot, digest, focus in plan:
+        for chapter, scene, shot, digest, focus, place in plan:
             writer.writerow([chapter, scene, shot, chunk_words, digest, prompt_hash,
-                             focus, chunking])
+                             focus, chunking, place])
     return path
+
+
+def _map_of(project_name: str, book_name: str, base: Optional[Path],
+            column: str) -> Dict[Tuple[int, int], str]:
+    return {(int(r["chapter"]), int(r["shot"])): (r.get(column) or "")
+            for r in load_plan(project_name, book_name, base)
+            if r.get("chapter") and r.get("shot")}
 
 
 def load_focus_map(
@@ -289,9 +350,19 @@ def load_focus_map(
     the only place an INSERT's subject is ever written down. Empty when the plan predates the
     column, so callers must treat "" as "no focus".
     """
-    return {(int(r["chapter"]), int(r["shot"])): (r.get("focus") or "")
-            for r in load_plan(project_name, book_name, base)
-            if r.get("chapter") and r.get("shot")}
+    return _map_of(project_name, book_name, base, "focus")
+
+
+def load_place_map(
+    project_name: str, book_name: str, base: Optional[Path] = None
+) -> Dict[Tuple[int, int], str]:
+    """``{(chapter, shot): place}`` from the stored plan.
+
+    The place the passage stands in, as the planner named it. Empty for a plan
+    that predates the column, and for a passage whose place could not be
+    determined; the prompt then omits the setting line rather than guessing one.
+    """
+    return _map_of(project_name, book_name, base, "place")
 
 
 def load_plan(
@@ -359,7 +430,7 @@ def scene_chunk(
     if chunk_words is None:
         chunk_words = plan_chunk_words(project_name, book_name, base) or DEFAULT_CHUNK_WORDS
     chunks, _source = scene_map.book_chunks(
-        book_dir(project_name, book_name, base), chunk_words)
+        book_dir(project_name, book_name, base), chunk_words, source="linear")
     for chunk in chunks:
         if chunk.chapter == int(chapter_num) and chunk.shot == int(shot_num):
             return chunk.text
@@ -376,7 +447,7 @@ def verify_plan(
         return []
     words = plan_chunk_words(project_name, book_name, base) or DEFAULT_CHUNK_WORDS
     chunks, _source = scene_map.book_chunks(
-        book_dir(project_name, book_name, base), words)
+        book_dir(project_name, book_name, base), words, source="linear")
     actual_by_key = {(chunk.chapter, chunk.shot): chunk_digest(chunk.text)
                      for chunk in chunks}
     mismatches: List[Tuple[int, int, str, str]] = []
@@ -413,7 +484,7 @@ async def ensure_book_plan(
         return {}
 
     chunks, source = scene_map.book_chunks(
-        book_dir(project_name, book_name, base), chunk_words, log)
+        book_dir(project_name, book_name, base), chunk_words, log, source="linear")
     template = planner_text(selection)
     digest = prompt_digest(template)
     stored = load_plan(project_name, book_name, base)
@@ -444,7 +515,7 @@ async def ensure_book_plan(
                            chunk_words=chunk_words, window=window, base=base, log=log,
                            template=template, chunks=chunks,
                            should_cancel=should_cancel)
-    if plan and all(shot == "NONE" for _chapter, _scene, shot, _digest, _focus in plan):
+    if plan and all(shot == "NONE" for _chapter, _scene, shot, *_rest in plan):
         # A dead or misconfigured LLM produces an all-NONE plan. Don't persist
         # that - fall back to the single prompt instead of poisoning the plan.
         if log:
@@ -453,4 +524,5 @@ async def ensure_book_plan(
         return {}
     save_plan(project_name, book_name, plan, chunk_words, base, prompt_hash=digest,
               chunking=source)
-    return {(chapter, scene): shot for chapter, scene, shot, _digest, _focus in plan}
+    return {(chapter, scene): shot
+            for chapter, scene, shot, *_rest in plan}

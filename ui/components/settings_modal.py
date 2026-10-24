@@ -184,6 +184,113 @@ class SettingsModal:
         else:
             ui.notify("Engine setup successfully completed!", type="positive")
 
+    # --- MCP server (character lookup) -----------------------------------
+    def _mcp_status(self, text: str, kind: str = "plain") -> None:
+        colours = {"ok": "text-emerald-600", "error": "text-rose-500",
+                   "plain": "text-slate-500"}
+        self.mcp_status.set_text(text)
+        self.mcp_status.classes(f'text-[10px] {colours.get(kind, colours["plain"])}',
+                                remove=" ".join(f'text-[10px] {c}'
+                                                for c in colours.values()))
+
+    async def connect_mcp(self) -> None:
+        """Handshake with the server, list its tools, remember them.
+
+        The HTTP call runs off the UI loop: a slow or unreachable server must not
+        freeze the modal, and the failure has to be visible rather than silent.
+        """
+        url = (self.settings.get("mcp_url") or "").strip()
+        if not url:
+            self._mcp_status("Enter a server URL first.", "error")
+            return
+        self._mcp_status("Connecting...")
+        try:
+            from services import mcp_client
+            result = await asyncio.to_thread(
+                mcp_client.list_tools, url,
+                self.settings.get("mcp_auth_header") or "")
+        except Exception as ex:
+            self._mcp_status(f"Failed: {ex}", "error")
+            ui.notify(f"MCP connection failed: {ex}", type="negative")
+            return
+
+        tools = result.get("tools") or []
+        cache = [{"name": tool["name"],
+                  "description": (tool.get("description") or "")[:400]}
+                 for tool in tools]
+        prefs = self.settings.get("mcp_tool_prefs")
+        if not isinstance(prefs, dict):
+            prefs = {}
+        # A tool that is new to this list defaults to enabled; one that vanished
+        # loses its entry so the panel cannot show a checkbox for nothing.
+        self.settings["mcp_tool_cache"] = cache
+        self.settings["mcp_tool_prefs"] = {
+            tool["name"]: bool(prefs.get(tool["name"], True)) for tool in cache}
+        self.redraw_mcp_tools()
+
+        server = result.get("server") or {}
+        label = server.get("name") or "server"
+        version = server.get("version")
+        self._mcp_status(
+            f"{len(tools)} tool(s) from {label}"
+            + (f" {version}" if version else ""), "ok")
+
+    def forget_mcp(self) -> None:
+        """Clear the server and the per-tool choices."""
+        self.settings["mcp_url"] = ""
+        self.settings["mcp_auth_header"] = ""
+        self.settings["mcp_tool_prefs"] = {}
+        self.settings["mcp_tool_cache"] = []
+        self.redraw_mcp_tools()
+        self._mcp_status("Server cleared. Save to apply.")
+
+    def redraw_mcp_tools(self) -> None:
+        """Render one checkbox per tool. Only ticked tools reach the model.
+
+        The summary is updated in place rather than by rebuilding the list: a
+        checkbox that clears the container it lives in while handling its own
+        change event is a NiceGUI delete-during-event hazard.
+        """
+        box = getattr(self, "mcp_tools_box", None)
+        if box is None:
+            return
+        box.clear()
+        cache = self.settings.get("mcp_tool_cache")
+        prefs = self.settings.get("mcp_tool_prefs")
+        if not isinstance(cache, list):
+            cache = []
+        if not isinstance(prefs, dict):
+            prefs = {}
+        if not cache:
+            self.mcp_tools_summary = None
+            with box:
+                ui.label("Connect to a server to list its tools.").classes(
+                    'text-[10px] text-slate-400')
+            return
+
+        def summary_text() -> str:
+            live = sum(1 for tool in cache if prefs.get(tool["name"], True))
+            return (f"{live} of {len(cache)} tools offered to the model. "
+                    f"Unticked tools are not described, which saves prompt tokens.")
+
+        def make_handler(tool_name: str):
+            def handler(event) -> None:
+                current = self.settings.setdefault("mcp_tool_prefs", {})
+                current[tool_name] = bool(event.value)
+                if self.mcp_tools_summary is not None:
+                    self.mcp_tools_summary.set_text(summary_text())
+            return handler
+
+        with box:
+            self.mcp_tools_summary = ui.label(summary_text()).classes(
+                'text-[10px] text-slate-500 leading-tight')
+            for tool in cache:
+                name = tool.get("name") or ""
+                ui.checkbox(name, value=bool(prefs.get(name, True)),
+                            on_change=make_handler(name)
+                            ).classes('text-[11px] text-slate-700').props('dense') \
+                    .tooltip(tool.get("description") or "No description provided.")
+
     async def refresh_llm_models(self) -> None:
         """Queries current connection details and updates options in the model selector."""
         url = self.settings.get("llm_url", "")
@@ -251,6 +358,16 @@ class SettingsModal:
         
         self.model_select.value = saved_model
         self.model_select.update()
+
+        # The tool checkboxes are rebuilt from saved state: this modal is created
+        # once, so the list would otherwise still show what it saw last time.
+        self.redraw_mcp_tools()
+        mcp_url = (self.settings.get("mcp_url") or "").strip()
+        cached = self.settings.get("mcp_tool_cache") or []
+        if mcp_url and cached:
+            self._mcp_status(f"{len(cached)} saved tool(s). Reconnect to refresh.")
+        else:
+            self._mcp_status("")
 
         self.update_installation_statuses()
         self.dialog.open()
@@ -359,6 +476,40 @@ class SettingsModal:
                     ).bind_value(self.settings, 'vram_auto_switch').tooltip(
                         'Sends the ComfyUI cache-clear before an LLM request, and unloads the LLM before rendering.'
                     )
+
+            # Character research through a user-supplied MCP server. The app is the
+            # MCP client, so the search provider is whatever server is added here
+            # (a SearXNG wrapper, Brave, Tavily, Firecrawl) and nothing has to be
+            # configured on the LLM host. Only ticked tools are described to the
+            # model, which keeps the prompt small.
+            with ui.expansion('Character Lookup (MCP)', icon='travel_explore') \
+                    .classes('w-full border rounded-lg'):
+                with ui.column().classes('w-full p-4 gap-3'):
+                    ui.label(
+                        'Optional. A Streamable-HTTP MCP server used when researching '
+                        'character descriptions. Any server that exposes search or '
+                        'page-reading tools works; the LLM host needs no changes.'
+                    ).classes('text-[11px] text-slate-500 leading-normal')
+                    ui.input('MCP Server URL', placeholder='https://example.com/mcp') \
+                        .bind_value(self.settings, 'mcp_url').classes('w-full')
+                    ui.input('Authorization Header (Optional)', password=True,
+                             password_toggle_button=True,
+                             placeholder='a bare token, or "Header-Name: value"') \
+                        .bind_value(self.settings, 'mcp_auth_header').classes('w-full') \
+                        .tooltip('A bare token is sent as "Authorization: Bearer <token>". '
+                                 'Use "Header-Name: value" for a service that wants a '
+                                 'different header.')
+                    with ui.row().classes('w-full items-center gap-2'):
+                        ui.button('Connect & List Tools', icon='sync',
+                                  on_click=self.connect_mcp).classes(
+                            'bg-blue-600 hover:bg-blue-700 text-white font-bold '
+                            'text-xs px-3 py-1 rounded')
+                        ui.button('Forget Server', icon='delete_outline',
+                                  on_click=self.forget_mcp).props('flat dense').classes(
+                            'text-[11px] text-slate-500')
+                        self.mcp_status = ui.label('').classes('text-[10px] text-slate-500')
+                    self.mcp_tools_box = ui.column().classes('w-full gap-1')
+                    self.redraw_mcp_tools()
 
             # 2. UI & Notifications Accordion
             with ui.expansion('Notifications & Export Options', icon='notifications').classes('w-full border rounded-lg bg-slate-50/50'):

@@ -36,6 +36,7 @@ from services.character_manager import (
     get_pinned_fields,
     set_pinned_fields,
     resolve_event_at,
+    is_non_human,
     NEW_TRAIT_FIELDS,
     RENDERED_TRAIT_FIELDS,
 )
@@ -1498,6 +1499,521 @@ def open_ai_check_editor_dialog(
 
     dialog.open()
 
+
+def open_bulk_descriptions_dialog(project: Project, books: List[Book],
+                                  refresh_callback: Any = None):
+    """The bulk description modal: sources as tabs, one ordered run.
+
+    Layout notes, because the first version of this broke: every label inside a
+    row needs ``min-w-0`` and a wrapping class, otherwise a long sentence sets the
+    row's min-content width, the row wraps its button, and the whole card grows a
+    horizontal scrollbar. The panels keep their own scroll area so the run bar is
+    always visible.
+    """
+    from services import character_coverage, description_runner
+    from services.project_settings import save_project_settings_to_disk
+    from database.connection import get_setting
+
+    rows = description_runner.load_rows(project.id)
+    counts = character_coverage.coverage_counts(rows, thresholds=(0, 1, 2, 3))
+    threshold_labels = {0: f"Nothing yet ({counts[0]})"}
+    for value in (1, 2, 3):
+        threshold_labels[value] = f"{value} or fewer traits ({counts[value]})"
+
+    saved_steps = {str(step.get("id")): step
+                   for step in (getattr(state, "description_steps", None) or [])}
+    steps_state = []
+    for index, spec in enumerate(description_runner.STEPS):
+        saved = saved_steps.get(spec["id"], {})
+        steps_state.append({
+            "id": spec["id"],
+            "enabled": bool(saved.get("enabled", spec["default"])),
+            "order": int(saved.get("order", index + 1)),
+        })
+
+    if not (state.mcp_series_name or "").strip():
+        state.mcp_series_name = project.name
+    if not (state.wiki_term or "").strip():
+        state.wiki_term = project.name
+
+    mcp_url = get_setting("mcp_url", "") or ""
+    mcp_prefs = get_setting("mcp_tool_prefs", {}) or {}
+    run_state = {"cancelled": False, "running": False, "needs_refresh": False}
+
+    def step_title(step_id: str) -> str:
+        return next(s["title"] for s in description_runner.STEPS
+                    if s["id"] == step_id)
+
+    def step_state(step_id: str) -> Dict:
+        return next(s for s in steps_state if s["id"] == step_id)
+
+    async def pick_reference_file() -> None:
+        """A real file picker. tkinter's dialog runs in a thread; the UI is only
+        touched afterwards, because Tk cannot be driven from another thread."""
+        def ask() -> str:
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+            except Exception:
+                return ""
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            try:
+                return filedialog.askopenfilename(
+                    title="Choose a reference document",
+                    filetypes=[("Reference", "*.epub *.md *.txt"),
+                               ("All files", "*.*")]) or ""
+            finally:
+                root.destroy()
+
+        path = await asyncio.to_thread(ask)
+        if path:
+            state.reference_path = path
+            reference_input.value = path
+            save_project_settings_to_disk(project.id)
+            step_notes["reference"].set_text(step_note("reference"))
+            step_notes["reference"].classes('text-slate-400',
+                                            remove='text-rose-500')
+            ui.notify("Reference file set.", type="positive")
+        else:
+            ui.notify("No file chosen. You can also type a path.", type="info")
+
+    def close_dialog() -> None:
+        """Persist the step choices and refresh the list on the way out.
+
+        The refresh is deliberately here rather than at the end of a run: the
+        dialog is built inside the characters tab's slot, so refreshing that tab
+        while the dialog is open destroys the dialog with it.
+        """
+        state.description_steps = sorted(steps_state, key=lambda s: s["order"])
+        save_project_settings_to_disk(project.id)
+        dialog.close()
+        if run_state.get("needs_refresh") and refresh_callback:
+            refreshed = refresh_callback()
+            if asyncio.iscoroutine(refreshed):
+                asyncio.create_task(refreshed)
+
+    with ui.dialog() as dialog, ui.card().classes(
+            'w-[780px] max-w-[95vw] h-[86vh] max-h-[780px] p-0 rounded-xl flex '
+            'flex-col overflow-hidden'):
+        # --- header ----------------------------------------------------------
+        with ui.row().classes('w-full items-center gap-3 px-5 pt-4 pb-2 flex-nowrap '
+                              'shrink-0'):
+            with ui.column().classes('gap-0 flex-1 min-w-0'):
+                ui.label('Fill Character Descriptions').classes(
+                    'text-base font-bold text-slate-800 leading-tight')
+                ui.label('Sources run in order. Each one targets the characters '
+                         'still below the threshold, and nothing overwrites an '
+                         'existing value.').classes(
+                    'text-[11px] text-slate-500 leading-tight whitespace-normal')
+            ui.button(icon='close', on_click=close_dialog).props('flat dense round') \
+                .classes('shrink-0 text-slate-400')
+
+        with ui.tabs().classes('w-full px-2 border-b shrink-0') as tabs:
+            tab_main = ui.tab('What to run', icon='playlist_play')
+            tab_ref = ui.tab('Reference', icon='menu_book')
+            tab_wiki = ui.tab('Wiki', icon='travel_explore')
+            tab_mcp = ui.tab('Web (MCP)', icon='cloud')
+            tab_book = ui.tab('Book text', icon='auto_stories')
+
+        # --- panels ----------------------------------------------------------
+        # The panels flex and scroll; the run bar below them is fixed height. If
+        # the results box were allowed to grow instead, it would push the run bar
+        # out of the card (which clips at the viewport) after three or four lines.
+        with ui.tab_panels(tabs, value=tab_main).classes(
+                'w-full px-4 py-3 overflow-y-auto flex-1 min-h-0'):
+            with ui.tab_panel(tab_main).classes('p-0 gap-3'):
+                with ui.row().classes('w-full items-start gap-3 flex-nowrap'):
+                    threshold_value = int(getattr(state, "bulk_threshold", 0) or 0)
+                    if threshold_value not in threshold_labels:
+                        threshold_value = 0
+
+                    def set_threshold(event) -> None:
+                        state.bulk_threshold = int(event.value)
+                    threshold_select = ui.select(threshold_labels,
+                                                 value=threshold_value,
+                                                 label='Target',
+                                                 on_change=set_threshold) \
+                        .classes('w-64 shrink-0').props('dense outlined')
+                    ui.label('A character with no sex is included regardless: '
+                             'without it they render as "a person".').classes(
+                        'text-[10px] text-slate-400 flex-1 min-w-0 leading-tight')
+
+                ui.separator()
+                ui.label('Order and sources').classes(
+                    'text-[10px] font-bold text-slate-400 uppercase tracking-wider')
+
+                def step_note(step_id: str) -> str:
+                    """A one-line 'is this source ready' note next to each step."""
+                    if step_id == "reference":
+                        path = (state.reference_path or "").strip()
+                        if not path:
+                            return "no file chosen"
+                        return Path(path).name + ("" if Path(path).exists()
+                                                  else " (missing)")
+                    if step_id == "wiki":
+                        url = (state.wiki_url or "").strip()
+                        return url.replace("https://", "") if url else "no site set"
+                    if step_id == "mcp":
+                        return mcp_url.replace("https://", "") if mcp_url else "no server"
+                    return "on demand"
+
+                step_notes = {}
+                for spec in description_runner.STEPS:
+                    current = step_state(spec["id"])
+                    with ui.row().classes('w-full items-center gap-2 flex-nowrap '
+                                          'border rounded-lg px-2 py-1'):
+                        ui.number(value=current["order"], min=1, max=9, step=1,
+                                  on_change=lambda e, s=current: s.update(
+                                      order=int(e.value or s["order"]))) \
+                            .props('dense outlined').classes('w-16 shrink-0') \
+                            .tooltip('Run order. Lower runs first.')
+                        ui.checkbox(spec["title"], value=current["enabled"],
+                                    on_change=lambda e, s=current: s.update(
+                                        enabled=bool(e.value))) \
+                            .classes('text-xs font-bold text-slate-700 w-32 shrink-0') \
+                            .props('dense')
+                        note = ui.label(step_note(spec["id"])).classes(
+                            'text-[10px] w-28 shrink-0 truncate whitespace-nowrap '
+                            + ('text-rose-500' if step_note(spec["id"]).startswith(
+                                ("no file", "no site", "no server"))
+                               else 'text-slate-400'))
+                        step_notes[spec["id"]] = note
+                        ui.label(spec["hint"]).classes(
+                            'text-[10px] text-slate-500 flex-1 min-w-0 leading-tight')
+
+                if mcp_url:
+                    ui.label(f"MCP server: {mcp_url}").classes(
+                        'text-[10px] text-emerald-600 leading-tight')
+                else:
+                    ui.label('No MCP server configured (Settings → Character '
+                             'Lookup).').classes('text-[10px] text-amber-600')
+
+            with ui.tab_panel(tab_ref).classes('p-0 gap-2'):
+                ui.label('A companion volume, glossary or hand-written sheet. Any '
+                         'file with "## Name" headings, or an epub with bold '
+                         'headwords, works.').classes(
+                    'text-[10px] text-slate-500 leading-tight')
+                with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
+                    reference_input = ui.input('File path') \
+                        .bind_value(state, 'reference_path') \
+                        .classes('flex-1 min-w-0').props('dense outlined')
+                    ui.button('Browse…', icon='folder_open',
+                              on_click=pick_reference_file).classes(
+                        'text-xs px-3 shrink-0').props('outline')
+                ref_status = ui.label(
+                    '' if (state.reference_path or '').strip()
+                    else 'No reference file chosen yet — pick one with Browse… '
+                         'or type a path.').classes('text-[10px] text-slate-500')
+
+                async def test_reference() -> None:
+                    from pathlib import Path
+                    from services import reference_import
+                    path = Path(state.reference_path or "")
+                    if not path.exists():
+                        ref_status.set_text('No such file.')
+                        ref_status.classes('text-[10px] text-rose-500')
+                        return
+                    ref_status.set_text('Reading…')
+                    try:
+                        blocks = await asyncio.to_thread(reference_import.load_blocks,
+                                                         path)
+                    except Exception as ex:
+                        ref_status.set_text(f'Could not read it: {ex}')
+                        ref_status.classes('text-[10px] text-rose-500')
+                        return
+                    names = {row["name"]: row["aliases"] for row in rows}
+                    matched, _unmatched = await asyncio.to_thread(
+                        reference_import.match_blocks, blocks, names)
+                    words = sum(len(body.split()) for _name, body in blocks)
+                    ref_status.set_text(
+                        f"{len(blocks):,} entries, {words:,} words; "
+                        f"{len(matched)} of {len(rows)} characters matched by "
+                        f"name or alias.")
+                    ref_status.classes('text-[10px] text-emerald-600')
+
+                ui.button('Test File', icon='fact_check',
+                          on_click=test_reference).props('flat dense') \
+                    .classes('text-[11px] text-blue-600')
+
+            with ui.tab_panel(tab_wiki).classes('p-0 gap-2'):
+                ui.label('One MediaWiki site per project, read through its API '
+                         'with a one-request-per-second limit and a page cache.').classes(
+                    'text-[10px] text-slate-500 leading-tight')
+                wiki_input = ui.input('Wiki URL').bind_value(state, 'wiki_url') \
+                    .classes('w-full').props('dense outlined')
+
+                def pick_known_site(event) -> None:
+                    # The known-site picker fills the field: binding alone would
+                    # leave the visible value behind.
+                    state.wiki_url = event.value or ""
+                    wiki_input.value = state.wiki_url
+
+                ui.select(
+                    {
+                        "": "Custom URL",
+                        "https://wot.fandom.com": "Wheel of Time wiki (fandom.com)",
+                        "https://awoiaf.westeros.org": "A Wiki of Ice and Fire",
+                        "https://starwars.fandom.com": "Wookieepedia",
+                    },
+                    label='Known sites', value='',
+                    on_change=pick_known_site,
+                ).classes('w-full').props('dense outlined')
+                ui.input('Series search term').bind_value(state, 'wiki_term') \
+                    .classes('w-full').props('dense outlined').tooltip(
+                    'What the tester and the page search look for, e.g. '
+                    '"Wheel of Time" - not your folder name.')
+                wiki_status = ui.label('').classes('text-[10px] text-slate-500')
+                wiki_hits = ui.column().classes('w-full gap-0')
+
+                async def test_wiki() -> None:
+                    from services import wiki_lookup
+                    wiki_status.set_text('Testing…')
+                    wiki_status.classes('text-[10px] text-slate-500')
+                    wiki_hits.clear()
+                    samples = [row["name"] for row in rows[:2]]
+                    result = await asyncio.to_thread(
+                        wiki_lookup.test_site, state.wiki_url or "",
+                        state.wiki_term or "", samples)
+                    if not result["ok"]:
+                        wiki_status.set_text(
+                            f"Cannot use this site: "
+                            f"{result['error'] or 'no results for that term'}")
+                        wiki_status.classes('text-[10px] text-rose-500')
+                        return
+                    wiki_status.set_text(
+                        f"{len(result['hits'])} results for that term; "
+                        f"sample pages below.")
+                    wiki_status.classes('text-[10px] text-emerald-600')
+                    with wiki_hits:
+                        for hit in result["hits"][:4]:
+                            ui.label(hit["title"]).classes(
+                                'text-[10px] text-slate-600 leading-tight')
+                        for page in result["pages"]:
+                            if not page["title"]:
+                                ui.label(f"{page['name']}: no page found").classes(
+                                    'text-[10px] text-amber-600')
+                            else:
+                                appearance = ("has Appearance"
+                                              if page["appearance"]
+                                              else "no Appearance section")
+                                ui.label(f"{page['name']} → {page['title']} "
+                                         f"({page['chars']} chars, {appearance})") \
+                                    .classes('text-[10px] text-slate-600 leading-tight')
+
+                ui.button('Test Site', icon='travel_explore',
+                          on_click=test_wiki).props('flat dense') \
+                    .classes('text-[11px] text-blue-600')
+
+            with ui.tab_panel(tab_mcp).classes('p-0 gap-2'):
+                ui.label('The MCP server configured in Settings. Any search or '
+                         'page-reading tools it offers can be used; only the ones '
+                         'ticked there are sent to the model.').classes(
+                    'text-[10px] text-slate-500 leading-tight')
+                ui.input('Series name for the question') \
+                    .bind_value(state, 'mcp_series_name').classes('w-full') \
+                    .props('dense outlined').tooltip(
+                    'Used as "In the book series <name>, find a physical '
+                    'description of <character>". The folder name is often wrong.')
+                if mcp_url:
+                    enabled = sum(1 for name, on in mcp_prefs.items() if on)
+                    ui.label(f"{mcp_url} — {enabled} tool(s) enabled").classes(
+                        'text-[10px] text-emerald-600 leading-tight')
+                else:
+                    ui.label('No server configured. Add one in Settings → '
+                             'Character Lookup (MCP).').classes(
+                        'text-[10px] text-amber-600 leading-tight')
+
+            with ui.tab_panel(tab_book).classes('p-0 gap-2'):
+                ui.label('Reads the book text itself: cue paragraphs that name the '
+                         'character, then the model decides which describe them. '
+                         'Slowest and least reliable - leave it off unless nothing '
+                         'else covers a character.').classes(
+                    'text-[10px] text-amber-700 leading-tight bg-amber-50 border '
+                    'border-amber-200 rounded-lg p-2')
+                ui.label('Ticking it here makes it part of the bulk run. For one '
+                         'character, use the icons on the detail page instead.').classes(
+                    'text-[10px] text-slate-500 leading-tight')
+
+        # --- run bar ---------------------------------------------------------
+        with ui.column().classes('w-full gap-2 px-4 py-3 border-t bg-slate-50/60 '
+                                 'shrink-0'):
+            progress = ui.label('Ready.').classes('text-[11px] text-slate-600')
+            results = ui.column().classes(
+                'w-full gap-0 h-36 overflow-y-auto border rounded-lg bg-white '
+                'px-2 py-1')
+
+            async def do_run(dry: bool = False):
+                if run_state["running"]:
+                    return
+                run_state["running"] = True
+                run_state["cancelled"] = False
+                run_button.disable()
+                dry_button.disable()
+                stop_button.enable()
+                results.clear()
+                state.description_steps = sorted(steps_state,
+                                                 key=lambda s: s["order"])
+                save_project_settings_to_disk(project.id)
+
+                def on_event(payload: Dict) -> None:
+                    if payload["type"] == "start":
+                        progress.set_text(f"Starting: {payload['targets']} "
+                                          f"characters in scope.")
+                    elif payload["type"] == "step":
+                        progress.set_text(f"{step_title(payload['id'])}: "
+                                          f"{payload['targets']} characters…")
+                    elif payload["type"] == "character":
+                        line = payload["name"]
+                        if payload["status"] == "failed":
+                            line += f" — {payload.get('error') or 'no result'}"
+                        else:
+                            line += " — " + (", ".join(payload.get("filled") or [])
+                                             or "no change")
+                        with results:
+                            ui.label(line).classes('text-[10px] text-slate-600 '
+                                                   'leading-tight')
+                        progress.set_text(f"{step_title(payload['step'])}: "
+                                          f"{payload['name']}")
+
+                config = {
+                    "reference_path": state.reference_path or "",
+                    "wiki_url": state.wiki_url or "",
+                    "wiki_term": state.wiki_term or "",
+                    "mcp_url": mcp_url,
+                    "mcp_auth": get_setting("mcp_auth_header", "") or "",
+                    "mcp_prefs": mcp_prefs,
+                    "series": state.mcp_series_name or project.name,
+                }
+
+                # Pre-flight: a missing file or URL is a problem to report, not a
+                # step that silently does nothing.
+                check = description_runner.validate_steps(state.description_steps,
+                                                          config)
+                if not check["runnable"]:
+                    reasons = "; ".join(f"{step_title(item['id'])}: {item['reason']}"
+                                        for item in check["skipped"])
+                    progress.set_text(f"Nothing to run — {reasons}")
+                    ui.notify(f"Nothing to run. {reasons}", type="warning",
+                              timeout=6000)
+                    # Take the user to the tab that needs the answer.
+                    tab_for = {"reference": tab_ref, "wiki": tab_wiki,
+                               "mcp": tab_mcp, "transcript": tab_book}
+                    first = check["skipped"][0]["id"] if check["skipped"] else ""
+                    if first in tab_for:
+                        tabs.value = tab_for[first]
+                    run_state["running"] = False
+                    run_button.enable()
+                    dry_button.enable()
+                    stop_button.disable()
+                    return
+                if check["skipped"]:
+                    skipped_text = ", ".join(
+                        f"{step_title(item['id'])} ({item['reason']})"
+                        for item in check["skipped"])
+                    ui.notify(f"Skipping: {skipped_text}", type="info", timeout=5000)
+
+                report = await description_runner.run(
+                    project.id,
+                    threshold=int(getattr(state, "bulk_threshold", 0) or 0),
+                    steps=state.description_steps,
+                    config=config,
+                    dry_run=dry,
+                    on_event=on_event,
+                    should_cancel=lambda: run_state["cancelled"],
+                )
+                progress.set_text(
+                    ("DRY RUN, nothing written. " if dry else "")
+                    + ("Cancelled. " if report["cancelled"] else "")
+                    + description_runner.summarise(report)
+                    + f"  ({report['seconds']}s)")
+                run_state["running"] = False
+                run_button.enable()
+                dry_button.enable()
+                stop_button.disable()
+                marker = "DRY RUN (nothing written): " if dry else ""
+                state.add_console_log(
+                    f"[Descriptions] {marker}{description_runner.summarise(report)}")
+
+                if not dry and any(step.get("filled") for step in report["steps"]):
+                    # Re-tally in place: the counts are the whole point of the
+                    # threshold, so they must move as soon as characters gain
+                    # traits instead of waiting for the dialog to be reopened.
+                    fresh = character_coverage.coverage_counts(
+                        description_runner.load_rows(project.id),
+                        thresholds=(0, 1, 2, 3))
+                    new_labels = {0: f"Nothing yet ({fresh[0]})"}
+                    for value in (1, 2, 3):
+                        new_labels[value] = (f"{value} or fewer traits "
+                                             f"({fresh[value]})")
+                    threshold_select.options = new_labels
+                    threshold_select.update()
+
+                # The summary stays in the results area: the run is over, and the
+                # per-character lines above it explain the failures. Nothing here
+                # refreshes the parent - that would tear the dialog down with the
+                # slot it was built in. The list refreshes when the dialog closes.
+                if report.get("steps"):
+                    if not dry:
+                        run_state["needs_refresh"] = True
+                    with results:
+                        ui.separator()
+                        if dry:
+                            ui.label('Dry run — nothing was written.').classes(
+                                'text-[10px] font-bold text-amber-600 leading-tight')
+                        for item in report["steps"]:
+                            if item.get("skipped_reason"):
+                                ui.label(f"{step_title(item['id'])}: skipped — "
+                                         f"{item['skipped_reason']}").classes(
+                                    'text-[10px] text-amber-600 leading-tight')
+                            else:
+                                ui.label(
+                                    f"{step_title(item['id'])}: {item['filled']} of "
+                                    f"{item['targets']} characters filled, "
+                                    f"{item['fields']} fields"
+                                    + (f", {item['conflicts']} conflicts"
+                                       if item["conflicts"] else "")
+                                    + (f", {item['failed']} failed"
+                                       if item["failed"] else "")
+                                ).classes('text-[10px] font-bold text-slate-700 '
+                                          'leading-tight')
+                        reasons: Dict[str, int] = {}
+                        for entry in report["characters"].values():
+                            for step in entry["steps"].values():
+                                error = (step.get("error") or "").strip()
+                                if error:
+                                    reasons[error] = reasons.get(error, 0) + 1
+                        for reason, count in sorted(reasons.items(),
+                                                    key=lambda kv: -kv[1])[:6]:
+                            ui.label(f"{count}× {reason}").classes(
+                                'text-[10px] text-rose-500 leading-tight')
+
+            def stop_run() -> None:
+                run_state["cancelled"] = True
+                progress.set_text('Stopping after the current character…')
+
+            with ui.row().classes('w-full items-center gap-2 flex-nowrap'):
+                run_button = ui.button('Run', icon='play_arrow',
+                                       on_click=lambda _: do_run(False)).classes(
+                    'bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs '
+                    'px-4 py-1.5 rounded-lg shrink-0')
+                dry_button = ui.button('Dry Run', icon='science',
+                                       on_click=lambda _: do_run(True)).classes(
+                    'bg-slate-100 text-slate-700 hover:bg-slate-200 font-bold '
+                    'text-xs px-3 py-1.5 rounded-lg border shrink-0').tooltip(
+                    'Do everything except write: shows what would be filled and '
+                    'which values conflict.')
+                stop_button = ui.button('Stop', icon='stop',
+                                        on_click=stop_run).classes(
+                    'bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs '
+                    'px-4 py-1.5 rounded-lg shrink-0')
+                stop_button.disable()
+                ui.label('Fields never written: face (manual), notes.').classes(
+                    'text-[10px] text-slate-400 flex-1 min-w-0 leading-tight')
+
+    dialog.open()
+
 def render_characters_tab(project: Project, books: List[Book], refresh_parent: Optional[Any] = None):
     # Enforce chronological book order indexing
     ensure_book_orders(project.id)
@@ -1683,42 +2199,18 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         .classes(f'text-xs px-3 py-1 rounded-md transition-all {prof_style}')\
                         .tooltip("Edit physical traits, craft visual prompts, and manage timeline overrides")
 
-                # 3. Project-wide rendering policy for the `carried` trait. It is a
-                # setting, not a per-character decision, because the problem is the
-                # trait itself: a prop the author mentions once decorates every later
-                # image, and there is no sentence saying it was put down.
-                carried_options = {
-                    "scene": "Scene only",
-                    "off": "Never rendered",
-                    "always": "Carry forward",
-                }
-
-                def set_carried_mode(value):
-                    mode = value if value in carried_options else "scene"
-                    state.carried_mode = mode
-                    from services.project_settings import save_project_settings_to_disk
-                    save_project_settings_to_disk(project.id)
-                    ui.notify(f"Carried props: {carried_options[mode]}", type="info")
-                    draw_header_toolbar.refresh()
-                    draw_details_panel.refresh()
-
-                with ui.row().classes('items-center gap-1 bg-white border px-2 py-0.5 rounded-lg'):
-                    ui.icon('backpack', size='14px', color='slate-400')
-                    ui.label('Carried').classes(
-                        'text-[9px] font-bold text-slate-400 uppercase tracking-wide')
-                    ui.select(carried_options,
-                              value=state.carried_mode if state.carried_mode in carried_options
-                              else "scene",
-                              on_change=lambda e: set_carried_mode(e.value))\
-                        .classes('w-32 text-[10px]').props('dense borderless')\
-                        .tooltip('Scene only: a carried prop appears only where the text '
-                                 'recorded it. Never rendered: stored and editable, but '
-                                 'left out of prompts like notes. Carry forward: the old '
-                                 'behaviour - it persists until something changes it. '
-                                 'Pinning a character\'s carried field overrides this.')
-
                 # 4. Action Buttons & Overflow Menu
                 with ui.row().classes('items-center gap-2'):
+                    ui.button(
+                        'Fill Descriptions',
+                        icon='auto_fix_high',
+                        on_click=lambda: open_bulk_descriptions_dialog(
+                            project, books, refresh_workspace_with_scroll)
+                    ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold '
+                              'text-xs px-3 py-1.5 rounded-lg shadow-sm').tooltip(
+                        'Import descriptions from a reference file, a wiki, or the '
+                        'MCP server - in one run, ordered, without overwriting.')
+
                     if not is_profiling_all:
                         ui.button(
                             'Batch Profile', 
@@ -1894,7 +2386,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
     def draw_character_list():
         global selected_character_id, search_query, sort_by, filter_status, selected_book_id, active_view_mode, hide_zero_hits
         row_elements.clear()
-        if filter_status not in ("all", "needs_description", "fully_known"):
+        if filter_status not in ("all", "needs_description", "fully_known", "non_human"):
             filter_status = "all"
 
         with Session(engine) as session:
@@ -1942,6 +2434,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             return total
 
         char_data_list = []
+        species_by_id: Dict[int, str] = {}
         with Session(engine) as session:
             for char in scoped_chars:
                 aliases_list = char_aliases.get(char.id, [])
@@ -1957,6 +2450,11 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     .where(CharacterTimelineEvent.character_id == char.id)
                     .where(CharacterTimelineEvent.book_id == None)
                 ).first()
+
+                # The species claim lives on the Base profile. Row-level states
+                # are not consulted: the filter exists to find wrong values, and
+                # "wrong in some chapters" is still worth a look.
+                species_by_id[char.id] = (base_ev.species or "") if base_ev else ""
 
                 if base_ev:
                     completion_count = known_counts.get(char.id, 0)
@@ -1997,6 +2495,11 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     continue
             elif filter_status == "fully_known":
                 if completion_count < completion_target:
+                    continue
+            elif filter_status == "non_human":
+                # Deliberately "species is set", not "species is a real species":
+                # the point is to surface the claim so a wrong one can be cleared.
+                if not is_non_human(species_by_id.get(char.id, "")):
                     continue
                 
             filtered_list.append((char, aliases_list, b_hits, s_hits, completion_count, completion_target, summary_pieces, has_col))
@@ -2045,6 +2548,16 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             if has_col:
                                 ui.badge('🟡 Collision', color='amber-50').classes('text-[9px] font-bold text-amber-700 px-1 py-0.5 rounded')\
                                 .tooltip('Another character shares a name or alias with this profile')
+
+                            species_value = species_by_id.get(char.id, "")
+                            if is_non_human(species_value):
+                                # Visible where it matters: an empty species means
+                                # human, so a filled one is a claim the user can
+                                # check at a glance and clear in one keystroke.
+                                ui.badge(species_value[:20], color='slate-50').classes(
+                                    'text-[9px] font-bold text-slate-500 px-1 py-0.5 rounded')\
+                                    .tooltip('Species is set, so this renders as a non-human. '
+                                             'Clear the field if that is wrong.')
                         
                         if active_view_mode == "profiles":
                             summary_text = (" • ".join(summary_pieces) if summary_pieces
@@ -3115,6 +3628,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                         options={
                             "all": "All",
                             "needs_description": "Needs Description (0–2)",
+                            "non_human": "Non-humans",
                             "fully_known": (
                                 f"Fully Known ({len(RENDERED_TRAIT_FIELDS)}"
                                 f"/{len(RENDERED_TRAIT_FIELDS)})")
@@ -3142,57 +3656,4 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 draw_details_panel()
 
     draw_header_toolbar()
-    def render_analysis_entry():
-        """One line pointing at the analysis pass, since this is where the gaps show.
-
-        The dashboard owns the run controls; this is the door from "this character
-        has no known fields" to "re-extract the book". It is deliberately a banner and
-        not a second copy of the control panel.
-        """
-        def turn_on(value: bool):
-            state.cast_enabled = bool(value)
-            from services.project_settings import save_project_settings_to_disk
-            save_project_settings_to_disk(project.id)
-            if hasattr(state, "action_buttons_refresh") and state.action_buttons_refresh:
-                state.action_buttons_refresh()
-            draw_workspace_layout.refresh()
-
-        def open_rerun():
-            from ui.pages.project.dashboard import open_stage_rerun
-            target = selected_book_id or (books[0].id if books else None)
-            if target is None:
-                ui.notify("No volume to analyse.", type="info")
-                return
-            book = next((b for b in books if b.id == target), None)
-            if book is None:
-                return
-            from database.connection import get_setting
-            from pathlib import Path
-            book_dir = (Path(get_setting("output_dir", "./output")).resolve()
-                        / project.name / book.name)
-            open_stage_rerun(target, book_dir)
-
-        with ui.row().classes('w-full items-center gap-3 bg-blue-50/60 border border-blue-100 '
-                              'rounded-lg px-3 py-1.5'):
-            if not state.cast_enabled:
-                ui.icon('face', size='16px', color='blue-400')
-                ui.label('Character descriptions are off for this project. Existing data is '
-                         'kept but nothing here is being updated.').classes(
-                    'text-[10px] text-slate-600 flex-1')
-                ui.button('Turn on', icon='toggle_on', on_click=lambda: turn_on(True)) \
-                    .props('flat dense').classes('text-[10px] text-blue-700 font-bold')
-            else:
-                ui.icon('person_search', size='16px', color='blue-400')
-                ui.label('Names and descriptions come from the analysis pass over the book. '
-                         'It can run before or after prompts - tags compile at render time.').classes(
-                    'text-[10px] text-slate-600 flex-1')
-                target_name = next(
-                    (b.name for b in books
-                     if b.id == (selected_book_id or (books[0].id if books else None))), "")
-                btn = ui.button('Analyse cast...', icon='replay', on_click=open_rerun) \
-                    .props('flat dense').classes('text-[10px] text-blue-700 font-bold')
-                if target_name:
-                    btn.tooltip(f"Pick the stages for {target_name}")
-
-    render_analysis_entry()
     draw_workspace_layout()

@@ -212,6 +212,15 @@ DEFAULT_SETTINGS = {
     "analysis_window_words": 12000,
     # fast = current pipeline, scenes = scene map + planner, full = + characters.
     "pipeline_mode": "full",
+    # Optional MCP server for character research. The app is the MCP client, so
+    # any Streamable-HTTP MCP server works (a SearXNG wrapper, Brave, Tavily...)
+    # and nothing has to be configured on the LLM host.
+    "mcp_url": "",
+    "mcp_auth_header": "",
+    # Tool names the user left ticked, and the last known tool list so the
+    # settings panel can render without reconnecting.
+    "mcp_tool_prefs": {},
+    "mcp_tool_cache": [],
     "vram_auto_switch": True,
     "stt_engine": "ABI-Subtitles",
     "stt_device": "GPU/CUDA",
@@ -653,59 +662,38 @@ async def _prompt_phase(project_id: int, book_ids):
     await start_project_prompt_gen(project_id, book_ids)
 
 
-def _events_by_book(book_ids) -> dict:
-    from sqlalchemy import func
-    from database.models import CharacterTimelineEvent
-    ids = list(book_ids)
-    if not ids:
-        return {}
-    with Session(engine) as session:
-        rows = session.exec(
-            select(CharacterTimelineEvent.book_id, func.count())
-            .where(CharacterTimelineEvent.book_id.in_(ids))
-            .group_by(CharacterTimelineEvent.book_id)).all()
-    return {bid: count for bid, count in rows}
-
-
 def _stage_targets(project_id: int, scope_ids, stage: str) -> list:
     """Book ids that need ``stage`` right now, from what is on disk.
 
-    Recomputed between phases on purpose: a scene map written a minute ago is
-    what makes the cast runnable, so a plan fixed at click time would have every
-    second stage in a fresh project doing nothing.
+    Recomputed between phases on purpose: prompts written a minute ago are what
+    makes the next stage runnable, so a plan fixed at click time would leave every
+    later stage doing nothing on a fresh project.
     """
     from services import pipeline_status
 
     _project_name, wanted = _book_dirs(project_id, scope_ids)
     if not wanted:
         return []
-    cast_enabled = bool(getattr(state, "cast_enabled", True))
-    if stage == "cast" and not cast_enabled:
-        return []
-    events = _events_by_book([book[0] for book in wanted])
     plan, _rows = pipeline_status.plan(
         wanted,
         chunk_words=getattr(state, "playground_chunk_size", 350) or 350,
-        cast_enabled=cast_enabled,
-        events_by_id=events,
         stages=(stage,))
     return plan.get(stage, [])
 
 
 async def _run_pipeline(project_id: int, scope_ids, stages):
-    """Map -> cast -> prompts for whatever needs each one, in that order.
+    """Prompts for whatever needs them, in reading order.
 
     ``scope_ids`` limits the run to those volumes (None = the project). Each
     phase recomputes its own target list, so one press does everything that is
     outstanding and never re-runs a stage that is already current.
 
-    One task rather than three chained buttons: it gives one Stop, one progress
-    line, and an order that cannot be got wrong by pressing the buttons in the
-    wrong sequence.
+    The scene map used to be the first phase and the cast the second; both are
+    gone from the run. A book is chunked straight from its transcript, and the
+    shot plan is ensured inline by prompt generation. Character descriptions are
+    a separate tab now.
     """
-    order = [s for s in ("map", "cast", "prompts") if s in set(stages or ())]
-    if not getattr(state, "cast_enabled", True):
-        order = [s for s in order if s != "cast"]
+    order = [s for s in ("prompts",) if s in set(stages or ())]
     try:
         for stage in order:
             if _pipeline_stopped():
@@ -718,16 +706,7 @@ async def _run_pipeline(project_id: int, scope_ids, stages):
                 state.add_console_log(
                     f"[Pipeline] {stage}: nothing to do.")
                 continue
-            if stage == "map":
-                ok = await _analyse_books(project_id, ids, {"segment"})
-            elif stage == "cast":
-                ok = await _analyse_books(project_id, ids,
-                                          {"gather", "refname", "extract"})
-            else:
-                await _prompt_phase(project_id, ids)
-                ok = True
-            if not ok:
-                return
+            await _prompt_phase(project_id, ids)
     except Exception as ex:
         state.add_console_log(f"[Pipeline] Critical error: {ex}")
     finally:
@@ -755,8 +734,8 @@ def start_pipeline(project_id: int, scope_ids: Optional[List[int]] = None,
     """Launch one dashboard run.
 
     ``scope_ids`` limits it to those volumes (``None`` = the whole project) and
-    ``stages`` is the subset of ``map`` / ``cast`` / ``prompts`` to consider;
-    which volumes actually run each stage is recomputed as the run progresses.
+    ``stages`` is the subset of ``prompts`` to consider; which volumes actually
+    run is recomputed as the run progresses.
     """
     if getattr(state, "pipeline_active", False):
         ui.notify("A pipeline run is already active.", type="warning")
@@ -764,8 +743,8 @@ def start_pipeline(project_id: int, scope_ids: Optional[List[int]] = None,
     if getattr(state, "prompt_gen_active", False) or getattr(state, "analysis_active", False):
         ui.notify("Another pipeline task is already running.", type="warning")
         return
-    chosen = [s for s in ("map", "cast", "prompts")
-              if s in set(stages or ("map", "cast", "prompts"))]
+    chosen = [s for s in ("prompts",)
+              if s in set(stages or ("prompts",))]
     if not chosen:
         ui.notify("Pick at least one stage to run.", type="warning")
         return

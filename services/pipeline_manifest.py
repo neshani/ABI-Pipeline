@@ -17,7 +17,7 @@ import hashlib
 import json
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 MANIFEST_FILENAME = "pipeline.json"
 
@@ -135,16 +135,19 @@ def stage_current(book_dir, stage: str, *, version=None, inputs=None,
 
 def record_chunking(book_dir, source: str, chunk_words: int,
                     seg_version: int = 0, transcript_sha: str = "",
-                    scene_map_sha: str = "") -> Path:
+                    scene_map_sha: str = "", chunker_version: int = 0) -> Path:
     """Record the chunking that owns this book from now on.
 
     Only called after :func:`check` has allowed the book, so overwriting a
     manifest is safe: either it agreed, or the book has no prompt rows yet.
+    ``chunker_version`` pins which linear packer defined the shot boundaries;
+    the scene-map and segmentation fields stay for books already numbered by one.
     """
     return write(
         book_dir,
         chunking=source,
         chunk_words=int(chunk_words),
+        chunker_version=int(chunker_version or 0),
         seg_version=int(seg_version),
         transcript_sha=transcript_sha,
         scene_map_sha=scene_map_sha,
@@ -152,7 +155,8 @@ def record_chunking(book_dir, source: str, chunk_words: int,
 
 
 def check(book_dir, source: str, chunk_words: int, transcript_sha: str = "",
-          scene_map_sha: str = "", prompts_exist: bool = True) -> Tuple[bool, str]:
+          scene_map_sha: str = "", prompts_exist: bool = True,
+          chunker_version: Optional[int] = None) -> Tuple[bool, str]:
     """May rows be appended to this book's ``prompts.csv`` with this chunking?
 
     Returns ``(allowed, reason)``. ``reason`` is empty when allowed and a
@@ -186,6 +190,15 @@ def check(book_dir, source: str, chunk_words: int, transcript_sha: str = "",
             f"this book's prompts.csv was generated at {recorded_words} words per "
             f"shot, but the current setting is {chunk_words}; change the setting "
             f"back or rebuild the book.")
+
+    recorded_version = data.get("chunker_version")
+    if (source == "linear" and chunker_version is not None
+            and recorded_version is not None
+            and int(recorded_version) != int(chunker_version)):
+        return False, (
+            f"this book's shots were numbered by chunker v{recorded_version}, but "
+            f"the current packer is v{chunker_version}; rebuild the book so every "
+            f"shot maps back to the text it describes.")
 
     recorded_sha = str(data.get("transcript_sha") or "")
     if transcript_sha and recorded_sha and recorded_sha != transcript_sha:

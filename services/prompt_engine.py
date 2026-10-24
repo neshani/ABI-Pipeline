@@ -10,16 +10,15 @@ from database.connection import get_setting
 from services import vram_manager
 from services import compat
 from services import scene_map
-# The paragraph chunker is the fast path of the scene-map module and lives
-# there now. It is re-exported here because prompt generation, the shot planner
-# and the character manager have always imported it from this module.
+# The linear chunker and the sentence machinery live in ``scene_map`` - the
+# module kept its name when the map stopped being a pipeline stage. They are
+# re-exported here because prompt generation, the shot planner and the character
+# manager have always imported them from this module.
 from services.scene_map import (
     PARA_SLACK,
     SENT_SLACK,
-    SEG_VERSION,
     StaleSceneMap,
     book_chunks,
-    scene_map_signature,
     smart_chunk_text,
     transcript_digest,
 )
@@ -93,6 +92,8 @@ async def get_llm_response(
     extra_payload: Optional[Dict[str, Any]] = None,
     timeout: float = 60.0,
     with_meta: bool = False,
+    with_message: bool = False,
+    messages: Optional[List[Dict[str, Any]]] = None,
 ):
     """Dispatches asynchronous request to local Ollama or LM Studio OpenAI-compatible endpoints.
 
@@ -101,6 +102,10 @@ async def get_llm_response(
     ``timeout`` is per request: scene segmentation reads a whole chapter and can
     take minutes, while a one-shot prompt is expected in under a minute.
     ``with_meta`` returns ``(content, finish_reason)`` instead of the bare string.
+    ``with_message`` returns ``(message, finish_reason)`` - the whole message dict,
+    which is the only way to see ``tool_calls`` in a tool-calling loop.
+    ``messages`` replaces the single-turn ``prompt`` with a whole conversation,
+    which a tool loop needs; ``prompt`` is then ignored.
     ``finish_reason == "length"`` is the only signal that the model was cut off at
     ``max_tokens``; callers that parse structured output need it to tell "nothing
     to report" from "the rest of the reply was never written".
@@ -122,7 +127,7 @@ async def get_llm_response(
 
     payload = {
         "model": model_name,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages or [{"role": "user", "content": prompt}],
         "temperature": temperature
     }
     if extra_payload:
@@ -135,6 +140,8 @@ async def get_llm_response(
             data = response.json()
             choice = data["choices"][0]
             content = choice["message"]["content"]
+            if with_message:
+                return choice["message"], choice.get("finish_reason") or ""
             if with_meta:
                 return content, choice.get("finish_reason") or ""
             return content
@@ -152,11 +159,17 @@ async def get_llm_response(
                     resp = await client.post(direct_endpoint, json=direct_payload, timeout=timeout)
                     resp.raise_for_status()
                     text = resp.json().get("response", "")
+                    if with_message:
+                        return {"role": "assistant", "content": text}, ""
                     return (text, "") if with_meta else text
                 except Exception as inner_e:
                     msg = f"API Connection Failed: {e} (Direct API Fallback failed: {inner_e})"
+                    if with_message:
+                        return {"role": "assistant", "content": msg}, "error"
                     return (msg, "error") if with_meta else msg
             msg = f"API Connection Failed: {e}"
+            if with_message:
+                return {"role": "assistant", "content": msg}, "error"
             return (msg, "error") if with_meta else msg
 
 
@@ -234,12 +247,13 @@ def fetch_test_chunks(
     with open(transcript_path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    cleaned_text = content.replace("==CHAPTER==", " ").strip()
     chunk_size = getattr(state, "playground_chunk_size", 350)
     if not chunk_size or chunk_size <= 0:
         chunk_size = 350
 
-    all_chunks = smart_chunk_text(cleaned_text, chunk_size)
+    # The real chunker, on the real text: a style sample should be a passage the
+    # pipeline would actually turn into one image, at the same size.
+    all_chunks = [chunk.text for chunk in scene_map.linear_chunks(content, chunk_size)]
     if not all_chunks:
         return []
 
@@ -376,60 +390,30 @@ def prepare_book_chunks(book_dir, chunk_words: int, full_text: str,
                         completed_scenes: set):
     """``(chunks, source, problem)`` for one book, enforcing the coordinate guard.
 
-    The chunks come from the chunking the book is bound to: its manifest, else
-    the legacy linear rule when it already has prompt rows, else its scene map
-    when it has one. A stale map, or a ``prompts.csv`` built under a different
-    chunking, comes back as ``problem`` instead of raising or silently switching
-    coordinate systems; the caller logs it and skips the book. On success the
-    pipeline manifest records which chunking owns the book from now on.
+    The book is chunked by the linear packer, at the version it is bound to: v2
+    for a book with no prompt rows yet, v1 for one that was numbered by the older
+    greedy packer. A ``prompts.csv`` built under a different chunking or packer
+    comes back as ``problem`` instead of raising or silently switching coordinate
+    systems; the caller logs it and skips the book. On success the pipeline
+    manifest records which chunking and packer own the book from now on.
     """
     prompts_exist = bool(completed_scenes) or scene_map.prompts_have_rows(book_dir)
-    # In Full/Scenes mode a book without a scene map has not been analysed yet.
-    # Generating it linearly would bind it to the old chunking and lock the new
-    # pipeline out, so skip it with an actionable message instead. Fast mode is
-    # the explicit request for linear, and a legacy book with rows keeps its
-    # existing coordinates.
+    version = scene_map.chunker_version(book_dir, prompts_exist=prompts_exist)
     try:
-        mode = str(get_setting("pipeline_mode", "full") or "full")
-    except Exception:
-        mode = "full"
-    if (mode in ("scenes", "full") and not prompts_exist
-            and not scene_map.scene_map_path(book_dir).exists()):
-        return None, "", (
-            f"no scene map yet; the project is in '{mode}' mode. Run character "
-            f"analysis for this book first, or switch the project to Fast.")
-    try:
-        source = scene_map.book_source(book_dir, prompts_exist=prompts_exist)
         chunks, source = book_chunks(book_dir, chunk_words, text=full_text,
-                                     source=source)
+                                     source="linear", version=version)
     except StaleSceneMap as ex:
         return None, "", str(ex)
 
     sha = transcript_digest(full_text)
-    map_sha = scene_map_signature(book_dir) if source == "scene_map" else ""
-
-    # The characters' event positions are the first chunk of their group at the
-    # chunk size analysis ran with. A different size would put every description
-    # a few shots off, so refuse rather than write subtly wrong prompts.
-    recorded_analysis_words = pipeline_manifest.read(book_dir).get("analysis_chunk_words")
-    if source == "scene_map" and recorded_analysis_words is not None:
-        try:
-            if int(recorded_analysis_words) != int(chunk_words):
-                return None, source, (
-                    f"character analysis was run at {recorded_analysis_words} words "
-                    f"per shot, but the current setting is {chunk_words}; restore "
-                    f"that setting or re-run analysis for this book.")
-        except (TypeError, ValueError):
-            pass
-
     allowed, reason = pipeline_manifest.check(
-        book_dir, source, chunk_words, transcript_sha=sha, scene_map_sha=map_sha,
-        prompts_exist=prompts_exist)
+        book_dir, source, chunk_words, transcript_sha=sha,
+        prompts_exist=prompts_exist, chunker_version=version)
     if not allowed:
         return None, source, reason
     pipeline_manifest.record_chunking(
-        book_dir, source, chunk_words, seg_version=SEG_VERSION,
-        transcript_sha=sha, scene_map_sha=map_sha)
+        book_dir, source, chunk_words, transcript_sha=sha,
+        chunker_version=version)
     return chunks, source, ""
 
 
@@ -559,14 +543,15 @@ async def start_project_prompt_gen(project_id: int,
                         session.add(db_book)
                         session.commit()
                 continue
-            source_label = "scene map" if chunk_source == "scene_map" else "linear chunker"
+            source_label = "linear chunker"
             state.add_console_log(
                 f"[Prompt-Gen] Chunking '{book_name}' with the {source_label}: "
                 f"{len(chunks)} chunks")
-            if chunk_source == "linear" and scene_map.scene_map_path(book_dir).exists():
+            if scene_map.scene_map_path(book_dir).exists():
                 state.add_console_log(
-                    f"[Prompt-Gen] Note: '{book_name}' has a scene map, but its "
-                    f"prompts were generated linearly; rebuild the book to use the map.")
+                    f"[Prompt-Gen] Note: '{book_name}' has a scene map on disk, but "
+                    f"maps are no longer part of the pipeline; its shots follow the "
+                    f"linear chunker.")
             current_keys = {(chunk.chapter, chunk.shot) for chunk in chunks}
             orphans = completed_scenes - current_keys
             if orphans:
@@ -589,6 +574,7 @@ async def start_project_prompt_gen(project_id: int,
             selection = prompt_lib.active_selection()
             shot_map = {}
             focus_map = {}
+            place_map = {}
             if pending:
                 shot_map = await shot_planner.ensure_book_plan(
                     project_name, book_name, llm_url,
@@ -601,6 +587,11 @@ async def start_project_prompt_gen(project_id: int,
                 # Without it the shared block's "the director has chosen a focus" line has
                 # nothing to point at, and the prompt model has to infer the subject.
                 focus_map = shot_planner.load_focus_map(project_name, book_name)
+                # ...and the place it read for that shot. A passage that is pure
+                # dialogue names no setting, so without this line the prompt model
+                # fills the background in itself - measured at 29 invented rooms in
+                # one book's 328 outdoor scenes.
+                place_map = shot_planner.load_place_map(project_name, book_name)
             state.add_console_log(
                 f"[Prompt-Gen] Shot mode for '{book_name}': {shot_mode}"
                 + f" - planner {selection.get('shot_direction', '?')}"
@@ -623,7 +614,8 @@ async def start_project_prompt_gen(project_id: int,
                     "project_id": project_id,
                     "prompt": prompt_lib.render_with_selection(
                         role, chunk_text, selection,
-                        focus=focus_map.get((chapter_num, shot_num), "")),
+                        focus=focus_map.get((chapter_num, shot_num), ""),
+                        place=place_map.get((chapter_num, shot_num), "")),
                 })
 
             total_chunks = len(completed_scenes) + len(tasks)

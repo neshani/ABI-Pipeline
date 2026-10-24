@@ -2,35 +2,35 @@
 
 The dashboard used to render one card per phase and pick between them on
 ``Project.status``. That cannot express what a project actually is: a project has
-N books, each with its own scene map, cast, prompt file and images, so a single
-status word is always a rollup and the cards were wrong most of the time (the
-analysis controls disappeared the moment the project reached "Prompts Created",
-which is exactly when a re-analysis is most useful).
+N books, each with its own prompts, plan and images, so a single status word is
+always a rollup and the cards were wrong most of the time (the analysis controls
+disappeared the moment the project reached "Prompts Created", which is exactly
+when a re-run is most useful).
 
 This module answers the per-book question instead: for each stage, does the
 artifact exist, is it current, and is it half-finished? It is deliberately
 side-effect free and cheap enough to call on every poll - the expensive inputs
 (the transcript digest) are cached against file modification times, the same
-trick ``sync_engine.get_book_stats_cached`` uses, and the DB counts are passed in
-by the caller as one aggregate query rather than one per row.
+trick ``sync_engine.get_book_stats_cached`` uses.
+
+The scene map and the cast stages are gone: a book is chunked directly from its
+transcript now. ``prompts`` and ``images`` are the stages; the shot plan is not a
+stage, it is planned inline by prompt generation.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Dict, Optional
 
-from services import checkpoints, pipeline_manifest, scene_map
+from services import pipeline_manifest, scene_map
 
-# Measured on a ~300k-word book (``.docs/pipeline-brief.md``: scenes ~20 min,
-# cast ~31 min - gather 22 + refname 3 + extract 6 - prompts ~30 min including
-# the shot plan). Word count is the only book-agnostic way to scale them, so the
-# estimate is proportional and floored rather than pretending to be exact.
+# Measured on a ~300k-word book (``.docs/pipeline-brief.md``: prompts ~30 min
+# including the shot plan). Word count is the only book-agnostic way to scale it,
+# so the estimate is proportional and floored rather than pretending to be exact.
 _REFERENCE_WORDS = 300_000
-_MINUTES_AT_REFERENCE = {"map": 20.0, "cast": 31.0, "prompts": 30.0}
+_MINUTES_AT_REFERENCE = {"prompts": 30.0}
 
-STAGE_LABELS = {"map": "Scene map", "cast": "Cast", "prompts": "Prompts",
-                "images": "Images"}
+STAGE_LABELS = {"prompts": "Prompts", "images": "Images"}
 
 
 def _state(state: str, detail: str = "", **extra) -> Dict:
@@ -64,11 +64,8 @@ def _count_images(book_dir: Path) -> int:
 def _signature(book_dir: Path, **extra) -> str:
     """Cheap fingerprint: any change to an input or an artifact invalidates."""
     parts = []
-    for name in ("transcript.txt", "scene_map.json", "gather.json",
-                 "extract.json", "prompts.csv", "shot_plan.csv",
-                 "pipeline.json", "scene.partial.jsonl", "gather.partial.jsonl",
-                 "extract.partial.jsonl", "refname.partial.jsonl",
-                 "plan.partial.jsonl"):
+    for name in ("transcript.txt", "prompts.csv", "shot_plan.csv",
+                 "pipeline.json", "plan.partial.jsonl"):
         path = book_dir / name
         try:
             if path.exists():
@@ -82,18 +79,15 @@ def _signature(book_dir: Path, **extra) -> str:
     return "|".join(parts)
 
 
-def snapshot(book_dir, *, chunk_words: int = 350, cast_enabled: bool = True,
-             events: int = 0, expected_prompts: int = 0,
+def snapshot(book_dir, *, chunk_words: int = 350, expected_prompts: int = 0,
              cached: bool = True) -> Dict:
     """Everything the dashboard needs to draw one book's row.
 
-    ``events`` is the book's extracted timeline-event count and
-    ``expected_prompts`` its ``Book.total_images`` when known - both come from
-    the caller so this module holds no session.
+    ``expected_prompts`` is the book's ``Book.total_images`` when known - it comes
+    from the caller so this module holds no session.
     """
     book_dir = Path(book_dir)
     signature = _signature(book_dir, chunk_words=int(chunk_words),
-                           cast=bool(cast_enabled), events=int(events),
                            expected=int(expected_prompts))
     if cached:
         from ui import state
@@ -102,7 +96,6 @@ def snapshot(book_dir, *, chunk_words: int = 350, cast_enabled: bool = True,
             return entry[1]
 
     row = _snapshot_uncached(book_dir, chunk_words=chunk_words,
-                             cast_enabled=cast_enabled, events=events,
                              expected_prompts=expected_prompts)
     if cached:
         from ui import state
@@ -111,12 +104,8 @@ def snapshot(book_dir, *, chunk_words: int = 350, cast_enabled: bool = True,
 
 
 def _snapshot_uncached(book_dir: Path, *, chunk_words: int,
-                       cast_enabled: bool, events: int,
                        expected_prompts: int) -> Dict:
     transcript_path = book_dir / scene_map.TRANSCRIPT_FILENAME
-    map_path = scene_map.scene_map_path(book_dir)
-    gather_path = book_dir / "gather.json"
-    extract_path = book_dir / "extract.json"
     prompts_path = book_dir / "prompts.csv"
 
     text, words = "", 0
@@ -127,117 +116,21 @@ def _snapshot_uncached(book_dir: Path, *, chunk_words: int,
         except Exception:
             pass
     transcript_sha = scene_map.transcript_digest(text) if text else ""
-    # Two different map identities, and they are not interchangeable:
-    #
-    # * ``map_sha`` digests the whole file and is the *checkpoint* identity. It is
-    #   what ``character_analysis`` records as a stage input and keys the gather /
-    #   extract partials on, so it must be computed the same way here.
-    # * ``map_signature`` digests only the sentence ranges and is the *coordinate*
-    #   identity. ``prompt_engine`` records it as ``scene_map_sha`` in the
-    #   manifest and ``pipeline_manifest.check`` compares it, because a map
-    #   rewritten with the same ranges is still the same set of shots.
-    #
-    # Passing the file digest to ``check`` made every scene-mapped book compare
-    # one hash against the other and report "map changed" forever.
-    map_sha = ""
-    map_signature = ""
-    if map_path.exists():
-        try:
-            map_sha = pipeline_manifest.digest(map_path.read_text(encoding="utf-8"))
-        except Exception:
-            map_sha = ""
-        map_signature = scene_map.scene_map_signature(book_dir)
 
     # --- transcript -------------------------------------------------------
     transcript = (_state("ok", f"{words:,} words") if text
                   else _state("missing", "no transcript"))
 
-    # --- scene map --------------------------------------------------------
-    segment_sha = pipeline_manifest.digest({
-        "transcript_sha": transcript_sha,
-        "window_words": scene_map.configured_window_words(),
-        "seg_version": scene_map.SEG_VERSION,
-    })
-    partial_map = checkpoints.summary(book_dir, "segment", segment_sha)["done"]
-    if not text:
-        scene = _state("blocked", "needs a transcript")
-    elif map_path.exists():
-        current, reasons = pipeline_manifest.stage_current(
-            book_dir, "segment", version=scene_map.SEG_VERSION,
-            inputs={"transcript_sha": transcript_sha,
-                    "window_words": scene_map.configured_window_words()})
-        record = pipeline_manifest.stage_record(book_dir, "segment")
-        if current:
-            scene = _state("ok", "")
-        elif not record:
-            # Built before stage records existed: the artifact may well be fine,
-            # but nothing can prove it, and "unknown" must not read as "fine".
-            scene = _state("unrecorded",
-                           "built before stage records; inputs cannot be verified")
-        elif reasons:
-            scene = _state("stale", ", ".join(reasons))
-        else:
-            scene = _state("stale", "inputs changed")
-    elif partial_map:
-        scene = _state("partial", f"{partial_map} windows done", done=partial_map)
-    else:
-        scene = _state("missing", "not built")
-
-    # --- cast (optional by design) ---------------------------------------
-    gather_partial = checkpoints.summary(
-        book_dir, "gather", map_sha)["done"] if map_sha else 0
-    gather_sha = ""
-    if gather_path.exists():
-        try:
-            gather_sha = pipeline_manifest.digest(
-                (json.loads(gather_path.read_text(encoding="utf-8")) or {})
-                .get("quotes", []))
-        except Exception:
-            gather_sha = ""
-    extract_partial = checkpoints.summary(
-        book_dir, "extract", gather_sha)["done"] if gather_sha else 0
-
-    if not cast_enabled:
-        cast = _state("off", "character descriptions are off", events=events)
-    elif not map_path.exists():
-        cast = _state("blocked", "needs a scene map", events=events)
-    elif extract_path.exists():
-        # Lazy import: this module is drawn on every poll and character_analysis
-        # is a large import graph. The version and cap are the same inputs
-        # ``analysis_stage_status`` compares, so the two never disagree.
-        from services import character_analysis as ca
-        current, reasons = pipeline_manifest.stage_current(
-            book_dir, "extract", version=ca.ANALYSIS_VERSION,
-            inputs={"gather_sha": gather_sha,
-                    "quote_cap": ca.EXTRACT_QUOTE_CAP})
-        if current and events:
-            cast = _state("ok", f"{events} events", events=events)
-        elif not pipeline_manifest.stage_record(book_dir, "extract"):
-            cast = _state("unrecorded",
-                          "built before stage records; inputs cannot be verified",
-                          events=events)
-        elif reasons:
-            cast = _state("stale", ", ".join(reasons), events=events)
-        else:
-            cast = _state("stale", "inputs changed", events=events)
-    elif extract_partial:
-        cast = _state("partial", f"{extract_partial} characters done",
-                     done=extract_partial, events=events)
-    elif gather_partial:
-        cast = _state("partial", f"{gather_partial} quote windows done",
-                     done=gather_partial, events=events)
-    else:
-        cast = _state("missing", "not built", events=events)
-
     # --- prompts ----------------------------------------------------------
     rows = _count_rows(prompts_path) if prompts_path.exists() else 0
     chunking = pipeline_manifest.chunking(book_dir)
+    version = scene_map.chunker_version(book_dir)
     blocked = ""
     if rows:
         allowed, reason = pipeline_manifest.check(
             book_dir, chunking or "linear", chunk_words,
-            transcript_sha=transcript_sha, scene_map_sha=map_signature,
-            prompts_exist=True)
+            transcript_sha=transcript_sha, prompts_exist=True,
+            chunker_version=version)
         if not allowed:
             blocked = reason
     if rows and blocked:
@@ -246,7 +139,9 @@ def _snapshot_uncached(book_dir: Path, *, chunk_words: int,
         # "the rows on disk belong to different text or a different shot grid",
         # so the cell reads as out of date, not as a failure: the images already
         # rendered from these prompts are still the right images.
-        if "scene map has been rebuilt" in blocked:
+        if "packer is v" in blocked:
+            short = "chunker changed"
+        elif "scene map has been rebuilt" in blocked:
             short = "map changed"
         elif "generated at" in blocked and "words per shot" in blocked:
             short = "size changed"
@@ -259,7 +154,7 @@ def _snapshot_uncached(book_dir: Path, *, chunk_words: int,
         prompts = _state("stale", blocked, rows=rows, short=short)
     elif rows:
         # ``expected_prompts`` is a chunk count recorded by a previous run, and a
-        # re-map can leave it one or two off the real total. Only a larger
+        # re-chunk can leave it one or two off the real total. Only a larger
         # expectation means rows are still missing; equal or fewer means done, and
         # "720 of 720" must not render as work in progress.
         total = expected_prompts if expected_prompts > rows else 0
@@ -283,15 +178,12 @@ def _snapshot_uncached(book_dir: Path, *, chunk_words: int,
 
     return {
         "transcript": transcript,
-        "map": scene,
-        "cast": cast,
         "prompts": prompts,
         "images": imgs,
         "words": words,
         "chunking": chunking,
+        "chunker_version": version,
         "transcript_sha": transcript_sha,
-        "map_sha": map_sha,
-        "gather_sha": gather_sha,
         "path": str(book_dir),
     }
 
@@ -322,21 +214,14 @@ def needs_work(row: Dict, stage: str) -> bool:
 
 def can_run(row: Dict, stage: str) -> bool:
     """Whether ``stage`` *may* run now, regardless of whether it needs to."""
-    map_state = (row.get("map") or {}).get("state")
-    cast_state = (row.get("cast") or {}).get("state")
-    map_usable = map_state in ("ok", "stale", "partial", "unrecorded")
-    if stage == "map":
-        return (row.get("transcript") or {}).get("state") == "ok"
-    if stage == "cast":
-        return cast_state != "off" and map_usable
+    transcript_ok = (row.get("transcript") or {}).get("state") == "ok"
     if stage == "prompts":
-        return map_usable
+        return transcript_ok
     return False
 
 
-def plan(books, *, chunk_words: int = 350, cast_enabled: bool = True,
-         events_by_id: Optional[Dict[int, int]] = None,
-         stages=("map", "cast", "prompts"), force: bool = False,
+def plan(books, *, chunk_words: int = 350,
+         stages=("prompts",), force: bool = False,
          expected_by_id: Optional[Dict[int, int]] = None):
     """``(plan, rows)`` for a set of books.
 
@@ -345,7 +230,6 @@ def plan(books, *, chunk_words: int = 350, cast_enabled: bool = True,
     the run engine both use this, which is what keeps "what the button says" and
     "what the run does" the same computation.
     """
-    events_by_id = events_by_id or {}
     expected_by_id = expected_by_id or {}
     rows: Dict[int, Dict] = {}
     out: Dict[str, list] = {}
@@ -353,12 +237,9 @@ def plan(books, *, chunk_words: int = 350, cast_enabled: bool = True,
         book_id = book[0]
         book_dir = book[2]
         rows[book_id] = snapshot(
-            book_dir, chunk_words=chunk_words, cast_enabled=cast_enabled,
-            events=events_by_id.get(book_id, 0),
+            book_dir, chunk_words=chunk_words,
             expected_prompts=expected_by_id.get(book_id, 0))
     for stage in stages:
-        if stage == "cast" and not cast_enabled:
-            continue
         targets = [book[0] for book in books
                    if can_run(rows[book[0]], stage)
                    and (force or needs_work(rows[book[0]], stage))]

@@ -425,13 +425,18 @@ def group_scenes(scenes, sentences, target: int = TARGET_WORDS,
 def split_group(words: Sequence[int], para_break: Sequence[bool],
                 scene_start: Sequence[bool], target: int, k: int, floor: int,
                 para_cost: Optional[float] = None,
-                power: float = SIZE_POWER) -> List[int]:
+                power: float = SIZE_POWER,
+                max_words: Optional[float] = None) -> List[int]:
     """Cut ONE group into exactly ``k`` chunks. Returns ``k+1`` cut offsets.
 
     Scene edges outrank paragraph edges, which outrank sentence edges. Nothing
     here needs a special case for a stub or for the chunk count: the boundaries
     are chosen by minimising a cost across the whole group, so the failure mode
     a forward-greedy pass has - a 1-word trailing chunk - cannot arise.
+
+    ``max_words`` bounds the search: a span wider than this is never the better
+    answer, so the inner loop stops there. It changes no result, only the time -
+    a chapter of 300 tiny paragraphs is otherwise ``k * n^2``.
     """
     para_cost = PARA_COST if para_cost is None else para_cost
     n = len(words)
@@ -442,25 +447,36 @@ def split_group(words: Sequence[int], para_break: Sequence[bool],
     for i, w in enumerate(words):
         pre[i + 1] = pre[i] + w
     inf = float("inf")
-    dp = [[inf] * (n + 1) for _ in range(k + 1)]
-    back = [[0] * (n + 1) for _ in range(k + 1)]
-    dp[0][0] = 0.0
-    for c in range(1, k + 1):
-        for i in range(c, n - (k - c) + 1):      # leave a sentence per later chunk
-            best, arg = inf, 0
-            for j in range(c - 1, i):
-                if dp[c - 1][j] == inf:
-                    continue
-                w = pre[i] - pre[j]
-                cost = size_cost(w, target, power)
-                if w < floor:
-                    cost += STUB_COST           # a stub is never the better answer
-                if j > 0 and not (para_break[j - 1] or scene_start[j]):
-                    cost += para_cost
-                v = dp[c - 1][j] + cost
-                if v < best:
-                    best, arg = v, j
-            dp[c][i], back[c][i] = best, arg
+
+    def solve(bound: Optional[float]):
+        dp = [[inf] * (n + 1) for _ in range(k + 1)]
+        back = [[0] * (n + 1) for _ in range(k + 1)]
+        dp[0][0] = 0.0
+        for c in range(1, k + 1):
+            for i in range(c, n - (k - c) + 1):  # leave a sentence per later chunk
+                best, arg = inf, 0
+                for j in range(i - 1, c - 2, -1):
+                    if bound is not None and pre[i] - pre[j] > bound and j < i - 1:
+                        break
+                    if dp[c - 1][j] == inf:
+                        continue
+                    w = pre[i] - pre[j]
+                    cost = size_cost(w, target, power)
+                    if w < floor:
+                        cost += STUB_COST       # a stub is never the better answer
+                    if j > 0 and not (para_break[j - 1] or scene_start[j]):
+                        cost += para_cost
+                    v = dp[c - 1][j] + cost
+                    if v < best:
+                        best, arg = v, j
+                dp[c][i], back[c][i] = best, arg
+        return dp, back
+
+    dp, back = solve(max_words)
+    if dp[k][n] == inf:
+        # The bound pruned every route to the last chunk. It is only ever an
+        # optimisation, so pay the full cost rather than return a broken path.
+        dp, back = solve(None)
     cuts, i = [n], n
     for c in range(k, 0, -1):
         i = back[c][i]
@@ -1058,14 +1074,37 @@ def chunk_map(scenes, sentences: Sequence[str], para_breaks: Sequence[bool],
     return out
 
 
-# --- the fast path: no scene map, the legacy paragraph chunker --------------
+# --- the linear chunker -----------------------------------------------------
 #
-# Kept byte-for-byte compatible with the chunker prompt generation has always
-# used, because a book generated with it must keep the same (chapter, shot)
-# coordinates. Fast mode is what makes a legacy project stay renderable.
+# This is what numbers ``(chapter, shot)`` now: there is no scene map in the
+# pipeline any more, so the image unit is cut from the transcript directly.
+#
+# The packer is the map chunker's size ladder without the scenes: the same
+# ``best_k`` / ``size_cost`` / ``split_group`` cost model, the same paragraph
+# preference, the same stub penalty. Only the cut PRIORITY changes - a paragraph
+# edge outranks a sentence edge, and there is no scene edge above them.
+#
+# Two versions exist and a book is bound to one of them by
+# ``pipeline_manifest.chunker_version``:
+#
+#   v1  the greedy paragraph packer this module has always shipped. Frozen: a
+#       book that already has prompts.csv was numbered by it, and changing its
+#       boundaries would silently re-point every later ``(chapter, shot)``.
+#   v2  the even packer. Same rules, but the cut positions are chosen by
+#       minimising size deviation across the whole chapter, so a short leftover
+#       is absorbed instead of becoming a stub image.
+#
+# THE RULE WHEN THIS CHANGES: a new packer is a new version, and the old one's
+# implementation stays frozen beside it - ``linear_chunks`` dispatches, it does
+# not "improve in place". Otherwise every book already numbered by the old packer
+# silently maps its shot numbers onto different text.
 
 PARA_SLACK = 0.15   # paragraph window: target +/- 15%  (350 -> 298..402)
 SENT_SLACK = 0.05   # sentence window:  target +/- 5%   (350 -> 333..367)
+
+LINEAR_V1 = 1       # greedy paragraph packer, frozen
+LINEAR_V2 = 2       # even packer
+CHUNKER_VERSION = LINEAR_V2
 
 
 def smart_chunk_text(text: str, max_chunk_words: int,
@@ -1131,26 +1170,104 @@ def smart_chunk_text(text: str, max_chunk_words: int,
     return chunks
 
 
-def linear_chunks(text: str, target: int = TARGET_WORDS) -> List[Chunk]:
-    """Chunks for a book with no scene map, numbered exactly as before.
+def _pack_chapter(indexes: Sequence[int], sentences: Sequence[str],
+                  para_breaks: Sequence[bool], target: int) -> List[Tuple[int, int]]:
+    """``[(first, last)]`` 0-based, inclusive, for one chapter's sentences.
 
-    ``group`` is 0: there is no group, so position-based character descriptions
-    do not apply in this mode.
+    Units are paragraphs, so every cut this can make is a paragraph boundary; a
+    paragraph fat enough to starve its neighbours is split into sentence units,
+    which the cost model will only use when it has to. The number of chunks comes
+    from ``best_k`` and the cut positions from ``split_group``, exactly as the map
+    chunker decides them inside a group - which is what evens the sizes out and
+    absorbs a short tail instead of leaving it as a stub.
     """
-    chapters = [c for c in text.replace("\r\n", "\n").split(CHAPTER_MARKER)
-                if c.strip()]
-    out: List[Chunk] = []
-    for chapter_num, body in enumerate(chapters, 1):
-        for shot_num, body_chunk in enumerate(smart_chunk_text(body, target), 1):
+    n = len(indexes)
+    if not n:
+        return []
+    words = [len(sentences[i].split()) for i in indexes]
+    para_cap = max(1.0, target * (1.0 + PARA_SLACK))
+
+    unit_words: List[int] = []
+    unit_ends_para: List[bool] = []
+    unit_first: List[int] = []
+    start = 0
+    for i in range(n):
+        if not para_breaks[indexes[i]] and i < n - 1:
+            continue
+        span = range(start, i + 1)
+        total = sum(words[k] for k in span)
+        if total <= para_cap or len(span) == 1:
+            unit_words.append(total)
+            unit_ends_para.append(True)
+            unit_first.append(start)
+        else:
+            for k in span:
+                unit_words.append(words[k])
+                unit_ends_para.append(k == i)
+                unit_first.append(k)
+        start = i + 1
+
+    total = sum(words)
+    floor = max(1, round(target * CHUNK_FLOOR_RATIO))
+    cuts = split_group(unit_words, unit_ends_para, [False] * len(unit_words),
+                       target, best_k(total, target), floor,
+                       max_words=target * CHUNK_MAX_RATIO)
+    out: List[Tuple[int, int]] = []
+    for a, b in zip(cuts, cuts[1:]):
+        first = unit_first[a]
+        last = unit_first[b] - 1 if b < len(unit_first) else n - 1
+        if out and first <= out[-1][1]:
+            out[-1] = (out[-1][0], last)
+        else:
+            out.append((first, last))
+    return out
+
+
+def linear_chunks(text: str, target: int = TARGET_WORDS,
+                  version: int = CHUNKER_VERSION) -> List[Chunk]:
+    """Chunks for a book, numbered by the packer named in ``version``.
+
+    ``group`` is 0: there is no group without a scene map. ``first_sentence`` /
+    ``last_sentence`` are absolute sentence numbers in the transcript - the same
+    coordinate ``chunk_map`` reports - and 0 for the frozen v1 packer, which
+    works on text and never learned where its boundaries landed.
+    """
+    text = text.replace("\r\n", "\n")
+    if version == LINEAR_V1:
+        chapters = [c for c in text.split(CHAPTER_MARKER) if c.strip()]
+        out: List[Chunk] = []
+        for chapter_num, body in enumerate(chapters, 1):
+            for shot_num, body_chunk in enumerate(smart_chunk_text(body, target), 1):
+                out.append(Chunk(chapter=chapter_num, shot=shot_num, group=0,
+                                 group_global=0, first_sentence=0, last_sentence=0,
+                                 scenes=(), text=body_chunk))
+        return out
+
+    sentences, para_breaks = split_sentences(text)
+    chapters = chapter_of_unit(sentences)
+    drop = furniture_indices(sentences)
+    by_chapter: Dict[int, List[int]] = {}
+    for i, chapter in enumerate(chapters):
+        by_chapter.setdefault(chapter, []).append(i)
+
+    out = []
+    for chapter_num in sorted(by_chapter):
+        indexes = by_chapter[chapter_num]
+        for shot_num, (a, b) in enumerate(
+                _pack_chapter(indexes, sentences, para_breaks, target), 1):
+            span = list(range(a, b + 1))
+            keep = [k for k in span if (indexes[k] + 1) not in drop]
+            if not keep:                    # a chunk of pure chapter machinery
+                keep = span
             out.append(Chunk(
                 chapter=chapter_num,
                 shot=shot_num,
                 group=0,
                 group_global=0,
-                first_sentence=0,
-                last_sentence=0,
+                first_sentence=indexes[a] + 1,
+                last_sentence=indexes[b] + 1,
                 scenes=(),
-                text=body_chunk,
+                text=" ".join(sentences[indexes[k]] for k in keep),
             ))
     return out
 
@@ -1282,13 +1399,17 @@ def prompts_have_rows(book_dir) -> bool:
 def book_source(book_dir, prompts_exist: Optional[bool] = None) -> str:
     """The chunking that owns this book: ``"scene_map"`` or ``"linear"``.
 
+    Retained for books already numbered by a scene map. The pipeline no longer
+    builds maps, so every caller in the app passes ``source="linear"``
+    explicitly; this remains as the read side for a legacy book and for the
+    retired cast path, which positions its facts by group.
+
     Once a book has prompt rows, the pipeline manifest is authoritative: a book
     generated linearly stays linear even if a map is built later, because
     switching would silently redefine every shot. Before any rows exist nothing
     is at risk, so the project's analysis mode decides: ``fast`` keeps the linear
-    chunker even when a map exists, and ``scenes``/``full`` prefer the map. That
-    keeps a crashed first run recoverable. A book with rows and no manifest is
-    legacy and stays linear.
+    chunker even when a map exists, and ``scenes``/``full`` prefer the map. A book
+    with rows and no manifest is legacy and stays linear.
     """
     if prompts_exist is None:
         prompts_exist = prompts_have_rows(book_dir)
@@ -1308,16 +1429,38 @@ def book_source(book_dir, prompts_exist: Optional[bool] = None) -> str:
     return "linear"
 
 
+def chunker_version(book_dir, prompts_exist: Optional[bool] = None) -> int:
+    """Which linear packer owns this book's ``(chapter, shot)`` numbering.
+
+    A recorded version wins. A book with prompt rows and no record was numbered
+    by the greedy v1 packer, and must keep it: re-deriving its chunks under v2
+    would point every existing shot at different text. A book with no rows is
+    free to use the current packer, so a fresh project always gets v2.
+    """
+    from services import pipeline_manifest
+    recorded = pipeline_manifest.read(book_dir).get("chunker_version")
+    try:
+        if recorded:
+            return int(recorded)
+    except (TypeError, ValueError):
+        pass
+    if prompts_exist is None:
+        prompts_exist = prompts_have_rows(book_dir)
+    return LINEAR_V1 if prompts_exist else CHUNKER_VERSION
+
+
 def book_chunks(book_dir, target: int = TARGET_WORDS, log=None,
                 text: Optional[str] = None,
-                source: Optional[str] = None) -> Tuple[List[Chunk], str]:
+                source: Optional[str] = None,
+                version: Optional[int] = None) -> Tuple[List[Chunk], str]:
     """``(chunks, source)`` for a book, honoring the chunking it is bound to.
 
     ``source`` defaults to :func:`book_source`. A book bound to a scene map whose
     map is missing or no longer matches the transcript raises
     :class:`StaleSceneMap` instead of falling back to the linear chunker:
     silently changing what ``(chapter, shot)`` means is exactly the failure this
-    exists to prevent.
+    exists to prevent. ``version`` picks the linear packer and defaults to the one
+    the book is recorded with.
     """
     book_dir = Path(book_dir)
     if text is None:
@@ -1326,10 +1469,10 @@ def book_chunks(book_dir, target: int = TARGET_WORDS, log=None,
             raise FileNotFoundError(transcript)
         text = transcript.read_text(encoding="utf-8", errors="ignore")
     text = text.replace("\r\n", "\n")
-    sentences, para_breaks = split_sentences(text)
     source = source or book_source(book_dir)
 
     if source == "scene_map":
+        sentences, para_breaks = split_sentences(text)
         path = scene_map_path(book_dir)
         if not path.exists():
             raise StaleSceneMap(
@@ -1347,12 +1490,13 @@ def book_chunks(book_dir, target: int = TARGET_WORDS, log=None,
                 f"transcript or segmentation version; re-run scene analysis")
         chunks = chunk_map(scenes, sentences, para_breaks, target=target)
         if log:
-            log(f"[Scene-Map] chunking from the map: {len(scenes)} scenes -> "
+            log(f"[Chunker] chunking from the map: {len(scenes)} scenes -> "
                 f"{len(chunks)} chunks")
         return chunks, "scene_map"
 
-    chunks = linear_chunks(text, target)
+    version = chunker_version(book_dir) if version is None else int(version)
+    chunks = linear_chunks(text, target, version=version)
     if log:
-        log(f"[Scene-Map] linear chunking for '{book_dir.name}' -> "
+        log(f"[Chunker] linear v{version} for '{book_dir.name}' -> "
             f"{len(chunks)} chunks")
     return chunks, "linear"

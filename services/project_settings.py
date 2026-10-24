@@ -36,6 +36,11 @@ def save_project_settings_to_disk(project_id: int) -> None:
         "playground_chunk_size": state.playground_chunk_size,
         "cast_enabled": bool(state.cast_enabled),
         "carried_mode": str(state.carried_mode or "scene"),
+        "description_steps": list(state.description_steps or []),
+        "reference_path": str(state.reference_path or ""),
+        "wiki_url": str(state.wiki_url or ""),
+        "wiki_term": str(state.wiki_term or ""),
+        "mcp_series_name": str(state.mcp_series_name or ""),
     }
     
     try:
@@ -70,6 +75,11 @@ def load_project_settings_from_disk(project_id: int) -> None:
         state.playground_chunk_size = 350
         state.cast_enabled = True
         state.carried_mode = "scene"
+        state.description_steps = []
+        state.reference_path = ""
+        state.wiki_url = ""
+        state.wiki_term = ""
+        state.mcp_series_name = ""
         load_style_preset_by_name(state.style_selected_preset)
         return
 
@@ -91,6 +101,11 @@ def load_project_settings_from_disk(project_id: int) -> None:
         state.cast_enabled = bool(data.get("cast_enabled", True))
         mode = str(data.get("carried_mode") or "scene")
         state.carried_mode = mode if mode in ("scene", "off", "always") else "scene"
+        state.description_steps = data.get("description_steps") or []
+        state.reference_path = str(data.get("reference_path") or "")
+        state.wiki_url = str(data.get("wiki_url") or "")
+        state.wiki_term = str(data.get("wiki_term") or "")
+        state.mcp_series_name = str(data.get("mcp_series_name") or "")
 
         # Loads the Character base + role deltas, the workflow, and the node overrides.
         load_style_preset_by_name(preset_name)

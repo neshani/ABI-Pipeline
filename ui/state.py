@@ -92,6 +92,21 @@ cast_enabled: bool = True
 # recorded it), "off" (never rendered, still stored) or "always" (carried
 # forward, the old behaviour). Per project, saved in project_settings.json.
 carried_mode: str = "scene"
+# Bulk description sources, in the order they run. Empty means the defaults from
+# services.description_runner.STEPS (reference, wiki, mcp on; transcript off).
+description_steps: List[Dict[str, Any]] = []
+# How many known traits a character may have and still be picked up by a bulk
+# description run. 0 means "only the ones with nothing yet", which is the point:
+# chasing the last missing field for 300 characters buys nothing.
+bulk_threshold: int = 0
+# The reference document and the one wiki site this project imports from. Per
+# project: they are series data, not app configuration.
+reference_path: str = ""
+wiki_url: str = ""
+wiki_term: str = ""
+# How the series is named when asking the MCP server ("In the book series X,
+# describe Y"). The folder name is often wrong for that, so it is its own field.
+mcp_series_name: str = ""
 # Volume ids ticked in the dashboard table. Ticked volumes narrow the run; an
 # empty list means the whole project.
 pipeline_selected_books: List[int] = []

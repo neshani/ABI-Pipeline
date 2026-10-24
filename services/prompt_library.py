@@ -126,7 +126,7 @@ def compose(role: str, variant: Optional[str] = None) -> str:
 
 def render(role: str, passage: str, variant: Optional[str] = None) -> str:
     """The exact string sent to the LLM for one passage."""
-    return compose(role, variant).replace("<text>", passage)
+    return neutralise(compose(role, variant).replace("<text>", passage))
 
 
 def render_from(shared: str, fragment: str, passage: str) -> str:
@@ -135,7 +135,18 @@ def render_from(shared: str, fragment: str, passage: str) -> str:
     Used by the editor so unsaved drafts can be tested without being saved,
     which is the sandbox behaviour the old playground had.
     """
-    return assemble(shared, fragment).replace("<text>", passage)
+    return neutralise(assemble(shared, fragment).replace("<text>", passage))
+
+
+def neutralise(text: str) -> str:
+    """Resolve markers a caller had no value for, so a preview never shows one.
+
+    ``<focus>`` and ``<place_rules>`` are filled by ``render_with_selection``
+    when a plan exists. A preview or a test bench has no plan, and a literal
+    ``<place_rules>`` in the prompt is worse than no setting line at all.
+    """
+    return (text.replace("<place_rules>", "")
+                .replace("<focus>", _FOCUS_FALLBACK))
 
 
 def variant_stem(slot: str, name: str) -> str:
@@ -245,8 +256,28 @@ def active_selection() -> Dict[str, str]:
 _FOCUS_FALLBACK = "the most memorable moment in the passage"
 
 
+def place_rules(place: str) -> str:
+    """The setting paragraph for the shared block, or "" when no place is known.
+
+    The planner names where each passage stands. Without it the prompt model has
+    only the passage to go on, and a passage that is pure dialogue names no place
+    at all - which is how a forest camp became a room with a table and a hearth
+    in 29 of 328 outdoor scenes. The passage still wins: the planner reads a
+    chapter at a time and can be a shot behind, so a place the text contradicts
+    is not to be drawn.
+    """
+    place = (place or "").strip().strip(".")
+    if not place:
+        return ""
+    return ("- Setting: the passage stands in " + place + ". Keep the image in "
+            "that kind of place, with its own ground, structures, and furniture. "
+            "If the shot is a close-up of one thing, the setting is only what "
+            "shows behind it. If the passage names or clearly shows a different "
+            "place, the passage wins; never contradict it to match this line.")
+
+
 def render_with_selection(role: str, passage: str, selection: Dict[str, str],
-                          focus: str = "") -> str:
+                          focus: str = "", place: str = "") -> str:
     """Compose a scene prompt from a captured selection rather than live settings.
 
     ``focus`` is the Shot Planner's phrase for this shot - "Rand running", "a print in the
@@ -254,8 +285,13 @@ def render_with_selection(role: str, passage: str, selection: Dict[str, str],
     chosen a focus for this shot: <focus>") and for a long time nothing filled it in, so the
     instruction dangled and the prompt model had to work the subject out for itself. With no
     focus the sentence still reads.
+
+    ``place`` is the planner's setting for the shot. It fills the shared block's
+    ``<place_rules>`` marker, and that whole paragraph is dropped when no place is
+    known, so a shared variant that does not carry the marker is unaffected.
     """
     shared = read_variant("shared", selection.get("shared", "shared"))
     fragment = read_variant(role, selection.get(role, role))
     text = assemble(shared, fragment).replace("<text>", passage)
-    return text.replace("<focus>", (focus or "").strip() or _FOCUS_FALLBACK)
+    text = text.replace("<focus>", (focus or "").strip() or _FOCUS_FALLBACK)
+    return text.replace("<place_rules>", place_rules(place))

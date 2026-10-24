@@ -997,6 +997,20 @@ _DETERMINERS = ("a ", "an ", "the ", "one ", "his ", "her ", "their ")
 _HUMAN_SPECIES = {"human", "person", "people", "man", "woman"}
 
 
+def is_non_human(species: str) -> bool:
+    """Whether a species value says "not an ordinary human".
+
+    There is deliberately no vocabulary of allowed species: a project may invent
+    any, and a whitelist would either be series-specific or reject them. The
+    useful signal is the opposite one - an empty value means human by default, so
+    anything present is a claim the user should see. That is also what makes junk
+    visible: a status such as "ta'veren" filed as a species shows up here and can
+    be deleted in one keystroke.
+    """
+    text = (species or "").strip().lower()
+    return bool(text) and text not in _HUMAN_SPECIES
+
+
 # --- pinned traits ----------------------------------------------------------
 #
 # A pin is deliberately narrower than Character.locked: it says "this field
