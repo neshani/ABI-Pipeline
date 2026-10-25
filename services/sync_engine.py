@@ -203,6 +203,11 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
                 reader = csv.reader(f, delimiter="|")
                 rows = list(reader)
 
+            # Local import: prompt_engine imports scene_map and ui.state, and this
+            # module is imported by main.py before either is needed.
+            from services.prompt_engine import is_unusable_prompt
+
+
             if rows:
                 header = rows[0]
                 header_clean = compat.normalize_fieldnames(header)
@@ -233,8 +238,9 @@ def sync_book_from_disk(book_id: int, session: Session) -> None:
                         continue
                     
                     prompt_text = row[pr_idx].strip() if len(row) > pr_idx else ""
-                    # Ignore unpopulated, NONE, or skipped refusal prompts in rendering counts
-                    if not prompt_text or prompt_text.lower() == "none" or prompt_text.lower() == "refusal":
+                    # Unpopulated, NONE, declined and refused rows are not scenes
+                    # that could have been rendered, so they stay out of the counts.
+                    if is_unusable_prompt(prompt_text):
                         continue
 
                     try:

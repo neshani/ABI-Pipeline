@@ -153,7 +153,7 @@ def copy_diagnostic_primer_to_clipboard():
 
     run_data_lines.append("### Segment Evaluation Output:")
     for idx, res in enumerate(state.playground_results):
-        status_label = "Refusal Skipped" if res.get("status") == "refusal" else "Extraction Match"
+        status_label = "Refusal Skipped" if res.get("status") in ("refusal", "declined") else "Extraction Match"
         run_data_lines.append(f"#### Segment Chunk {idx + 1} ({status_label})")
         run_data_lines.append(f"**Source Text Passage:**\n> \"{res['chunk']}\"\n")
         run_data_lines.append(f"**Extracted Verbatim Quote:**\n> \"{res['quote']}\"\n")
@@ -211,7 +211,7 @@ def copy_results_to_clipboard():
 
     markdown_lines.append("### Segment Evaluation Output:")
     for idx, res in enumerate(state.playground_results):
-        status_label = "Refusal Skipped" if res.get("status") == "refusal" else "Extraction Match"
+        status_label = "Refusal Skipped" if res.get("status") in ("refusal", "declined") else "Extraction Match"
         markdown_lines.append(f"#### Segment Chunk {idx + 1} ({status_label})")
         markdown_lines.append(f"**Source Text Passage:**\n> \"{res['chunk']}\"\n")
         markdown_lines.append(f"**Extracted Verbatim Quote:**\n> \"{res['quote']}\"\n")
@@ -285,7 +285,7 @@ def render_playground_results_container():
 
     with ui.column().classes('w-full gap-4'):
         for idx, res in enumerate(state.playground_results):
-            is_refusal = res.get("status") == "refusal"
+            is_refusal = res.get("status") in ("refusal", "declined")
             border_color = "border-red-200 bg-red-50/20" if is_refusal else "border-slate-200 bg-white"
             badge_color = "bg-red-50 text-red-700 border border-red-200" if is_refusal else "bg-blue-50 text-blue-700 border border-blue-200"
             badge_label = "Refusal Skipped" if is_refusal else "Extraction Match"

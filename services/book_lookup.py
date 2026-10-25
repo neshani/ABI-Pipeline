@@ -31,6 +31,8 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from services import trait_vocab
+
 MAX_PARAGRAPHS = 14
 MAX_PARAGRAPH_CHARS = 900
 
@@ -58,7 +60,7 @@ _EXTRACT_PROMPT = (
     'Reply with JSON only: {"sex","species","age","height","build","hair_color",'
     '"hair_style","eye_color"} - null for anything not stated. No prose, no fence.\n'
     "Shapes: sex = male|female. species = lowercase noun, null for a human. "
-    "age = young|adult|middle-aged|old. height = as the text says it, including "
+    "age = child|teen|young|adult|middle-aged|old. height = as the text says it, including "
     "comparisons (\"half a head shorter than Rand\"). build = adjectives only. "
     "hair_color/eye_color = colour words. hair_style = a short phrase."
 )
@@ -112,13 +114,21 @@ def cue_paragraphs(books: Sequence[Tuple[str, str]], aliases: Sequence[str],
 
 
 def _mentions(answer: str, aliases: Sequence[str]) -> bool:
-    """Does a 'who is described' answer name this character?"""
-    text = _clean(answer).lower()
-    if not text or text.startswith(("none", "no one", "nobody")):
+    """Does a 'who is described' answer name this character?
+
+    Word boundaries rather than a length heuristic. The first version required a
+    first token of four characters or more, which quietly made every three-letter
+    name in a project unattributable - "Tam", "Mat", "Min", "Lan" all came back as
+    "none of the candidate paragraphs describe this character" while the model had
+    named them correctly. ``\\b`` is what keeps "Mat" out of "Math" without
+    refusing the name itself.
+    """
+    text = _clean(answer)
+    if not text or text.lower().startswith(("none", "no one", "nobody")):
         return False
     for alias in aliases:
-        token = alias.strip().lower().split(" ")[0]
-        if len(token) >= 4 and token in text:
+        alias = (alias or "").strip()
+        if alias and re.search(r"\b" + re.escape(alias) + r"\b", text, re.I):
             return True
     return False
 
@@ -213,27 +223,11 @@ async def lookup(
 
 
 def merge_height(fields: Dict[str, str]) -> Dict[str, str]:
-    """Fold ``height`` into ``build``, the field that renders.
+    """Fold ``height`` into ``build`` and put both into the canonical vocabulary.
 
     There is no height column by design: heights asked for separately from build
-    drift apart, and a number in the prompt does not help an image model. The
-    verbal part of build is kept first so the clause still reads, with the
-    height - often a comparison ("half a head shorter than Rand") - appended.
+    drift apart, and a measurement in the prompt does not help an image model.
+    ``8'3" tall`` becomes ``tall`` and ``170 pounds`` disappears, which is why this
+    runs on the way in from the extractor rather than at render time.
     """
-    out = dict(fields)
-    height = _clean(out.pop("height", ""))
-    build = _clean(out.get("build", ""))
-    if height and build:
-        if height.lower() in build.lower():
-            pass
-        elif build.lower() in height.lower():
-            build = height
-        else:
-            build = f"{build}, {height}"
-    elif height:
-        build = height
-    if build:
-        out["build"] = build
-    else:
-        out.pop("build", None)
-    return out
+    return trait_vocab.normalise_traits(fields)

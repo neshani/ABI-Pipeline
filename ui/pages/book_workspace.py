@@ -11,6 +11,7 @@ from database.connection import engine, get_setting
 from database.models import Book, Project, Character, CharacterAlias, CharacterTimelineEvent
 from services.character_manager import (
     compile_character_visual_prompt,
+    is_placeholder_description,
     replace_character_tags_in_prompt,
     save_project_characters_to_json,
     ensure_book_orders,
@@ -437,8 +438,10 @@ def render_book_tabs(book_id: int):
                 print(f"[Proofreader-Chips] Could not compile '{char.name}': {exc}")
                 return f"{char.name} (description unavailable)"
             text = (text or "").strip()
-            # With no traits and no override the compiler hands the name back bare.
-            if not text or text == char.name:
+            # With no traits and no override the compiler names the character as
+            # the fallback; there is no visual description to report yet.
+            if (not text or text == char.name
+                    or is_placeholder_description(text)):
                 return f"{char.name} (no description yet)"
             return text
 
@@ -1125,7 +1128,9 @@ def render_book_tabs(book_id: int):
         role = style_library.normalize_role(row.get("shot_role"))
 
         from services import shot_planner, prompt_library
-        from services.prompt_engine import get_llm_response, parse_llm_response, REFUSAL_KEYWORDS
+        from services.prompt_engine import (
+            get_llm_response, parse_llm_response, REFUSAL_KEYWORDS, is_unusable_prompt,
+        )
 
         try:
             chunk = shot_planner.scene_chunk(project_name, book_name, ch, sc)
@@ -1159,13 +1164,24 @@ def render_book_tabs(book_id: int):
         parsed = parse_llm_response(raw_text)
         # ``parse_llm_response`` falls back to the whole reply as the prompt when
         # the model ignores the QUOTE/PROMPT format, which would let a plain
-        # refusal overwrite a good prompt. Reject those here.
+        # refusal overwrite a good prompt. Reject those here - and reject a
+        # lawful decline too: the INSERT fragment answers NONE when the passage
+        # holds nothing worth showing close, and writing "NONE" into the row only
+        # parks the same hole in the file for the renderer to skip.
         looks_like_refusal = any(k in raw_text.lower() for k in REFUSAL_KEYWORDS)
-        if parsed["status"] == "refusal" or looks_like_refusal or not parsed.get("prompt"):
+        if is_unusable_prompt(parsed.get("prompt")) or looks_like_refusal:
             state.add_console_log(
-                f"[Theater] No usable prompt for Ch {ch}, Scene {sc}:\n{parsed.get('raw', '')}"
+                f"[Theater] No usable {SHOT_ROLE_LABELS[role]} prompt for Ch {ch}, Scene {sc}:\n"
+                f"{parsed.get('raw', '')}"
             )
-            ui.notify("The LLM declined or returned nothing. Prompt left unchanged.", type="warning")
+            alternatives = prompt_library.fallback_roles(role)
+            if parsed.get("status") == "declined" and alternatives:
+                hint = (f" This passage suits {SHOT_ROLE_LABELS.get(alternatives[0], alternatives[0])}"
+                        f" better - switch the shot type and try again.")
+            else:
+                hint = " Prompt left unchanged."
+            ui.notify(f"The {SHOT_ROLE_LABELS[role]} prompt declined this passage.{hint}",
+                      type="warning", timeout=6.0)
             return
 
         row["prompt"] = parsed["prompt"]

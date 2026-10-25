@@ -30,6 +30,24 @@ class ComfyClient:
         Scans for standard KSamplers, custom samplers, schedulers, checkpoint loaders, etc.
         """
         discovered = {}
+
+        # A ComfySwitchNode routes one of its two branch inputs to its output, so
+        # the branch it takes when switched on is the feature it gates. Record both
+        # directions up front: a switch can then say what it enables, and the gated
+        # node can say which switch turns it on.
+        switch_targets: Dict[str, str] = {}   # switch id -> class_type it enables
+        gated_by: Dict[str, str] = {}         # gated id  -> switch id that enables it
+        for node_id, node_data in workflow_json.items():
+            if node_data.get("class_type") != "ComfySwitchNode":
+                continue
+            ref = node_data.get("inputs", {}).get("on_true")
+            if not (isinstance(ref, (list, tuple)) and ref):
+                continue
+            target_id = str(ref[0])
+            target = workflow_json.get(target_id) or {}
+            switch_targets[node_id] = target.get("class_type", "")
+            gated_by[target_id] = node_id
+
         for node_id, node_data in workflow_json.items():
             class_type = node_data.get("class_type", "")
             inputs = node_data.get("inputs", {})
@@ -203,6 +221,45 @@ class ComfyClient:
                         "vae_name": vae_name
                     }
                 }
+            elif class_type in ["SkipLayerGuidanceDiTSimple", "SkipLayerGuidanceDiT"]:
+                single_layers = inputs.get("single_layers", "")
+                double_layers = inputs.get("double_layers", "")
+                start_percent = inputs.get("start_percent", 0.0)
+                end_percent = inputs.get("end_percent", 0.5)
+
+                if not isinstance(single_layers, str): single_layers = ""
+                if not isinstance(double_layers, str): double_layers = ""
+                if not isinstance(start_percent, (int, float)): start_percent = 0.0
+                if not isinstance(end_percent, (int, float)): end_percent = 0.5
+
+                discovered[node_id] = {
+                    "type": "skip_layer_guidance",
+                    "title": title,
+                    "class_type": class_type,
+                    "params": {
+                        "double_layers": double_layers,
+                        "single_layers": single_layers,
+                        "start_percent": float(start_percent),
+                        "end_percent": float(end_percent),
+                        "gate_node": gated_by.get(node_id, "")
+                    }
+                }
+            elif class_type == "ComfySwitchNode":
+                value = inputs.get("switch", False)
+                if not isinstance(value, bool):
+                    value = False
+
+                enables = switch_targets.get(node_id, "")
+
+                discovered[node_id] = {
+                    "type": "switch",
+                    "title": f"{title} → {enables}" if enables else title,
+                    "class_type": class_type,
+                    "params": {
+                        "switch": value,
+                        "enables": enables
+                    }
+                }
             elif class_type == "PrimitiveBoolean":
                 value = inputs.get("value", False)
                 if not isinstance(value, bool):
@@ -216,6 +273,13 @@ class ComfyClient:
                         "value": value
                     }
                 }
+        # Gates first: reading "SLG is gated by switch 18_32" is useless if the
+        # switch appears further down the panel.
+        switch_nodes = {k: v for k, v in discovered.items() if v["type"] == "switch"}
+        if switch_nodes:
+            rest = {k: v for k, v in discovered.items() if v["type"] != "switch"}
+            discovered = {**switch_nodes, **rest}
+
         return discovered
 
     def generate_image_sync(

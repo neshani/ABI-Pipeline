@@ -109,7 +109,7 @@ class CharacterTimelineEvent(SQLModel, table=True):
     # extractor; the rest are short noun phrases.
     sex: Optional[str] = Field(default=None)            # male | female
     species: Optional[str] = Field(default=None)        # human unless stated
-    age: Optional[str] = Field(default=None)            # young | adult | middle-aged | old
+    age: Optional[str] = Field(default=None)            # child | teen | young | adult | middle-aged | old
     hair_color: Optional[str] = Field(default=None)
     hair_style: Optional[str] = Field(default=None)
     eye_color: Optional[str] = Field(default=None)

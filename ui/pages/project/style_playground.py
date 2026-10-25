@@ -142,7 +142,9 @@ def resolve_best_model_match(available_checkpoints: List[str], workflow_name: st
 
 def save_default_to_workflow(workflow_name: str, node_id: str, param_key: str, value: Any) -> bool:
     """Writes an updated input value directly back to the active ComfyUI workflow JSON file."""
-    if not workflow_name or not value:
+    # False and 0 are legitimate defaults (a switch that ships off); only blanks
+    # and a missing workflow are refused.
+    if not workflow_name or value is None or (isinstance(value, str) and not value.strip()):
         return False
         
     wf_path = Path("./workflows") / workflow_name
@@ -703,6 +705,25 @@ def _get_resolved_workflow_settings() -> List[str]:
         elif node_type == "primitive_boolean":
             val = overrides.get("value", params.get("value"))
             lines.append(f"  - `value`: {val}")
+        elif node_type == "switch":
+            val = overrides.get("switch", params.get("switch"))
+            enables = params.get("enables", "")
+            lines.append(f"  - `switch`: {val}" + (f"  (enables {enables})" if enables else ""))
+        elif node_type == "skip_layer_guidance":
+            single = overrides.get("single_layers", params.get("single_layers", ""))
+            double = overrides.get("double_layers", params.get("double_layers", ""))
+            start = overrides.get("start_percent", params.get("start_percent"))
+            end = overrides.get("end_percent", params.get("end_percent"))
+            gate = params.get("gate_node", "")
+            lines.append(f"  - `single_layers`: {single}")
+            lines.append(f"  - `double_layers`: {double}")
+            lines.append(f"  - `start_percent`: {start}")
+            lines.append(f"  - `end_percent`: {end}")
+            if gate:
+                gate_params = state.style_discovered_params.get(gate, {}).get("params", {})
+                gate_on = state.style_workflow_overrides.get(gate, {}).get(
+                    "switch", gate_params.get("switch", False))
+                lines.append(f"  - gated by switch `{gate}`: {'on' if gate_on else 'off'}")
             
     return lines
 
@@ -2040,7 +2061,12 @@ def render_workflow_overrides_ui():
             # Evaluate warnings on the active node
             node_warnings = analyze_node_for_warnings(node_id, data)
             
-            if node_type == "primitive_boolean":
+            if node_type in ("primitive_boolean", "switch"):
+                # A ComfySwitchNode carries its boolean on `switch`, a primitive
+                # boolean on `value`. The override key has to match the workflow's
+                # own input name or comfy_client drops it silently on submit.
+                toggle_key = "switch" if node_type == "switch" else "value"
+
                 # Clean up Boolean title wrappers to look premium
                 clean_title = node_title
                 if clean_title.startswith("Boolean (") and clean_title.endswith(")"):
@@ -2048,7 +2074,7 @@ def render_workflow_overrides_ui():
                 elif clean_title.startswith("Boolean "):
                     clean_title = clean_title[8:]
                 
-                current_val = state.style_workflow_overrides.get(node_id, {}).get("value", params["value"])
+                current_val = state.style_workflow_overrides.get(node_id, {}).get(toggle_key, params.get(toggle_key))
                 if not isinstance(current_val, bool):
                     current_val = False
                     
@@ -2063,12 +2089,12 @@ def render_workflow_overrides_ui():
                     with ui.row().classes('items-center gap-2'):
                         ui.switch(
                             value=current_val,
-                            on_change=lambda e, nid=node_id: (update_override_state(nid, "value", bool(e.value)), render_workflow_overrides_ui.refresh())
+                            on_change=lambda e, nid=node_id, key=toggle_key: (update_override_state(nid, key, bool(e.value)), render_workflow_overrides_ui.refresh())
                         ).props('dense size=sm')
                         
                         ui.button(
                             icon='save',
-                            on_click=lambda nid=node_id, val=current_val: save_default_to_workflow(state.style_selected_workflow, nid, "value", val)
+                            on_click=lambda nid=node_id, key=toggle_key, val=current_val: save_default_to_workflow(state.style_selected_workflow, nid, key, val)
                         ).props('flat round size=sm').classes('text-blue-600').tooltip("Save default state to workflow file (.json)")
             else:
                 # Apply visual feedback color and prefix icon labels
@@ -2340,6 +2366,86 @@ def render_workflow_overrides_ui():
                                     icon='save',
                                     on_click=lambda nid=node_id, val=current_mult: save_default_to_workflow(state.style_selected_workflow, nid, "multiple", val)
                                 ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default multiple to workflow file (.json)")
+
+                        elif node_type == "skip_layer_guidance":
+                            current_single = state.style_workflow_overrides.get(node_id, {}).get("single_layers", params.get("single_layers", ""))
+                            current_double = state.style_workflow_overrides.get(node_id, {}).get("double_layers", params.get("double_layers", ""))
+                            current_start = state.style_workflow_overrides.get(node_id, {}).get("start_percent", params.get("start_percent", 0.0))
+                            current_end = state.style_workflow_overrides.get(node_id, {}).get("end_percent", params.get("end_percent", 0.5))
+
+                            if isinstance(current_single, (list, dict)): current_single = ""
+                            if isinstance(current_double, (list, dict)): current_double = ""
+                            if isinstance(current_start, (list, dict)): current_start = 0.0
+                            if isinstance(current_end, (list, dict)): current_end = 0.5
+
+                            # The guidance node is inert unless the switch feeding the
+                            # sampler is on, so say which switch that is instead of
+                            # leaving the sliders looking broken.
+                            gate_id = params.get("gate_node", "")
+                            gate_on = False
+                            if gate_id:
+                                gate_default = state.style_discovered_params.get(gate_id, {}).get("params", {}).get("switch", False)
+                                gate_on = bool(state.style_workflow_overrides.get(gate_id, {}).get("switch", gate_default))
+
+                            ui.label(
+                                "Perturbs the listed transformer blocks on the conditional pass "
+                                "and re-applies them as guidance. Layer indices are comma-separated; "
+                                "leave Double Layers empty for a single-layer pass."
+                            ).classes('text-[10px] leading-snug text-slate-500')
+
+                            if gate_id:
+                                if gate_on:
+                                    with ui.row().classes('w-full items-center gap-1.5 p-2 bg-emerald-50 border border-emerald-200 rounded text-[10px] font-semibold text-emerald-800'):
+                                        ui.icon('bolt', size='xs', color='emerald')
+                                        ui.label(f"Active — switch {gate_id} is on.")
+                                else:
+                                    with ui.row().classes('w-full items-center gap-1.5 p-2 bg-amber-50 border border-amber-200 rounded text-[10px] font-semibold text-amber-800'):
+                                        ui.icon('warning', size='xs', color='amber')
+                                        ui.label(f"Inert until switch {gate_id} is turned on above.")
+
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.input(
+                                    label="Single Layers",
+                                    value=str(current_single),
+                                    on_change=lambda e, nid=node_id: update_override_state(nid, "single_layers", e.value)
+                                ).classes('flex-1')
+
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, val=current_single: save_default_to_workflow(state.style_selected_workflow, nid, "single_layers", val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default single layers to workflow file (.json)")
+
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.input(
+                                    label="Double Layers",
+                                    value=str(current_double),
+                                    on_change=lambda e, nid=node_id: update_override_state(nid, "double_layers", e.value)
+                                ).classes('flex-1')
+
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, val=current_double: save_default_to_workflow(state.style_selected_workflow, nid, "double_layers", val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default double layers to workflow file (.json)")
+
+                            with ui.row().classes('w-full items-end gap-2'):
+                                ui.number(
+                                    label="Start Percent",
+                                    value=current_start,
+                                    min=0.0, max=1.0, step=0.05,
+                                    on_change=lambda e, nid=node_id: update_override_state(nid, "start_percent", e.value)
+                                ).classes('flex-1')
+
+                                ui.number(
+                                    label="End Percent",
+                                    value=current_end,
+                                    min=0.0, max=1.0, step=0.05,
+                                    on_change=lambda e, nid=node_id: update_override_state(nid, "end_percent", e.value)
+                                ).classes('flex-1')
+
+                                ui.button(
+                                    icon='save',
+                                    on_click=lambda nid=node_id, val=current_end: save_default_to_workflow(state.style_selected_workflow, nid, "end_percent", val)
+                                ).props('flat round size=md').classes('text-blue-600 mb-1').tooltip("Save default end percent to workflow file (.json)")
 
                         elif node_type == "lora_loader":
                             current_lora_name = state.style_workflow_overrides.get(node_id, {}).get("lora_name", params["lora_name"])

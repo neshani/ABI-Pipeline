@@ -662,12 +662,17 @@ async def _prompt_phase(project_id: int, book_ids):
     await start_project_prompt_gen(project_id, book_ids)
 
 
-def _stage_targets(project_id: int, scope_ids, stage: str) -> list:
+def _stage_targets(project_id: int, scope_ids, stage: str,
+                   force: bool = False) -> list:
     """Book ids that need ``stage`` right now, from what is on disk.
 
     Recomputed between phases on purpose: prompts written a minute ago are what
     makes the next stage runnable, so a plan fixed at click time would leave every
     later stage doing nothing on a fresh project.
+
+    ``force`` is the run bar's "Even if current": it takes the scoped volumes
+    regardless of state, which is the only way to re-run a stage that looks
+    finished. Without it the checkbox enabled the button and then did nothing.
     """
     from services import pipeline_status
 
@@ -677,11 +682,12 @@ def _stage_targets(project_id: int, scope_ids, stage: str) -> list:
     plan, _rows = pipeline_status.plan(
         wanted,
         chunk_words=getattr(state, "playground_chunk_size", 350) or 350,
-        stages=(stage,))
+        stages=(stage,),
+        force=force)
     return plan.get(stage, [])
 
 
-async def _run_pipeline(project_id: int, scope_ids, stages):
+async def _run_pipeline(project_id: int, scope_ids, stages, force: bool = False):
     """Prompts for whatever needs them, in reading order.
 
     ``scope_ids`` limits the run to those volumes (None = the project). Each
@@ -701,7 +707,7 @@ async def _run_pipeline(project_id: int, scope_ids, stages):
                     "[Pipeline] Stopped between stages. Finished work is on disk; "
                     "Run picks up from here.")
                 return
-            ids = _stage_targets(project_id, scope_ids, stage)
+            ids = _stage_targets(project_id, scope_ids, stage, force)
             if not ids:
                 state.add_console_log(
                     f"[Pipeline] {stage}: nothing to do.")
@@ -730,12 +736,14 @@ def _refresh_after_run() -> None:
 
 
 def start_pipeline(project_id: int, scope_ids: Optional[List[int]] = None,
-                   stages: Optional[List[str]] = None) -> None:
+                   stages: Optional[List[str]] = None,
+                   force: bool = False) -> None:
     """Launch one dashboard run.
 
     ``scope_ids`` limits it to those volumes (``None`` = the whole project) and
     ``stages`` is the subset of ``prompts`` to consider; which volumes actually
-    run is recomputed as the run progresses.
+    run is recomputed as the run progresses. ``force`` re-runs the scoped volumes
+    even where the stage reads as current (the run bar's "Even if current").
     """
     if getattr(state, "pipeline_active", False):
         ui.notify("A pipeline run is already active.", type="warning")
@@ -752,7 +760,7 @@ def start_pipeline(project_id: int, scope_ids: Optional[List[int]] = None,
     state.active_task_type = "pipeline"
     state.cancel_pipeline_flag = False
     state.cancel_prompt_gen_flag = False
-    asyncio.create_task(_run_pipeline(project_id, scope_ids, chosen))
+    asyncio.create_task(_run_pipeline(project_id, scope_ids, chosen, force))
     ui.notify(f"Started: {', '.join(chosen)}. Progress is in the console.",
               type="positive")
     _refresh_after_run()
@@ -943,10 +951,10 @@ async def async_run_project_image_gen_logic(project_id: int):
             continue
 
         # Filter valid rows
+        from services.prompt_engine import is_unusable_prompt
         valid_rows = []
         for r in rows:
-            p_text = r.get("prompt", "").strip()
-            if p_text and p_text.lower() != "none" and p_text.lower() != "refusal":
+            if not is_unusable_prompt(r.get("prompt", "")):
                 valid_rows.append(r)
 
         total_prompts = len(valid_rows)

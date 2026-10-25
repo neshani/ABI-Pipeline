@@ -31,10 +31,11 @@ LOOKUP_FIELDS = ("sex", "species", "age", "height", "build", "hair_color",
 
 _SYSTEM = (
     "You research the physical appearance of a fictional character for an "
-    "illustration pipeline. Use the tools provided to find reference material. "
-    "Search at least once; read a page when the search snippet does not contain "
-    "an appearance description.\n"
+    "illustration pipeline. Use the tools provided to find reference material.\n"
     "Rules:\n"
+    "- Search at least once. If the search snippets do not themselves contain an "
+    "appearance description, open a result page with the page-reading tool before "
+    "answering. A snippet is a summary, not a source.\n"
     "- Report only what your sources state. Never guess, never fill a gap with "
     "what is typical for the setting, never use your own memory of the story.\n"
     "- Prefer sources that describe the book over screen adaptations.\n"
@@ -46,7 +47,7 @@ _SYSTEM = (
     "Field shapes:\n"
     "- sex: male or female.\n"
     "- species: lowercase noun; null for an ordinary human.\n"
-    "- age: young / adult / middle-aged / old, only if the source says so.\n"
+    "- age: child / teen / young / adult / middle-aged / old, only if the source says so.\n"
     "- height: as stated, e.g. 5'10\" or close to ten feet.\n"
     "- build: adjectives only, e.g. lean, stocky, broad-shouldered.\n"
     "- hair_color and eye_color: colour words only.\n"
@@ -128,6 +129,25 @@ def _is_colour(value: str) -> bool:
     return any(token in _COLOUR_WORDS for token in tokens)
 
 
+def short_phrase(value: str, limit: int = 90) -> str:
+    """One clause of a build, because a sentence of it renders as a paragraph.
+
+    Asked for adjectives the model usually gives adjectives, but a companion
+    volume's "About 5'7\" tall, a little shorter than Aviendha, she was quite
+    tall for an Andoran woman. Her brother Gawyn was a head taller than she."
+    arrives as build, and every word of it ends up in the image prompt. The first
+    sentence carries the usable half; the rest is comparison.
+    """
+    text = " ".join((value or "").split()).strip(" ,;")
+    text = re.sub(r"^(?:about|around|approximately|roughly)\s+", "", text, flags=re.I)
+    text = re.split(r"(?<=[.!?])\s+(?=[A-Z\"'])", text)[0]
+    if len(text) > limit:
+        cut = text[:limit]
+        comma = cut.rfind(",")
+        text = (cut[:comma] if comma > 30 else cut).rstrip(" ,;")
+    return text.strip(" ,;")
+
+
 def sanitise(fields: Dict[str, str]) -> Dict[str, str]:
     """Force the shapes the renderer expects.
 
@@ -145,6 +165,15 @@ def sanitise(fields: Dict[str, str]) -> Dict[str, str]:
                 out[field] = value
             else:
                 out.pop(field, None)
+    for field in ("build", "height"):
+        value = out.get(field)
+        if not value:
+            continue
+        value = short_phrase(value)
+        if value:
+            out[field] = value
+        else:
+            out.pop(field, None)
     sex = out.get("sex", "").strip().lower()
     if sex in ("m", "male"):
         out["sex"] = "male"
@@ -178,6 +207,7 @@ async def lookup_character(
     tool_prefs: Optional[Dict[str, bool]] = None,
     llm_url: str,
     model: str,
+    query: str = "",
     should_cancel: Optional[Callable[[], bool]] = None,
     log: Optional[Callable[[str], None]] = None,
 ) -> Dict:
@@ -187,6 +217,11 @@ async def lookup_character(
     and a per-round ``trace`` of tool calls. ``error`` is set when nothing could
     be looked up, so a misconfigured server is reported instead of being written
     down as "this character has no description".
+
+    ``query`` is a user-edited first search. It is offered rather than commanded -
+    the model rewords it when it returns nothing - but it is the only way to give
+    a search a specific book title, a disambiguating surname or a quoted phrase
+    without editing the prompt.
     """
     from services.prompt_engine import get_llm_response
 
@@ -196,7 +231,7 @@ async def lookup_character(
     client = mcp_client.McpHttpClient(mcp_url, mcp_auth)
     try:
         return await _lookup(client, name, series, tool_prefs=tool_prefs,
-                             llm_url=llm_url, model=model,
+                             llm_url=llm_url, model=model, query=query,
                              should_cancel=should_cancel, log=log,
                              started=started)
     finally:
@@ -204,8 +239,8 @@ async def lookup_character(
 
 
 async def _lookup(client, name: str, series: str, *, tool_prefs,
-                  llm_url: str, model: str, should_cancel, log, started: float
-                  ) -> Dict:
+                  llm_url: str, model: str, query: str = "", should_cancel, log,
+                  started: float) -> Dict:
     from services.prompt_engine import get_llm_response
 
     def say(message: str) -> None:
@@ -230,6 +265,8 @@ async def _lookup(client, name: str, series: str, *, tool_prefs,
         {"role": "user", "content": (
             f"Character: {name}\n"
             + (f"Book series: {series}\n" if series else "")
+            + (f"Start with this search query, verbatim: {query}\n"
+               if query else "")
             + "Find a physical description of this character.")},
     ]
     trace: List[Dict] = []

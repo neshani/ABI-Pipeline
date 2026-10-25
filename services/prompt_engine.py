@@ -31,6 +31,35 @@ REFUSAL_KEYWORDS = [
     "cannot fulfill", "as an ai", "language model"
 ]
 
+# Answers that mean "no image" instead of describing one. The INSERT fragment is
+# allowed to decline when a passage holds nothing worth showing close, and a model
+# that ignores the OUTPUT FORMAT echoes that refusal into the PROMPT line. The
+# sentinel has to be recognised in one place: the writer, the renderer, the
+# progress counters and the workspace all have to agree, or a declined row is
+# stored as if it were a prompt and then dropped silently further down - which is
+# how a book renders with a hole in it and still reports 100%.
+UNUSABLE_PROMPTS = {"", "none", "refusal", "n/a", "na", "nil", "-", "--", "..."}
+
+# Refusal words are only meaningful in a short reply. A real prompt can legitimately
+# contain "restricted" or "forbidden" ("a forbidden shrine"), and it is 20+ words long.
+_REFUSAL_MAX_WORDS = 12
+
+
+def is_unusable_prompt(text: Optional[str]) -> bool:
+    """True when ``text`` is empty, a ``NONE``/``REFUSAL`` sentinel, or a refusal echo.
+
+    The single definition of "this row cannot be rendered". Callers that decide
+    whether a prompt is worth storing or drawing must use it rather than comparing
+    against their own list of sentinels.
+    """
+    cleaned = (text or "").strip().strip('"\'*_`').strip().lower()
+    cleaned = cleaned.strip(".:;!?()[] ")
+    if not cleaned or cleaned in UNUSABLE_PROMPTS:
+        return True
+    if len(cleaned.split()) <= _REFUSAL_MAX_WORDS:
+        return any(keyword in cleaned for keyword in REFUSAL_KEYWORDS)
+    return False
+
 def ensure_templates_directory() -> Path:
     """Ensures prompt_templates folder exists and creates a default.txt file if empty."""
     templates_dir = Path("./prompt_templates")
@@ -220,14 +249,44 @@ def parse_llm_response(raw_response: str) -> Dict[str, str]:
 
     raw_lower = raw_response.lower()
     has_refusal_words = any(keyword in raw_lower for keyword in REFUSAL_KEYWORDS)
-    is_refusal = has_refusal_words and (not parsed_prompt or parsed_prompt == parsed_quote)
+
+    # A refusal is the stronger evidence: a short reply that says "I can't" is a
+    # refusal whether or not it lands in the PROMPT line. A decline is the lawful
+    # ``QUOTE: NONE`` / ``PROMPT: NONE`` answer the INSERT fragment is allowed to
+    # give. Either way the row is unusable - the split only decides what the
+    # console and ``refusals.log`` call it.
+    short_reply = len(parsed_prompt.split()) <= _REFUSAL_MAX_WORDS
+    if has_refusal_words and short_reply:
+        status = "refusal"
+    elif is_unusable_prompt(parsed_prompt):
+        status = "declined"
+    else:
+        status = "success"
 
     return {
         "raw": raw_response,
         "quote": parsed_quote,
         "prompt": parsed_prompt,
-        "status": "refusal" if is_refusal else "success"
+        "status": status
     }
+
+
+def _log_unusable(res: Dict[str, Any], chunk: str, log_path: Path) -> None:
+    """Replace a declined or refused result with the ``REFUSAL`` sentinel.
+
+    ``NONE`` is meaningful to the prompt model and meaningless to everything
+    downstream, so it is normalised to the sentinel the renderer, the progress
+    counters and the workspace already recognise. The raw reply is kept in
+    ``refusals.log``. The quote is the passage itself, because that is what the
+    row is *about* - it still places on the timeline even though it draws nothing.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    tried = " -> ".join([*(res.get("declined_roles") or []), "nothing"])
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(f"Chapter {res['chapter']}, Scene {res['shot']} "
+                     f"({tried}):\n{res.get('raw', '')}\n\n{'-' * 40}\n\n")
+    res["prompt"] = "REFUSAL"
+    res["quote"] = chunk
 
 
 def fetch_test_chunks(
@@ -278,19 +337,73 @@ async def generate_prompt_for_chunk_async(
     task: dict, 
     llm_url: str, 
     model_name: str, 
-    semaphore: asyncio.Semaphore
+    semaphore: asyncio.Semaphore,
+    extra_payload: Optional[Dict[str, Any]] = None,
+    simulate_decline: bool = False,
 ) -> dict:
     """Generates prompt for a single chunk using a concurrency semaphore.
 
     ``task["prompt"]`` is already fully composed (shared block plus the
     shot-role fragment chosen for this scene) by the caller.
+
+    A role may lawfully decline: the INSERT fragment answers ``NONE`` when the
+    passage holds nothing worth showing close. Declining is not an error, it is
+    the planner having picked a shot type the passage cannot fill, so the same
+    passage is re-asked under the next role in ``prompt_library.FALLBACK_ROLES``
+    (INSERT -> WIDE -> SINGLE) before anything is written. The role that actually
+    produced the text comes back as ``shot_role`` so the caller records it.
+
+    ``extra_payload`` is forwarded to the request body, so a caller that wants a
+    model's thinking mode off (the Prompt Lab does) still gets the same fallback
+    walk the pipeline uses. ``simulate_decline`` forces the first role's answer to
+    be the ``NONE`` sentinel; it exists so the Prompt Lab can demonstrate the walk
+    on demand, and nothing in the pipeline passes it.
     """
     async with semaphore:
-        final_prompt = task["prompt"]
-        raw_response = await get_llm_response(final_prompt, llm_url, model_name)
-        parsed = parse_llm_response(raw_response)
         # Local import: character_manager imports this module.
         from services.character_manager import auto_bracket_character_names
+        from services import prompt_library
+
+        original_role = task.get("shot_role") or "single"
+        chain = [original_role, *prompt_library.fallback_roles(original_role)]
+        role = original_role
+        parsed = None
+        declined: List[str] = []
+        for index, role in enumerate(chain):
+            if index == 0:
+                final_prompt = task["prompt"]
+            else:
+                # Rebuild from the same passage and the same plan, with a role the
+                # passage can satisfy. The shared block is identical, so this is one
+                # extra call, not a re-plan.
+                final_prompt = prompt_library.render_with_selection(
+                    role,
+                    task.get("chunk", ""),
+                    task.get("selection") or {},
+                    focus=task.get("focus", ""),
+                    place=task.get("place", ""),
+                )
+            if simulate_decline and index == 0:
+                # Prompt Lab only: a decline is not reliably reproducible on demand
+                # - the INSERT fragment refuses by judgement, not by rule - so the
+                # test bench can force the first answer to be the sentinel and watch
+                # the real fallback walk from there.
+                raw_response = "QUOTE: NONE\nPROMPT: NONE"
+            else:
+                raw_response = await get_llm_response(
+                    final_prompt, llm_url, model_name, extra_payload=extra_payload)
+            parsed = parse_llm_response(raw_response)
+            if parsed["status"] == "success":
+                break
+            declined.append(role)
+            nxt = chain[index + 1] if index + 1 < len(chain) else None
+            state.add_console_log(
+                f"[Prompt-Gen] Ch {task['chapter_num']} shot {task['shot_num']}: "
+                f"{role} {parsed['status']} the passage -> "
+                + (f"retrying as {nxt}" if nxt else "no role left to try")
+            )
+
+        used_role = role if parsed and parsed["status"] == "success" else original_role
         return {
             "chapter": task["chapter_num"],
             "shot": task["shot_num"],
@@ -298,6 +411,11 @@ async def generate_prompt_for_chunk_async(
             "prompt": auto_bracket_character_names(
                 parsed["prompt"], task.get("project_id") or 0),
             "status": parsed["status"],
+            "shot_role": used_role,
+            # Every role that came back unusable, in order. On a fallback that
+            # succeeded this is the roles it stepped over; on total failure it is
+            # the whole chain, so ``refusals.log`` names what was tried.
+            "declined_roles": declined,
             "raw": parsed["raw"]
         }
 
@@ -606,16 +724,23 @@ async def start_project_prompt_gen(project_id: int,
                 role = prompt_lib.resolve_role(
                     shot_map.get((chapter_num, shot_num)), shot_mode
                 ) or "single"
+                focus_for_shot = focus_map.get((chapter_num, shot_num), "")
+                place_for_shot = place_map.get((chapter_num, shot_num), "")
                 tasks.append({
                     "chunk": chunk_text,
                     "chapter_num": chapter_num,
                     "shot_num": shot_num,
                     "shot_role": role,
                     "project_id": project_id,
+                    # Carried so a declined role can be re-asked from the same
+                    # passage and the same plan without re-planning.
+                    "selection": selection,
+                    "focus": focus_for_shot,
+                    "place": place_for_shot,
                     "prompt": prompt_lib.render_with_selection(
                         role, chunk_text, selection,
-                        focus=focus_map.get((chapter_num, shot_num), ""),
-                        place=place_map.get((chapter_num, shot_num), "")),
+                        focus=focus_for_shot,
+                        place=place_for_shot),
                 })
 
             total_chunks = len(completed_scenes) + len(tasks)
@@ -689,17 +814,17 @@ async def start_project_prompt_gen(project_id: int,
 
             # Persist sequential Warm-up result
             if warm_up_res:
-                if warm_up_res["status"] == "refusal":
-                    ref_log_path = base_output_dir / project_name / book_name / "refusals.log"
-                    ref_log_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(ref_log_path, "a", encoding="utf-8") as ref_f:
-                        ref_f.write(f"Chapter {warm_up_res['chapter']}, Scene {warm_up_res['shot']}:\n{warm_up_res['raw']}\n\n{'-'*40}\n\n")
-                    warm_up_res["prompt"] = "REFUSAL"
-                    warm_up_res["quote"] = first_task["chunk"]
+                if warm_up_res["status"] in ("refusal", "declined"):
+                    _log_unusable(
+                        warm_up_res, first_task["chunk"],
+                        base_output_dir / project_name / book_name / "refusals.log")
 
                 with open(output_csv_path, "a", encoding="utf-8", newline="") as csv_f:
                     writer = csv.writer(csv_f, delimiter="|")
-                    writer.writerow([warm_up_res["chapter"], warm_up_res["shot"], warm_up_res["prompt"], warm_up_res["quote"], first_task.get("shot_role", "character")])
+                    writer.writerow([warm_up_res["chapter"], warm_up_res["shot"],
+                                     warm_up_res["prompt"], warm_up_res["quote"],
+                                     warm_up_res.get("shot_role")
+                                     or first_task.get("shot_role", "character")])
 
                 with Session(engine) as session:
                     db_book = session.get(Book, book_id)
@@ -746,20 +871,17 @@ async def start_project_prompt_gen(project_id: int,
                         return None
 
                     # Treat refusals and failures gracefully
-                    if res["status"] == "refusal":
-                        ref_log_path = base_output_dir / project_name / book_name / "refusals.log"
-                        ref_log_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(ref_log_path, "a", encoding="utf-8") as ref_f:
-                            ref_f.write(f"Chapter {res['chapter']}, Scene {res['shot']}:\n{res['raw']}\n\n{'-'*40}\n\n")
-                        
-                        # Store refusal in CSV with a placeholder for grid highlighting in Phase 5
-                        res["prompt"] = "REFUSAL"
-                        res["quote"] = task_data["chunk"]
+                    if res["status"] in ("refusal", "declined"):
+                        _log_unusable(
+                            res, task_data["chunk"],
+                            base_output_dir / project_name / book_name / "refusals.log")
 
                     # Append results to prompts.csv immediately
                     with open(output_csv_path, "a", encoding="utf-8", newline="") as csv_f:
                         writer = csv.writer(csv_f, delimiter="|")
-                        writer.writerow([res["chapter"], res["shot"], res["prompt"], res["quote"], task_data.get("shot_role", "character")])
+                        writer.writerow([res["chapter"], res["shot"], res["prompt"],
+                                         res["quote"], res.get("shot_role")
+                                         or task_data.get("shot_role", "character")])
 
                     # Update database progress in-place
                     with Session(engine) as session:

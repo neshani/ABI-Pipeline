@@ -723,7 +723,8 @@ def render_run_bar(project, ordered_books, rows_by_id, *, start_pipeline_cb,
                 # The selection *is* the scope, so it is always passed explicitly
                 # when non-empty; None means "the whole project".
                 scope_ids = [b.id for b in pool] if selected_ids else None
-                start_pipeline_cb(project.id, scope_ids, wanted)
+                start_pipeline_cb(project.id, scope_ids, wanted,
+                                  bool(getattr(state, "pipeline_run_force", False)))
 
             label = ('Resume' if resuming else 'Run')
             if volume_count:
@@ -1309,9 +1310,11 @@ def render_recent_prompts_feed():
                 ui.icon('science', size='md', color='slate-300')
                 ui.label('Feed is currently empty. Start prompt generation to stream live prompts here...').classes('text-xs text-center')
         else:
+            from services.prompt_engine import is_unusable_prompt
             with ui.column().classes('w-full gap-2'):
                 for item in reversed(state.recent_prompts):
-                    is_refusal = item["status"] == "refusal" or item["prompt"] == "REFUSAL"
+                    is_refusal = (item["status"] in ("refusal", "declined")
+                                  or is_unusable_prompt(item.get("prompt", "")))
                     bg_color = "bg-red-50/40 border-red-100" if is_refusal else "bg-slate-50/50 border-slate-100"
                     badge_label = "Refused" if is_refusal else "Success"
                     badge_color = "rose" if is_refusal else "emerald"
@@ -1511,7 +1514,7 @@ def render_project_tabs(
                         stop_cb=stop_transcribe_cb,
                         start_analysis_cb=start_analysis_cb,
                         start_pipeline_cb=start_pipeline_cb or (
-                            lambda pid, plan: None),
+                            lambda *args, **kwargs: None),
                         start_image_gen_cb=start_image_gen_cb,
                     )
 

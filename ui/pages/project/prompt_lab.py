@@ -27,7 +27,10 @@ from nicegui import ui
 from database.connection import get_setting
 from services import prompt_library as pl
 from services import shot_planner as sp
-from services.prompt_engine import fetch_test_chunks, get_llm_response, parse_llm_response
+from services.prompt_engine import (
+    fetch_test_chunks, generate_prompt_for_chunk_async, get_llm_response,
+    parse_llm_response,
+)
 from ui import state
 
 # --- module-level working state (persists across tab switches) -------------
@@ -51,6 +54,7 @@ _chain_mode = ""          # "" = use the book's effective (production) mode
 _chain_results: List[dict] = []
 _chain_meta: Dict[str, object] = {}
 _chain_loading = False
+_chain_force_decline = False
 
 _SHOT_MODE_OPTIONS = {
     "auto": "Plan shots (auto)",
@@ -499,20 +503,39 @@ def render_chain_results() -> None:
     ui.label("plan: " + "   ".join(f"{k} {v}" for k, v in dist.most_common())
              + f"      scenes: {len(_chain_results)}"
              ).classes('text-xs font-bold text-slate-600')
+    fell_back = [r for r in _chain_results if r["planned_role"] != r["role"]]
+    if fell_back:
+        chain = Counter(f"{r['planned_role']} → {r['role']}" for r in fell_back)
+        ui.label("fell back: " + "   ".join(f"{k} {v}" for k, v in chain.most_common())
+                 ).classes('text-xs font-bold text-amber-700')
+    unusable = [r for r in _chain_results if r["status"] != "success"]
+    if unusable:
+        ui.label(f"no role could render {len(unusable)} scene(s) - "
+                 f"they would be stored as REFUSAL"
+                 ).classes('text-xs font-bold text-rose-700')
 
     for res in _chain_results:
         with ui.card().classes('w-full border p-3 shadow-sm bg-white gap-1'):
             with ui.row().classes('items-center gap-2'):
                 ui.badge(res["shot_type"], color='indigo').classes('text-[10px]')
-                ui.label(f"scene {res['shot']} · role {res['role']}").classes(
+                ui.label(f"scene {res['shot']} · role {res['planned_role']}").classes(
                     'text-[10px] text-slate-400')
+                if res["planned_role"] != res["role"]:
+                    label = f"fell back to {res['role']}"
+                    if res.get("forced"):
+                        label += " (forced)"
+                    ui.badge(label, color='amber').classes('text-[10px]')
+                if res["status"] != "success":
+                    ui.badge(f"{res['status']} by every role", color='rose').classes('text-[10px]')
             ui.label(" ".join(res["chunk"].split())[:170] + "…").classes(
                 'text-[11px] text-slate-500 italic')
             ui.label(f'"{res["quote"]}"').classes('text-xs text-slate-700')
-            ui.label(res["prompt"]).classes('text-xs font-semibold text-blue-700')
+            ui.label(res["prompt"]).classes(
+                'text-xs font-semibold '
+                + ('text-rose-700' if res["status"] != "success" else 'text-blue-700'))
 
 
-async def run_full_chain(project_name: str) -> None:
+async def run_full_chain(project_name: str, project_id: int = 0) -> None:
     global _chain_loading
     segs = _book_segments(project_name, _chain_book)
     if not segs or _chain_chapter == "":
@@ -538,17 +561,47 @@ async def run_full_chain(project_name: str) -> None:
     mode = _chain_mode or pl.get_shot_mode(project_name, _chain_book)
     selection = pl.active_selection()
 
-    shots = await sp.plan_chunks(chunks, llm_url, model)
-    for i, (shot, chunk) in enumerate(zip(shots, chunks), start=1):
+    # One planner pass, keeping the focus and place it read for each shot rather
+    # than just the label: the shared block asks for them ("the director has
+    # chosen a focus for this shot: <focus>", "<place_rules>"), and a tab that
+    # drops them tests a prompt the pipeline never sends.
+    detail = await sp.plan_chunks_detail(chunks, llm_url, model)
+    # The production function, not a copy of it: this run has to exercise the
+    # same decline-and-fall-back walk the pipeline does, or the tab stops
+    # predicting what a real run will produce. Sequential on purpose - one
+    # semaphore slot, so the console order matches the scene order.
+    semaphore = asyncio.Semaphore(1)
+    for i, chunk in enumerate(chunks, start=1):
+        shot, focus, place = (detail[i - 1] if i - 1 < len(detail)
+                              else ("NONE", "", ""))
         role = pl.resolve_role(shot, mode) or "single"
-        prompt = pl.render_with_selection(role, chunk, selection)
-        raw = await get_llm_response(
-            prompt, llm_url, model, temperature=0.7,
-            extra_payload={"chat_template_kwargs": {"enable_thinking": False}})
-        parsed = parse_llm_response(raw)
+        task = {
+            "chunk": chunk,
+            "chapter_num": idx,
+            "shot_num": i,
+            "shot_role": role,
+            "project_id": project_id,
+            "selection": selection,
+            "focus": focus,
+            "place": place,
+            "prompt": pl.render_with_selection(role, chunk, selection,
+                                               focus=focus, place=place),
+        }
+        res = await generate_prompt_for_chunk_async(
+            task, llm_url, model, semaphore,
+            extra_payload={"chat_template_kwargs": {"enable_thinking": False}},
+            simulate_decline=_chain_force_decline)
         _chain_results.append({
-            "shot": i, "shot_type": shot, "role": role,
-            "chunk": chunk, "quote": parsed["quote"], "prompt": parsed["prompt"],
+            "shot": i,
+            "shot_type": shot,
+            "planned_role": role,
+            "role": res["shot_role"],
+            "declined_roles": res.get("declined_roles") or [],
+            "forced": _chain_force_decline,
+            "status": res["status"],
+            "chunk": chunk,
+            "quote": res["quote"],
+            "prompt": res["prompt"],
         })
 
     _chain_meta.clear()
@@ -561,11 +614,21 @@ async def run_full_chain(project_name: str) -> None:
         "model": model,
         "chunk_words": chunk_words,
         "active_variants": selection,
+        "fallback_roles": dict(pl.FALLBACK_ROLES),
+        "forced_decline": _chain_force_decline,
         "plan_counts": dict(Counter(r["shot_type"] for r in _chain_results)),
+        "fallback_counts": dict(Counter(
+            f"{r['planned_role']}->{r['role']}" for r in _chain_results
+            if r["planned_role"] != r["role"] or r["status"] != "success")),
     })
     _chain_loading = False
     render_chain_results.refresh()
-    ui.notify("Full chain complete.", type="positive")
+    fallbacks = len([r for r in _chain_results if r["planned_role"] != r["role"]])
+    if fallbacks:
+        ui.notify(f"Full chain complete - {fallbacks} scene(s) fell back to another role.",
+                  type="positive")
+    else:
+        ui.notify("Full chain complete.", type="positive")
 
 
 def copy_chain_json() -> None:
@@ -587,6 +650,11 @@ def _set_chain(key: str, value) -> None:
     else:
         _chain_chapter = value
     render_chain_panel.refresh()
+
+
+def _set_chain_force_decline(value: bool) -> None:
+    global _chain_force_decline
+    _chain_force_decline = bool(value)
 
 
 @ui.refreshable
@@ -611,7 +679,8 @@ def render_chain_panel(project, books) -> None:
                       value=_chain_mode,
                       on_change=lambda e: _set_chain("mode", e.value)).classes('w-48')
             ui.button('Run full chain', icon='account_tree', color='primary',
-                      on_click=lambda: asyncio.create_task(run_full_chain(project.name))
+                      on_click=lambda: asyncio.create_task(
+                          run_full_chain(project.name, project.id))
                       ).classes('text-white font-bold text-xs h-10')
         with ui.row().classes('w-full items-center justify-between'):
             ui.label(f"mode: {_chain_mode or pl.get_shot_mode(project.name, _chain_book)}"
@@ -621,6 +690,17 @@ def render_chain_panel(project, books) -> None:
                      ).classes('text-[10px] text-slate-400')
             ui.button('Copy results as JSON', icon='content_copy',
                       on_click=copy_chain_json).props('flat dense').classes('text-xs')
+        ui.checkbox(
+            'Force the planned role to decline (exercises the fallback chain)',
+            value=_chain_force_decline,
+            on_change=lambda e: _set_chain_force_decline(e.value)
+        ).classes('text-[11px] text-slate-600').tooltip(
+            'The first answer is replaced with the NONE sentinel, so '
+            + ' -> '.join(f"{role}->{'/'.join(dests) or 'nothing'}"
+                          for role, dests in pl.FALLBACK_ROLES.items() if dests)
+            + ' runs for real from the second role onward. A decline is not '
+              'reliably reproducible on demand, which is why this exists.'
+        )
 
     render_chain_results()
 

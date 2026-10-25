@@ -9,6 +9,7 @@ from database.connection import engine
 from database.models import Book, Project, Character, CharacterAlias, CharacterTimelineEvent
 from services.character_manager import (
     compile_character_visual_prompt,
+    is_placeholder_description,
     save_project_characters_to_json,
     run_stateful_character_profiling,
     get_alias_occurrences,
@@ -412,9 +413,14 @@ class QuickCharactersModal:
         # override has to stay dynamic: a blur that changes nothing must not freeze
         # the computed text into ``visual_description``.
         shown_desc = (display_ev.visual_description or "").strip()
+        # The no-trait placeholder was stamped automatically; show the compiled
+        # fields instead so the box reflects what the renderer will use.
+        if is_placeholder_description(shown_desc):
+            shown_desc = ""
         desc_state = {"shown": shown_desc, "is_override": bool(shown_desc)}
         if not shown_desc and event_trait_count(display_ev):
-            desc_state["shown"] = compile_character_visual_prompt(display_ev)
+            desc_state["shown"] = compile_character_visual_prompt(
+                display_ev, name=char.name)
 
         def make_quick_trait_handler(ev_id, key):
             def handler(e):
@@ -449,7 +455,8 @@ class QuickCharactersModal:
                             shot_num=db_ev.shot_num)
                     if char_obj and not char_obj.locked:
                         if event_trait_count(db_ev):
-                            new_prompt = compile_character_visual_prompt(db_ev)
+                            new_prompt = compile_character_visual_prompt(
+                                db_ev, name=char_obj.name)
                             # Only refresh an override that already exists; an event
                             # with none stays dynamic, so pins and the carried scope
                             # still reach the render.
@@ -472,7 +479,7 @@ class QuickCharactersModal:
         trait_fields = [
             ("sex", "Sex (male / female)"),
             ("species", "Species (human unless stated)"),
-            ("age", "Age (young / adult / middle-aged / old)"),
+            ("age", "Age (child / teen / young / adult / middle-aged / old)"),
             ("hair_color", "Hair Colour"),
             ("hair_style", "Hair Style"),
             ("eye_color", "Eye Colour"),
@@ -697,7 +704,10 @@ class QuickCharactersModal:
                             session.add(new_alias)
                             session.commit()
                             
-                            b_ev.visual_description = compile_character_visual_prompt(b_ev)
+                            initial_desc = compile_character_visual_prompt(
+                                b_ev, name=alias_name)
+                            if not is_placeholder_description(initial_desc):
+                                b_ev.visual_description = initial_desc
                             session.add(b_ev)
                             session.commit()
                             

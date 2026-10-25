@@ -190,15 +190,29 @@ def _title_is_about(title: str, candidates: List[str]) -> bool:
     return False
 
 
-def _title_score(title: str, candidates: List[str]) -> int:
+def _title_score(title: str, candidates: List[str], *,
+                 require_name_word: bool = True) -> int:
     """How well a page title names a candidate: 0 exact, 9 not this character.
 
     The score has to prefer the *fuller* match, not the shorter title. A project
     character called "Bornhald" with the alias "Geofram Bornhald" must resolve to
     Geofram, not to his son Dain, and both pages contain the surname.
+
+    ``require_name_word`` is the guard against a page about an office, a place or
+    a rank: the title must use a word from the character's own name, not merely
+    from an alias. The alias table is full of titles ("the Amyrlin Seat", "Lord of
+    Fal Dara"), and a title alias scores 0 against the page about that title - so
+    "Siuan Sanche" was being answered with the article on the Amyrlin Seat, and
+    the extractor reported "sex: female" from it. A user-supplied query relaxes
+    this, because typing a title is an explicit request for that page.
     """
     title_tokens = _tokens(title)
     title_low = title.strip().lower()
+    if require_name_word and candidates:
+        own = [w for w in re.findall(r"[a-z']+", (candidates[0] or "").lower())
+               if len(w) > 2]
+        if own and not any(word in title_tokens for word in own):
+            return 9
     best = 9
     for candidate in candidates:
         words = [w for w in re.findall(r"[a-z']+", (candidate or "").lower())
@@ -214,7 +228,24 @@ def _title_score(title: str, candidates: List[str]) -> int:
     return best
 
 
-def resolve_title(base: str, names: List[str], term: str = "") -> str:
+def name_bearing_probe(character_name: str, names: List[str]) -> str:
+    """The fullest name that still contains the character's own name.
+
+    "Longest candidate wins" picks a title when the alias table holds one: for a
+    character called Siuan with the alias "the Amyrlin Seat", three words beat two,
+    so the wiki gets searched for the office rather than the person, returns the
+    article about the office, and the extractor dutifully reports "sex: female"
+    from it. An alias is only a better *search* term when it extends the name.
+    """
+    tokens = set(re.findall(r"[a-z']+", (character_name or "").lower()))
+    bearing = [n for n in names
+               if tokens & set(re.findall(r"[a-z']+", (n or "").lower()))]
+    return max(bearing or [character_name],
+               key=lambda n: (len(n.split()), len(n)))
+
+
+def resolve_title(base: str, names: List[str], term: str = "",
+                  query: str = "") -> str:
     """The page about this character, or "" when no page is about them.
 
     ``list=search`` rather than an exact title, because characters are filed under
@@ -227,13 +258,16 @@ def resolve_title(base: str, names: List[str], term: str = "") -> str:
     if not names:
         return ""
     # Search with the most specific name available; the project's own name is
-    # often a nickname ("Master Gill", "Bornhald").
-    probe = max(names, key=lambda n: len(n.split()))
-    query = f'"{probe}" {term}'.strip() if term else f'"{probe}"'
-    hits = search_pages(base, query, limit=10)
+    # often a nickname ("Master Gill", "Bornhald"). A user-supplied query wins,
+    # and typing one also relaxes the name-word check: it is an explicit request.
+    explicit = bool((query or "").strip())
+    probe = name_bearing_probe(names[0], names)
+    search = (query.strip() if explicit
+              else (f'"{probe}" {term}'.strip() if term else f'"{probe}"'))
+    hits = search_pages(base, search, limit=10)
     scored = []
     for hit in hits:
-        score = _title_score(hit["title"], names)
+        score = _title_score(hit["title"], names, require_name_word=not explicit)
         if score > 2:
             continue
         title = hit["title"]
@@ -273,21 +307,26 @@ def page_block(base: str, title: str) -> Dict:
 
 
 def lookup(name: str, *, base: str, term: str = "",
-           aliases: Optional[List[str]] = None) -> Dict:
+           aliases: Optional[List[str]] = None, query: str = "") -> Dict:
     """``{ok, title, block, error, tried}`` for one character.
 
     Tries the project name, then the aliases: the page is often under a fuller
     name ("Basel Gill" for "Master Gill") and the alias table is the only thing
     that knows that.
+
+    ``query`` overrides the search string. The default is built from the most
+    specific name, but a user who can see the term is the one who knows whether
+    the wiki files someone under a title, a nickname or a full name - and the
+    title check below still decides whether the hit is really about this person.
     """
     base = normalise_base(base)
     if not base:
         return {"ok": False, "title": "", "block": "", "error": "no wiki URL set",
                 "tried": ""}
     names = list(dict.fromkeys([name, *(aliases or [])]))
-    tried = ", ".join(names[:4])
+    tried = query.strip() or ", ".join(names[:4])
     try:
-        title = resolve_title(base, names, term)
+        title = resolve_title(base, names, term, query=query)
         if not title:
             return {"ok": False, "title": "", "block": "",
                     "error": f"no page is about this character ({tried})",

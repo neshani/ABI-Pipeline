@@ -29,7 +29,9 @@ from database.connection import engine, get_setting
 from database.models import (Book, Character, CharacterAlias, CharacterTimelineEvent,
                              Project)
 from services import character_coverage
+from services import trait_vocab
 from services.character_manager import is_non_human  # noqa: F401  (re-exported for UI)
+from services.character_manager import is_placeholder_description
 
 STEPS: List[Dict] = [
     {"id": "reference", "title": "Reference file",
@@ -100,6 +102,28 @@ def validate_steps(steps: Optional[Sequence[Dict]], config: Dict) -> Dict:
 
 # --- targets ----------------------------------------------------------------
 
+def load_transcripts(project_id: int) -> List[tuple]:
+    """``[(book name, transcript text)]`` in reading order, for the book-text step.
+
+    Shared with the single-character lookup so both paths search the same books in
+    the same order. A missing transcript is skipped rather than fatal: a project
+    mid-transcription should still be able to describe the books it has.
+    """
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        if not project:
+            return []
+        base_dir = Path(get_setting("output_dir", "./output")).resolve()
+        books = []
+        for book in session.exec(select(Book).where(Book.project_id == project_id)
+                                 .order_by(Book.book_order)).all():
+            path = base_dir / project.name / book.name / "transcript.txt"
+            if path.exists():
+                books.append((book.name, path.read_text(encoding="utf-8",
+                                                        errors="ignore")))
+        return books
+
+
 def load_rows(project_id: int) -> List[Dict]:
     """Every character with its Base profile and aliases, for target selection."""
     with Session(engine) as session:
@@ -146,6 +170,13 @@ def apply_fields(event, fields: Dict[str, str]) -> Dict:
     for field, value in fields.items():
         value = (value or "").strip()
         if not value or field not in _FIELD_LABELS:
+            continue
+        # Values arrive from a model, so they are normalised here - once, on the
+        # way in. A hand edit in the Character tab never passes through this.
+        normalised = trait_vocab.normalise_value(field, value)
+        if normalised is not None:
+            value = normalised
+        if not value:
             continue
         current = (getattr(event, field, None) or "").strip()
         if not current:
@@ -248,14 +279,7 @@ async def run(project_id: int, *, threshold: int = 0,
 
     books: List[tuple] = []
     if "transcript" in ordered_steps(steps):
-        base_dir = Path(get_setting("output_dir", "./output")).resolve()
-        with Session(engine) as session:
-            for book in session.exec(select(Book).where(Book.project_id == project_id)
-                                     .order_by(Book.book_order)).all():
-                path = base_dir / project_name / book.name / "transcript.txt"
-                if path.exists():
-                    books.append((book.name, path.read_text(encoding="utf-8",
-                                                            errors="ignore")))
+        books = load_transcripts(project_id)
 
     blocks = None
     if "reference" in ordered_steps(steps) and config.get("reference_path"):
@@ -366,6 +390,10 @@ async def run(project_id: int, *, threshold: int = 0,
                 event = ensure_base_event(session, row["id"])
                 outcome = apply_fields(event, result.get("fields") or {})
                 if outcome["filled"] and not dry_run:
+                    # A no-trait placeholder stamped at creation is not an
+                    # override; leaving it would keep hiding the traits just filled.
+                    if is_placeholder_description(event.visual_description):
+                        event.visual_description = None
                     if event.source != "manual":
                         event.source = "manual"  # a curated import stays put
                     session.add(event)
@@ -397,8 +425,33 @@ async def run(project_id: int, *, threshold: int = 0,
             break
 
     report["seconds"] = round(time.time() - started, 1)
+    report["report_path"] = _save_report(project_name, report, dry_run=dry_run)
     emit({"type": "done", "report": report})
     return report
+
+
+def _save_report(project_name: str, report: Dict, *, dry_run: bool = False) -> str:
+    """Write the run report to disk and return its path.
+
+    The modal is the only place a report used to exist, so closing it destroyed
+    the answer to "why did this character get nothing?". A run that reports only
+    inside a dialog it cannot outlive is a run nobody can audit - and the failures
+    are exactly the part worth keeping (a dead MCP server, an ambiguous reference
+    entry). Never raises: losing a report must not fail an import.
+    """
+    import json
+    from datetime import datetime
+    try:
+        base = Path(get_setting("output_dir", "./output"))
+        folder = base / project_name / "description_runs"
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        suffix = "_dry" if dry_run else ""
+        path = folder / f"{stamp}{suffix}.json"
+        path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        return str(path)
+    except Exception:
+        return ""
 
 
 def summarise(report: Dict) -> str:

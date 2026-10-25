@@ -123,6 +123,13 @@ def _snapshot_uncached(book_dir: Path, *, chunk_words: int,
 
     # --- prompts ----------------------------------------------------------
     rows = _count_rows(prompts_path) if prompts_path.exists() else 0
+    # The shot plan is the coordinate set the prompts are supposed to cover: one
+    # row per chunk, written by the same chunker at the same size, and the guard
+    # below refuses a plan and a prompts.csv that disagree. So a prompts.csv
+    # shorter than its own plan is missing scenes. ``Book.total_images`` cannot
+    # answer this - the progress counter is recomputed from the rows that are
+    # present, so deleting a broken row silently lowers the expectation with it.
+    plan_rows = _count_rows(book_dir / "shot_plan.csv")
     chunking = pipeline_manifest.chunking(book_dir)
     version = scene_map.chunker_version(book_dir)
     blocked = ""
@@ -154,10 +161,12 @@ def _snapshot_uncached(book_dir: Path, *, chunk_words: int,
         prompts = _state("stale", blocked, rows=rows, short=short)
     elif rows:
         # ``expected_prompts`` is a chunk count recorded by a previous run, and a
-        # re-chunk can leave it one or two off the real total. Only a larger
-        # expectation means rows are still missing; equal or fewer means done, and
+        # re-chunk can leave it one or two off the real total. The plan's row count
+        # is the exact coordinate set, so it is preferred; only a larger
+        # expectation than the rows present means scenes are still missing, and
         # "720 of 720" must not render as work in progress.
-        total = expected_prompts if expected_prompts > rows else 0
+        expected = max(plan_rows, expected_prompts)
+        total = expected if expected > rows else 0
         prompts = (_state("partial", f"{rows} of {total}", rows=rows, total=total)
                    if total else _state("ok", f"{rows} prompts", rows=rows))
     else:
@@ -165,7 +174,7 @@ def _snapshot_uncached(book_dir: Path, *, chunk_words: int,
 
     # --- images -----------------------------------------------------------
     images = _count_images(book_dir)
-    prompts_total = (expected_prompts if expected_prompts >= rows else rows)
+    prompts_total = max(rows, plan_rows, expected_prompts)
     if not rows:
         imgs = _state("blocked", "needs prompts", done=images, expected=prompts_total)
     elif prompts_total and images >= prompts_total:

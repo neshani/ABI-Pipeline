@@ -6,7 +6,11 @@ from nicegui import ui
 from sqlmodel import Session, select
 from database.connection import engine, get_setting
 from database.models import Book, Project, Character, CharacterAlias, CharacterTimelineEvent
-from services.character_manager import compile_character_visual_prompt, save_project_characters_to_json
+from services.character_manager import (
+    compile_character_visual_prompt,
+    is_placeholder_description,
+    save_project_characters_to_json,
+)
 from ui.components.autocomplete import PromptAutocompleteManager
 from ui import state
 
@@ -659,8 +663,9 @@ def render_prompt_editor_view(
 
                             # The event may describe the character with the new
                             # trait fields or the legacy quartet; the helper knows.
-                            desc = compile_character_visual_prompt(active_ev) if active_ev else ""
-                            if desc.startswith("a person named "):
+                            desc = (compile_character_visual_prompt(
+                                active_ev, name=char.name) if active_ev else "")
+                            if is_placeholder_description(desc):
                                 desc = ""
                             tooltip_desc = f"👤 {char.name}" + (f" ({desc})" if desc else "")
                             

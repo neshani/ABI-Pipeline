@@ -267,6 +267,48 @@ def _block_index(blocks: List[Block]) -> Dict[str, Block]:
     return index
 
 
+def _name_tokens(text: str) -> set:
+    return set(re.findall(r"[a-z']+", normalise(text).lower()))
+
+
+def _shares_a_name_word(block: Block, character: str) -> bool:
+    """Does the entry's headword use a word from the character's own name?
+
+    This is the guard that stops a *related* word being mistaken for a *name*.
+    "Loial" carries the alias "Ogier", and a dictionary has an entry called
+    "Ogier"; without this check the alias looks up the species entry and the
+    character is described as a race. Likewise "Byar" + the alias "Child Byar"
+    reached "Child of the Dragon" through "Child".
+
+    Aliases that share nothing with the name are still useful for *searching*
+    (a wiki, the web), just not for accepting a block by themselves.
+    """
+    return bool(_name_tokens(block[0]) & _name_tokens(character))
+
+
+def _dominant_prefix(index: Dict[str, Block], token: str) -> Optional[Block]:
+    """The article when several entries begin with the name, else ``None``.
+
+    A dictionary gives the spear-carrier one line and the protagonist a column:
+    "Elayne Traemane" (94 characters) and "Elayne Trakand" (8,384). Refusing that
+    as ambiguous is technically correct and practically useless - the character
+    with 48 prompt hits and no description is the one with the column.
+
+    Size is the only signal used, and the bar is deliberately high: three times
+    the runner-up *and* 200 characters in its own right. Two real entries of
+    comparable size stay ambiguous, which is the honest answer.
+    """
+    hits = sorted((block for key, block in index.items()
+                   if key.startswith(token + " ")),
+                  key=lambda block: len(block[1]), reverse=True)
+    if len(hits) < 2:
+        return None
+    runner_up = max(len(hits[1][1]), 1)
+    if len(hits[0][1]) >= 200 and len(hits[0][1]) >= 3 * runner_up:
+        return hits[0]
+    return None
+
+
 def match_blocks(blocks: List[Block], names: Dict[str, List[str]]
                  ) -> Tuple[Dict[str, Block], List[Block]]:
     """``({character: block}, unmatched)``, accepting only what is certain.
@@ -275,11 +317,17 @@ def match_blocks(blocks: List[Block], names: Dict[str, List[str]]
     only accept an unambiguous answer:
 
     1. the project name, exactly;
-    2. an alias, exactly;
+    2. an alias, exactly - but only when the entry's headword uses a word from
+       the character's own name (see ``_shares_a_name_word``);
     3. a dictionary cross-reference ("Finngar, Ewin. See Ewin Finngar");
-    4. a single-token name that is a unique prefix ("Darl" -> "Darl Coplin");
+    4. a single-token name that is a unique prefix ("Darl" -> "Darl Coplin"), or
+       the clearly dominant entry when several share it ("Elayne" -> the column
+       for "Elayne Trakand", not the line for "Elayne Traemane");
     5. the same, with an honorific stripped ("Mistress Luhhan" is *not* accepted:
-       two Luhhans exist, and guessing the woman would be a coin flip).
+       two Luhhans exist, and guessing the woman would be a coin flip);
+    6. a trailing epithet, where the *first* token is a name rather than a rank
+       ("Sheriam Sedai" -> "Sheriam Bayanar"; "Master Gill" is refused because
+       "Master" is an honorific and "Child of the Dragon" is not about "Byar").
 
     Anything else comes back as unmatched, which the UI reports so the user can
     add an alias.
@@ -300,6 +348,9 @@ def match_blocks(blocks: List[Block], names: Dict[str, List[str]]
                 if key.startswith(token + " ")]
         return hits[0] if len(hits) == 1 else None
 
+    def by_prefix(token: str) -> Optional[Block]:
+        return unique_prefix(token) or _dominant_prefix(index, token)
+
     matched: Dict[str, Block] = {}
     used = set()
     for character, aliases in names.items():
@@ -308,8 +359,14 @@ def match_blocks(blocks: List[Block], names: Dict[str, List[str]]
         for candidate in candidates:                       # 1 and 2
             block = lookup(candidate)
             if block and block[0].lower() not in used:
-                found = block
-                break
+                # The exact project name always counts. An alias has to look like
+                # a name (two words) or reuse a word from the character's name:
+                # "Rand al'Thor" for a row tagged "Master al'Vere" is a real alias
+                # from the user's side, while "Ogier" for "Loial" is a species.
+                if (candidate == character or len(candidate.split()) > 1
+                        or _shares_a_name_word(block, character)):
+                    found = block
+                    break
         if not found:                                      # 3
             for candidate in candidates:
                 target = target_of.get(normalise(candidate).lower())
@@ -320,8 +377,9 @@ def match_blocks(blocks: List[Block], names: Dict[str, List[str]]
         if not found:                                      # 4
             for candidate in candidates:
                 if len(candidate.split()) == 1:
-                    block = unique_prefix(normalise(candidate).lower())
-                    if block and block[0].lower() not in used:
+                    block = by_prefix(normalise(candidate).lower())
+                    if block and block[0].lower() not in used \
+                            and _shares_a_name_word(block, character):
                         found = block
                         break
         if not found:                                      # 5
@@ -331,19 +389,22 @@ def match_blocks(blocks: List[Block], names: Dict[str, List[str]]
                     rest = normalise(" ".join(words[1:])).lower()
                     block = lookup(rest) or (unique_prefix(rest)
                                              if len(rest.split()) == 1 else None)
-                    if block and block[0].lower() not in used:
+                    if block and block[0].lower() not in used \
+                            and _shares_a_name_word(block, character):
                         found = block
                         break
         if not found:                                      # 6
             # A trailing epithet ("Sheriam Sedai", "Lan Gaidin"): the project tag
             # carries words the reference entry does not. Only the FIRST token is
-            # tried, and only when it uniquely identifies one entry - anything
-            # looser starts attaching descriptions to the wrong people.
+            # tried, it must not be an honorific, and it must uniquely identify
+            # one entry - anything looser starts attaching descriptions to the
+            # wrong people.
             for candidate in candidates:
                 words = normalise(candidate).split()
-                if len(words) > 1:
+                if len(words) > 1 and words[0].lower().strip(".") not in _HONORIFICS:
                     block = unique_prefix(normalise(words[0]).lower())
-                    if block and block[0].lower() not in used:
+                    if block and block[0].lower() not in used \
+                            and _shares_a_name_word(block, character):
                         found = block
                         break
         if found:

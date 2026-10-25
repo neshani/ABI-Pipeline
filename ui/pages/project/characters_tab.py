@@ -17,6 +17,7 @@ from services.character_manager import (
     save_setting,
     compile_character_visual_prompt,
     compile_character_description_from_event,
+    is_placeholder_description,
     ensure_book_orders,
     get_matching_source_projects,
     get_character_import_matches,
@@ -1119,7 +1120,9 @@ def open_add_character_dialog(project_id: int, default_book_id: Optional[int], r
                     session.add(link)
                     session.commit()
                 
-                base_ev.visual_description = compile_character_visual_prompt(base_ev)
+                initial_desc = compile_character_visual_prompt(base_ev, name=name)
+                if not is_placeholder_description(initial_desc):
+                    base_ev.visual_description = initial_desc
                 session.add(base_ev)
                 session.commit()
                 
@@ -1281,7 +1284,8 @@ def open_hair_picker_modal(project_id: int, event_id: int, compiled_desc_input: 
                             db_ev.source = "manual"
                         char_obj = session.get(Character, db_ev.character_id)
                         if char_obj and not char_obj.locked:
-                            new_prompt = compile_character_visual_prompt(db_ev)
+                            new_prompt = compile_character_visual_prompt(
+                                db_ev, name=char_obj.name)
                             db_ev.visual_description = new_prompt
                             compiled_desc_input.set_value(new_prompt)
                         session.add(db_ev)
@@ -1387,8 +1391,14 @@ def generate_ai_check_prompt(
         if active_ev is not None:
             compiled_desc = compile_character_description_from_event(
                 char, active_ev, {}, True)
-            if compiled_desc == char.name:
+            if (compiled_desc == char.name
+                    or is_placeholder_description(compiled_desc)):
                 compiled_desc = ""
+            stored_desc = (active_ev.visual_description or "").strip()
+            if is_placeholder_description(stored_desc):
+                stored_desc = ""
+        else:
+            stored_desc = ""
         replacements = {
             "{project_name}": project.name,
             "{book_name}": book_name,
@@ -1396,8 +1406,7 @@ def generate_ai_check_prompt(
             "{assigned_aliases}": alias_str,
             "{candidate_names}": sug_str,
             "{visual_description}": (
-                (active_ev.visual_description if active_ev and active_ev.visual_description
-                 else compiled_desc) or "None generated yet"),
+                (stored_desc or compiled_desc) or "None generated yet"),
             # The legacy quartet may be empty for an event written by the new
             # extractor; point the reviewer at the trait line rather than lying.
             "{demographics}": ((active_ev.demographics if active_ev and active_ev.demographics
@@ -1934,7 +1943,9 @@ def open_bulk_descriptions_dialog(project: Project, books: List[Book],
                 stop_button.disable()
                 marker = "DRY RUN (nothing written): " if dry else ""
                 state.add_console_log(
-                    f"[Descriptions] {marker}{description_runner.summarise(report)}")
+                    f"[Descriptions] {marker}{description_runner.summarise(report)}"
+                    + (f"  (report: {report['report_path']})"
+                       if report.get("report_path") else ""))
 
                 if not dry and any(step.get("filled") for step in report["steps"]):
                     # Re-tally in place: the counts are the whole point of the
@@ -1988,6 +1999,9 @@ def open_bulk_descriptions_dialog(project: Project, books: List[Book],
                                                     key=lambda kv: -kv[1])[:6]:
                             ui.label(f"{count}× {reason}").classes(
                                 'text-[10px] text-rose-500 leading-tight')
+                        if report.get("report_path"):
+                            ui.label(f"Report: {report['report_path']}").classes(
+                                'text-[10px] text-slate-400 leading-tight break-all')
 
             def stop_run() -> None:
                 run_state["cancelled"] = True
@@ -2013,6 +2027,324 @@ def open_bulk_descriptions_dialog(project: Project, books: List[Book],
                     'text-[10px] text-slate-400 flex-1 min-w-0 leading-tight')
 
     dialog.open()
+
+
+# --- one character, one source, on demand -----------------------------------
+
+def default_web_query(character_name: str, series: str) -> str:
+    """The first search a single-character web lookup runs.
+
+    The name is quoted because an unquoted one drifts: a two-word name matches the
+    actor, the television episode and every page that lists the cast, and a single
+    given name matches half the book. Quoting it is a hint the model can see and
+    reword, which is exactly the amount of control worth offering.
+    """
+    series = (series or "").strip()
+    return f'"{character_name}" {series} appearance description'.strip()
+
+
+def default_wiki_query(character_name: str, names: List[str], term: str) -> str:
+    """The wiki search a single-character lookup starts with."""
+    from services.wiki_lookup import name_bearing_probe
+    probe = name_bearing_probe(character_name, names)
+    return f'"{probe}" {term}'.strip()
+
+
+def available_lookup_sources(project: Project) -> Dict[str, str]:
+    """Which single-character sources can run, and what stops the others.
+
+    A disabled button with a reason is better than a button that silently does
+    nothing, and better than hiding it: the reason is the instruction.
+    """
+    from pathlib import Path as _Path
+    mcp_url = (get_setting("mcp_url", "") or "").strip()
+    wiki_url = (getattr(state, "wiki_url", "") or "").strip()
+    base_dir = _Path(get_setting("output_dir", "./output")).resolve()
+    has_transcript = any(
+        (base_dir / project.name / book.name / "transcript.txt").exists()
+        for book in project_books(project.id))
+    return {
+        "web": "" if mcp_url else "no MCP server in Settings",
+        "wiki": "" if wiki_url else "no wiki URL set in Fill Descriptions",
+        "book": "" if has_transcript else "no transcripts on disk",
+    }
+
+
+def project_books(project_id: int) -> List[Book]:
+    with Session(engine) as session:
+        return list(session.exec(select(Book).where(Book.project_id == project_id)
+                                 .order_by(Book.book_order)).all())
+
+
+def open_lookup_dialog(project: Project, char: Character, refresh_callback: Any = None,
+                       initial_source: str = "web") -> None:
+    """Search one character in one source, showing the query before it is sent.
+
+    Three sources, one modal: the bulk run answers "describe everyone else", this
+    answers "describe *this* one", which is what a principal character in the
+    middle of a book actually needs. Nothing is written until a source returns
+    fields, and even then only the empty ones - the same rule as the bulk run.
+
+    The query is shown and editable because the search is the part a user can
+    actually improve: a model will not know that the project means a particular
+    book, and a quoted name is the cheapest way to say so.
+    """
+    from services import (book_lookup, description_extract, description_runner,
+                          wiki_lookup, web_lookup)
+
+    llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
+    model = get_setting("llm_model", "local-model")
+    mcp_url = (get_setting("mcp_url", "") or "").strip()
+    mcp_auth = get_setting("mcp_auth_header", "") or ""
+    mcp_prefs = get_setting("mcp_tool_prefs", {}) or {}
+    wiki_url = (getattr(state, "wiki_url", "") or "").strip()
+    wiki_term = (getattr(state, "wiki_term", "") or project.name).strip()
+    series = (getattr(state, "mcp_series_name", "") or project.name).strip()
+
+    with Session(engine) as session:
+        aliases = [a.alias for a in session.exec(
+            select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
+            if (a.alias or "").strip()]
+    names = list(dict.fromkeys([char.name, *aliases]))
+
+    availability = available_lookup_sources(project)
+    run_state = {"source": initial_source if not availability.get(initial_source)
+                 else "", "running": False, "changed": False}
+    elements: Dict[str, Any] = {"query_input": None}
+
+    def style_sources() -> None:
+        for key, button in source_buttons.items():
+            active = key == run_state["source"]
+            button.classes(
+                add=('bg-blue-600 text-white border-blue-600' if active
+                     else 'bg-white text-slate-600 border-slate-200'),
+                remove=('bg-white text-slate-600 border-slate-200' if active
+                        else 'bg-blue-600 text-white border-blue-600'))
+
+    def set_source(source: str) -> None:
+        if run_state["running"] or availability.get(source):
+            return
+        run_state["source"] = source
+        style_sources()
+        query_panel.clear()
+        render_query_help()
+
+    def render_query_help() -> None:
+        # Opens its own container: the first render happens after the footer is
+        # built, and without this the query widgets were appended to the card and
+        # landed *below* the Search button.
+        source = run_state["source"]
+        elements["query_input"] = None
+        elements["wiki_query"] = None
+        with query_panel:
+            if source == "web":
+                ui.label('First search query').classes(
+                    'text-[10px] font-bold text-slate-400 uppercase tracking-wider')
+                query_input = ui.input(value=default_web_query(char.name, series)) \
+                    .classes('w-full text-xs').props('dense outlined')
+                elements["query_input"] = query_input
+                ui.label('Sent as the model\'s starting point. The quotes bias it to '
+                         'the exact spelling; it may reword the query if nothing '
+                         'comes back, and it opens a result page when a snippet is '
+                         'not enough.').classes(
+                    'text-[10px] text-slate-400 leading-tight')
+            elif source == "wiki":
+                ui.label('Page search').classes(
+                    'text-[10px] font-bold text-slate-400 uppercase tracking-wider')
+                wiki_query = ui.input(
+                    value=default_wiki_query(char.name, names, wiki_term)) \
+                    .classes('w-full text-xs').props('dense outlined')
+                elements["wiki_query"] = wiki_query
+                ui.label('Searches this wiki through its API, one request per '
+                         'second. The page title must contain the name; a page '
+                         'that merely mentions them is refused.').classes(
+                    'text-[10px] text-slate-400 leading-tight')
+            else:
+                ui.label('Paragraphs searched').classes(
+                    'text-[10px] font-bold text-slate-400 uppercase tracking-wider')
+                ui.label(', '.join(names)).classes(
+                    'text-xs text-slate-700 bg-slate-50 border rounded px-2 py-1.5 '
+                    'w-full')
+                ui.label('Code narrows to paragraphs that name the character, then '
+                         'the model decides which of them describe them. Every book '
+                         'with a transcript is searched.').classes(
+                    'text-[10px] text-slate-400 leading-tight')
+
+    def close_dialog() -> None:
+        dialog.close()
+        if run_state["changed"] and refresh_callback:
+            refreshed = refresh_callback()
+            if asyncio.iscoroutine(refreshed):
+                asyncio.create_task(refreshed)
+
+    def show_result(lines: List[str], solution: str = "negative") -> None:
+        for line in lines:
+            with results:
+                ui.label(line).classes('text-[11px] leading-tight ' + (
+                    'text-slate-600' if solution == "negative" else
+                    'text-emerald-700 font-semibold'))
+
+    with ui.dialog() as dialog, ui.card().classes(
+            'w-[620px] max-w-[95vw] max-h-[88vh] p-0 rounded-xl flex flex-col '
+            'overflow-hidden'):
+        with ui.row().classes('w-full items-center gap-3 px-5 pt-4 pb-2 flex-nowrap'):
+            with ui.column().classes('gap-0 flex-1 min-w-0'):
+                ui.label(f'Find a description: {char.name}').classes(
+                    'text-base font-bold text-slate-800 leading-tight truncate')
+                ui.label('One source at a time. Only empty fields are written, so '
+                         'nothing you have edited is replaced.').classes(
+                    'text-[11px] text-slate-500 leading-tight whitespace-normal')
+            ui.button(icon='close', on_click=close_dialog).props('flat dense round') \
+                .classes('shrink-0 text-slate-400')
+
+        with ui.column().classes('w-full px-5 gap-3 pb-4 overflow-y-auto flex-1 '
+                                 'min-h-0'):
+            source_buttons: Dict[str, Any] = {}
+            with ui.row().classes('w-full gap-2 flex-nowrap'):
+                for key, label, icon in (("web", "Web (MCP)", "cloud"),
+                                         ("wiki", "Wiki", "travel_explore"),
+                                         ("book", "Book text", "auto_stories")):
+                    reason = availability.get(key, "")
+                    button = ui.button(label, icon=icon, color=None,
+                                       on_click=lambda _, k=key: set_source(k)) \
+                        .props('unelevated dense no-caps')\
+                        .classes('text-xs font-bold px-3 py-1.5 rounded-lg border '
+                                 'bg-white text-slate-600 border-slate-200 '
+                                 'flex-1 min-w-0')
+                    if reason:
+                        button.disable()
+                        button.classes(add='opacity-50')
+                        button.tooltip(reason)
+                    source_buttons[key] = button
+
+            query_panel = ui.column().classes('w-full gap-1')
+            results = ui.column().classes(
+                'w-full gap-0 min-h-[60px] max-h-56 overflow-y-auto border '
+                'rounded-lg bg-white px-2 py-1.5')
+            with results:
+                ui.label('Results appear here.').classes(
+                    'text-[11px] text-slate-400')
+
+            async def do_lookup() -> None:
+                if run_state["running"] or not run_state["source"]:
+                    return
+                run_state["running"] = True
+                run_button.disable()
+                results.clear()
+                progress.set_text('Searching…')
+                source = run_state["source"]
+                fields: Dict[str, str] = {}
+                error = ""
+                detail: List[str] = []
+                try:
+                    if source == "web":
+                        found = await web_lookup.lookup_character(
+                            char.name, series, mcp_url=mcp_url, mcp_auth=mcp_auth,
+                            tool_prefs=mcp_prefs, llm_url=llm_url, model=model,
+                            query=(elements["query_input"].value or "").strip()
+                            if elements["query_input"] else "",
+                            log=lambda message: progress.set_text(
+                                message.replace("[Lookup] ", "")))
+                        fields = found.get("fields") or {}
+                        error = found.get("error", "")
+                        if found.get("sources"):
+                            detail.append("Sources: " + ", ".join(found["sources"][:3]))
+                        if found.get("rounds"):
+                            detail.append(f"{found['rounds']} model rounds, "
+                                          f"{found.get('seconds')}s")
+                    elif source == "wiki":
+                        got = wiki_lookup.lookup(
+                            char.name, base=wiki_url, term=wiki_term,
+                            aliases=aliases,
+                            query=(elements["wiki_query"].value or "").strip()
+                            if elements["wiki_query"] else "")
+                        if not got["ok"]:
+                            error = got["error"]
+                        else:
+                            detail.append(f'Page: {got["title"]}')
+                            extracted = await description_extract.extract_from_text(
+                                char.name, got["block"], llm_url=llm_url, model=model)
+                            fields = extracted.get("fields") or {}
+                            error = extracted.get("error", "")
+                    else:
+                        progress.set_text('Loading transcripts…')
+                        transcripts = await asyncio.to_thread(
+                            description_runner.load_transcripts, project.id)
+                        found = await book_lookup.lookup(
+                            char.name, books=transcripts, aliases=aliases,
+                            llm_url=llm_url, model=model)
+                        fields = found.get("fields") or {}
+                        error = found.get("error", "")
+                        if found.get("who"):
+                            detail.append(f'The model attributes: {found["who"]}')
+                        if found.get("used"):
+                            detail.append(f'{len(found["used"])} paragraphs used')
+                except Exception as ex:
+                    error = f"{type(ex).__name__}: {ex}"
+
+                try:
+                    if not fields:
+                        progress.set_text('Nothing found.')
+                        show_result([error or "The source stated nothing about "
+                                     "their appearance."], solution="negative")
+                    else:
+                        with Session(engine) as session:
+                            event = description_runner.ensure_base_event(session, char.id)
+                            outcome = description_runner.apply_fields(event, fields)
+                            if outcome["filled"]:
+                                if event.source != "manual":
+                                    event.source = "manual"
+                                session.add(event)
+                                session.commit()
+                                run_state["changed"] = True
+                            else:
+                                session.rollback()
+                        filled = outcome["filled"]
+                        progress.set_text(
+                            f"{len(filled)} field(s) filled" if filled
+                            else "Nothing new: every field already has a value.")
+                        show_result(
+                            [f"{field.replace('_', ' ')}: {fields[field]}"
+                             for field in fields],
+                            solution="negative")
+                        if filled:
+                            show_result([f"Written: {', '.join(filled)}"], solution="positive")
+                        for conflict in outcome["conflicts"]:
+                            show_result([f"kept {conflict['field']}: "
+                                         f"{conflict['was']} (source said "
+                                         f"{conflict['found']})"], solution="negative")
+                        if detail:
+                            show_result(detail, solution="negative")
+                        state.add_console_log(
+                            f"[Lookup] {char.name} via {source}: "
+                            + (", ".join(filled) if filled else "no change")
+                            + (f" ({error})" if error else ""))
+                except Exception as ex:
+                    # A locked database or a vanished character must not leave the
+                    # Search button disabled for the rest of the session.
+                    progress.set_text('Could not save.')
+                    show_result([f"{type(ex).__name__}: {ex}"], solution="negative")
+                finally:
+                    run_state["running"] = False
+                    run_button.enable()
+
+            with ui.row().classes('w-full items-center gap-2 flex-nowrap px-5 py-3 '
+                                  'border-t shrink-0'):
+                run_button = ui.button('Search', icon='search', on_click=do_lookup) \
+                    .props('unelevated dense no-caps')\
+                    .classes('bg-blue-600 hover:bg-blue-700 text-white font-bold '
+                             'text-xs px-4 py-1.5 rounded-lg shrink-0')
+                with ui.column().classes('gap-0 flex-1 min-w-0'):
+                    progress = ui.label('Ready.').classes(
+                        'text-[11px] text-slate-600 leading-tight truncate')
+                    ui.label('Writes to the Base profile only.').classes(
+                        'text-[10px] text-slate-400 leading-tight')
+
+            render_query_help()
+            style_sources()
+
+    dialog.open()
+
 
 def render_characters_tab(project: Project, books: List[Book], refresh_parent: Optional[Any] = None):
     # Enforce chronological book order indexing
@@ -2462,7 +2794,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     summary_pieces = []
                     if any(_trait_text(getattr(base_ev, key, None))
                            for key in RENDERED_TRAIT_FIELDS):
-                        summary = compile_character_visual_prompt(base_ev)
+                        summary = compile_character_visual_prompt(
+                            base_ev, name=char.name)
                         if summary:
                             summary_pieces.append(summary)
                     else:
@@ -2870,59 +3203,62 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     .tooltip("Rendered traits known anywhere in the project (Base + all books)")
                 
             with ui.row().classes('items-center gap-2 flex-grow justify-end'):
-                # Mode-Aware AI Check Button (Left-Click: Copy Rendered Prompt, Right-Click: Template Editor)
-                def copy_ai_prompt():
-                    prompt_text = generate_ai_check_prompt(
-                        project.id, char.id, selected_book_id, mode=active_view_mode, event_id=selected_event_id
-                    )
-                    if prompt_text:
-                        ui.clipboard.write(prompt_text)
-                        msg_mode = "Alias check" if active_view_mode == "merge" else "Visual sanity check"
-                        ui.notify(f"{msg_mode} prompt for '{char.name}' copied to clipboard!", type="positive", icon="content_copy")
+                # Merge tools live in the merge view. The visual-profile header is
+                # for describing one character; the alias and merge-check buttons
+                # only ever made it look like a control panel.
+                if active_view_mode == "merge":
+                    def copy_ai_prompt():
+                        prompt_text = generate_ai_check_prompt(
+                            project.id, char.id, selected_book_id,
+                            mode="merge", event_id=selected_event_id
+                        )
+                        if prompt_text:
+                            ui.clipboard.write(prompt_text)
+                            ui.notify(f"Alias check prompt for '{char.name}' "
+                                      f"copied to clipboard!", type="positive",
+                                      icon="content_copy")
 
-                btn_label = 'AI Merge Check' if active_view_mode == "merge" else 'AI Sanity Check'
-                btn_tooltip = (
-                    'Left-click: Copy alias verification prompt | Right-click: Edit template'
-                    if active_view_mode == "merge" else
-                    'Left-click: Copy visual description sanity check | Right-click: Edit template'
-                )
+                    ui.button('AI Merge Check', icon='auto_awesome')\
+                        .classes('bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs px-2.5 py-1.5 rounded-lg shadow-sm')\
+                        .on('click', copy_ai_prompt)\
+                        .on('contextmenu.prevent', lambda: open_ai_check_editor_dialog(
+                            project.id, char.id, selected_book_id, mode="merge",
+                            event_id=selected_event_id
+                        ))\
+                        .tooltip('Left-click: Copy alias verification prompt | '
+                                 'Right-click: Edit template')
 
-                ui.button(btn_label, icon='auto_awesome')\
-                    .classes('bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs px-2.5 py-1.5 rounded-lg shadow-sm')\
-                    .on('click', copy_ai_prompt)\
-                    .on('contextmenu.prevent', lambda: open_ai_check_editor_dialog(
-                        project.id, char.id, selected_book_id, mode=active_view_mode, event_id=selected_event_id
-                    ))\
-                    .tooltip(btn_tooltip)
+                    ui.button(
+                        'Become Alias...',
+                        icon='call_merge',
+                        on_click=lambda: open_become_alias_dialog(
+                            project.id, char, books, refresh_workspace_with_scroll)
+                    ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-2.5 py-1.5 rounded-lg shadow-sm')\
+                    .tooltip("Merge this profile into an established character")
+                elif char.locked:
+                    # Only worth a chip when it is on. A lock stops the cached
+                    # visual_description being rewritten under a hand-edited
+                    # profile; the bulk import can set it, so it needs a way out.
+                    def unlock_profile(c_id=char.id):
+                        with Session(engine) as session:
+                            db_char = session.get(Character, c_id)
+                            if db_char:
+                                db_char.locked = False
+                                session.add(db_char)
+                                session.commit()
+                        save_project_characters_to_json(project.id)
+                        draw_character_list.refresh()
+                        draw_details_panel.refresh()
+                        draw_stats_bar.refresh()
+                        ui.notify("Profile unlocked.", type="info")
 
-                # Lock Button
-                def toggle_locked(c_id=char.id, val=not char.locked):
-                    with Session(engine) as session:
-                        db_char = session.get(Character, c_id)
-                        if db_char:
-                            db_char.locked = val
-                            session.add(db_char)
-                            session.commit()
-                    save_project_characters_to_json(project.id)
-                    draw_character_list.refresh()
-                    draw_details_panel.refresh()
-                    draw_stats_bar.refresh()
-                    ui.notify(f"Profile {'Locked' if val else 'Unlocked'}!", type="info")
-
-                lock_icon = "lock" if char.locked else "lock_open"
-                lock_color = "bg-rose-50 text-rose-600 hover:bg-rose-100" if char.locked else "bg-slate-100 text-slate-600 hover:bg-slate-200"
-                ui.button(
-                    icon=lock_icon, 
-                    on_click=lambda c_id=char.id: toggle_locked(c_id)
-                ).props('flat dense').classes(f'p-1.5 rounded-lg {lock_color}').tooltip('Toggle manual editing lock')
-
-                # "Become Alias" (Reverse Merge) Action
-                ui.button(
-                    'Become Alias...',
-                    icon='call_merge',
-                    on_click=lambda: open_become_alias_dialog(project.id, char, books, refresh_workspace_with_scroll)
-                ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs px-2.5 py-1.5 rounded-lg shadow-sm')\
-                .tooltip("Merge this profile into an established character")
+                    ui.button('Locked', icon='lock', color=None,
+                              on_click=unlock_profile)\
+                        .props('flat dense no-caps')\
+                        .classes('bg-rose-50 text-rose-600 hover:bg-rose-100 '
+                                 'text-xs font-bold px-2 py-1 rounded-lg')\
+                        .tooltip('Click to unlock: a locked profile keeps its '
+                                 'compiled prompt when its traits change')
 
                 # Delete Button
                 async def delete_profile(c_id=char.id):
@@ -3036,79 +3372,58 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             with ui.column().classes('w-full flex-1 overflow-y-auto gap-3.5 pr-1 '
                                       'char-details-scroll'):
                 
-                # Research / Vibe Dedication Row
-                with ui.row().classes('w-full items-center justify-between bg-purple-50/40 border border-purple-100 p-3 rounded-xl gap-2'):
-                    with ui.row().classes('items-center gap-2'):
-                        async def scan_single_char():
-                            global currently_profiling_char_id, profiler_scan_depth, selected_event_id
-                            client = ui.context.client
-                            if char.locked:
-                                with client:
-                                    ui.notify("Character is locked. Unlock to re-profile.", type="warning")
-                                return
-                            currently_profiling_char_id = char.id
-                            draw_details_panel.refresh()
-                            try:
-                                with client:
-                                    ui.notify(f"Scanning written descriptions for {char.name}...", type="info")
-                                await run_stateful_character_profiling(
-                                    project.id, char.id, selected_book_id, 
-                                    max_chunks_to_scan=profiler_scan_depth, event_id=selected_event_id
-                                )
-                                with client:
-                                    ui.notify("Profiling completed!", type="positive")
-                            except Exception as ex:
-                                with client:
-                                    ui.notify(f"Profiling failed: {ex}", type="negative")
-                            finally:
-                                currently_profiling_char_id = None
-                                await refresh_workspace_with_scroll()
+                # Lookup row: one character, one source, on demand. This replaces
+                # the old "Research (LLM)" / "Deduce Vibe" pair, which ran the
+                # whole-book profiler per character and is the path the import
+                # workstream exists to retire.
+                lookup_sources = available_lookup_sources(project)
+                with ui.row().classes('w-full items-center gap-2 flex-wrap '
+                                      'bg-slate-50 border p-2.5 rounded-xl'):
+                    def open_lookup(source: str):
+                        open_lookup_dialog(project, char,
+                                           refresh_workspace_with_scroll,
+                                           initial_source=source)
 
-                        async def speculate_single_char():
-                            global currently_profiling_char_id, profiler_scan_depth, selected_event_id
-                            client = ui.context.client
-                            if char.locked:
-                                with client:
-                                    ui.notify("Character is locked. Unlock to re-profile.", type="warning")
-                                return
-                            currently_profiling_char_id = char.id
-                            draw_details_panel.refresh()
-                            try:
-                                with client:
-                                    ui.notify(f"Speculating character concept for {char.name}...", type="info")
-                                await run_stateful_character_profiling(
-                                    project.id, char.id, selected_book_id, 
-                                    max_chunks_to_scan=profiler_scan_depth, speculate=True, event_id=selected_event_id
-                                )
-                                with client:
-                                    ui.notify("Casting speculation completed!", type="positive")
-                            except Exception as ex:
-                                with client:
-                                    ui.notify(f"Speculation failed: {ex}", type="negative")
-                            finally:
-                                currently_profiling_char_id = None
-                                await refresh_workspace_with_scroll()
-
-                        is_card_profiling = currently_profiling_char_id == char.id
-                        if is_card_profiling:
-                            with ui.row().classes('items-center gap-1.5 bg-purple-100 px-3 py-1.5 rounded-lg'):
-                                ui.spinner(size='xs', color='purple')
-                                ui.label('LLM Active...').classes('text-xs text-purple-700 font-bold')
+                    for source, label, icon in (
+                            ("web", "Search Web", "cloud"),
+                            ("wiki", "Search Wiki", "travel_explore"),
+                            ("book", "Search Book", "auto_stories")):
+                        reason = lookup_sources.get(source, "")
+                        # color=None: a Quasar colour sets the text colour too,
+                        # so the default 'primary' turned a white button into
+                        # white-on-white once bg-white was applied.
+                        button = ui.button(
+                            label, icon=icon, color=None,
+                            on_click=lambda _, s=source: open_lookup(s))\
+                            .props('unelevated dense no-caps')\
+                            .classes('bg-white hover:bg-slate-100 text-slate-700 '
+                                     'font-bold text-xs px-2.5 py-1.5 rounded-lg '
+                                     'border shadow-sm shrink-0')
+                        if reason:
+                            button.disable()
+                            button.classes(add='opacity-50')
+                            button.tooltip(reason)
                         else:
-                            ui.button('Research (LLM)', icon='science', on_click=scan_single_char)\
-                                .classes('text-white font-bold text-xs bg-purple-600 hover:bg-purple-700 shadow-sm')\
-                                .tooltip("Scan transcript for written physical descriptions")
-                            
-                            ui.button('Deduce Vibe', icon='theater_comedy', on_click=speculate_single_char)\
-                                .classes('text-white font-bold text-xs bg-indigo-600 hover:bg-indigo-700 shadow-sm')\
-                                .tooltip("Deduce characteristics when details are unwritten")
+                            button.tooltip({
+                                "web": "Search the MCP server from Settings. "
+                                       "Shows the query first, then follows a "
+                                       "result page if a snippet is thin.",
+                                "wiki": "Search the configured wiki, one page, "
+                                        "read through its API.",
+                                "book": "Find the paragraphs in your own "
+                                        "transcripts that describe this "
+                                        "character.",
+                            }[source])
+
+                    ui.element('div').classes('flex-1 min-w-0')
 
                     # Hairstyle Helper Button
                     ui.button(
                         'Hairstyle Helper',
                         icon='face',
+                        color=None,
                         on_click=lambda: open_hair_picker_modal(project.id, active_event.id, compiled_desc_input, inputs_dict.get("hair_and_face"))
-                    ).classes('bg-purple-50 hover:bg-purple-100 text-purple-700 font-bold text-xs px-3 py-1.5 rounded-lg border border-purple-200 shadow-sm')
+                    ).props('unelevated dense no-caps').classes('bg-purple-50 hover:bg-purple-100 text-purple-700 font-bold text-xs px-3 py-1.5 rounded-lg border border-purple-200 shadow-sm shrink-0')
 
                 # --- Timeline: book-scoped, change points only ----------------
                 book_events = sorted(
@@ -3283,8 +3598,11 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     # Show the computed description, but do NOT persist it just by
                     # opening the panel: visual_description is a manual override,
                     # and the render path compiles from the fields when it is empty.
-                    computed_desc = display_event.visual_description or (
-                        compile_character_visual_prompt(display_event)
+                    stored_desc = (display_event.visual_description or "").strip()
+                    if is_placeholder_description(stored_desc):
+                        stored_desc = ""  # an automatic no-trait artefact, not an override
+                    computed_desc = stored_desc or (
+                        compile_character_visual_prompt(display_event, name=char.name)
                         if event_trait_count(display_event) else "")
                     if pinned_fields:
                         ui.label(
@@ -3354,7 +3672,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                         log=state.add_console_log)
                                 if char_obj and not char_obj.locked:
                                     if event_trait_count(db_ev):
-                                        new_prompt = compile_character_visual_prompt(db_ev)
+                                        new_prompt = compile_character_visual_prompt(
+                                            db_ev, name=char_obj.name)
                                         # Only refresh an override that exists; leave
                                         # an uncompiled event dynamic for the renderer.
                                         if db_ev.visual_description:
@@ -3456,7 +3775,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 trait_fields = [
                     ("sex", "Sex (male / female)"),
                     ("species", "Species (human unless stated)"),
-                    ("age", "Age (young / adult / middle-aged / old)"),
+                    ("age", "Age (child / teen / young / adult / middle-aged / old)"),
                     ("hair_color", "Hair Colour"),
                     ("hair_style", "Hair Style"),
                     ("eye_color", "Eye Colour"),

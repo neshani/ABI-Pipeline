@@ -96,13 +96,31 @@ def ensure_book_orders(project_id: int):
             session.commit()
 
 
-def compile_character_visual_prompt(obj) -> str:
+_PLACEHOLDER_DESCRIPTION = re.compile(r"^\s*a person named\b", re.IGNORECASE)
+
+
+def is_placeholder_description(text: Any) -> bool:
+    """True when a description is only the no-trait fallback.
+
+    New Base events were stamped with ``a person named person`` because the
+    compiler ran on an event that had neither a name nor any traits. That is an
+    artefact, not a manual override: it must never shadow traits filled in
+    later, or the character renders as "a person named person" forever.
+    """
+    return bool(_PLACEHOLDER_DESCRIPTION.match(str(text or "")))
+
+
+def compile_character_visual_prompt(obj, name: Optional[str] = None) -> str:
     """Assembles the inner description (no character name) from an event's fields.
 
     Accepts either a CharacterTimelineEvent or a legacy Character object. A
     new-field event uses the extracted trait set; a legacy event keeps the old
     four-field comma list, so a project profiled by an older build produces the
     same text it always did.
+
+    ``name`` is the character's display name. Timeline events do not carry one,
+    so a caller holding an event must pass it; otherwise the no-trait fallback
+    can only say "a person named person".
     """
     if has_new_traits(obj):
         inner = compile_event_fields(obj, {}, True)
@@ -129,8 +147,8 @@ def compile_character_visual_prompt(obj) -> str:
             seen.add(p_clean.lower())
 
     if not cleaned_pieces:
-        name = getattr(obj, "name", "person")
-        return f"a person named {name}"
+        who = (name or getattr(obj, "name", None) or "").strip()
+        return f"a person named {who or 'person'}"
         
     return ", ".join(cleaned_pieces)
 
@@ -906,7 +924,10 @@ async def run_stateful_character_profiling(
             db_event.distinguishing_marks = state_checklist["distinguishing_marks"]
             
             if char and not char.locked:
-                db_event.visual_description = compile_character_visual_prompt(db_event)
+                initial_desc = compile_character_visual_prompt(
+                    db_event, name=char.name)
+                if not is_placeholder_description(initial_desc):
+                    db_event.visual_description = initial_desc
                 
             session.add(db_event)
             session.commit()
@@ -985,7 +1006,11 @@ RENDERED_TRAIT_FIELDS = tuple(f for f in NEW_TRAIT_FIELDS if f != "notes")
 TRAIT_ORDER = ("eye_color", "face", "build", "attire", "carried")
 
 _SEX_NOUN = {"male": "man", "female": "woman"}
-_VALID_AGES = {"young", "adult", "middle-aged", "old"}
+# A child is a noun, not an adjective in front of one: "young man" describes a
+# grown adult, which is why boy/girl need their own slot.
+_CHILD_NOUN = {"male": "boy", "female": "girl"}
+_CHILD_AGES = {"child", "teen"}
+_ADULT_AGES = {"young", "adult", "middle-aged", "old"}
 _BLANK_VALUES = {"", "null", "none", "unknown", "not stated", "n/a", "unstated",
                  "blank", "blanks", "empty", "no value"}
 # An animal word that already carries a sex must not be given a second one
@@ -1339,7 +1364,8 @@ def propagate_trait_change(session: Session, character: Character, field: str,
             event.source = "manual"  # a re-analysis must not undo it
         if event.visual_description:
             # A stored override would otherwise keep the old wording.
-            event.visual_description = compile_character_visual_prompt(event)
+            event.visual_description = compile_character_visual_prompt(
+                event, name=character.name)
         session.add(event)
         changed += 1
     if changed:
@@ -1486,6 +1512,10 @@ def _base_noun(event) -> str:
     Returns "" when none of them is stated. That is deliberate: "a person" adds
     nothing to an image, and a missing base is visible in the tab as a field the
     user can fill. A non-human species takes the slot instead of man/woman.
+
+    A child or a teenager is a different noun, not an adjective: "young man" reads
+    as a grown adult, so age ``child`` gives "a boy"/"a girl" and ``teen`` gives
+    "a teenage boy"/"a teenage girl". With no sex stated, the noun is the age.
     """
     sex = _trait_value(event, "sex").lower()
     species = _trait_value(event, "species")
@@ -1493,18 +1523,31 @@ def _base_noun(event) -> str:
     species_word = species.lower()
     nonhuman = species_word not in _HUMAN_SPECIES and species_word != ""
     species_tokens = set(re.findall(r"[a-z]+", species_word))
-    sex_word = ""
-    if sex in _SEX_NOUN and not (species_tokens & _SEXED_ANIMAL):
-        sex_word = sex if nonhuman else _SEX_NOUN[sex]
+    sex_usable = sex in _SEX_NOUN and not (species_tokens & _SEXED_ANIMAL)
     parts = []
-    if age in _VALID_AGES:
-        parts.append(age)
-    if sex_word:
-        parts.append(sex_word)
+
     if nonhuman:
+        # The species is the noun, so age goes back to being an adjective.
+        age_word = "young" if age in _CHILD_AGES else age
+        if age_word in _ADULT_AGES:
+            parts.append(age_word)
+        if sex_usable:
+            parts.append(sex)
         parts.append(species)
+        return " ".join(p for p in parts if p)
+
+    if age in _CHILD_AGES:
+        if sex_usable:
+            noun = _CHILD_NOUN[sex]
+            return f"teenage {noun}" if age == "teen" else noun
+        return "child" if age == "child" else "teenager"
+
+    if age in _ADULT_AGES:
+        parts.append(age)
+    if sex_usable:
+        parts.append(_SEX_NOUN[sex])
     # An age with no noun ("a young") is not a base. Give it one.
-    if parts and not sex_word and not nonhuman:
+    elif parts:
         parts.append("person")
     return " ".join(p for p in parts if p)
 
@@ -1953,13 +1996,16 @@ def compile_character_description_from_event(
     """
     Returns the compiled character description (visual_description) for a specific timeline event state.
     """
-    if event.visual_description and str(event.visual_description).strip():
-        desc = event.visual_description.strip()
+    stored = (event.visual_description or "").strip() if event.visual_description else ""
+    # A stored description is a deliberate override, and it wins. The no-trait
+    # placeholder is the one exception: it is written automatically when a
+    # profile is empty, so treating it as an override made later traits invisible.
+    if stored and not is_placeholder_description(stored):
         if use_sentence_structure:
-            if desc.startswith(char.name) or "(" in desc:
-                return desc
-            return f"{char.name} ({desc})"
-        return desc
+            if stored.startswith(char.name) or "(" in stored:
+                return stored
+            return f"{char.name} ({stored})"
+        return stored
 
     # The extracted trait set, when this event has one.
     if has_new_traits(event):
@@ -1981,7 +2027,7 @@ def compile_character_description_from_event(
         for f in [demo, build, hair_face, marks]
     )
     if not has_any_details:
-        return char.name
+        return f"a person named {char.name}"
 
     if not use_sentence_structure:
         pieces = []
@@ -1999,7 +2045,7 @@ def compile_character_description_from_event(
                 seen.add(p_clean.lower())
 
         if not cleaned_pieces:
-            return char.name
+            return f"a person named {char.name}"
             
         return ", ".join(cleaned_pieces)
     else:
@@ -2270,6 +2316,27 @@ def auto_bracket_character_names(prompt: str, project_id: int,
     return work
 
 
+def _replace_bracket_tag(text: str, raw_tag: str, replacement: str) -> str:
+    """Replace one bracketed occurrence of ``raw_tag`` with ``replacement``.
+
+    The usual case is a literal ``[tag]``. The prompt is whitespace-normalised
+    first, so ``[ a man ]`` survives with its padding; a literal lookup would
+    miss it and send the brackets to the image model. The fallback matches the
+    tag with optional inner whitespace (and an empty ``[]`` too), so a tag that
+    does not resolve is always stripped rather than left behind.
+    """
+    literal = f"[{raw_tag}]"
+    if literal in text:
+        return text.replace(literal, replacement, 1)
+    pattern = re.compile(
+        r"\[\s*[\"']?\s*" + re.escape(clean_character_tag(raw_tag))
+        + r"\s*[\"']?\s*\]",
+        re.IGNORECASE)
+    # Lambda: a replacement string is literal, so a backslash in a character
+    # description cannot be read as a regex escape.
+    return pattern.sub(lambda _match: replacement, text, count=1)
+
+
 def replace_character_tags_in_prompt(
     prompt: str, 
     project_id: int, 
@@ -2318,7 +2385,7 @@ def replace_character_tags_in_prompt(
 
             # Already given its full description earlier in this prompt: keep the bare name.
             if tag_lower in described_tags:
-                modified_prompt = modified_prompt.replace(f"[{raw_tag}]", tag, 1)
+                modified_prompt = _replace_bracket_tag(modified_prompt, raw_tag, tag)
                 continue
 
             # 1. Gather all candidate characters matching either alias or canonical name
@@ -2346,7 +2413,7 @@ def replace_character_tags_in_prompt(
 
             if not candidate_chars:
                 # No character entity found; strip brackets and keep raw tag text
-                modified_prompt = modified_prompt.replace(f"[{raw_tag}]", tag, 1)
+                modified_prompt = _replace_bracket_tag(modified_prompt, raw_tag, tag)
                 continue
 
             # 2. Book-Aware Disambiguation
@@ -2416,7 +2483,7 @@ def replace_character_tags_in_prompt(
                 )
                 expanded_character_ids.add(char.id)
             
-            modified_prompt = modified_prompt.replace(f"[{raw_tag}]", replacement, 1)
+            modified_prompt = _replace_bracket_tag(modified_prompt, raw_tag, replacement)
             described_tags.add(tag_lower)
 
     return modified_prompt
@@ -3232,7 +3299,10 @@ def merge_character_into_target(
 
         if tgt and not tgt.locked:
             if target_base and not target_base.visual_description:
-                target_base.visual_description = compile_character_visual_prompt(target_base)
+                initial_desc = compile_character_visual_prompt(
+                    target_base, name=tgt.name)
+                if not is_placeholder_description(initial_desc):
+                    target_base.visual_description = initial_desc
                 session.add(target_base)
                 session.commit()
 
@@ -3309,7 +3379,10 @@ def detach_alias_to_character(
             )
             session.add(base_ev)
             session.flush()
-            base_ev.visual_description = compile_character_visual_prompt(base_ev)
+            initial_desc = compile_character_visual_prompt(
+                base_ev, name=new_char.name)
+            if not is_placeholder_description(initial_desc):
+                base_ev.visual_description = initial_desc
             session.add(base_ev)
 
             self_alias = CharacterAlias(character_id=new_char.id, alias=alias_name)

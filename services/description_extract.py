@@ -32,9 +32,10 @@ PROMPT = (
     '"height","build","hair_color","hair_style","eye_color"} - null for anything '
     "not stated.\n"
     "Shapes: sex = male|female. species = lowercase noun, null for an ordinary "
-    "human. age = young|adult|middle-aged|old. height = as the material says it, "
-    "including comparisons. build = adjectives only. hair_color and eye_color = "
-    "colour words. hair_style = a short phrase."
+    "human. age = child|teen|young|adult|middle-aged|old (child and teen change the "
+    "noun the image gets, so use them whenever the material says so). height = as "
+    "the material says it, including comparisons. build = adjectives only. "
+    "hair_color and eye_color = colour words. hair_style = a short phrase."
 )
 
 

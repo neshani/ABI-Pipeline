@@ -52,6 +52,7 @@ from services import scene_map
 from services import checkpoints
 from services import pipeline_manifest
 from services import llm_config
+from services import trait_vocab
 from services.character_manager import (NEW_TRAIT_FIELDS, RENDERED_TRAIT_FIELDS,
                                         normalize_character_text,
                                         save_project_characters_to_json)
@@ -138,8 +139,10 @@ SPECIES_FIELD = (
     '- species: what KIND of being they are, one word - "human", "horse", "cat".\n'
     '  "human" is the default; say anything else only when a sentence calls them it.\n')
 AGE_FIELD = (
-    '- age: ONE word - "young", "adult", "middle-aged", "old". Not a number and not a\n'
-    '  description. Answer "unknown" if no sentence says.\n')
+    '- age: ONE word - "child", "teen", "young", "adult", "middle-aged", "old".\n'
+    '  "child" is a boy or girl before their teens, "teen" an adolescent; use these\n'
+    '  whenever the sentences say so, because they change the noun the image gets.\n'
+    '  Not a number and not a description. Answer "unknown" if no sentence says.\n')
 HAIR_COLOR_FIELD = (
     '- hair_color: the COLOUR of the hair, and nothing else - "gray", "black",\n'
     '  "reddish", "fair". Not a length, not a style, not a colour of anything else.\n')
@@ -503,7 +506,10 @@ MALE_WORDS = re.compile(r"\b(man|men|male|boy|boys|lad|lads|sir|master|father|so
 FEMALE_WORDS = re.compile(r"\b(woman|women|female|girl|girls|lady|ladies|madam|mistress|"
                           r"mother|daughter|sister|wife|mare|ewe|cow|doe|hen)\b", re.I)
 AGE_SYN = {
-    "young": ("young", "youth", "youthful", "boy", "girl", "child", "lad", "lass",
+    "child": ("child", "children", "boy", "girl", "lad", "lass", "kid",
+              "youngster", "little"),
+    "teen": ("teen", "teenager", "teenaged", "adolescent", "youth", "young"),
+    "young": ("young", "youth", "youthful", "boy", "girl", "lad", "lass",
               "younger", "little"),
     "adult": ("adult", "grown", "grown-up", "man", "woman", "men", "women"),
     "middle-aged": ("middle-aged", "middle aged", "middle years", "mature", "middle"),
@@ -1916,6 +1922,14 @@ def write_book_analysis(project_id: int, book_id: int, payload: Dict[str, Any],
                 # position is sorted. Last value wins, as in reading order.
                 for fact in own_positions[position]:
                     field, value = fact["field"], fact["value"]
+                    # The extractor's wording is normalised once, here, on the way
+                    # into the database - never at render time. A later manual edit
+                    # is stored exactly as typed.
+                    normalised = trait_vocab.normalise_value(field, value)
+                    if normalised is not None:
+                        value = normalised
+                    if not value:
+                        continue
                     current = state.get(field)
                     if current and value.strip().lower() == current.strip().lower():
                         continue

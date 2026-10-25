@@ -20,7 +20,7 @@ selected from its own active variant, like the roles.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from database.connection import get_setting, set_setting
 
@@ -39,6 +39,25 @@ SHOT_TYPES = ("WIDE", "CHARACTER", "INSERT", "NONE")
 
 # Roles that have a prompt fragment. "single" is the planner-off fallback.
 SHOT_ROLES = ("single", "wide", "character", "insert")
+
+# Where a role goes when it declines to answer. The INSERT fragment refuses when
+# the passage holds nothing worth showing close, and the step out of a refusal is
+# always outward - to the place, then to the unconstrained prompt. Never to
+# CHARACTER: demanding a person from a passage that has none is exactly the
+# invented-subject failure the shared block forbids ("Physically Present
+# Characters Only"), and the model satisfies it by making somebody up.
+FALLBACK_ROLES: Dict[str, Tuple[str, ...]] = {
+    "insert": ("wide", "single"),
+    "character": ("wide", "single"),
+    "wide": ("single",),
+    "single": (),
+}
+
+
+def fallback_roles(role: str) -> Tuple[str, ...]:
+    """Roles to try, in order, when ``role`` returns no usable prompt."""
+    return FALLBACK_ROLES.get(role, ())
+
 
 # Slots the editor shows and the run-time snapshot records: the common block,
 # the standalone Shot Planner, then the role fragments.
