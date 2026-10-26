@@ -19,13 +19,16 @@ import time
 from typing import Callable, Dict, Iterable, List, Optional
 
 from services import mcp_client
+from services import trait_vocab
 
 MAX_ROUNDS = 6
 MAX_TOOL_CHARS = 7000
 
-# Only the fields the renderer compiles. ``attire`` and ``carried`` are
-# deliberately absent: they are scene props, and a reference source describes
-# them for a moment in the story rather than for the character.
+# The fields the lookup asks for. ``attire`` and ``carried`` are deliberately
+# absent: they are scene props, and a reference source describes them for a moment
+# in the story rather than for the character. ``marks`` stays because a scar or a
+# tattoo is permanent and a user may want it; it is stored in ``notes`` rather than
+# compiled into the prompt.
 LOOKUP_FIELDS = ("sex", "species", "age", "height", "build", "hair_color",
                  "hair_style", "eye_color", "face", "marks")
 
@@ -153,9 +156,12 @@ def sanitise(fields: Dict[str, str]) -> Dict[str, str]:
 
     The model is told these shapes and mostly obeys; the few that matter are
     enforced here because a value like ``eye_color="large dark eyes"`` composes
-    into "a woman with large dark eyes eyes" at render time.
+    into "a woman with large dark eyes eyes" at render time. A refusal ("not
+    specified", "unknown") is not a value either: it is dropped here, once, for
+    every source that ends up in the profile.
     """
-    out = dict(fields)
+    out = {key: value for key, value in (fields or {}).items()
+           if not trait_vocab.is_non_answer(str(value or ""))}
     for field in ("hair_color", "eye_color"):
         value = out.get(field)
         if value:
@@ -165,7 +171,7 @@ def sanitise(fields: Dict[str, str]) -> Dict[str, str]:
                 out[field] = value
             else:
                 out.pop(field, None)
-    for field in ("build", "height"):
+    for field in ("build", "height", "face"):
         value = out.get(field)
         if not value:
             continue

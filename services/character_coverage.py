@@ -6,16 +6,17 @@ book never says it - so chasing the final field for 300 characters buys nothing
 and costs a call each. The threshold says "start with the characters who have
 nothing, and only widen it deliberately".
 
-``face`` does not count towards coverage: it is a manual field, so counting it
-would make every character look one field short of the truth. ``notes`` is not a
-trait at all.
+``face`` does not count towards coverage: a reference lookup can fill it, but most
+sources do not state one, so counting it would make every character look one field
+short of the truth. ``notes`` is not a trait at all.
 """
 from __future__ import annotations
 
 from typing import Dict, Iterable, List, Optional, Sequence
 
 # The traits a source can actually supply, and the ones the renderer compiles.
-# `face` is excluded on purpose: manual only.
+# `face` is excluded on purpose: a lookup may fill it, but too few sources state
+# one for it to mean "this character is described".
 COVERAGE_FIELDS = ("sex", "species", "age", "build", "hair_color", "hair_style",
                    "eye_color")
 

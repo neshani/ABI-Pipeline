@@ -10,6 +10,10 @@ from sqlalchemy import func
 from database.connection import engine, get_setting
 from database.models import Project, Book, Character, CharacterAlias, CharacterTimelineEvent, CharacterBookLink, ScenePrompt
 from ui import state
+from ui.components.description_lookup_modal import (
+    available_lookup_sources,
+    open_lookup_dialog,
+)
 from services.character_manager import (
     save_project_characters_to_json,
     run_stateful_character_profiling,
@@ -1880,6 +1884,11 @@ def open_bulk_descriptions_dialog(project: Project, books: List[Book],
                         else:
                             line += " — " + (", ".join(payload.get("filled") or [])
                                              or "no change")
+                            not_saved = payload.get("dropped") or []
+                            if not_saved:
+                                fields_text = ", ".join(d["field"]
+                                                        for d in not_saved)
+                                line += f" (not saved: {fields_text})"
                         with results:
                             ui.label(line).classes('text-[10px] text-slate-600 '
                                                    'leading-tight')
@@ -1985,6 +1994,8 @@ def open_bulk_descriptions_dialog(project: Project, books: List[Book],
                                     f"{item['fields']} fields"
                                     + (f", {item['conflicts']} conflicts"
                                        if item["conflicts"] else "")
+                                    + (f", {item['dropped']} values not storable"
+                                       if item.get("dropped") else "")
                                     + (f", {item['failed']} failed"
                                        if item["failed"] else "")
                                 ).classes('text-[10px] font-bold text-slate-700 '
@@ -2023,327 +2034,20 @@ def open_bulk_descriptions_dialog(project: Project, books: List[Book],
                     'bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs '
                     'px-4 py-1.5 rounded-lg shrink-0')
                 stop_button.disable()
-                ui.label('Fields never written: face (manual), notes.').classes(
+                ui.label('Notes and a source\'s marks are stored but never '
+                         'rendered.').classes(
                     'text-[10px] text-slate-400 flex-1 min-w-0 leading-tight')
 
     dialog.open()
 
 
 # --- one character, one source, on demand -----------------------------------
+#
+# The dialog lives in ``ui/components/description_lookup_modal.py`` because the
+# book workspace's character editor opens the same four sources. It imports
+# ``default_web_query``/``open_lookup_dialog`` from there; this module keeps the
+# names in its namespace for the call sites below and for older imports.
 
-def default_web_query(character_name: str, series: str) -> str:
-    """The first search a single-character web lookup runs.
-
-    The name is quoted because an unquoted one drifts: a two-word name matches the
-    actor, the television episode and every page that lists the cast, and a single
-    given name matches half the book. Quoting it is a hint the model can see and
-    reword, which is exactly the amount of control worth offering.
-    """
-    series = (series or "").strip()
-    return f'"{character_name}" {series} appearance description'.strip()
-
-
-def default_wiki_query(character_name: str, names: List[str], term: str) -> str:
-    """The wiki search a single-character lookup starts with."""
-    from services.wiki_lookup import name_bearing_probe
-    probe = name_bearing_probe(character_name, names)
-    return f'"{probe}" {term}'.strip()
-
-
-def available_lookup_sources(project: Project) -> Dict[str, str]:
-    """Which single-character sources can run, and what stops the others.
-
-    A disabled button with a reason is better than a button that silently does
-    nothing, and better than hiding it: the reason is the instruction.
-    """
-    from pathlib import Path as _Path
-    mcp_url = (get_setting("mcp_url", "") or "").strip()
-    wiki_url = (getattr(state, "wiki_url", "") or "").strip()
-    base_dir = _Path(get_setting("output_dir", "./output")).resolve()
-    has_transcript = any(
-        (base_dir / project.name / book.name / "transcript.txt").exists()
-        for book in project_books(project.id))
-    return {
-        "web": "" if mcp_url else "no MCP server in Settings",
-        "wiki": "" if wiki_url else "no wiki URL set in Fill Descriptions",
-        "book": "" if has_transcript else "no transcripts on disk",
-    }
-
-
-def project_books(project_id: int) -> List[Book]:
-    with Session(engine) as session:
-        return list(session.exec(select(Book).where(Book.project_id == project_id)
-                                 .order_by(Book.book_order)).all())
-
-
-def open_lookup_dialog(project: Project, char: Character, refresh_callback: Any = None,
-                       initial_source: str = "web") -> None:
-    """Search one character in one source, showing the query before it is sent.
-
-    Three sources, one modal: the bulk run answers "describe everyone else", this
-    answers "describe *this* one", which is what a principal character in the
-    middle of a book actually needs. Nothing is written until a source returns
-    fields, and even then only the empty ones - the same rule as the bulk run.
-
-    The query is shown and editable because the search is the part a user can
-    actually improve: a model will not know that the project means a particular
-    book, and a quoted name is the cheapest way to say so.
-    """
-    from services import (book_lookup, description_extract, description_runner,
-                          wiki_lookup, web_lookup)
-
-    llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
-    model = get_setting("llm_model", "local-model")
-    mcp_url = (get_setting("mcp_url", "") or "").strip()
-    mcp_auth = get_setting("mcp_auth_header", "") or ""
-    mcp_prefs = get_setting("mcp_tool_prefs", {}) or {}
-    wiki_url = (getattr(state, "wiki_url", "") or "").strip()
-    wiki_term = (getattr(state, "wiki_term", "") or project.name).strip()
-    series = (getattr(state, "mcp_series_name", "") or project.name).strip()
-
-    with Session(engine) as session:
-        aliases = [a.alias for a in session.exec(
-            select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-            if (a.alias or "").strip()]
-    names = list(dict.fromkeys([char.name, *aliases]))
-
-    availability = available_lookup_sources(project)
-    run_state = {"source": initial_source if not availability.get(initial_source)
-                 else "", "running": False, "changed": False}
-    elements: Dict[str, Any] = {"query_input": None}
-
-    def style_sources() -> None:
-        for key, button in source_buttons.items():
-            active = key == run_state["source"]
-            button.classes(
-                add=('bg-blue-600 text-white border-blue-600' if active
-                     else 'bg-white text-slate-600 border-slate-200'),
-                remove=('bg-white text-slate-600 border-slate-200' if active
-                        else 'bg-blue-600 text-white border-blue-600'))
-
-    def set_source(source: str) -> None:
-        if run_state["running"] or availability.get(source):
-            return
-        run_state["source"] = source
-        style_sources()
-        query_panel.clear()
-        render_query_help()
-
-    def render_query_help() -> None:
-        # Opens its own container: the first render happens after the footer is
-        # built, and without this the query widgets were appended to the card and
-        # landed *below* the Search button.
-        source = run_state["source"]
-        elements["query_input"] = None
-        elements["wiki_query"] = None
-        with query_panel:
-            if source == "web":
-                ui.label('First search query').classes(
-                    'text-[10px] font-bold text-slate-400 uppercase tracking-wider')
-                query_input = ui.input(value=default_web_query(char.name, series)) \
-                    .classes('w-full text-xs').props('dense outlined')
-                elements["query_input"] = query_input
-                ui.label('Sent as the model\'s starting point. The quotes bias it to '
-                         'the exact spelling; it may reword the query if nothing '
-                         'comes back, and it opens a result page when a snippet is '
-                         'not enough.').classes(
-                    'text-[10px] text-slate-400 leading-tight')
-            elif source == "wiki":
-                ui.label('Page search').classes(
-                    'text-[10px] font-bold text-slate-400 uppercase tracking-wider')
-                wiki_query = ui.input(
-                    value=default_wiki_query(char.name, names, wiki_term)) \
-                    .classes('w-full text-xs').props('dense outlined')
-                elements["wiki_query"] = wiki_query
-                ui.label('Searches this wiki through its API, one request per '
-                         'second. The page title must contain the name; a page '
-                         'that merely mentions them is refused.').classes(
-                    'text-[10px] text-slate-400 leading-tight')
-            else:
-                ui.label('Paragraphs searched').classes(
-                    'text-[10px] font-bold text-slate-400 uppercase tracking-wider')
-                ui.label(', '.join(names)).classes(
-                    'text-xs text-slate-700 bg-slate-50 border rounded px-2 py-1.5 '
-                    'w-full')
-                ui.label('Code narrows to paragraphs that name the character, then '
-                         'the model decides which of them describe them. Every book '
-                         'with a transcript is searched.').classes(
-                    'text-[10px] text-slate-400 leading-tight')
-
-    def close_dialog() -> None:
-        dialog.close()
-        if run_state["changed"] and refresh_callback:
-            refreshed = refresh_callback()
-            if asyncio.iscoroutine(refreshed):
-                asyncio.create_task(refreshed)
-
-    def show_result(lines: List[str], solution: str = "negative") -> None:
-        for line in lines:
-            with results:
-                ui.label(line).classes('text-[11px] leading-tight ' + (
-                    'text-slate-600' if solution == "negative" else
-                    'text-emerald-700 font-semibold'))
-
-    with ui.dialog() as dialog, ui.card().classes(
-            'w-[620px] max-w-[95vw] max-h-[88vh] p-0 rounded-xl flex flex-col '
-            'overflow-hidden'):
-        with ui.row().classes('w-full items-center gap-3 px-5 pt-4 pb-2 flex-nowrap'):
-            with ui.column().classes('gap-0 flex-1 min-w-0'):
-                ui.label(f'Find a description: {char.name}').classes(
-                    'text-base font-bold text-slate-800 leading-tight truncate')
-                ui.label('One source at a time. Only empty fields are written, so '
-                         'nothing you have edited is replaced.').classes(
-                    'text-[11px] text-slate-500 leading-tight whitespace-normal')
-            ui.button(icon='close', on_click=close_dialog).props('flat dense round') \
-                .classes('shrink-0 text-slate-400')
-
-        with ui.column().classes('w-full px-5 gap-3 pb-4 overflow-y-auto flex-1 '
-                                 'min-h-0'):
-            source_buttons: Dict[str, Any] = {}
-            with ui.row().classes('w-full gap-2 flex-nowrap'):
-                for key, label, icon in (("web", "Web (MCP)", "cloud"),
-                                         ("wiki", "Wiki", "travel_explore"),
-                                         ("book", "Book text", "auto_stories")):
-                    reason = availability.get(key, "")
-                    button = ui.button(label, icon=icon, color=None,
-                                       on_click=lambda _, k=key: set_source(k)) \
-                        .props('unelevated dense no-caps')\
-                        .classes('text-xs font-bold px-3 py-1.5 rounded-lg border '
-                                 'bg-white text-slate-600 border-slate-200 '
-                                 'flex-1 min-w-0')
-                    if reason:
-                        button.disable()
-                        button.classes(add='opacity-50')
-                        button.tooltip(reason)
-                    source_buttons[key] = button
-
-            query_panel = ui.column().classes('w-full gap-1')
-            results = ui.column().classes(
-                'w-full gap-0 min-h-[60px] max-h-56 overflow-y-auto border '
-                'rounded-lg bg-white px-2 py-1.5')
-            with results:
-                ui.label('Results appear here.').classes(
-                    'text-[11px] text-slate-400')
-
-            async def do_lookup() -> None:
-                if run_state["running"] or not run_state["source"]:
-                    return
-                run_state["running"] = True
-                run_button.disable()
-                results.clear()
-                progress.set_text('Searching…')
-                source = run_state["source"]
-                fields: Dict[str, str] = {}
-                error = ""
-                detail: List[str] = []
-                try:
-                    if source == "web":
-                        found = await web_lookup.lookup_character(
-                            char.name, series, mcp_url=mcp_url, mcp_auth=mcp_auth,
-                            tool_prefs=mcp_prefs, llm_url=llm_url, model=model,
-                            query=(elements["query_input"].value or "").strip()
-                            if elements["query_input"] else "",
-                            log=lambda message: progress.set_text(
-                                message.replace("[Lookup] ", "")))
-                        fields = found.get("fields") or {}
-                        error = found.get("error", "")
-                        if found.get("sources"):
-                            detail.append("Sources: " + ", ".join(found["sources"][:3]))
-                        if found.get("rounds"):
-                            detail.append(f"{found['rounds']} model rounds, "
-                                          f"{found.get('seconds')}s")
-                    elif source == "wiki":
-                        got = wiki_lookup.lookup(
-                            char.name, base=wiki_url, term=wiki_term,
-                            aliases=aliases,
-                            query=(elements["wiki_query"].value or "").strip()
-                            if elements["wiki_query"] else "")
-                        if not got["ok"]:
-                            error = got["error"]
-                        else:
-                            detail.append(f'Page: {got["title"]}')
-                            extracted = await description_extract.extract_from_text(
-                                char.name, got["block"], llm_url=llm_url, model=model)
-                            fields = extracted.get("fields") or {}
-                            error = extracted.get("error", "")
-                    else:
-                        progress.set_text('Loading transcripts…')
-                        transcripts = await asyncio.to_thread(
-                            description_runner.load_transcripts, project.id)
-                        found = await book_lookup.lookup(
-                            char.name, books=transcripts, aliases=aliases,
-                            llm_url=llm_url, model=model)
-                        fields = found.get("fields") or {}
-                        error = found.get("error", "")
-                        if found.get("who"):
-                            detail.append(f'The model attributes: {found["who"]}')
-                        if found.get("used"):
-                            detail.append(f'{len(found["used"])} paragraphs used')
-                except Exception as ex:
-                    error = f"{type(ex).__name__}: {ex}"
-
-                try:
-                    if not fields:
-                        progress.set_text('Nothing found.')
-                        show_result([error or "The source stated nothing about "
-                                     "their appearance."], solution="negative")
-                    else:
-                        with Session(engine) as session:
-                            event = description_runner.ensure_base_event(session, char.id)
-                            outcome = description_runner.apply_fields(event, fields)
-                            if outcome["filled"]:
-                                if event.source != "manual":
-                                    event.source = "manual"
-                                session.add(event)
-                                session.commit()
-                                run_state["changed"] = True
-                            else:
-                                session.rollback()
-                        filled = outcome["filled"]
-                        progress.set_text(
-                            f"{len(filled)} field(s) filled" if filled
-                            else "Nothing new: every field already has a value.")
-                        show_result(
-                            [f"{field.replace('_', ' ')}: {fields[field]}"
-                             for field in fields],
-                            solution="negative")
-                        if filled:
-                            show_result([f"Written: {', '.join(filled)}"], solution="positive")
-                        for conflict in outcome["conflicts"]:
-                            show_result([f"kept {conflict['field']}: "
-                                         f"{conflict['was']} (source said "
-                                         f"{conflict['found']})"], solution="negative")
-                        if detail:
-                            show_result(detail, solution="negative")
-                        state.add_console_log(
-                            f"[Lookup] {char.name} via {source}: "
-                            + (", ".join(filled) if filled else "no change")
-                            + (f" ({error})" if error else ""))
-                except Exception as ex:
-                    # A locked database or a vanished character must not leave the
-                    # Search button disabled for the rest of the session.
-                    progress.set_text('Could not save.')
-                    show_result([f"{type(ex).__name__}: {ex}"], solution="negative")
-                finally:
-                    run_state["running"] = False
-                    run_button.enable()
-
-            with ui.row().classes('w-full items-center gap-2 flex-nowrap px-5 py-3 '
-                                  'border-t shrink-0'):
-                run_button = ui.button('Search', icon='search', on_click=do_lookup) \
-                    .props('unelevated dense no-caps')\
-                    .classes('bg-blue-600 hover:bg-blue-700 text-white font-bold '
-                             'text-xs px-4 py-1.5 rounded-lg shrink-0')
-                with ui.column().classes('gap-0 flex-1 min-w-0'):
-                    progress = ui.label('Ready.').classes(
-                        'text-[11px] text-slate-600 leading-tight truncate')
-                    ui.label('Writes to the Base profile only.').classes(
-                        'text-[10px] text-slate-400 leading-tight')
-
-            render_query_help()
-            style_sources()
-
-    dialog.open()
 
 
 def render_characters_tab(project: Project, books: List[Book], refresh_parent: Optional[Any] = None):
@@ -3387,7 +3091,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     for source, label, icon in (
                             ("web", "Search Web", "cloud"),
                             ("wiki", "Search Wiki", "travel_explore"),
-                            ("book", "Search Book", "auto_stories")):
+                            ("book", "Search Book", "auto_stories"),
+                            ("deduce", "Deduce Vibe", "theater_comedy")):
                         reason = lookup_sources.get(source, "")
                         # color=None: a Quasar colour sets the text colour too,
                         # so the default 'primary' turned a white button into
@@ -3413,6 +3118,9 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                 "book": "Find the paragraphs in your own "
                                         "transcripts that describe this "
                                         "character.",
+                                "deduce": "Research the book first, then cast a "
+                                          "look for the traits it leaves empty. "
+                                          "Deduced values are marked in notes.",
                             }[source])
 
                     ui.element('div').classes('flex-1 min-w-0')
@@ -3779,11 +3487,11 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     ("hair_color", "Hair Colour"),
                     ("hair_style", "Hair Style"),
                     ("eye_color", "Eye Colour"),
-                    ("face", "Face (manual entry)"),
+                    ("face", "Face (shape, complexion)"),
                     ("build", "Build (Height / Frame)"),
                     ("attire", "Attire (Wearing Now)"),
                     ("carried", "Carried (Held or Worn)"),
-                    ("notes", "Notes (extracted, never rendered)"),
+                    ("notes", "Notes (stored, never rendered)"),
                 ]
                 with ui.grid().classes('w-full grid-cols-1 md:grid-cols-2 gap-3'):
                     for key, label in trait_fields:

@@ -11,7 +11,6 @@ from services.character_manager import (
     compile_character_visual_prompt,
     is_placeholder_description,
     save_project_characters_to_json,
-    run_stateful_character_profiling,
     get_alias_occurrences,
     resolve_event_at,
     get_pinned_fields,
@@ -22,6 +21,7 @@ from services.character_manager import (
     RENDERED_TRAIT_FIELDS,
 )
 from ui.pages.project.characters_tab import get_character_frequency_map, event_trait_count
+from ui.components.description_lookup_modal import open_lookup_dialog
 
 try:
     from services.character_manager import merge_character_aliases
@@ -56,9 +56,8 @@ class QuickCharactersModal:
         self.selected_char_id: Optional[int] = initial_char_id
         self.selected_event_id: Optional[int] = None  # Tracks which chronological event state is being edited
         self.active_row_id: Optional[int] = None
-        self.is_profiling = False
         self.search_query = ""
-        
+
         # Load core data
         with Session(engine) as session:
             self.project = session.get(Project, self.project_id)
@@ -363,33 +362,38 @@ class QuickCharactersModal:
             ).classes('bg-purple-600 text-white font-bold text-xs p-2 rounded-lg').tooltip('Add Timeline Override State')
 
         with ui.row().classes('w-full items-center gap-2 flex-shrink-0'):
-            async def run_research_quick(speculate: bool = False):
+            def open_find_dialog(source: str):
+                """Open the shared lookup dialog, then rebuild this panel on close.
+
+                The work happens in the dialog, not in a handler inside this grid.
+                That is deliberate: refreshing the grid from a handler *inside* it
+                deletes the element the handler is running on, which is why these
+                two buttons used to leave the form frozen until the modal was
+                reopened. The dialog refreshes the host once, when it closes.
+                """
                 if char.locked:
                     ui.notify("Character is locked from being profiled.", type="warning")
                     return
-                self.is_profiling = True
-                self.draw_right_details.refresh()
-                try:
-                    ui.notify(f"Running LLM {'speculation' if speculate else 'factual research'}...", type="info")
-                    await run_stateful_character_profiling(
-                        self.project_id, char.id, book_id=self.book_id, 
-                        max_chunks_to_scan=5, speculate=speculate
-                    )
-                    ui.notify("LLM complete!", type="positive")
-                except Exception as e:
-                    ui.notify(f"Research failed: {e}", type="negative")
-                self.is_profiling = False
+                open_lookup_dialog(self.project, char,
+                                   refresh_callback=refresh_after_lookup,
+                                   initial_source=source)
+
+            def refresh_after_lookup():
                 self.draw_left_list.refresh()
                 self.draw_right_details.refresh()
                 self.trigger_workspace_refresh()
 
-            if self.is_profiling:
-                with ui.row().classes('items-center gap-2 bg-purple-50 px-3 py-1.5 rounded-lg border border-purple-200'):
-                    ui.spinner(size='xs', color='purple')
-                    ui.label('LLM Active...').classes('text-xs text-purple-700 font-bold')
-            else:
-                ui.button('Research (LLM)', icon='science', on_click=lambda: run_research_quick(False)).classes('text-white font-bold text-xs bg-purple-600 hover:bg-purple-700')
-                ui.button('Deduce Vibe', icon='theater_comedy', on_click=lambda: run_research_quick(True)).classes('text-white font-bold text-xs bg-indigo-600 hover:bg-indigo-700')
+            ui.button('Research (LLM)', icon='science',
+                      on_click=lambda: open_find_dialog("book")) \
+                .classes('text-white font-bold text-xs bg-purple-600 hover:bg-purple-700') \
+                .tooltip('Read the book text and keep only what it states. Nothing '
+                         'is invented and nothing you have set is replaced.')
+            ui.button('Deduce Vibe', icon='theater_comedy',
+                      on_click=lambda: open_find_dialog("deduce")) \
+                .classes('text-white font-bold text-xs bg-indigo-600 hover:bg-indigo-700') \
+                .tooltip('Research first, then give the empty traits a look that '
+                         'fits their role, age and bearing. Values it invents are '
+                         'noted as not coming from the text.')
 
         # --- PHYSICAL TRAITS INPUT GRID (BOUND TO SELECTED EVENT) ---
         # These are the fields the renderer compiles, at this scene's position. The
@@ -483,7 +487,7 @@ class QuickCharactersModal:
             ("hair_color", "Hair Colour"),
             ("hair_style", "Hair Style"),
             ("eye_color", "Eye Colour"),
-            ("face", "Face (manual entry)"),
+            ("face", "Face (shape, complexion)"),
             ("build", "Build (Height / Frame)"),
             ("attire", "Attire (Wearing Now)"),
             ("carried", "Carried (Held or Worn)"),

@@ -148,6 +148,16 @@ def height_word(inches: Optional[float]) -> str:
     return "average"
 
 
+def states_average_build(text: str) -> bool:
+    """True when a build value names a middling frame.
+
+    An average frame is dropped from the prompt on purpose (it says nothing an
+    image model can draw), which is a different outcome from "not a frame at all"
+    and deserves a different explanation to the user.
+    """
+    return _find_phrase(text or "", _FRAME_SYNONYMS) == "average"
+
+
 def normalise_build(build: str, height: str = "") -> str:
     """A canonical frame/height phrase, or ``""`` when nothing usable is stated.
 
@@ -204,8 +214,22 @@ _ages("old", "old", "older", "elderly", "elder", "aged", "ancient", "grizzled",
       "gray-haired", "grey-haired", "white-haired", "in his seventies",
       "in her seventies", "seventies", "venerable")
 
-_NON_ANSWERS = {"", "unknown", "n/a", "na", "none", "null", "unspecified",
-                "unclear", "not stated", "-", "?"}
+_NON_ANSWERS = {"", "-", "?", "null", "none", "n/a", "na", "unknown",
+                "unspecified", "unclear", "unstated", "unmentioned",
+                "unremarkable", "not stated", "not specified", "not mentioned",
+                "not described", "not known", "not given", "not available",
+                "no value", "blank", "nobody", "nothing"}
+
+
+def is_non_answer(value: str) -> bool:
+    """True when a value is a refusal to answer rather than a value.
+
+    A model asked for a face and given no basis writes "not specified" about as
+    often as it omits the key. Stored, that renders as "a man, not specified",
+    so it is filtered on the way in - for every source, not just the caster.
+    """
+    text = " ".join((value or "").lower().split()).strip(" .,;:")
+    return text in _NON_ANSWERS
 
 _NUMERIC_AGE = re.compile(r"\b(\d{1,3})\b")
 

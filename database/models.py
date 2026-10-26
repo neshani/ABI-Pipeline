@@ -113,12 +113,14 @@ class CharacterTimelineEvent(SQLModel, table=True):
     hair_color: Optional[str] = Field(default=None)
     hair_style: Optional[str] = Field(default=None)
     eye_color: Optional[str] = Field(default=None)
-    # The face slot: manual entry only. Face shape, complexion, permanent marks -
-    # the detail that is neither hair nor build and that extraction cannot be
-    # trusted with ("a sly, narrow face" and "face went redder" look alike to the
-    # model). Facial hair does NOT live here: for most characters it is the
-    # hairstyle, so it stays in hair_style and the composer renders it
-    # ("long white hair and a bushy beard", "white hair, bushy white brows").
+    # The face slot: face shape, complexion, permanent marks - the detail that is
+    # neither hair nor build. The web/MCP lookup may fill it, because a reference
+    # source states a face as a stable feature; the transcript extractor never
+    # asks for it, because prose there is mostly transient ("a sly, narrow face"
+    # and "her face reddened" look alike to the model). Facial hair does NOT live
+    # here: for most characters it is the hairstyle, so it stays in hair_style and
+    # the composer renders it ("long white hair and a bushy beard", "white hair,
+    # bushy white brows").
     face: Optional[str] = Field(default=None)
     build: Optional[str] = Field(default=None)          # height / frame, not a face
     attire: Optional[str] = Field(default=None)         # what they are wearing now

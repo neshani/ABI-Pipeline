@@ -6,8 +6,9 @@ the trimming rules cannot drift between sources.
 
 Two things are deliberate:
 
-* ``face`` is not requested. It is a manual field: prose descriptions of it are
-  transient ("cheeks turning pink") and an automated value there is noise.
+* ``face`` is not requested. Prose descriptions of it are transient ("cheeks
+  turning pink") and an automated value there is noise, so only the web lookup -
+  where the source states a face as a stable feature - fills it.
 * ``height`` is requested but never stored. It is folded into ``build`` by
   ``merge_height``, which is the one field that renders.
 """

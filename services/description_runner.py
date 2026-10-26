@@ -153,11 +153,70 @@ def targets(rows: Sequence[Dict], threshold: int) -> List[Dict]:
 
 # --- applying ---------------------------------------------------------------
 
-_FIELD_LABELS = {
-    "sex": "sex", "species": "species", "age": "age", "build": "build",
-    "hair_color": "hair colour", "hair_style": "hair style",
-    "eye_color": "eye colour",
+# The fields a lookup may write. ``face`` is one of them on purpose: a reference
+# source states it as a stable feature ("a narrow face, high cheekbones"), which is
+# exactly what the renderer wants, whereas the transcript extractor sees mostly
+# transient prose ("her face reddened") and deliberately does not ask for it.
+# ``height`` is absent because no column stores it - it is folded into ``build``
+# below, the same way every other import folds it.
+APPLIED_FIELDS = ("sex", "species", "age", "build", "hair_color", "hair_style",
+                   "eye_color", "face")
+
+# Marks and notes have no field of their own in the compiled prompt, so they are
+# collected in ``notes`` - stored, searchable, never rendered. That is the point of
+# notes: a detail worth keeping does not have to be worth drawing.
+_NOTE_FIELDS = ("notes", "marks")
+
+# Asked for by a source but impossible to store: saying so beats showing a value
+# in the results and then dropping it in silence.
+_UNSTORED_FIELDS = {
+    "attire": "clothing is a scene prop, not a profile field",
+    "carried": "a carried object is a scene prop, not a profile field",
 }
+
+
+def _drop_reason(field: str, before: str = "") -> str:
+    """Why the vocabulary emptied a value, in words a user can act on."""
+    if field == "build":
+        if trait_vocab.states_average_build(before):
+            return ("a middling frame adds nothing to a prompt, so it is not "
+                    "stored - type the wording you want in the Character tab")
+        return ("no frame or height word the renderer can use - type the wording "
+                "you want in the Character tab")
+    if field == "age":
+        return "not an age stage this app knows"
+    if field in ("hair_color", "eye_color"):
+        return "not a colour"
+    return "nothing left after normalising"
+
+
+def _merge_notes(event, additions: List[tuple]) -> List[Dict[str, str]]:
+    """Append source ``notes``/``marks`` to the event's notes; report what was added.
+
+    Notes is a note drawer, not a trait, so this appends instead of filling only
+    when empty: a second run that mentions the same scar must not delete it, and a
+    hand-written note must not be replaced by a search result. The dedup is on the
+    text itself, which is what makes a repeated run a no-op.
+    """
+    current = (getattr(event, "notes", None) or "").strip()
+    pieces = [piece.strip().strip(" .,;") for piece in current.split(";") if piece]
+    added: List[Dict[str, str]] = []
+
+    def known(text: str) -> bool:
+        low = text.lower()
+        existing = pieces + [item["value"] for item in added]
+        return any(low in other.lower() for other in existing)
+
+    for field, value in additions:
+        text = " ".join(str(value or "").split()).strip(" .,;")
+        if not text or trait_vocab.is_non_answer(text) or known(text):
+            continue
+        added.append({"field": field, "value": text})
+        pieces.append(text)
+
+    if added:
+        event.notes = "; ".join(pieces)
+    return added
 
 
 def apply_fields(event, fields: Dict[str, str]) -> Dict:
@@ -165,19 +224,39 @@ def apply_fields(event, fields: Dict[str, str]) -> Dict:
 
     Not committed here: the caller owns the session, which keeps the dry run and
     the real run on exactly the same code path.
+
+    Every input value ends up in exactly one bucket, and a value the vocabulary
+    cannot express goes to ``dropped`` with its original wording rather than
+    vanishing. A silent drop reads to the user as "the search found it and the app
+    threw it away", which is indistinguishable from nothing having been found.
+    ``notes`` and ``marks`` are appended to the notes field and reported in
+    ``noted``: kept for reference, never compiled into the prompt.
     """
-    filled, conflicts, unchanged = [], [], []
-    for field, value in fields.items():
-        value = (value or "").strip()
-        if not value or field not in _FIELD_LABELS:
+    raw: Dict[str, str] = {}
+    for field, value in (fields or {}).items():
+        text = str(value or "").strip()
+        if text:
+            raw[str(field)] = text
+
+    # Normalise once, on the way in, exactly as the reference/wiki/book paths do:
+    # this is what folds a separate ``height`` into ``build`` and canonicalises the
+    # frame wording. A hand edit in the Character tab never passes through here.
+    changes: List[tuple] = []
+    values = trait_vocab.normalise_traits(raw, changes)
+    rewritten_by_field = {field: after for field, _before, after in changes}
+
+    filled, conflicts, unchanged, dropped, rewritten = [], [], [], [], []
+    for field in APPLIED_FIELDS:
+        before = raw.get(field)
+        if not before:
             continue
-        # Values arrive from a model, so they are normalised here - once, on the
-        # way in. A hand edit in the Character tab never passes through this.
-        normalised = trait_vocab.normalise_value(field, value)
-        if normalised is not None:
-            value = normalised
+        value = (values.get(field) or "").strip()
         if not value:
+            dropped.append({"field": field, "found": before,
+                            "reason": _drop_reason(field, before)})
             continue
+        if field in rewritten_by_field and value != before:
+            rewritten.append({"field": field, "was": before, "now": value})
         current = (getattr(event, field, None) or "").strip()
         if not current:
             setattr(event, field, value)
@@ -185,8 +264,40 @@ def apply_fields(event, fields: Dict[str, str]) -> Dict:
         elif current.lower() == value.lower():
             unchanged.append(field)
         else:
-            conflicts.append({"field": field, "was": current, "found": value})
-    return {"filled": filled, "conflicts": conflicts, "unchanged": unchanged}
+            # ``found`` is the stored shape, ``source`` the source's own wording,
+            # so the "kept X (source said Y)" line quotes what was actually read.
+            conflicts.append({"field": field, "was": current, "found": value,
+                              "source": before})
+
+    # A height on its own has no column and is only worth mentioning when it did
+    # not produce a build: an average height is dropped by design (it says nothing
+    # an image model can draw), and that is the case a user would otherwise report
+    # as "it found the height and saved nothing".
+    height = raw.get("height")
+    if height and not raw.get("build") and not (values.get("build") or "").strip():
+        dropped.append({
+            "field": "height", "found": height,
+            "reason": ("folded into build, and this height is either average "
+                       "(dropped as uninformative) or not readable as a height")})
+
+    # Notes and marks are kept, not drawn: no trait field renders them, so they are
+    # appended to notes. Notes is the one field where appending is right - it is a
+    # note drawer rather than a value the prompt reads, and the dedup in
+    # ``_merge_notes`` keeps a repeated lookup from writing the same scar twice.
+    noted = _merge_notes(event, [(field, raw[field]) for field in _NOTE_FIELDS
+                                 if raw.get(field)])
+    if noted and "notes" not in filled:
+        filled.append("notes")
+
+    for field, value in raw.items():
+        if field in APPLIED_FIELDS or field in _NOTE_FIELDS or field == "height":
+            continue
+        dropped.append({"field": field, "found": value,
+                        "reason": _UNSTORED_FIELDS.get(
+                            field, "there is no such field in the profile")})
+
+    return {"filled": filled, "conflicts": conflicts, "unchanged": unchanged,
+            "dropped": dropped, "rewritten": rewritten, "noted": noted}
 
 
 def ensure_base_event(session: Session, character_id: int):
@@ -323,7 +434,7 @@ async def run(project_id: int, *, threshold: int = 0,
             continue
         summary = {"id": step_id, "targets": len(step_rows), "filled": 0,
                    "fields": 0, "failed": 0, "skipped": 0, "conflicts": 0,
-                   "skipped_reason": ""}
+                   "dropped": 0, "skipped_reason": ""}
         emit({"type": "step", "id": step_id, "targets": len(step_rows)})
 
         if step_id == "reference" and isinstance(blocks, dict):
@@ -408,17 +519,22 @@ async def run(project_id: int, *, threshold: int = 0,
             else:
                 summary["skipped"] += 1
             summary["conflicts"] += len(outcome["conflicts"])
+            summary["dropped"] += len(outcome["dropped"])
             entry["steps"][step_id] = {
                 "status": "filled" if outcome["filled"] else "no change",
                 "filled": outcome["filled"],
                 "conflicts": outcome["conflicts"],
+                "dropped": outcome["dropped"],
+                "rewritten": outcome["rewritten"],
+                "noted": outcome["noted"],
                 "sources": result.get("sources") or [],
                 "source_title": result.get("source_title", ""),
             }
             emit({"type": "character", "id": row["id"], "name": row["name"],
                   "step": step_id,
                   "status": entry["steps"][step_id]["status"],
-                  "filled": outcome["filled"], "conflicts": outcome["conflicts"]})
+                  "filled": outcome["filled"], "conflicts": outcome["conflicts"],
+                  "dropped": outcome["dropped"], "noted": outcome["noted"]})
 
         report["steps"].append(summary)
         if report["cancelled"]:
