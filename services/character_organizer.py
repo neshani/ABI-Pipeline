@@ -381,8 +381,12 @@ def recalculate_project_character_hits(project_id: int):
             if total_hits == 0:
                 total_hits = freq_map.get(clean_character_key(char.name), 0)
 
-            char.hit_count = total_hits
-            session.add(char)
+            # Only dirty the rows that actually move: after a merge that is one
+            # character, not the whole cast. Writing all of them cost ~150 ms and
+            # an update per character in the flush.
+            if (char.hit_count or 0) != total_hits:
+                char.hit_count = total_hits
+                session.add(char)
         session.commit()
 
 
@@ -487,11 +491,20 @@ def get_suggested_alias_merges(project_id: int, target_character_id: int, book_i
             query = query.join(CharacterBookLink).where(CharacterBookLink.book_id == book_id)
         candidate_chars = session.exec(query).all()
 
+        # One join for every candidate's aliases. Asking per character cost 1,000+
+        # round trips on a large cast, and this runs on every render of the merge
+        # view - so it was most of the wait between merges.
+        aliases_by_char: Dict[int, List[str]] = {}
+        if candidate_chars:
+            for char_id, alias in session.exec(
+                    select(CharacterAlias.character_id, CharacterAlias.alias)
+                    .join(Character, Character.id == CharacterAlias.character_id)
+                    .where(Character.project_id == project_id)).all():
+                aliases_by_char.setdefault(char_id, []).append(alias)
+
         for cand in candidate_chars:
-            cand_aliases = session.exec(
-                select(CharacterAlias).where(CharacterAlias.character_id == cand.id)
-            ).all()
-            cand_variant_strings = [cand.name] + [a.alias for a in cand_aliases]
+            cand_aliases = aliases_by_char.get(cand.id, [])
+            cand_variant_strings = [cand.name] + cand_aliases
             cand_details_list = [extract_name_details(v) for v in cand_variant_strings if v.strip()]
 
             cand_tokens: Set[str] = set()
@@ -547,7 +560,7 @@ def get_suggested_alias_merges(project_id: int, target_character_id: int, book_i
                 suggestions.append({
                     "character_id": cand.id,
                     "name": cand.name,
-                    "aliases": [a.alias for a in cand_aliases],
+                    "aliases": list(cand_aliases),
                     "hits": hits,
                     "reason": reason,
                     "similarity": best_similarity

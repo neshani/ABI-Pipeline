@@ -89,7 +89,7 @@ if hasattr(core.sio, 'eio'):
 from sqlmodel import Session, select
 from database.connection import init_db, get_setting, set_setting, engine
 from database.models import Project, Book, Chapter
-from services.sync_engine import recover_from_temp_workspaces, get_book_stats, get_book_stats_cached
+from services.sync_engine import recover_from_temp_workspaces, get_book_stats, get_book_stats_cached, get_book_summary
 from services import compat
 from services.transcription import (
     start_project_transcription, 
@@ -277,6 +277,33 @@ def cleanup_book_workspace_resources():
 
 
 # --- Navigation State Control Handlers ---
+async def audit_project_async(project_id: int) -> None:
+    """Re-audit one project from disk, off the event loop, then rebuild once.
+
+    The audit reads every transcript and prompts.csv in the project - roughly
+    half a second a volume - so it does not belong in a click handler: the
+    portal used to sit frozen on the click for seconds with no feedback. The
+    page paints from the database first (which holds what the last audit found),
+    and this fills in anything that moved on disk since.
+    """
+    from ui.pages.project.dashboard import rescan_project_database_state
+
+    state.project_sync_count += 1
+    try:
+        await asyncio.to_thread(rescan_project_database_state, project_id)
+    except Exception as ex:
+        state.add_console_log(f"[ProjectLoad-Sync] Error during load synchronization: {ex}")
+    finally:
+        state.project_sync_count = max(0, state.project_sync_count - 1)
+
+    # Rebuild only if the user is still in the project, and only on the project
+    # view: a book workspace can hold unsaved UI state that a rebuild would drop.
+    # The dashboard body is what the audit changes; the sidebar and the status
+    # badge follow from the 2 s poll through their bindings.
+    if state.active_project_id == project_id and state.active_book_id is None:
+        _refresh_ui_soon()
+
+
 def select_project(project_id: int):
     """Sets the active project in memory and restores its saved settings from disk."""
     cleanup_book_workspace_resources()
@@ -295,16 +322,13 @@ def select_project(project_id: int):
         proj = session.get(Project, project_id)
         if proj:
             state.last_known_status = proj.status
-    
-    # Dynamically rescan project database state on load to align database with disk
-    try:
-        from ui.pages.project.dashboard import rescan_project_database_state
-        rescan_project_database_state(project_id)
-    except Exception as ex:
-        print(f"[ProjectLoad-Sync] Error during load synchronization: {ex}")
 
+    # Paint first, audit after: the render above is database-backed, so the page
+    # is usable immediately; the disk re-audit runs in a worker and rebuilds the
+    # panels when it is done (``audit_project_async``).
     header_controls.refresh()
     main_layout.refresh()
+    asyncio.create_task(audit_project_async(project_id))
 
 
 async def async_select_book(book_id: int, client):
@@ -354,19 +378,15 @@ def select_book_from_portal(project_id: int, book_id: int):
         if proj:
             state.last_known_status = proj.status
 
-    # Dynamically rescan project database state on load to align database with disk
-    try:
-        from ui.pages.project.dashboard import rescan_project_database_state
-        rescan_project_database_state(project_id)
-    except Exception as ex:
-        print(f"[ProjectLoad-Sync] Error during load synchronization: {ex}")
-
     state.active_book_id = book_id
     state.active_book_tab = 'Dashboard'
     state.active_log_widget = None
     ui.run_javascript('window.scrollTo(0, 0)')
     header_controls.refresh()
     main_layout.refresh()
+
+    # Same paint-then-audit order as ``select_project``.
+    asyncio.create_task(audit_project_async(project_id))
 
 
 def exit_to_portal():
@@ -467,14 +487,18 @@ def stop_transcribing(project_id: int):
     # One dashboard run covers analysis and prompts, so it is checked before the
     # per-phase status branch below: during an analysis the project status is
     # whatever it was before, and the old chain silently did nothing.
-    if getattr(state, "pipeline_active", False):
+    # ``prompt_gen_active`` and ``analysis_active`` are in the same check for the
+    # same reason: the status in the database lags the phase that is actually
+    # running by up to one poll, so keying the stop off it loses the click.
+    if (getattr(state, "pipeline_active", False)
+            or getattr(state, "prompt_gen_active", False)
+            or getattr(state, "analysis_active", False)):
         state.cancel_pipeline_flag = True
         state.cancel_prompt_gen_flag = True
+        state.pipeline_progress_line = "Stopping..."
         ui.notify("Stopping after the current step - finished work is kept.",
                   type="warning")
-        if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
-            state.action_buttons_refresh()
-        header_controls.refresh()
+        _refresh_ui_soon()
         return
 
     if state.project_status == "Transcribing":
@@ -492,9 +516,7 @@ def stop_transcribing(project_id: int):
         state.project_status = "Prompts Created"
     
     # Fast trigger to update action buttons and stepper layout
-    if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
-        state.action_buttons_refresh()
-    header_controls.refresh()
+    _refresh_ui_soon()
 
 
 def start_prompt_generation(project_id: int, book_ids: Optional[List[int]] = None):
@@ -509,6 +531,11 @@ def start_prompt_generation(project_id: int, book_ids: Optional[List[int]] = Non
     # Clear cancellation tracking status
     state.was_manually_cancelled = False
     state.active_task_type = "prompt_gen"
+    # The run's start is the only place a stop latch is cleared - the prompt
+    # stage itself must see a stop that arrived before it began.
+    state.cancel_prompt_gen_flag = False
+    state.cancel_pipeline_flag = False
+    state.pipeline_progress_line = ""
 
     # Reset progress for the books this run will actually touch.
     with Session(engine) as session:
@@ -532,14 +559,40 @@ def start_prompt_generation(project_id: int, book_ids: Optional[List[int]] = Non
     ui.notify("Background prompt generation sequences initiated!", type="positive")
 
     state.project_status = "Generating Prompts"
-    if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
-        state.action_buttons_refresh()
-    header_controls.refresh()
+    _refresh_ui_soon()
 
 
 def _pipeline_stopped() -> bool:
     """The one stop signal, polled between units by every stage."""
     return bool(getattr(state, "cancel_pipeline_flag", False))
+
+
+def _refresh_ui_soon() -> None:
+    """Rebuild the dashboard once the click handler that asked for it returns.
+
+    ``action_buttons_refresh`` rebuilds the dashboard subtree, which contains the
+    very Run/Stop button whose handler is running. NiceGUI deletes the elements
+    it rebuilds, so doing this inline leaves every later UI call in that handler
+    raising "The parent element this slot belongs to has been deleted"; the
+    refresh helper swallows those, and what the user sees is a panel that stopped
+    updating - a prompt feed that never fills in, a Stop button whose click
+    changes nothing on screen.
+    """
+    def run() -> None:
+        if hasattr(state, 'action_buttons_refresh') and state.action_buttons_refresh:
+            try:
+                state.action_buttons_refresh()
+            except Exception:
+                pass
+        try:
+            header_controls.refresh()
+        except Exception:
+            pass
+
+    try:
+        asyncio.get_running_loop().call_soon(run)
+    except RuntimeError:
+        run()
 
 
 def _book_dirs(project_id: int, book_ids):
@@ -595,6 +648,7 @@ async def _analyse_books(project_id: int, book_ids, stages) -> bool:
             state.add_console_log("[Analysis] Stopped. Finished work is on disk.")
             return False
         state.add_console_log(f"[Analysis] === {book_name} ===")
+        state.pipeline_progress_line = f"Analysis: {book_name}"
         try:
             if "segment" in run_stages:
                 await scene_map.build_book_map(
@@ -634,11 +688,25 @@ async def _run_character_analysis(project_id: int, book_ids: Optional[List[int]]
         state.add_console_log(f"[Analysis] Critical error: {ex}")
     finally:
         state.analysis_active = False
+        # Per-run latches: a stop that ended one run must not make the next run
+        # unwind on its first check.
+        state.cancel_pipeline_flag = False
+        state.cancel_prompt_gen_flag = False
+        state.pipeline_progress_line = ""
+        _refresh_ui_soon()
 
 
 async def _prompt_phase(project_id: int, book_ids):
     """Generate prompts for the selected books, resuming any half-written file."""
     from services.prompt_engine import start_project_prompt_gen
+
+    # A stop that arrived before this phase began must still stop it. The latch
+    # is cleared by ``start_pipeline``, not here - clearing it here is how a
+    # stopped run resumed into prompt generation.
+    if _pipeline_stopped():
+        state.add_console_log(
+            "[Pipeline] prompts: stopped before starting. Nothing was written.")
+        return
 
     with Session(engine) as session:
         project = session.get(Project, project_id)
@@ -657,8 +725,11 @@ async def _prompt_phase(project_id: int, book_ids):
         session.add(project)
         session.commit()
 
+    # Mirrored into the UI state so the dashboard is in the prompt phase at once
+    # instead of a poll later (the live prompt feed keys off this).
+    state.project_status = "Generating Prompts"
     state.active_task_type = "prompt_gen"
-    state.cancel_prompt_gen_flag = False
+    state.pipeline_progress_line = "Prompt-gen: preparing..."
     await start_project_prompt_gen(project_id, book_ids)
 
 
@@ -719,6 +790,11 @@ async def _run_pipeline(project_id: int, scope_ids, stages, force: bool = False)
         state.pipeline_active = False
         if getattr(state, "active_task_type", None) == "pipeline":
             state.active_task_type = None
+        # Both latches are per-run. Left set, the next Run reads as already
+        # stopped and unwinds on its first check.
+        state.cancel_pipeline_flag = False
+        state.cancel_prompt_gen_flag = False
+        state.pipeline_progress_line = ""
         _refresh_after_run()
 
 
@@ -728,11 +804,8 @@ def _refresh_after_run() -> None:
         clear_cache()
     except Exception:
         pass
-    if hasattr(state, "action_buttons_refresh") and state.action_buttons_refresh:
-        try:
-            state.action_buttons_refresh()
-        except Exception:
-            pass
+    # Deferred: this is also called from the Run button's own handler.
+    _refresh_ui_soon()
 
 
 def start_pipeline(project_id: int, scope_ids: Optional[List[int]] = None,
@@ -760,6 +833,7 @@ def start_pipeline(project_id: int, scope_ids: Optional[List[int]] = None,
     state.active_task_type = "pipeline"
     state.cancel_pipeline_flag = False
     state.cancel_prompt_gen_flag = False
+    state.pipeline_progress_line = ""
     asyncio.create_task(_run_pipeline(project_id, scope_ids, chosen, force))
     ui.notify(f"Started: {', '.join(chosen)}. Progress is in the console.",
               type="positive")
@@ -787,10 +861,12 @@ def start_character_analysis(project_id: int, book_ids: Optional[List[int]] = No
     state.analysis_active = True
     state.cancel_pipeline_flag = False
     state.cancel_prompt_gen_flag = False
+    state.pipeline_progress_line = ""
     asyncio.create_task(_run_character_analysis(project_id, book_ids, mode, stages))
     scope = ", ".join(stages) if stages else "all stages"
     ui.notify(f"Background analysis initiated ({scope}). Progress is in the console.",
               type="positive")
+    _refresh_ui_soon()
 
 
 # --- Image Generation Pipeline & Metadata Baker Utilities ---
@@ -908,56 +984,74 @@ async def async_run_project_image_gen_logic(project_id: int):
     state.add_console_log(f"[Image-Gen] Starting generation for project '{project_name}'...")
     state.add_console_log(f"[Image-Gen] Target ComfyUI API Address: {comfy_url}")
 
-    # --- Pre-scan all books to establish Global Batch Progress metrics ---
+    # --- Plan the run: which scenes actually need rendering? ---
+    #
+    # This used to walk every row of every volume and write progress for each one
+    # it skipped, so a regen on a finished series spent thousands of database
+    # commits and console lines before the first image. A set difference answers
+    # the same question in one pass per volume, and a complete book then has
+    # nothing to iterate. The plan is derived from the files on every run and
+    # never remembered: deleting an image (which also clears its approval in the
+    # workspace) puts that scene straight back into the next plan, with no status
+    # to maintain and nothing to invalidate.
+    from services.prompt_engine import is_unusable_prompt
+
     global_total_prompts = 0
     global_completed_prompts = 0
     actual_render_durations = []
+    plan = []
 
-    for b_info in books_info:
-        csv_path = find_prompts_csv(project_name, b_info["name"])
-        if csv_path:
+    def rendered_coords(book_dir: Path) -> set:
+        """``(chapter, shot)`` for every PNG already in this volume's folders."""
+        found = set()
+        for directory in (book_dir, book_dir / "images"):
+            if not directory.exists():
+                continue
             try:
-                rows = read_prompts_from_csv(csv_path)
-                valid_count = 0
-                for r in rows:
-                    p_text = r.get("prompt", "").strip()
-                    if p_text and p_text.lower() != "none" and p_text.lower() != "refusal":
-                        valid_count += 1
-                global_total_prompts += valid_count
-            except Exception:
-                pass
+                for filename in os.listdir(directory):
+                    if not filename.lower().endswith('.png'):
+                        continue
+                    parts = os.path.splitext(filename)[0].split('_')
+                    if len(parts) >= 2:
+                        try:
+                            found.add((int(parts[0]), int(parts[1])))
+                        except ValueError:
+                            pass
+            except Exception as e:
+                state.add_console_log(f"[Image-Gen] Error pre-indexing folder {directory.name}: {e}")
+        return found
 
-    state.add_console_log(f"[Image-Gen] Global Project Batch Master Prompt Count: {global_total_prompts}")
+    def row_coords(row, idx: int):
+        """The ``(chapter, shot)`` a row renders under, tolerating junk values."""
+        try:
+            chapter = int(float(row.get("chapter", "1")))
+        except (ValueError, TypeError):
+            chapter = 1
+        try:
+            scene = int(float(row.get("shot", str(idx + 1))))
+        except (ValueError, TypeError):
+            scene = idx + 1
+        return chapter, scene
 
     for b_info in books_info:
         book_id = b_info["id"]
         book_name = b_info["name"]
+        book_dir = Path(f"./output/{project_name}/{book_name}")
 
-        if state.cancel_image_gen_flag:
-            state.add_console_log("[Image-Gen] Image generation cancelled by user.")
-            break
-            
         csv_path = find_prompts_csv(project_name, book_name)
         if not csv_path:
             state.add_console_log(f"[Image-Gen] Warning: No prompts.csv found for volume '{book_name}'. Skipping.")
             continue
-            
-        state.add_console_log(f"[Image-Gen] Processing volume: {book_name}")
-        
+
         try:
             rows = read_prompts_from_csv(csv_path)
         except Exception as e:
             state.add_console_log(f"[Image-Gen] Error reading prompts for {book_name}: {str(e)}")
             continue
 
-        # Filter valid rows
-        from services.prompt_engine import is_unusable_prompt
-        valid_rows = []
-        for r in rows:
-            if not is_unusable_prompt(r.get("prompt", "")):
-                valid_rows.append(r)
-
+        valid_rows = [r for r in rows if not is_unusable_prompt(r.get("prompt", ""))]
         total_prompts = len(valid_rows)
+
         if total_prompts == 0:
             state.add_console_log(f"[Image-Gen] No valid prompt entries found in {csv_path.name}.")
             with Session(engine) as session:
@@ -969,80 +1063,91 @@ async def async_run_project_image_gen_logic(project_id: int):
                     session.commit()
             continue
 
-        state.add_console_log(f"[Image-Gen] Discovered {total_prompts} scenes to process inside {book_name}.")
-        
+        existing_coords = rendered_coords(book_dir)
+        missing = []
+        for idx, valid_row in enumerate(valid_rows):
+            coords = row_coords(valid_row, idx)
+            if coords not in existing_coords:
+                missing.append(coords)
+
+        global_total_prompts += total_prompts
+        global_completed_prompts += total_prompts - len(missing)
+        plan.append({
+            "id": book_id,
+            "name": book_name,
+            "csv_path": csv_path,
+            "out_dir": book_dir / "images",
+            "total": total_prompts,
+            "missing": missing,
+        })
+
+    complete_books = [p for p in plan if not p["missing"]]
+    pending_books = [p for p in plan if p["missing"]]
+
+    state.add_console_log(
+        f"[Image-Gen] Global Project Batch Master Prompt Count: {global_total_prompts}"
+        + (f" ({global_completed_prompts:,} already rendered)" if global_completed_prompts else ""))
+    if complete_books:
+        names = ", ".join(p["name"] for p in complete_books[:6])
+        state.add_console_log(
+            f"[Image-Gen] {len(complete_books)} volume(s) already complete, skipped: {names}"
+            + (" ..." if len(complete_books) > 6 else ""))
+    state.add_console_log(
+        f"[Image-Gen] {sum(len(p['missing']) for p in pending_books):,} scene(s) to render "
+        f"across {len(pending_books)} volume(s).")
+
+    # Volumes that need nothing: one status write each, no rows touched.
+    for entry in complete_books:
+        with Session(engine) as session:
+            db_book = session.get(Book, entry["id"])
+            if db_book:
+                db_book.status = "Images Created"
+                db_book.progress = 1.0
+                session.add(db_book)
+                session.commit()
+
+    for entry in pending_books:
+        book_id = entry["id"]
+        book_name = entry["name"]
+        csv_path = entry["csv_path"]
+        out_dir = entry["out_dir"]
+
+        if state.cancel_image_gen_flag:
+            state.add_console_log("[Image-Gen] Image generation cancelled by user.")
+            break
+
+        # The plan kept coordinates, not a copy of every row in the project, so
+        # only the volume being rendered is held in memory.
+        try:
+            rows = read_prompts_from_csv(csv_path)
+        except Exception as e:
+            state.add_console_log(f"[Image-Gen] Error reading prompts for {book_name}: {str(e)}")
+            continue
+
+        wanted = set(entry["missing"])
+        total_prompts = entry["total"]
+        completed_prompts = total_prompts - len(wanted)
+
+        state.add_console_log(
+            f"[Image-Gen] Processing volume: {book_name} "
+            f"({completed_prompts:,}/{total_prompts:,} already rendered, {len(wanted):,} to go)")
+
         # Nested target directory initialization
-        parent_dir = Path(f"./output/{project_name}/{book_name}")
-        out_dir = parent_dir / "images"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Pre-index existing files on disk exactly once to prevent thousands of O(N^2) directory globs
-        existing_coords = set()
-        def index_existing_images(directory: Path):
-            if not directory.exists():
-                return
-            try:
-                for filename in os.listdir(directory):
-                    if filename.lower().endswith('.png'):
-                        stem, _ = os.path.splitext(filename)
-                        parts = stem.split('_')
-                        if len(parts) >= 2:
-                            try:
-                                ch = int(parts[0])
-                                sc = int(parts[1])
-                                existing_coords.add((ch, sc))
-                            except ValueError:
-                                pass
-            except Exception as e:
-                state.add_console_log(f"[Image-Gen] Error pre-indexing folder {directory.name}: {e}")
-
-        index_existing_images(parent_dir)
-        index_existing_images(out_dir)
-
-        completed_prompts = 0
-        
-        for idx, row in enumerate(valid_rows):
+        for idx, row in enumerate(rows):
             if state.cancel_image_gen_flag:
                 break
-                
+
             prompt_text = row.get("prompt", "").strip()
-            quote_text = row.get("quote", "").strip()
-            chapter_str = row.get("chapter", "1")
-            scene_str = row.get("shot", str(idx + 1))
-            
-            try:
-                chapter = int(float(chapter_str))
-            except ValueError:
-                chapter = 1
-            try:
-                scene = int(float(scene_str))
-            except ValueError:
-                scene = idx + 1
-
-            # High performance coordinate set lookup
-            if (chapter, scene) in existing_coords:
-                state.add_console_log(f"[Image-Gen] Resume Skip: Ch {chapter}, Scene {scene} already rendered.")
-                completed_prompts += 1
-                global_completed_prompts += 1
-                
-                # Update Global project ETA dynamically on resume skips
-                global_remaining = max(0, global_total_prompts - global_completed_prompts)
-                if actual_render_durations:
-                    avg_render_time = sum(actual_render_durations) / len(actual_render_durations)
-                    eta_sec = avg_render_time * global_remaining
-                else:
-                    eta_sec = 10.0 * global_remaining  # fallback guess
-
-                state.batch_eta_label = f"ETA: {format_eta(eta_sec)}"
-
-                progress_val = completed_prompts / total_prompts
-                with Session(engine) as session:
-                    db_book = session.get(Book, book_id)
-                    if db_book:
-                        db_book.progress = progress_val
-                        session.add(db_book)
-                        session.commit()
+            if is_unusable_prompt(prompt_text):
                 continue
+
+            chapter, scene = row_coords(row, idx)
+            if (chapter, scene) not in wanted:
+                continue
+
+            quote_text = row.get("quote", "").strip()
 
             # Inject compiled character descriptions (bracketed tags only)
             from services.character_manager import replace_character_tags_in_prompt
@@ -1585,6 +1690,15 @@ def render_split_panel_shell(project_id: int):
                     
                 # Applying break-words and whitespace-normal to prevent overflows
                 ui.label(project.name).classes('text-sm font-bold text-slate-800 leading-tight break-words whitespace-normal')
+
+                # The project audit runs after the page has painted. Bound rather
+                # than rebuilt, so the indicator appears and disappears on its own
+                # without waiting for a refresh.
+                with ui.row().classes('items-center gap-1.5 text-[9px] font-semibold text-blue-600') \
+                        .bind_visibility_from(state, 'project_sync_count',
+                                              backward=lambda n: bool(n)):
+                    ui.spinner(size='sm', color='blue')
+                    ui.label('Checking files...')
                 
                 with ui.column().classes('w-full gap-0.5 mt-1'):
                     ui.label('').classes('text-[9px] font-bold text-slate-500 uppercase tracking-wide') \
@@ -1613,8 +1727,10 @@ def render_split_panel_shell(project_id: int):
                     if book.id not in state.books_status:
                         state.books_status[book.id] = book.status
                     if book.id not in state.books_subtitle:
-                        # Fetch initial stats
-                        stats = get_book_stats_cached(project.name, book.name)
+                        # Seed from the database: the 2s poll overwrites this
+                        # with the live counters, and reading every transcript
+                        # here would make the first paint of a long series slow.
+                        stats = get_book_summary(project.name, book)
                         total_scenes = stats["total_prompts"] or stats["estimated_scenes"] or 1
                         state.books_subtitle[book.id] = f"Rendered: {stats['generated_images']}/{total_scenes}"
 

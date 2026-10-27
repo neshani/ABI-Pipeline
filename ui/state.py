@@ -84,6 +84,20 @@ cancel_prompt_gen_flag: bool = False
 # because the prompt phase already owns that one.
 pipeline_active: bool = False
 cancel_pipeline_flag: bool = False
+# One line for the Run bar: stage, volume and position ("Shot planning: Chapter 3,
+# scenes 25-36 - Book", "Prompt-gen: 45/1125 - Book"). Written by the running
+# stage, bound into the dashboard, cleared when the run ends. Kept as text so
+# nothing has to poll the database to render it.
+pipeline_progress_line: str = ""
+# How many project re-audits are running in the background (normally 0 or 1).
+# A counter rather than a flag so a fast second click cannot clear the
+# "checking files" indicator while the first audit is still going.
+project_sync_count: int = 0
+# How many character rows the list paints before asking for a click. A cast of a
+# thousand was a thousand rows of elements - seconds of building and a
+# multi-megabyte update for a list the user scrolls two screens of.
+characters_list_limit: int = 200
+
 # Whether this project builds character descriptions at all. Per project, saved
 # in project_settings.json; off means the cast stages are skipped, not deleted -
 # prompts are unaffected either way because tags compile at render time.

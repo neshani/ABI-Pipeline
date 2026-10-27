@@ -426,6 +426,47 @@ def cancel_prompt_generation(project_id: int):
     state.add_console_log(f"[Prompt-Gen] Cancellation signal sent to Project ID {project_id}...")
 
 
+def prompt_gen_stopped() -> bool:
+    """True when the running prompt stage has been asked to stop.
+
+    Both latches count: ``cancel_prompt_gen_flag`` is this stage's own and
+    ``cancel_pipeline_flag`` is the dashboard run's, which is set for the whole
+    run - shot planning included. Reading only the prompt flag is what let a
+    stopped run resume: the stage that owns the flag resets it when it starts,
+    so a stop raised during shot planning (or just before the phase began) was
+    cleared by the next entry into the prompt stage.
+    """
+    return bool(getattr(state, "cancel_prompt_gen_flag", False)
+                or getattr(state, "cancel_pipeline_flag", False))
+
+
+def planner_progress_log(book_name: str):
+    """The planner's console log, plus the Run bar's one-line summary.
+
+    The Shot Planner already says where it is, per chapter and per window, so
+    the summary is read off those same lines instead of threading a second
+    callback through three functions. Two string comparisons per line is the
+    whole cost.
+    """
+    chapter = ""
+
+    def log(message: str) -> None:
+        nonlocal chapter
+        state.add_console_log(message)
+        if message.startswith("[Shot-Plan] Chapter "):
+            # "[Shot-Plan] Chapter 3: 12 scenes"
+            chapter = message.split("Chapter ", 1)[1].split(":", 1)[0].strip()
+            state.pipeline_progress_line = (
+                f"Shot planning: Chapter {chapter} - {book_name}")
+        elif message.startswith("[Shot-Plan] classifying scenes "):
+            span = message.split("classifying scenes ", 1)[1].strip()
+            where = f"Chapter {chapter}, " if chapter else ""
+            state.pipeline_progress_line = (
+                f"Shot planning: {where}scenes {span} - {book_name}")
+
+    return log
+
+
 def ensure_shot_role_column(csv_path: Path) -> None:
     """Guarantee ``shot_role`` exists and sits directly after ``quote``.
 
@@ -477,6 +518,50 @@ def ensure_shot_role_column(csv_path: Path) -> None:
             csv.writer(f, delimiter="|").writerows(out_rows)
     except Exception:
         pass
+
+
+def clear_prompt_approvals(csv_path: Path) -> int:
+    """Set ``approved`` to False on every row. Returns how many were cleared.
+
+    Used when the images those approvals referred to have been archived: a
+    regenerated image has not been looked at, so it must not arrive already
+    ticked. That is the same rule the workspace applies when one image is
+    deleted - the difference is that a rollback deletes all of them at once.
+
+    The file is rewritten in place, keeping its own header order: the append
+    paths downstream write rows positionally, so the column layout must not move.
+    """
+    if not csv_path.exists():
+        return 0
+    try:
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            rows = list(csv.reader(f, delimiter="|"))
+    except Exception:
+        return 0
+    if not rows:
+        return 0
+
+    header = compat.normalize_fieldnames(rows[0])
+    if "approved" not in header:
+        return 0  # legacy file with no such column: nothing was ever approved
+
+    column = header.index("approved")
+    cleared = 0
+    out_rows = [rows[0]]
+    for row in rows[1:]:
+        row = list(row)
+        if len(row) > column and (row[column] or "").strip().lower() == "true":
+            row[column] = "False"
+            cleared += 1
+        out_rows.append(row)
+
+    if cleared:
+        try:
+            with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                csv.writer(f, delimiter="|").writerows(out_rows)
+        except Exception:
+            return 0
+    return cleared
 
 
 def sort_csv_by_chapter_scene(csv_path: Path):
@@ -552,13 +637,22 @@ async def start_project_prompt_gen(project_id: int,
     from sqlmodel import Session, select
     from database.models import Project, Book
     from database.connection import engine, get_setting
+    from services import checkpoints
 
     if state.prompt_gen_active:
         state.add_console_log("[Prompt-Gen] Warning: A prompt generation task is already active.")
         return
 
+    # The stop latches are cleared by whoever *starts* the run (the dashboard's
+    # Run bar, or the prompt-gen button), never here: a Stop pressed while the
+    # previous stage was still unwinding used to be wiped by this line, and the
+    # run carried on into prompt generation as if it had never been asked to stop.
+    if prompt_gen_stopped():
+        state.add_console_log(
+            "[Prompt-Gen] A stop is already pending - the run will not start.")
+        return
+
     state.prompt_gen_active = True
-    state.cancel_prompt_gen_flag = False
     state.recent_prompts.clear()
     skipped_books = 0
     completed_books = 0
@@ -609,7 +703,7 @@ async def start_project_prompt_gen(project_id: int,
             book_id = book_dict["id"]
             book_name = book_dict["name"]
 
-            if state.cancel_prompt_gen_flag:
+            if prompt_gen_stopped():
                 state.add_console_log("[Prompt-Gen] Process interrupted by user.")
                 break
 
@@ -694,12 +788,14 @@ async def start_project_prompt_gen(project_id: int,
             focus_map = {}
             place_map = {}
             if pending:
+                state.pipeline_progress_line = (
+                    f"Shot planning: {book_name} - checking the stored plan")
                 shot_map = await shot_planner.ensure_book_plan(
                     project_name, book_name, llm_url,
                     llm_config.stage_model("plan"),
                     chunk_words=chunk_size_words, mode=shot_mode,
-                    log=state.add_console_log, selection=selection,
-                    should_cancel=lambda: state.cancel_prompt_gen_flag,
+                    log=planner_progress_log(book_name), selection=selection,
+                    should_cancel=prompt_gen_stopped,
                 )
                 # The focus the planner chose for each shot, read back from the stored plan.
                 # Without it the shared block's "the director has chosen a focus" line has
@@ -746,6 +842,14 @@ async def start_project_prompt_gen(project_id: int,
             total_chunks = len(completed_scenes) + len(tasks)
             state.add_console_log(f"[Prompt-Gen] Total chunks/scenes: {total_chunks} ({len(tasks)} pending)")
 
+            # The Run bar's counter. Incremented where a row is saved, so it can
+            # never claim more prompts than prompts.csv holds.
+            progress = {"done": len(completed_scenes), "total": total_chunks}
+
+            def report_prompt_progress() -> None:
+                state.pipeline_progress_line = (
+                    f"Prompt-gen: {progress['done']}/{progress['total']} - {book_name}")
+
             # Save total count in SQLite for metrics tracking
             with Session(engine) as session:
                 db_book = session.get(Book, book_id)
@@ -755,9 +859,12 @@ async def start_project_prompt_gen(project_id: int,
                     db_book.progress = len(completed_scenes) / total_chunks if total_chunks > 0 else 0.0
                     session.add(db_book)
                     session.commit()
+            report_prompt_progress()
 
             if not tasks:
                 state.add_console_log(f"[Prompt-Gen] All scenes for {book_name} are already generated.")
+                state.pipeline_progress_line = (
+                    f"Prompt-gen: {book_name} - already complete")
                 completed_books += 1
                 with Session(engine) as session:
                     db_book = session.get(Book, book_id)
@@ -788,10 +895,13 @@ async def start_project_prompt_gen(project_id: int,
             
             # Allow up to 3 warm-up attempts to handle GPU allocation spikes
             for attempt in range(3):
-                if state.cancel_prompt_gen_flag:
+                if prompt_gen_stopped():
                     break
                 try:
-                    res = await generate_prompt_for_chunk_async(first_task, llm_url, model_name, warm_up_sem)
+                    res = await checkpoints.await_cancellable(
+                        generate_prompt_for_chunk_async(
+                            first_task, llm_url, model_name, warm_up_sem),
+                        prompt_gen_stopped)
                     if res and res["status"] != "error":
                         warm_up_success = True
                         warm_up_res = res
@@ -799,17 +909,20 @@ async def start_project_prompt_gen(project_id: int,
                         break
                     else:
                         state.add_console_log(f"[Prompt-Gen] Warm-up attempt {attempt+1} returned API error. Retrying...")
+                except checkpoints.Cancelled:
+                    # A stop is not a failed warm-up: re-raising keeps it out of
+                    # the retry loop, which would otherwise re-ask three times.
+                    raise
                 except Exception as e:
                     state.add_console_log(f"[Prompt-Gen] Warm-up attempt {attempt+1} failed: {str(e)}. Retrying...")
                 await asyncio.sleep(2.5)
 
-            if state.cancel_prompt_gen_flag:
+            if prompt_gen_stopped():
                 state.add_console_log("[Prompt-Gen] Process interrupted by user during warm-up.")
                 break
 
             if not warm_up_success:
                 state.add_console_log("[Prompt-Gen] Error: Model warm-up failed. Suspending generation to prevent concurrent load errors.")
-                state.cancel_prompt_gen_flag = True
                 break
 
             # Persist sequential Warm-up result
@@ -842,6 +955,8 @@ async def start_project_prompt_gen(project_id: int,
                     "quote": warm_up_res["quote"],
                     "status": warm_up_res["status"]
                 })
+                progress["done"] += 1
+                report_prompt_progress()
 
             # Exclude the first task and process the rest of the queue concurrently
             remaining_tasks = tasks[1:]
@@ -861,13 +976,13 @@ async def start_project_prompt_gen(project_id: int,
             semaphore = asyncio.Semaphore(4)  # Limit concurrent API requests to 4
             
             async def run_and_save_task(task_data):
-                if state.cancel_prompt_gen_flag:
+                if prompt_gen_stopped():
                     return None
 
                 try:
                     res = await generate_prompt_for_chunk_async(task_data, llm_url, model_name, semaphore)
                     
-                    if state.cancel_prompt_gen_flag:
+                    if prompt_gen_stopped():
                         return None
 
                     # Treat refusals and failures gracefully
@@ -905,6 +1020,9 @@ async def start_project_prompt_gen(project_id: int,
                     if len(state.recent_prompts) > 5:
                         state.recent_prompts.pop(0)
 
+                    progress["done"] += 1
+                    report_prompt_progress()
+
                     return res
                 except asyncio.CancelledError:
                     raise
@@ -917,7 +1035,7 @@ async def start_project_prompt_gen(project_id: int,
             
             # Active Loop Monitor
             while not all(t.done() for t in active_tasks):
-                if state.cancel_prompt_gen_flag:
+                if prompt_gen_stopped():
                     state.add_console_log("[Prompt-Gen] Cancelling active background LLM requests...")
                     for task in active_tasks:
                         if not task.done():
@@ -929,7 +1047,7 @@ async def start_project_prompt_gen(project_id: int,
             await asyncio.gather(*active_tasks, return_exceptions=True)
 
             # Sort prompts.csv, run timing synchronization, and update book status to final
-            if not state.cancel_prompt_gen_flag:
+            if not prompt_gen_stopped():
                 sort_csv_by_chapter_scene(output_csv_path)
                 
                 # Trigger Phase C Timing Sync Pipeline automatically
@@ -948,7 +1066,7 @@ async def start_project_prompt_gen(project_id: int,
         # Update Project Status upon completing loop. A project with skipped books
         # stays in the prompt phase so the analysis card is still available for
         # the rest of the series.
-        if not state.cancel_prompt_gen_flag:
+        if not prompt_gen_stopped():
             with Session(engine) as session:
                 db_project = session.get(Project, project_id)
                 if db_project:
@@ -965,6 +1083,12 @@ async def start_project_prompt_gen(project_id: int,
         else:
             state.add_console_log("[Prompt-Gen] Prompt generation suspended successfully.")
 
+    except checkpoints.Cancelled:
+        # A stop raised out of shot planning or a request: not a failure. The
+        # book's plan is written whole or not at all, so the run resumes cleanly.
+        state.add_console_log(
+            "[Prompt-Gen] Stopped by user. Rows already written are kept; Run "
+            "resumes from them.")
     except Exception as ex:
         state.add_console_log(f"[Prompt-Gen] Critical Error: {str(ex)}")
     finally:

@@ -21,6 +21,7 @@ class PromptAutocompleteManager:
         self.selected_index = 0
         self.last_bracket = -1
         self.cursor_pos = -1
+        self._suggestion_signature = None
         
         # Load database characters and aliases cache
         self.characters = self._load_characters()
@@ -145,7 +146,12 @@ class PromptAutocompleteManager:
             if self.active_matches:
                 if self.selected_index >= len(self.active_matches):
                     self.selected_index = 0
-                self._render_suggestions()
+                # Rebuilding the suggestion rows on every keyup is avoidable work
+                # pushed over the websocket; only do it when the list changed.
+                signature = (query, tuple(m["id"] for m in self.active_matches))
+                if signature != self._suggestion_signature:
+                    self._suggestion_signature = signature
+                    self._render_suggestions()
                 self.popup.style('display: block;')
             else:
                 self._hide_popup()
@@ -196,6 +202,9 @@ class PromptAutocompleteManager:
     def _hide_popup(self):
         self.popup.style('display: none;')
         self.active_matches.clear()
+        # The rows stay in the DOM while hidden, so a re-show with the same
+        # matches must redraw them (their callbacks are re-bound on redraw).
+        self._suggestion_signature = None
 
     def select_match(self, match: dict):
         val = self.textarea.value or ""
@@ -265,10 +274,20 @@ class PromptAutocompleteManager:
                 print(f"[Autocomplete] Could not load character frequency map: {e}")
                 
             chars = session.exec(select(Character).where(Character.project_id == self.project_id)).all()
+
+            # One join for every alias in the project, not one query per
+            # character: a 1,000-character project paid 1,000 round trips here
+            # every time the editor opened.
+            aliases_by_char: dict = {}
+            for char_id, alias in session.exec(
+                    select(CharacterAlias.character_id, CharacterAlias.alias)
+                    .join(Character, Character.id == CharacterAlias.character_id)
+                    .where(Character.project_id == self.project_id)).all():
+                aliases_by_char.setdefault(char_id, []).append(alias)
+
             data = []
             for c in chars:
-                aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == c.id)).all()
-                alias_list = [a.alias.lower() for a in aliases]
+                alias_list = [a.lower() for a in aliases_by_char.get(c.id, [])]
                 if c.name.lower() not in alias_list:
                     alias_list.append(c.name.lower())
                 

@@ -24,10 +24,11 @@ much has accumulated.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypeVar
 
 
 class Cancelled(Exception):
@@ -144,3 +145,53 @@ def stopped(should_cancel: Optional[callable] = None) -> None:
     """
     if should_cancel is not None and should_cancel():
         raise Cancelled()
+
+
+T = TypeVar("T")
+
+
+async def await_cancellable(awaitable: Awaitable[T],
+                            should_cancel: Optional[Callable[[], bool]] = None,
+                            poll: float = 0.25) -> T:
+    """Await ``awaitable``, raising :class:`Cancelled` as soon as the predicate says so.
+
+    Checking between units is enough for a stage that owns a loop, but one LLM
+    request can take a minute or more (a chapter's worth of shot planning, a
+    long prompt), and that single request is where Stop looks dead. This races
+    the request against a cheap poll, so the wait is interruptible no matter
+    whether the caller's transport would honour a cancellation by itself.
+
+    The in-flight request is cancelled, not awaited to completion: the point of
+    a stop is that it stops paying for tokens now, and a lost reply is worthless
+    to a run that is not continuing. No predicate means plain ``await``.
+    """
+    if should_cancel is None:
+        return await awaitable
+    if should_cancel():
+        _close(awaitable)
+        raise Cancelled()
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        while True:
+            done, _pending = await asyncio.wait({task}, timeout=poll)
+            if done:
+                return task.result()
+            if should_cancel():
+                raise Cancelled()
+    finally:
+        if not task.done():
+            task.cancel()
+            # ``return_exceptions`` so a cancelled transport cannot replace the
+            # Cancelled we are already unwinding with.
+            await asyncio.gather(task, return_exceptions=True)
+
+
+def _close(awaitable) -> None:
+    """Close a coroutine that was never started, so Python does not warn."""
+    close = getattr(awaitable, "close", None)
+    if close is not None:
+        try:
+            close()
+        except Exception:
+            pass

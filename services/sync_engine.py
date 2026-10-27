@@ -468,9 +468,21 @@ def heal_project_book_orders(project_id: int, session: Session) -> None:
 
 def recover_from_temp_workspaces(session: Session) -> None:
     """
-    Scans both workspace_temp/ and output/ folders for transcription tracking metadata.
-    Reconstructs the complete database index on database wipe. Includes self-healing 
-    cleanup for deleted projects and automatic metadata.json healing to align with disk split.
+    Rebuilds *missing* database records from what is on disk, and restores
+    interrupted transcriptions.
+
+    This runs on every startup, so it is deliberately a **reconstruction** pass,
+    not an audit: a project, book or cast that is already in the database is
+    trusted. Re-reading every transcript and prompts.csv to re-derive numbers
+    that only change when the app itself writes them cost ~14 s for 250 volumes
+    and grew with the library - and opening a project re-audits exactly that
+    project (``rescan_project_database_state``), which is where the work belongs.
+    The same applies to the cast: ``characters.json`` is rebuilt from the
+    database on every edit, so it only needs reading back when the rows are gone.
+
+    Disk evidence of something the database does not know about is still picked
+    up: stale rows are pruned, a temp workspace resumes, and an output folder
+    with no Book row gets a row plus its chapters and indexes.
     """
     # Run a safe database cleanup first to synchronize DB records with disk deletions
     prune_stale_database_records(session)
@@ -558,6 +570,7 @@ def recover_from_temp_workspaces(session: Session) -> None:
     print(f"[Sync-Engine] Found {len(meta_items)} project tracking records to synchronize.")
 
     # 3. Direct Reconstruction of parent Projects and Books (No deep source folder re-scanning)
+    created_book_ids: set = set()
     for item in meta_items:
         proj_name = item.get("project_name")
         proj_path = item.get("project_path")
@@ -612,6 +625,7 @@ def recover_from_temp_workspaces(session: Session) -> None:
                 book.cover_path = cover_path
             session.add(book)
             session.flush()
+            created_book_ids.add(book.id)
             print(f"[Sync-Engine] Reconstructed database Book record: '{book_name}'")
 
     session.commit()
@@ -638,11 +652,17 @@ def recover_from_temp_workspaces(session: Session) -> None:
             continue
 
         if source_type == "output":
-            # Ensure Chapter records are fully populated (probes audio or parses transcript)
-            ensure_book_chapters_populated(book, Path(item["book_output_dir"]), item.get("book_path"), session)
+            # Only a row this pass just rebuilt needs its index filled in from
+            # the disk. An already-registered book is trusted here; its project
+            # re-audits it on open (``rescan_project_database_state``), and
+            # re-deriving every transcript word count at boot is what made
+            # startup grow with the size of the library.
+            if book.id in created_book_ids:
+                # Ensure Chapter records are fully populated (probes audio or parses transcript)
+                ensure_book_chapters_populated(book, Path(item["book_output_dir"]), item.get("book_path"), session)
 
-            # Book has a completed transcript on disk, perform audit to resolve correct step
-            sync_book_from_disk(book.id, session)
+                # Book has a completed transcript on disk, perform audit to resolve correct step
+                sync_book_from_disk(book.id, session)
 
         elif source_type == "temp":
             # Book transcription was in-progress, restore temp segments
@@ -704,8 +724,20 @@ def recover_from_temp_workspaces(session: Session) -> None:
     session.commit()
 
     # 3. Re-scan and synchronize characters.json for each active project in a separate isolated transaction
+    from database.models import Character
     for p_id in recovered_project_ids:
         try:
+            # The cast is rebuilt from characters.json on every edit, so the file
+            # is a mirror of the database. It only needs reading back when the
+            # rows are gone (a wiped or copied database) - re-inserting a whole
+            # cast per project on every boot cost ~11 s and grew with the library.
+            with Session(engine) as probe:
+                already_synced = probe.exec(
+                    select(Character).where(Character.project_id == p_id)
+                ).first() is not None
+            if already_synced:
+                continue
+
             from services.character_manager import sync_project_characters_from_json
             # Calling with session=None allows the function to handle its own clean, non-deadlocking transaction
             sync_project_characters_from_json(p_id)
@@ -930,6 +962,57 @@ def get_book_stats(project_name: str, book_name: str) -> dict:
             except Exception:
                 pass
                 
+    return stats
+
+
+def get_book_summary(project_name: str, book: Book,
+                     base_output_dir: Optional[Path] = None) -> dict:
+    """One book's headline numbers, read from the database instead of the disk.
+
+    Every value here is maintained by ``sync_book_from_disk``, which runs when a
+    project is opened, so the portal can paint a whole library without reading a
+    single transcript. That matters at scale: a cold disk pass over 250 volumes
+    was ~1.6 s of transcript reads and prompt-csv parsing *before the first
+    page*, and it grows with the library.
+
+    The disk is consulted only for a book the database knows nothing about - one
+    imported but never opened - where the numbers would be missing rather than
+    merely stale. Same shape as :func:`get_book_stats` so the portal can use it
+    in the same place.
+    """
+    from ui import state
+
+    stats = {
+        "has_transcript": False,
+        "char_count": 0,
+        "word_count": 0,
+        "total_prompts": 0,
+        "approved_prompts": 0,
+        "generated_images": 0,
+        "estimated_scenes": 0,
+    }
+
+    words = book.word_count or 0
+    if words <= 0:
+        base = (Path(base_output_dir) if base_output_dir is not None
+                else Path(get_setting("output_dir", "./output")).resolve())
+        if (base / project_name / book.name / "transcript.txt").exists():
+            # Never synced: this is the one case worth a file read, and it is
+            # self-limiting - the next project open writes the numbers down.
+            return get_book_stats(project_name, book.name)
+        return stats
+
+    chunk_size = getattr(state, "playground_chunk_size", 350)
+    if not chunk_size or chunk_size <= 0:
+        chunk_size = 350
+
+    stats["has_transcript"] = True
+    stats["word_count"] = words
+    # ``total_images`` is the count of *renderable* prompt rows (unusable ones are
+    # excluded), which is what the progress bars divide by.
+    stats["total_prompts"] = book.total_images or 0
+    stats["generated_images"] = book.completed_images or 0
+    stats["estimated_scenes"] = max(1, words // chunk_size)
     return stats
 
 

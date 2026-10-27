@@ -1560,6 +1560,10 @@ def open_bulk_descriptions_dialog(project: Project, books: List[Book],
     def step_state(step_id: str) -> Dict:
         return next(s for s in steps_state if s["id"] == step_id)
 
+    # Filled in when the "What to run" panel is built; the Browse handler below
+    # uses it to switch the source on in the same click.
+    step_checks: Dict[str, Any] = {}
+
     async def pick_reference_file() -> None:
         """A real file picker. tkinter's dialog runs in a thread; the UI is only
         touched afterwards, because Tk cannot be driven from another thread."""
@@ -1584,11 +1588,22 @@ def open_bulk_descriptions_dialog(project: Project, books: List[Book],
         if path:
             state.reference_path = path
             reference_input.value = path
+            # A chosen file with the source switched off is never what is meant:
+            # it reads as "my reference is ignored". Switching it on here is the
+            # difference between setting a file and using one.
+            if not step_state("reference")["enabled"]:
+                step_state("reference")["enabled"] = True
+                check = step_checks.get("reference")
+                if check is not None:
+                    check.value = True
+                ui.notify("Reference file set, and the Reference source switched on.",
+                          type="positive")
+            else:
+                ui.notify("Reference file set.", type="positive")
             save_project_settings_to_disk(project.id)
             step_notes["reference"].set_text(step_note("reference"))
             step_notes["reference"].classes('text-slate-400',
                                             remove='text-rose-500')
-            ui.notify("Reference file set.", type="positive")
         else:
             ui.notify("No file chosen. You can also type a path.", type="info")
 
@@ -1682,11 +1697,13 @@ def open_bulk_descriptions_dialog(project: Project, books: List[Book],
                                       order=int(e.value or s["order"]))) \
                             .props('dense outlined').classes('w-16 shrink-0') \
                             .tooltip('Run order. Lower runs first.')
-                        ui.checkbox(spec["title"], value=current["enabled"],
-                                    on_change=lambda e, s=current: s.update(
-                                        enabled=bool(e.value))) \
+                        step_check = ui.checkbox(
+                            spec["title"], value=current["enabled"],
+                            on_change=lambda e, s=current: s.update(
+                                enabled=bool(e.value))) \
                             .classes('text-xs font-bold text-slate-700 w-32 shrink-0') \
                             .props('dense')
+                        step_checks[spec["id"]] = step_check
                         note = ui.label(step_note(spec["id"])).classes(
                             'text-[10px] w-28 shrink-0 truncate whitespace-nowrap '
                             + ('text-rose-500' if step_note(spec["id"]).startswith(
@@ -1719,6 +1736,9 @@ def open_bulk_descriptions_dialog(project: Project, books: List[Book],
                     '' if (state.reference_path or '').strip()
                     else 'No reference file chosen yet — pick one with Browse… '
                          'or type a path.').classes('text-[10px] text-slate-500')
+                ui.label('Runs use this file only while “Reference file” is '
+                         'ticked under “What to run”.').classes(
+                    'text-[10px] text-slate-400 leading-tight whitespace-normal')
 
                 async def test_reference() -> None:
                     from pathlib import Path
@@ -2472,6 +2492,17 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
         char_data_list = []
         species_by_id: Dict[int, str] = {}
         with Session(engine) as session:
+            # One query for every Base profile in the project. Asking per row was
+            # 1,000+ round trips on a large cast, on every list refresh.
+            base_events: Dict[int, CharacterTimelineEvent] = {}
+            for ev in session.exec(
+                    select(CharacterTimelineEvent)
+                    .join(Character, Character.id == CharacterTimelineEvent.character_id)
+                    .where(Character.project_id == project.id)
+                    .where(CharacterTimelineEvent.book_id == None)  # noqa: E711
+            ).all():
+                base_events.setdefault(ev.character_id, ev)
+
             for char in scoped_chars:
                 aliases_list = char_aliases.get(char.id, [])
                 series_hits = calc_hits(char, aliases_list, series_freq_map)
@@ -2481,11 +2512,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 char_all_terms.update(clean_character_key(a.alias) for a in aliases_list)
                 has_collision = bool(char_all_terms.intersection(collision_names))
 
-                base_ev = session.exec(
-                    select(CharacterTimelineEvent)
-                    .where(CharacterTimelineEvent.character_id == char.id)
-                    .where(CharacterTimelineEvent.book_id == None)
-                ).first()
+                base_ev = base_events.get(char.id)
 
                 # The species claim lives on the Base profile. Row-level states
                 # are not consulted: the filter exists to find wrong values, and
@@ -2559,11 +2586,19 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
             ui.label(f'0 shown').classes('text-[9px] text-slate-400 px-1 py-0.5')
             ui.label('No matching characters found.').classes('text-xs text-slate-400 text-center py-8 w-full')
         else:
-            ui.label(f'{len(filtered_list)} shown'
+            # A cast of a thousand is a thousand rows of elements: painting them
+            # all costs seconds and a multi-megabyte websocket update. The cap
+            # keeps the tab usable and the button below it makes the rest one
+            # click away; a search or filter usually makes the list short anyway.
+            limit = max(50, int(getattr(state, "characters_list_limit", 200) or 200))
+            visible = filtered_list[:limit]
+            hidden = len(filtered_list) - len(visible)
+
+            ui.label(f'{len(visible)} of {len(filtered_list)} shown'
                      + (' · 0-hit hidden' if hide_zero_hits else '')).classes(
                 'text-[9px] text-slate-400 px-1 py-0.5')\
                 .tooltip('Prompt hits only hides characters with no bracketed tag in prompts.csv')
-            for char, aliases_list, b_hits, s_hits, completion_count, completion_target, summary_pieces, has_col in filtered_list:
+            for char, aliases_list, b_hits, s_hits, completion_count, completion_target, summary_pieces, has_col in visible:
                 is_selected = char.id == selected_character_id
                 bg_class = "bg-blue-50 border-l-4 border-blue-600 font-semibold text-blue-900" if is_selected else "hover:bg-slate-50 text-slate-700"
                 border_class = "" if is_selected else "border-l border-slate-100"
@@ -2615,6 +2650,20 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                      else "text-slate-400")
                         ui.label(f"{completion_count}/{completion_target} known").classes(f'text-[9px] font-bold {bar_color}')\
                             .tooltip("Rendered traits known anywhere in the project (Base + all books)")
+
+            if hidden > 0:
+                def show_more() -> None:
+                    state.characters_list_limit = limit + 200
+                    # The button is inside the list this rebuilds, so it is gone
+                    # once the refresh returns - nothing may touch the UI after it.
+                    try:
+                        draw_character_list.refresh()
+                    except Exception:
+                        pass
+
+                ui.button(f'Show {min(hidden, 200)} more ({hidden} not drawn)',
+                          icon='expand_more', on_click=show_more) \
+                    .props('flat dense').classes('w-full text-[10px] font-bold text-blue-600')
 
     @ui.refreshable
     def draw_details_panel():
@@ -3620,6 +3669,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 def on_search_change(e):
                     global search_query
                     search_query = e.value or ""
+                    state.characters_list_limit = 200
                     draw_character_list.refresh()
                 
                 ui.input(
@@ -3637,6 +3687,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     def on_filter_change(e):
                         global filter_status
                         filter_status = e.value
+                        state.characters_list_limit = 200
                         draw_character_list.refresh()
                         
                     ui.select(

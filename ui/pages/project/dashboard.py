@@ -173,15 +173,19 @@ def execute_project_rollback_io(project_id: int, choice: str) -> None:
         # prompts.csv must not inherit the previous run's shot choices. (Only
         # chunk size and the planner prompt digest are checked for reuse, so a
         # re-transcribed book would otherwise keep a plan for the old text.)
+        # A resumed planning checkpoint goes with it: it holds the same plan, in
+        # chapters, and would otherwise silently carry the old choices forward.
         if choice in ("transcripts", "prompts"):
-            plan_path = book_dir / "shot_plan.csv"
-            if plan_path.exists():
-                new_plan = book_dir / f"shot_plan_backup_{timestamp}.csv"
+            for plan_file in (book_dir / "shot_plan.csv",
+                              book_dir / "shot_plan.partial.jsonl"):
+                if not plan_file.exists():
+                    continue
+                new_plan = book_dir / f"{plan_file.stem}_backup_{timestamp}{plan_file.suffix}"
                 try:
-                    plan_path.rename(new_plan)
-                    state.add_console_log(f"[Rollback-Engine] Archived shot plan to: {new_plan.name}")
+                    plan_file.rename(new_plan)
+                    state.add_console_log(f"[Rollback-Engine] Archived {plan_file.name} to: {new_plan.name}")
                 except Exception as e:
-                    state.add_console_log(f"[Rollback-Engine] Error archiving shot_plan.csv: {str(e)}")
+                    state.add_console_log(f"[Rollback-Engine] Error archiving {plan_file.name}: {str(e)}")
 
         # 4. Archive rendered images (All options archive generated visual records)
         images_dir = book_dir / "images"
@@ -192,7 +196,20 @@ def execute_project_rollback_io(project_id: int, choice: str) -> None:
                 state.add_console_log(f"[Rollback-Engine] Archived images folder to: {new_images.name}")
             except Exception as e:
                 state.add_console_log(f"[Rollback-Engine] Error archiving images folder: {str(e)}")
-                    
+
+        # 5. The approvals in prompts.csv were a review of the images archived
+        # above. A regenerated image has not been looked at, so it must not
+        # arrive already ticked - the same rule the workspace applies when a
+        # single image is deleted. Only the images-only rollback keeps
+        # prompts.csv; the wider ones archive it, approvals and all.
+        if choice == "images":
+            from services.prompt_engine import clear_prompt_approvals
+            cleared = clear_prompt_approvals(book_dir / "prompts.csv")
+            if cleared:
+                state.add_console_log(
+                    f"[Rollback-Engine] Cleared {cleared} approval(s) in '{book.name}': "
+                    f"the images they referred to were archived.")
+
     state.add_console_log("[Rollback-Engine] State rollback file archival step complete.")
 
 
@@ -662,8 +679,15 @@ def render_run_bar(project, ordered_books, rows_by_id, *, start_pipeline_cb,
             ui.label().classes('flex-1 min-w-2')
             if running:
                 ui.spinner(size='sm', color='blue')
-                ui.label('Working - progress is in the console.').classes(
-                    'text-[10px] font-semibold text-blue-700 animate-pulse')
+                # Bound rather than passed as text: the dashboard is only
+                # rebuilt on discrete events, while this line changes many times
+                # during a run. A binding costs one small websocket patch per
+                # change - the prompt stage already writes one per saved row.
+                ui.label().classes(
+                    'text-[10px] font-semibold text-blue-700 animate-pulse '
+                    'truncate min-w-0 max-w-[22rem]') \
+                    .bind_text_from(state, 'pipeline_progress_line',
+                                    backward=lambda v: v or 'Working...')
                 ui.button('Stop', icon='stop', on_click=lambda: stop_cb(project.id)) \
                     .classes('bg-rose-600 text-white text-xs font-bold px-4')
 

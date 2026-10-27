@@ -369,35 +369,88 @@ def render_book_tabs(book_id: int):
         bracket_regex = re.compile(r"\[(.*?)\]")
         return [t.strip() for t in bracket_regex.findall(prompt_text) if t.strip()]
 
+    # Character lookup for the chip row under the prompt editor.
+    #
+    # This is on the keystroke path: the autocomplete manager calls it on every
+    # keyup, so it has to be a dictionary lookup, not a database round trip. The
+    # old version loaded every character and then queried its aliases one by one
+    # (1,083 queries on a 1,082-character project) and recompiled a tooltip per
+    # keypress - about half a second of work per character typed, which starved
+    # the websocket until the client reported "connection lost".
+    chip_cache: Dict[str, Any] = {
+        "index": None,      # cleaned alias -> character id
+        "names": {},        # character id -> Character
+        "tooltips": {},     # (id, chapter, shot) -> compiled hover text
+        "signature": None,  # what is currently drawn
+    }
+
+    def character_tag_index():
+        """``{cleaned alias: [character ids]}`` and the characters, built once.
+
+        A list per alias, not one id: an alias table can carry the same name on
+        more than one character (a prompt-scan artefact), and the old per-keystroke
+        loop showed a chip for every one of them. Keeping that would be an
+        accident; keeping it *identical* is what makes this cache safe.
+        """
+        if chip_cache["index"] is None:
+            index: Dict[str, List[int]] = {}
+            names: Dict[int, Character] = {}
+            with Session(engine) as session:
+                for char in session.exec(
+                        select(Character).where(Character.project_id == project.id)).all():
+                    names[char.id] = char
+                    index.setdefault(clean_character_key(char.name), []).append(char.id)
+                # One join, not one query per character.
+                for char_id, alias in session.exec(
+                        select(CharacterAlias.character_id, CharacterAlias.alias)
+                        .join(Character, Character.id == CharacterAlias.character_id)
+                        .where(Character.project_id == project.id)).all():
+                    ids = index.setdefault(clean_character_key(alias), [])
+                    if char_id not in ids:
+                        ids.append(char_id)
+            chip_cache["index"] = index
+            chip_cache["names"] = names
+        return chip_cache["index"], chip_cache["names"]
+
+    def forget_character_cache() -> None:
+        """Called when characters or aliases change, so the chips re-read them."""
+        chip_cache["index"] = None
+        chip_cache["names"] = {}
+        chip_cache["tooltips"] = {}
+        chip_cache["signature"] = None
+
     def open_character_edit_dialog(char_id: int):
         """Spawns the quick characters manager modal pre-selected to a specific character."""
+        def after_change():
+            forget_character_cache()
+            if modal_prompt_input:
+                render_scene_character_chips(modal_prompt_input.value)
+
         modal = QuickCharactersModal(
             project_id=project.id,
             book_id=book_id,
             initial_char_id=char_id,
-            on_change_callback=lambda: [
-                render_scene_character_chips(modal_prompt_input.value) if modal_prompt_input else None
-            ]
+            on_change_callback=after_change
         )
         modal.open()
 
     def open_quick_characters_dialog():
         """Spawns an interactive split-screen project characters quick manager dialog."""
+        def after_change():
+            forget_character_cache()
+            if modal_prompt_input:
+                render_scene_character_chips(modal_prompt_input.value)
+
         modal = QuickCharactersModal(
             project_id=project.id, 
             book_id=book_id,
-            on_change_callback=lambda: [
-                render_scene_character_chips(modal_prompt_input.value) if modal_prompt_input else None
-            ]
+            on_change_callback=after_change
         )
         modal.open()
 
     def render_scene_character_chips(prompt_text: str):
         """Safely clears and populates matched character tags on the scene with descriptive hover tooltips."""
-        scene_chips_container.clear()
         tags = extract_prompt_character_tags(prompt_text)
-        if not tags:
-            return
 
         # The theater's cursor IS a (chapter, shot) position: ``book_active_scene``
         # is the row's ``shot``, not a narrative scene. Pass it through so every
@@ -405,15 +458,26 @@ def render_book_tabs(book_id: int):
         target_ch = int(float(getattr(state, 'book_active_chapter', 1)))
         target_sc = int(float(getattr(state, 'book_active_scene', 1)))
 
-        matched_chars: List[Character] = []
-        with Session(engine) as session:
-            chars = session.exec(select(Character).where(Character.project_id == project.id)).all()
-            for char in chars:
-                aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-                alias_texts = {clean_character_key(a.alias) for a in aliases}
-                alias_texts.add(clean_character_key(char.name))
-                if any(clean_character_key(t) in alias_texts for t in tags):
-                    matched_chars.append(char)
+        index, names = character_tag_index()
+        wanted_ids: set = set()
+        for tag in tags:
+            for char_id in index.get(clean_character_key(tag), ()):
+                wanted_ids.add(char_id)
+
+        # Character order, so the row looks the same as it always did.
+        matched_chars: List[Character] = [names[cid] for cid in names
+                                          if cid in wanted_ids]
+
+        # Same characters at the same position: nothing to redraw. This is what
+        # keeps ordinary typing from clearing and rebuilding the row per key.
+        signature = (tuple(char.id for char in matched_chars), target_ch, target_sc)
+        if signature == chip_cache["signature"]:
+            return
+        chip_cache["signature"] = signature
+
+        scene_chips_container.clear()
+        if not matched_chars:
+            return
 
         # The hover text is whatever the renderer would inject at this scene, so it
         # is produced by ``replace_character_tags_in_prompt`` rather than by
@@ -424,6 +488,10 @@ def render_book_tabs(book_id: int):
         use_sentence = getattr(state, "style_use_sentence_structure", True)
 
         def chip_tooltip(char: Character) -> str:
+            key = (char.id, target_ch, target_sc)
+            cached = chip_cache["tooltips"].get(key)
+            if cached is not None:
+                return cached
             try:
                 text = replace_character_tags_in_prompt(
                     f"[{char.name}]",
@@ -442,7 +510,12 @@ def render_book_tabs(book_id: int):
             # the fallback; there is no visual description to report yet.
             if (not text or text == char.name
                     or is_placeholder_description(text)):
-                return f"{char.name} (no description yet)"
+                text = f"{char.name} (no description yet)"
+            if len(chip_cache["tooltips"]) > 600:
+                # Bounded: a long reviewing session touches thousands of
+                # (character, position) pairs and none of them is precious.
+                chip_cache["tooltips"] = {}
+            chip_cache["tooltips"][key] = text
             return text
 
         if matched_chars:

@@ -164,33 +164,46 @@ def save_project_characters_to_json(project_id: int):
 
     with Session(engine) as session:
         characters = session.exec(select(Character).where(Character.project_id == project_id)).all()
-        
+
+        # Everything this file needs, in a handful of queries instead of four per
+        # character. It is rewritten after *every* edit, and the per-character
+        # lookups cost ~1.2 s on a 1,000-character project - more than the merge
+        # that triggered them.
+        book_names = {b.id: b.name for b in session.exec(select(Book)).all()}
+
+        aliases_by_char: Dict[int, List[str]] = {}
+        for char_id, alias in session.exec(
+                select(CharacterAlias.character_id, CharacterAlias.alias)
+                .join(Character, Character.id == CharacterAlias.character_id)
+                .where(Character.project_id == project_id)).all():
+            aliases_by_char.setdefault(char_id, []).append(alias)
+
+        links_by_char: Dict[int, List[int]] = {}
+        for char_id, link_book_id in session.exec(
+                select(CharacterBookLink.character_id, CharacterBookLink.book_id)
+                .join(Character, Character.id == CharacterBookLink.character_id)
+                .where(Character.project_id == project_id)).all():
+            links_by_char.setdefault(char_id, []).append(link_book_id)
+
+        events_by_char: Dict[int, List[CharacterTimelineEvent]] = {}
+        for ev in session.exec(
+                select(CharacterTimelineEvent)
+                .join(Character, Character.id == CharacterTimelineEvent.character_id)
+                .where(Character.project_id == project_id)
+                .order_by(CharacterTimelineEvent.id)).all():
+            events_by_char.setdefault(ev.character_id, []).append(ev)
+
         serialized_data = []
         for char in characters:
-            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-            book_links = session.exec(select(CharacterBookLink).where(CharacterBookLink.character_id == char.id)).all()
-            
-            # Resolve book names from links
-            linked_book_names = []
-            for link in book_links:
-                book = session.get(Book, link.book_id)
-                if book and book.name not in linked_book_names:
-                    linked_book_names.append(book.name)
+            # Resolve book names from links, in link order, without duplicates
+            linked_book_names = list(dict.fromkeys(
+                book_names[bid] for bid in links_by_char.get(char.id, [])
+                if bid in book_names))
 
-            timeline_events = session.exec(
-                select(CharacterTimelineEvent)
-                .where(CharacterTimelineEvent.character_id == char.id)
-                .order_by(CharacterTimelineEvent.id)
-            ).all()
-            
             timeline_serialized = []
-            for ev in timeline_events:
-                book_name = None
-                if ev.book_id is not None:
-                    b = session.get(Book, ev.book_id)
-                    if b:
-                        book_name = b.name
-                
+            for ev in events_by_char.get(char.id, []):
+                book_name = book_names.get(ev.book_id) if ev.book_id is not None else None
+
                 timeline_serialized.append({
                     "book_name": book_name,
                     "chapter_num": ev.chapter_num,
@@ -218,7 +231,7 @@ def save_project_characters_to_json(project_id: int):
                 "merge_checked": getattr(char, "merge_checked", False),
                 "hit_count": getattr(char, "hit_count", 0) or 0,
                 "pinned_traits": getattr(char, "pinned_traits", None),
-                "aliases": [alias.alias for alias in aliases],
+                "aliases": aliases_by_char.get(char.id, []),
                 "books": linked_book_names,
                 "timeline": timeline_serialized
             }

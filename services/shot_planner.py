@@ -42,6 +42,10 @@ DEFAULT_WINDOW = 30
 DEFAULT_CHUNK_WORDS = 350
 
 PLAN_FILENAME = "shot_plan.csv"
+# Resumable planning lives beside the plan: one line per finished chapter. A
+# chapter is the smallest unit that can be saved, because the INSERT spacing rule
+# looks at the chapter's own labels and a half-chapter has nothing safe to write.
+PLAN_CHECKPOINT_STAGE = "shot_plan"
 PLAN_COLUMNS = ("chapter", "shot", "shot_type", "chunk_words", "chunk_hash",
                 "prompt_hash", "focus", "chunking", "place")
 
@@ -161,10 +165,11 @@ async def plan_chunks(
     log: Optional[Callable[[str], None]] = None,
     template: Optional[str] = None,
     previous_place: str = "",
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> List[str]:
     """Shot type per chunk, in order. Anything unparsed falls back to NONE."""
     detail = await plan_chunks_detail(chunks, llm_url, model, window, log, template,
-                                      previous_place)
+                                      previous_place, should_cancel=should_cancel)
     return [label for label, _focus, _place in detail]
 
 
@@ -176,6 +181,7 @@ async def plan_chunks_detail(
     log: Optional[Callable[[str], None]] = None,
     template: Optional[str] = None,
     previous_place: str = "",
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> List[Tuple[str, str, str]]:
     """``[(shot_type, focus, place)]`` per chunk, in order. Unparsed falls back to ``NONE``.
 
@@ -183,18 +189,26 @@ async def plan_chunks_detail(
     is read live, which is what the Prompt Lab test bench wants. Places are
     resolved across the whole window chain, so "same" inherits the place of the
     passage before it rather than the start of the window.
+
+    ``should_cancel`` is polled before every window and while the request is in
+    flight. Per window, not per chapter: one chapter can be dozens of sequential
+    calls, which is minutes of work in which a Stop looked like it did nothing.
     """
     template = template if template is not None else planner_text()
     out: List[Tuple[str, str, str]] = []
     carry = previous_place
     for start in range(0, len(chunks), window):
+        checkpoints.stopped(should_cancel)
         window_chunks = chunks[start:start + window]
         if log:
             log(f"[Shot-Plan] classifying scenes {start + 1}-{start + len(window_chunks)}")
-        raw = await get_llm_response(
-            plan_prompt(window_chunks, template, carry), llm_url, model,
-            temperature=0.0,
-            extra_payload={"chat_template_kwargs": {"enable_thinking": False}},
+        raw = await checkpoints.await_cancellable(
+            get_llm_response(
+                plan_prompt(window_chunks, template, carry), llm_url, model,
+                temperature=0.0,
+                extra_payload={"chat_template_kwargs": {"enable_thinking": False}},
+            ),
+            should_cancel,
         )
         got = parse_shot_plan(raw, len(window_chunks))
         rows = [got.get(i + 1, ("NONE", "", "")) for i in range(len(window_chunks))]
@@ -253,6 +267,28 @@ def read_book_text(project_name: str, book_name: str,
 
 # --- whole-book planning ---------------------------------------------------
 
+def plan_identity(chunks: Sequence[scene_map.Chunk],
+                  template: Optional[str]) -> str:
+    """Digest of everything a saved chapter plan depends on.
+
+    The chunk enumeration, not just the chunk count: it carries each chunk's text
+    and its ``(chapter, shot)`` coordinates, so a changed transcript, a different
+    chunk size or a different chunker version all produce a different identity and
+    the saved chapters are dropped rather than spliced into a different book.
+    ``window`` is deliberately absent - labels are per chunk and the stored plan
+    does not record the window either.
+    """
+    from services import pipeline_manifest
+
+    enum = hashlib.sha1()
+    for chunk in chunks:
+        enum.update(f"{chunk.chapter}:{chunk.shot}:{chunk_digest(chunk.text)}\n".encode("utf-8"))
+    return pipeline_manifest.digest({
+        "planner": prompt_digest(template if template is not None else planner_text()),
+        "chunks": enum.hexdigest(),
+    })
+
+
 async def plan_book(
     project_name: str,
     book_name: str,
@@ -279,11 +315,23 @@ async def plan_book(
     has to invent a room for a passage that does not name one.
     ``enforce_insert_spacing`` corrects consecutive INSERTs per chapter, which the
     prompt forbids and the model does anyway.
+
+    Each finished chapter is appended to ``shot_plan.partial.jsonl``, so a stop
+    resumes at the next unplanned chapter instead of at chapter one. The artifact
+    is still written once, whole, by the caller.
     """
     if chunks is None:
         chunks, _source = scene_map.book_chunks(
             book_dir(project_name, book_name, base), chunk_words, log,
             source="linear")
+
+    book_path = book_dir(project_name, book_name, base)
+    identity = plan_identity(chunks, template)
+    checkpoints.reset_if_stale(book_path, PLAN_CHECKPOINT_STAGE, identity)
+    saved = checkpoints.load(book_path, PLAN_CHECKPOINT_STAGE, identity)
+    if saved and log:
+        log(f"[Shot-Plan] Resuming: {len(saved)} chapter(s) already planned "
+            f"in '{book_name}' - continuing at the first unplanned one.")
 
     plan: List[Tuple[int, int, str, str, str, str]] = []
     carry = ""
@@ -291,21 +339,44 @@ async def plan_book(
             scene_map.chunks_by_chapter(chunks).items()):
         if not chapter_chunks:
             continue
-        # Per chapter, not per window: a plan is saved for the whole book or not
-        # at all, so the useful stop point is between books, and one chapter is
-        # a few seconds of calls.
+        # Cheap enough to check per chapter, including the ones being reused.
         checkpoints.stopped(should_cancel)
-        if log:
-            log(f"[Shot-Plan] Chapter {chapter_num}: {len(chapter_chunks)} scenes")
-        detail = await plan_chunks_detail(
-            [chunk.text for chunk in chapter_chunks], llm_url, model, window, log,
-            template, previous_place=carry)
-        labels = enforce_insert_spacing([label for label, _focus, _place in detail])
-        for chunk, label, (_raw_label, focus, place) in zip(chapter_chunks, labels, detail):
-            plan.append((chunk.chapter, chunk.shot, label,
-                         chunk_digest(chunk.text), focus, place))
-        if detail and detail[-1][2]:
-            carry = detail[-1][2]
+
+        saved_rows = saved.get(str(chapter_num))
+        rows: List[Tuple[int, str, str, str, str]] = []
+        if saved_rows:
+            try:
+                rows = [(int(r["shot"]), str(r["label"]), str(r["hash"]),
+                         str(r.get("focus") or ""), str(r.get("place") or ""))
+                        for r in saved_rows]
+            except (KeyError, TypeError, ValueError):
+                # A structurally broken entry is worth less than re-planning the
+                # chapter, which is one call.
+                rows = []
+        if rows:
+            if log:
+                log(f"[Shot-Plan] Chapter {chapter_num}: reusing {len(rows)} "
+                    f"planned scene(s) from the checkpoint")
+        else:
+            if log:
+                log(f"[Shot-Plan] Chapter {chapter_num}: {len(chapter_chunks)} scenes")
+            detail = await plan_chunks_detail(
+                [chunk.text for chunk in chapter_chunks], llm_url, model, window, log,
+                template, previous_place=carry, should_cancel=should_cancel)
+            labels = enforce_insert_spacing([label for label, _focus, _place in detail])
+            rows = [(chunk.shot, label, chunk_digest(chunk.text), focus, place)
+                    for chunk, label, (_raw_label, focus, place)
+                    in zip(chapter_chunks, labels, detail)]
+            checkpoints.add(book_path, PLAN_CHECKPOINT_STAGE, identity,
+                            str(chapter_num),
+                            [{"shot": shot, "label": label, "hash": digest,
+                              "focus": focus, "place": place}
+                             for shot, label, digest, focus, place in rows])
+
+        for shot, label, digest, focus, place in rows:
+            plan.append((chapter_num, shot, label, digest, focus, place))
+        if rows and rows[-1][4]:
+            carry = rows[-1][4]
     return plan
 
 
@@ -483,6 +554,7 @@ async def ensure_book_plan(
     if mode != "auto":
         return {}
 
+    checkpoints.stopped(should_cancel)
     chunks, source = scene_map.book_chunks(
         book_dir(project_name, book_name, base), chunk_words, log, source="linear")
     template = planner_text(selection)
@@ -518,11 +590,19 @@ async def ensure_book_plan(
     if plan and all(shot == "NONE" for _chapter, _scene, shot, *_rest in plan):
         # A dead or misconfigured LLM produces an all-NONE plan. Don't persist
         # that - fall back to the single prompt instead of poisoning the plan.
+        # The checkpoint goes too, or the next run would "resume" into a plan of
+        # nothing but NONE.
+        checkpoints.discard(book_dir(project_name, book_name, base),
+                            PLAN_CHECKPOINT_STAGE)
         if log:
             log("[Shot-Plan] planning produced no usable labels (LLM unreachable?) "
                 "- falling back to the single prompt for this book.")
         return {}
     save_plan(project_name, book_name, plan, chunk_words, base, prompt_hash=digest,
               chunking=source)
+    # The plan supersedes the partial: leaving it behind would invite a later run
+    # to resume into a book that already has its whole shot_plan.csv.
+    checkpoints.discard(book_dir(project_name, book_name, base),
+                        PLAN_CHECKPOINT_STAGE)
     return {(chapter, scene): shot
             for chapter, scene, shot, *_rest in plan}

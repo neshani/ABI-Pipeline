@@ -1,8 +1,9 @@
 import asyncio
+from pathlib import Path
 from typing import Callable
 from nicegui import ui
 from sqlmodel import Session, select
-from database.connection import engine
+from database.connection import engine, get_setting
 from database.models import Project, Book
 from services.scanner import scan_directory, ingest_project
 from ui import state
@@ -178,7 +179,11 @@ def toggle_project_expansion(project_id: int, refresh_parent: Callable):
 
 
 def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, refresh_parent: Callable):
-    from services.sync_engine import get_book_stats_cached
+    from services.sync_engine import get_book_summary
+
+    # Resolved once: the per-book lookup used to open a session per book just to
+    # read this one setting.
+    output_base = Path(get_setting("output_dir", "./output")).resolve()
 
     projects_data = []
     with Session(engine) as session:
@@ -193,7 +198,10 @@ def render_portal_view(select_project_cb: Callable, select_book_cb: Callable, re
             books_data = []
             
             for b in books:
-                stats = get_book_stats_cached(p.name, b.name)
+                # Database numbers, not a disk scan: the portal paints every
+                # project's volumes on load, and reading each transcript here
+                # made first paint scale with the size of the whole library.
+                stats = get_book_summary(p.name, b, output_base)
                 total_words += stats["word_count"]
                 
                 # Deduce total scenes either from existing prompts or fallback estimates
