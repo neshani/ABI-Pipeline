@@ -3538,6 +3538,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     ("eye_color", "Eye Colour"),
                     ("face", "Face (shape, complexion)"),
                     ("build", "Build (Height / Frame)"),
+                    ("distinguishing_marks", "Distinguishing Marks & Key Accessories"),
                     ("attire", "Attire (Wearing Now)"),
                     ("carried", "Carried (Held or Worn)"),
                     ("notes", "Notes (stored, never rendered)"),
@@ -3583,12 +3584,11 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     ("demographics", "Demographics (Age, Race, Gender)"),
                     ("hair_and_face", "Hair & Face Details"),
                     ("physical_build", "Physical Build (Height/Weight/Posture)"),
-                    ("distinguishing_marks", "Distinguishing Marks & Key Accessories"),
                 ]
                 with ui.expansion('Legacy description fields', icon='history', value=False)\
                         .classes('w-full border rounded-xl bg-slate-50/40 text-xs'):
                     ui.label(
-                        'The four fields the older profiler wrote. Kept editable so '
+                        'The remaining fields the older profiler wrote. Kept editable so '
                         'existing projects lose nothing; new descriptions use the '
                         'fields above.'
                     ).classes('text-[10px] text-slate-500 leading-tight')

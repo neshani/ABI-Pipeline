@@ -44,6 +44,53 @@ except ImportError:
             session.commit()
 
 
+def retime_timeline_event(event_id: int, book_id: int, chapter_num: int,
+                          shot_num: int, label: str) -> Optional[str]:
+    """Move one change to a new (book, chapter, shot) and/or relabel it.
+
+    Returns None when the row was written, otherwise the reason it was not:
+    the caller shows that message and leaves the form open.
+    """
+    with Session(engine) as session:
+        ev = session.get(CharacterTimelineEvent, event_id)
+        if ev is None:
+            return "This change no longer exists."
+        if ev.book_id is None:
+            return "The Base state has no position on the timeline."
+        dup = session.exec(
+            select(CharacterTimelineEvent)
+            .where(CharacterTimelineEvent.character_id == ev.character_id)
+            .where(CharacterTimelineEvent.book_id == book_id)
+            .where(CharacterTimelineEvent.chapter_num == chapter_num)
+            .where(CharacterTimelineEvent.shot_num == shot_num)
+            .where(CharacterTimelineEvent.id != event_id)
+        ).first()
+        if dup:
+            return "Another change already sits at that coordinate."
+        ev.book_id = book_id
+        ev.chapter_num = chapter_num
+        ev.shot_num = shot_num
+        ev.label = label
+        if ev.source == "extraction":
+            # Re-timing is a manual decision. Left as extraction, a re-analysis
+            # clears the row and the change snaps back to where it came from.
+            ev.source = "manual"
+        session.add(ev)
+        session.commit()
+    return None
+
+
+def delete_timeline_event(event_id: int) -> bool:
+    """Remove one change. The Base state is a snapshot and is not deletable."""
+    with Session(engine) as session:
+        ev = session.get(CharacterTimelineEvent, event_id)
+        if ev is None or ev.book_id is None:
+            return False
+        session.delete(ev)
+        session.commit()
+    return True
+
+
 class QuickCharactersModal:
     # ui/components/quick_characters_modal.py
 
@@ -355,6 +402,20 @@ class QuickCharactersModal:
                 on_change=on_state_change,
                 label="Timeline Active State"
             ).classes('flex-1 bg-white').props('dense outlined clearable=false')
+
+            # Re-time or delete the selected change. The Base state is a
+            # snapshot, not a point on the axis, so it has nothing to edit.
+            if current_ev is not None and current_ev.book_id is not None:
+                ui.button(
+                    icon='edit',
+                    on_click=lambda _, eid=current_ev.id: self.open_edit_timeline_dialog(eid)
+                ).props('flat dense').classes(
+                    'p-2 text-purple-700 bg-purple-50 hover:bg-purple-100 rounded-lg')\
+                 .tooltip('Edit when this change happens, or delete it')
+            else:
+                ui.button(icon='edit').props('flat dense disable').classes(
+                    'p-2 text-slate-300 bg-slate-100 rounded-lg')\
+                 .tooltip('The Base state is not on the timeline; select a change to edit it')
             
             ui.button(
                 icon='add_circle',
@@ -489,6 +550,7 @@ class QuickCharactersModal:
             ("eye_color", "Eye Colour"),
             ("face", "Face (shape, complexion)"),
             ("build", "Build (Height / Frame)"),
+            ("distinguishing_marks", "Distinguishing Marks & Key Accessories"),
             ("attire", "Attire (Wearing Now)"),
             ("carried", "Carried (Held or Worn)"),
             ("notes", "Notes (extracted, never rendered)"),
@@ -644,13 +706,12 @@ class QuickCharactersModal:
             ("demographics", "Demographics (Age, Race, Gender)"),
             ("hair_and_face", "Hair & Face Details"),
             ("physical_build", "Physical Build (Height/Weight/Posture)"),
-            ("distinguishing_marks", "Distinguishing Marks & Key Accessories"),
         ]
         with ui.expansion('Legacy description fields', icon='history', value=False)\
                 .classes('w-full border rounded-lg bg-slate-50/40 text-xs'):
             ui.label(
-                'The four fields the older profiler wrote. Kept editable so an existing '
-                'project loses nothing; new descriptions use the fields above.'
+                'The remaining fields the older profiler wrote. Kept editable so an '
+                'existing project loses nothing; new descriptions use the fields above.'
             ).classes('text-[10px] text-slate-500 leading-tight')
             with ui.grid().classes('w-full grid-cols-1 md:grid-cols-2 gap-2'):
                 for key, label in legacy_fields:
@@ -993,6 +1054,105 @@ class QuickCharactersModal:
         dialog.open()
         # Prepopulate cloning on window mount
         copy_previous()
+
+    def open_edit_timeline_dialog(self, event_id: int):
+        """Edit where an existing change happens, or delete it.
+
+        The add dialog only ever creates. Before this, a change that landed on
+        the wrong shot could only be moved by duplicating the state at the right
+        position and then finding a way to remove the old one.
+        """
+        with Session(engine) as session:
+            ev = session.get(CharacterTimelineEvent, event_id)
+            if ev is None or ev.book_id is None:
+                ui.notify("The Base state has no position on the timeline.",
+                          type="warning")
+                return
+            start_book = ev.book_id
+            start_chapter = int(ev.chapter_num or 0)
+            start_shot = int(ev.shot_num or 0)
+            start_label = (ev.label or "").strip()
+
+        with ui.dialog() as dialog, ui.card().classes('w-[450px] p-5 rounded-xl flex flex-col gap-3'):
+            ui.label('Timing of This Change').classes('text-sm font-bold text-slate-800')
+            ui.label(
+                'Move the change to the chapter and shot where it actually starts. '
+                'The traits stay with the state; nothing is copied.'
+            ).classes('text-[10px] text-slate-500 leading-tight')
+
+            book_opts = {b.id: b.name for b in self.books_list}
+            book_select = ui.select(options=book_opts, value=start_book, label="Book")\
+                .classes('w-full bg-white').props('dense outlined')
+            # min=0: most change rows sit on shot 0, and an edit form must not
+            # silently clamp a coordinate the user never touched.
+            chapter_input = ui.number(label="Chapter Number", value=start_chapter,
+                                      min=0, step=1).classes('w-full').props('outlined dense')
+            scene_input = ui.number(label="Scene Number", value=start_shot,
+                                    min=0, step=1).classes('w-full').props('outlined dense')
+            label_input = ui.input(label="Event Label", value=start_label,
+                                   placeholder="e.g. Gandalf the White")\
+                .classes('w-full').props('outlined dense')
+
+            def save_timing():
+                b_id = book_select.value
+                if b_id is None or chapter_input.value is None or scene_input.value is None:
+                    ui.notify("Choose a book and give both coordinates.",
+                              type="warning")
+                    return
+                ch = int(float(chapter_input.value))
+                sc = int(float(scene_input.value))
+                typed_label = (label_input.value or "").strip()
+                moved = (b_id != start_book or ch != start_chapter
+                         or sc != start_shot or typed_label != start_label)
+                if not moved:
+                    dialog.close()
+                    return
+                error = retime_timeline_event(event_id, b_id, ch, sc,
+                                              typed_label or "Override State")
+                if error:
+                    ui.notify(error, type="warning")
+                    return
+                save_project_characters_to_json(self.project_id)
+                ui.notify("Change timing updated.", type="positive")
+                dialog.close()
+                self.draw_right_details.refresh()
+                self.trigger_workspace_refresh()
+
+            def delete_change():
+                if not delete_timeline_event(event_id):
+                    ui.notify("This change no longer exists.", type="warning")
+                else:
+                    save_project_characters_to_json(self.project_id)
+                    # Let the panel self-heal to the state in force at the scene
+                    # the workspace is showing, rather than a row that is gone.
+                    self.selected_event_id = None
+                    ui.notify("Change deleted.", type="warning")
+                dialog.close()
+                self.draw_right_details.refresh()
+                self.trigger_workspace_refresh()
+
+            with ui.row().classes('w-full justify-between items-center border-t pt-3 mt-2 gap-2'):
+                ui.button('Delete Change', icon='delete', on_click=lambda: confirm_dialog.open())\
+                    .props('flat dense').classes('text-red-600 text-xs')
+                with ui.row().classes('gap-2'):
+                    ui.button('Cancel', on_click=dialog.close).props('flat').classes('text-xs')
+                    ui.button('Save Timing', on_click=save_timing)\
+                        .classes('bg-blue-600 text-white font-bold text-xs px-3 py-1.5 rounded-lg')
+
+        # Built after the editor, opened from inside it. Deleting a change has no
+        # undo, so it takes a second click that names the change being removed.
+        with ui.dialog() as confirm_dialog, ui.card().classes('w-[380px] p-5 rounded-xl flex flex-col gap-3'):
+            ui.label('Delete this change?').classes('text-sm font-bold text-slate-800')
+            ui.label(
+                f"Ch {start_chapter} · {start_shot} ({start_label or 'Override State'}). "
+                "The state is removed for this character and cannot be undone."
+            ).classes('text-xs text-slate-500 leading-tight')
+            with ui.row().classes('w-full justify-end gap-2 border-t pt-3 mt-1'):
+                ui.button('Keep It', on_click=confirm_dialog.close).props('flat').classes('text-xs')
+                ui.button('Delete', on_click=delete_change)\
+                    .classes('bg-red-600 text-white font-bold text-xs px-3 py-1.5 rounded-lg')
+
+        dialog.open()
 
     def quick_add_new_character(self):
         with ui.dialog() as add_dialog, ui.card().classes('w-[350px] p-4 rounded-xl flex flex-col gap-3'):

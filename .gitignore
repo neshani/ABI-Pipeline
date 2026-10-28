@@ -54,3 +54,4 @@ test_parakeet_timestamps.py
 AGENTS.md
 abi_pipeline.db.pre_traits_20261024_163815
 abi_pipeline.db.pre_traits_20261024_170735
+abi_pipeline.db.pre_*

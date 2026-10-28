@@ -1014,9 +1014,33 @@ def load_prompt_template_from_file(mode: str) -> str:
 NEW_TRAIT_FIELDS = ("sex", "species", "age", "hair_color", "hair_style",
                     "eye_color", "face", "build", "attire", "carried", "notes")
 RENDERED_TRAIT_FIELDS = tuple(f for f in NEW_TRAIT_FIELDS if f != "notes")
+# `distinguishing_marks` is the legacy field name, but it is a normal rendered
+# trait: it compiles into the description, it changes from book to book, and a
+# hand edit has to carry forward like every other field. Without this, editing a
+# mark wrote one row and every later snapshot kept asserting the old value - the
+# only trait that did not follow "the change lasts until overwritten".
+#
+# It is appended here rather than added to NEW_TRAIT_FIELDS on purpose: the
+# extraction schemas, the trait vocabulary and the visible trait grid all read
+# NEW_TRAIT_FIELDS, and none of them should start treating a free-text mark like a
+# normalised trait. Render, propagation, pinning, the known-count and the
+# per-field stats read this tuple instead, so they all pick it up.
+RENDERED_TRAIT_FIELDS = RENDERED_TRAIT_FIELDS + ("distinguishing_marks",)
+# Pinning must accept the same set, or a pinned mark is silently dropped by
+# set_pinned_fields while the UI still offers the pin.
+PINNABLE_TRAIT_FIELDS = tuple(NEW_TRAIT_FIELDS) + ("distinguishing_marks",)
 # Build order for the compiled phrase. Hair is not in this list: it is one
 # clause composed from two fields, so it is added before the loop.
-TRAIT_ORDER = ("eye_color", "face", "build", "attire", "carried")
+# `distinguishing_marks` is the legacy four-field name, not a new-field trait, but
+# it renders here rather than only in the legacy branch: a permanent mark (a
+# brand, a scar, an eyepatch) is the one thing a later event must still show, and
+# it is the field the character editor exposes for it. It stays out of
+# NEW_TRAIT_FIELDS so the extraction schemas and the trait vocabulary do not start
+# treating free-text marks as normalised traits - but it IS in
+# RENDERED_TRAIT_FIELDS, so it counts toward "N/11 known", propagates on a manual
+# edit, and can be pinned, exactly like the other rendered traits.
+TRAIT_ORDER = ("eye_color", "face", "build", "distinguishing_marks", "attire",
+               "carried")
 
 _SEX_NOUN = {"male": "man", "female": "woman"}
 # A child is a noun, not an adjective in front of one: "young man" describes a
@@ -1060,7 +1084,12 @@ def _clone_event(event: CharacterTimelineEvent, **overrides) -> CharacterTimelin
     """A transient copy of a timeline event. Never added to the session."""
     data = {field: getattr(event, field, None) for field in NEW_TRAIT_FIELDS}
     data.update(overrides)
-    return CharacterTimelineEvent(
+    # `distinguishing_marks` is pinnable but is not in NEW_TRAIT_FIELDS, so its
+    # override cannot ride in `data`: the explicit keyword below already sets it,
+    # and passing both is a duplicate-keyword TypeError. Lift it out and apply it
+    # by attribute after construction.
+    marks_override = data.pop("distinguishing_marks", None)
+    copy = CharacterTimelineEvent(
         id=event.id,
         character_id=event.character_id,
         book_id=event.book_id,
@@ -1075,6 +1104,9 @@ def _clone_event(event: CharacterTimelineEvent, **overrides) -> CharacterTimelin
         visual_description=event.visual_description,
         **data,
     )
+    if marks_override is not None:
+        copy.distinguishing_marks = marks_override
+    return copy
 
 
 def carried_scope_mode() -> str:
@@ -1141,12 +1173,12 @@ def get_pinned_fields(character: Optional[Character]) -> List[str]:
     if not isinstance(values, (list, tuple, set)):
         values = [values]
     return [str(value).strip() for value in values
-            if str(value).strip() in NEW_TRAIT_FIELDS]
+            if str(value).strip() in PINNABLE_TRAIT_FIELDS]
 
 
 def set_pinned_fields(session: Session, character: Character,
                       fields: List[str]) -> None:
-    clean = sorted({field for field in fields if field in NEW_TRAIT_FIELDS})
+    clean = sorted({field for field in fields if field in PINNABLE_TRAIT_FIELDS})
     character.pinned_traits = json.dumps(clean) if clean else None
     session.add(character)
 
@@ -1175,7 +1207,12 @@ def _effective_event(event: Optional[CharacterTimelineEvent],
         return event
     data = {field: getattr(event, field, None) for field in NEW_TRAIT_FIELDS}
     data.update(overrides)
-    return CharacterTimelineEvent(
+    # `distinguishing_marks` is pinnable but is not in NEW_TRAIT_FIELDS, so its
+    # override cannot ride in `data`: the explicit keyword below already sets it,
+    # and passing both is a duplicate-keyword TypeError. Lift it out and apply it
+    # by attribute after construction.
+    marks_override = data.pop("distinguishing_marks", None)
+    copy = CharacterTimelineEvent(
         id=event.id,
         character_id=event.character_id,
         book_id=event.book_id,
@@ -1190,6 +1227,9 @@ def _effective_event(event: Optional[CharacterTimelineEvent],
         visual_description=event.visual_description,
         **data,
     )
+    if marks_override is not None:
+        copy.distinguishing_marks = marks_override
+    return copy
 
 
 def resolve_event_at(session: Session, character: Character,
@@ -1913,6 +1953,9 @@ def _render_trait(field: str, value: str) -> str:
         return f"who is {value}"
     if field == "attire" and not low.startswith(("wearing ", "dressed ", "in ")):
         return f"wearing {value}"
+    if field == "distinguishing_marks" and not low.startswith(
+            ("with ", "bearing ", "having ", "marked ", "who is ")):
+        return f"with {value}"
     if field == "carried" and not low.startswith(("carrying ", "holding ", "with ")):
         return f"carrying {value}"
     return value
