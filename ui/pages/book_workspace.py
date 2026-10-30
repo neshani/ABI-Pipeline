@@ -2,6 +2,7 @@ import csv
 import os
 import time
 import re
+import html
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import asyncio
@@ -363,6 +364,37 @@ def find_quote_context(project_name: str, book_name: str, quote: str, char_windo
     return res["html"]
 
 
+# An entity reference as ``html.escape`` writes it (``&amp;``, ``&#x27;``). Alias
+# highlighting must step over these, not match inside them.
+HTML_ENTITY_REF = re.compile(r'&(?:[a-zA-Z][a-zA-Z0-9]{1,31}|#\d{1,7}|#x[0-9a-fA-F]{1,6});')
+
+# Sentence ends, for a passage that carries no line structure of its own: a
+# terminal mark, whitespace, then the sort of thing a new sentence starts with.
+_SENTENCE_BREAK = re.compile(r'([.!?\u2026])\s+(?=[A-Z\u201c\u2018"\'\[&<])')
+
+
+def format_transcript_context(text: str) -> str:
+    """Readable HTML for a transcript passage: paragraphs if it has any, else sentences.
+
+    ``transcript.txt`` is plain text - ``\\n\\n`` between paragraphs, ``\\n`` for a
+    line break inside one (verse, addresses). Handing that straight to ``ui.html``
+    collapses every newline to a space, which is why theater context read as one
+    dense wall of text.
+
+    A window cut from the middle of a paragraph has no newlines at all, so there is
+    no structure to keep; break on sentence ends instead. Text is escaped first: a
+    transcript can hold ``&`` and occasionally ``<``, and an unescaped ``<``
+    silently swallows the rest of the passage.
+    """
+    if not text:
+        return ""
+    escaped = html.escape(text.replace("\r\n", "\n").replace("\r", "\n"))
+    if "\n" in escaped:
+        escaped = re.sub(r"\n[ \t]*\n+", "<br><br>", escaped)
+        return escaped.replace("\n", "<br>")
+    return _SENTENCE_BREAK.sub(r"\1<br><br>", escaped)
+
+
 def find_quote_context_paginated(project_name: str, book_name: str, quote: str, window_before: int = 400, window_after: int = 400) -> dict:
     """
     Finds the quote context inside transcript.txt using distinct before and after boundaries,
@@ -415,13 +447,16 @@ def find_quote_context_paginated(project_name: str, book_name: str, quote: str, 
     has_prev = start_idx > 0
     has_next = end_idx < len(text)
 
-    highlighted = (
-        snippet[:hit_start] +
-        '<mark id="quote-target" class="bg-yellow-200 text-slate-900 font-bold px-1 rounded shadow-2xs">' +
-        snippet[hit_start:hit_end] +
-        '</mark>' +
-        snippet[hit_end:]
+    # Format the whole passage in one pass, carrying the quote between two private
+    # sentinels, so paragraph (or sentence) breaks land on the right side of the
+    # highlight. Escaping and both break patterns leave \x00/\x01 untouched.
+    formatted = format_transcript_context(
+        snippet[:hit_start] + "\x00" + snippet[hit_start:hit_end].strip() + "\x01" + snippet[hit_end:]
     )
+    highlighted = formatted.replace(
+        "\x00",
+        '<mark id="quote-target" class="bg-yellow-200 text-slate-900 font-bold px-1 rounded shadow-2xs">',
+    ).replace("\x01", '</mark>')
     return {"html": f"... {highlighted} ...", "has_prev": has_prev, "has_next": has_next}
 
 
@@ -508,6 +543,20 @@ def render_book_tabs(book_id: int):
         chip_cache["tooltips"] = {}
         chip_cache["signature"] = None
 
+    def after_stale_purge(rows):
+        """Keep this page's in-memory rows in step with the approval reset.
+
+        The gallery, the theater and every prompt edit all write back from
+        ``prompts``, so an ``approved`` flag left True here would be written
+        straight over the one the purge just cleared in ``prompts.csv``.
+        """
+        keys = {_row_key(ch, sc) for book_id_, ch, sc in rows if book_id_ == book_id}
+        if not keys:
+            return
+        for p in prompts:
+            if _row_key(p.get("chapter"), p.get("shot")) in keys:
+                p["approved"] = "False"
+
     def open_character_edit_dialog(char_id: int):
         """Spawns the quick characters manager modal pre-selected to a specific character."""
         def after_change():
@@ -519,7 +568,8 @@ def render_book_tabs(book_id: int):
             project_id=project.id,
             book_id=book_id,
             initial_char_id=char_id,
-            on_change_callback=after_change
+            on_change_callback=after_change,
+            on_purge_done=after_stale_purge
         )
         modal.open()
 
@@ -533,7 +583,8 @@ def render_book_tabs(book_id: int):
         modal = QuickCharactersModal(
             project_id=project.id, 
             book_id=book_id,
-            on_change_callback=after_change
+            on_change_callback=after_change,
+            on_purge_done=after_stale_purge
         )
         modal.open()
 
@@ -1857,12 +1908,12 @@ def render_book_tabs(book_id: int):
             combined_regex = re.compile(combined_pattern, flags=re.IGNORECASE)
             
             # Tokenize by HTML tags to isolate raw text and prevent highlights inside tag structures
-            tokens = re.split(r'(<[^>]+>)', html_content)
+            tokens = re.split(r'(<[^>]+>|&[a-zA-Z#0-9]+;)', html_content)
             highlighted_tokens = []
             
             for token in tokens:
-                if token.startswith('<') and token.endswith('>'):
-                    # Keep existing HTML tags intact
+                if (token.startswith('<') and token.endswith('>')) or HTML_ENTITY_REF.fullmatch(token):
+                    # Keep existing HTML tags and character entities intact
                     highlighted_tokens.append(token)
                 else:
                     text_segment = token

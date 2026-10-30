@@ -18,7 +18,9 @@ from services.character_manager import (
     character_field_stats,
     propagate_trait_change,
     NEW_TRAIT_FIELDS,
+    RENDERED_TRAIT_FIELDS,
 )
+from services.stale_renders import plan_stale_renders, apply_stale_render_purge
 from ui.pages.project.characters_tab import get_character_frequency_map, event_trait_count
 from ui.components.description_lookup_modal import open_lookup_dialog
 from ui.components.trait_grid import render_trait_grid, render_legacy_fields
@@ -94,16 +96,24 @@ def delete_timeline_event(event_id: int) -> bool:
 class QuickCharactersModal:
     # ui/components/quick_characters_modal.py
 
-    def __init__(self, project_id: int, book_id: int, initial_char_id: Optional[int] = None, on_change_callback: Optional[callable] = None):
+    def __init__(self, project_id: int, book_id: int, initial_char_id: Optional[int] = None, on_change_callback: Optional[callable] = None, on_purge_done: Optional[callable] = None):
         self.project_id = project_id
         self.book_id = book_id
         self.on_change_callback = on_change_callback
+        self.on_purge_done = on_purge_done
         
         # State tracking
         self.selected_char_id: Optional[int] = initial_char_id
         self.selected_event_id: Optional[int] = None  # Tracks which chronological event state is being edited
         self.active_row_id: Optional[int] = None
         self.search_query = ""
+
+        # Trait edits made in this modal session, keyed by (character_id, field):
+        # the position that was edited and the value it now holds. The purge button
+        # only exists because of these - an edit that was never made has nothing to
+        # offer, and the span it covers can be re-derived from the timeline later.
+        self.pending_trait_changes: Dict[tuple, dict] = {}
+        self._purge_plan: Optional[dict] = None
 
         # Load core data
         with Session(engine) as session:
@@ -117,6 +127,7 @@ class QuickCharactersModal:
         # This prevents it from being destroyed when dynamic sub-containers (like chips) are cleared.
         with ui.context.client:
             self.dialog = ui.dialog()
+            self.purge_dialog = ui.dialog()
 
     def open(self):
         with self.dialog, ui.card().classes('w-full max-w-[95vw] lg:max-w-5xl h-[650px] p-5 rounded-xl flex flex-col gap-3 outline-none bg-white'):
@@ -152,6 +163,7 @@ class QuickCharactersModal:
                 with self.right_details_container:
                     self.draw_right_details()
 
+        self.build_purge_dialog()
         self.dialog.open()
 
         # Smooth auto-scroll viewport adjustment after client connection settled
@@ -177,6 +189,147 @@ class QuickCharactersModal:
     def trigger_workspace_refresh(self):
         if self.on_change_callback:
             self.on_change_callback()
+
+    # --- Stale renders ------------------------------------------------------
+    #
+    # A trait edit carries forward until the book changes the value, which strands
+    # every image rendered inside that stretch (see services/stale_renders.py). The
+    # count is only worked out when the button is clicked - deletion is destructive
+    # and needs a confirmation, so there is nothing to compute on every save.
+
+    def pending_for(self, char_id: int) -> List[dict]:
+        return [info for key, info in self.pending_trait_changes.items()
+                if key[0] == char_id]
+
+    def pending_text(self, pending: List[dict]) -> str:
+        names = sorted({info["field"].replace('_', ' ') for info in pending})
+        label = "trait change" if len(pending) == 1 else "trait changes"
+        return (f"{len(pending)} {label} · {', '.join(names)} — images rendered with "
+                f"the old value are stale.")
+
+    def note_trait_change(self, char_id: int, field: str,
+                          event: CharacterTimelineEvent, value: str) -> None:
+        """Remember an edit so the purge button can offer the images it stranded.
+
+        Keyed by position as well as field: editing the same trait at two places in
+        one sitting strands two spans, and dropping the earlier one would leave its
+        images behind.
+        """
+        self.pending_trait_changes[
+            (char_id, field, event.book_id, event.chapter_num, event.shot_num)
+        ] = {
+            "field": field,
+            "book_id": event.book_id,
+            "chapter": event.chapter_num,
+            "shot": event.shot_num,
+            "value": value,
+        }
+        pending = self.pending_for(char_id)
+        row = getattr(self, "_pending_row", None)
+        if row is not None:
+            row.set_visibility(bool(pending))
+        label = getattr(self, "_pending_label", None)
+        if label is not None and pending:
+            label.set_text(self.pending_text(pending))
+
+    def build_purge_dialog(self):
+        """The confirmation dialog. Built once per modal, contents updated per open."""
+        with self.purge_dialog, ui.card().classes('w-[520px] p-5 rounded-xl gap-3 outline-none'):
+            with ui.row().classes('w-full items-center gap-2'):
+                ui.icon('delete_sweep', size='sm', color='red-600')
+                ui.label('Delete stale renders').classes('text-sm font-bold text-slate-800')
+
+            self._purge_summary = ui.label('').classes('text-xs font-semibold text-slate-700')
+            self._purge_breakdown = ui.label('').classes(
+                'text-[11px] text-slate-500 leading-relaxed whitespace-pre-line')
+            self._purge_note = ui.label(
+                'Approval is cleared on every deleted scene.').classes(
+                'text-[11px] text-amber-700')
+
+            self._purge_other = ui.checkbox('Also delete from other books', value=True) \
+                .classes('text-xs font-semibold text-slate-700')
+            self._purge_other.on_value_change(lambda _e: self.update_purge_labels())
+
+            with ui.row().classes('w-full justify-end gap-2 mt-1'):
+                ui.button('Cancel', on_click=self.purge_dialog.close) \
+                    .props('flat').classes('text-xs font-semibold text-slate-500')
+                self._purge_confirm = ui.button('Delete', on_click=self.confirm_purge) \
+                    .classes('bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold '
+                             'px-4 py-1.5 rounded-lg')
+
+    def open_purge_dialog(self, char_id: int):
+        changes = self.pending_for(char_id)
+        plan = plan_stale_renders(self.project_id, char_id, changes,
+                                  current_book_id=self.book_id)
+        self._purge_plan = {"char_id": char_id, **plan}
+
+        others = [entry for entry in plan["entries"] if entry["book_id"] != self.book_id]
+        self._purge_other.set_visibility(bool(others))
+        self._purge_other.set_value(bool(others))
+        self.update_purge_labels()
+        self.purge_dialog.open()
+
+    def selected_purge_entries(self) -> List[dict]:
+        entries = (self._purge_plan or {}).get("entries", [])
+        if not self._purge_other.value:
+            return [entry for entry in entries if entry["book_id"] == self.book_id]
+        return list(entries)
+
+    def update_purge_labels(self):
+        plan = self._purge_plan or {}
+        entries = plan.get("entries", [])
+        include_others = self._purge_other.value
+        selected = self.selected_purge_entries()
+        images = sum(len(entry["files"]) for entry in selected)
+        book_ids = {entry["book_id"] for entry in selected}
+        by_book = [b for b in plan.get("by_book", [])
+                   if include_others or b["book_id"] == self.book_id]
+
+        if not entries:
+            self._purge_summary.set_text("No images match these trait changes.")
+            self._purge_breakdown.set_text(
+                "Nothing was rendered for this character inside the span the change covers.")
+        elif not selected:
+            self._purge_summary.set_text("Nothing left to delete in this book.")
+            self._purge_breakdown.set_text("")
+        else:
+            books = len(book_ids)
+            self._purge_summary.set_text(
+                f"{images} image{'s' if images != 1 else ''} in "
+                f"{books} book{'s' if books != 1 else ''} will be deleted.")
+            self._purge_breakdown.set_text("\n".join(
+                f"· {b['book_name']} — {b['count']} image"
+                f"{'s' if b['count'] != 1 else ''}" for b in by_book))
+
+        self._purge_confirm.set_text(
+            f"Delete {images} image{'s' if images != 1 else ''}")
+        self._purge_confirm.set_enabled(bool(selected))
+
+    def confirm_purge(self):
+        plan = self._purge_plan or {}
+        entries = self.selected_purge_entries()
+        if not entries:
+            self.purge_dialog.close()
+            return
+
+        result = apply_stale_render_purge(self.project_id, entries)
+
+        char_id = plan.get("char_id")
+        self.pending_trait_changes = {
+            key: info for key, info in self.pending_trait_changes.items()
+            if key[0] != char_id}
+        row = getattr(self, "_pending_row", None)
+        if row is not None:
+            row.set_visibility(False)
+        self._purge_plan = None
+        self.purge_dialog.close()
+
+        message = f"{result['images']} images deleted"
+        if result["books"] > 1:
+            message += f" across {result['books']} books"
+        ui.notify(message, type="positive", position="bottom-right")
+        if self.on_purge_done:
+            self.on_purge_done(result.get("rows", []))
 
     def get_sorted_events(self, char_id: int) -> List[CharacterTimelineEvent]:
         """Loads and chronologically orders all timeline state events for a character."""
@@ -541,6 +694,14 @@ class QuickCharactersModal:
                         desc_state["is_override"] = False
                 session.add(db_ev)
                 session.commit()
+
+                # A real edit (not a blur that saved the same text) strands the
+                # images rendered with the old value; remember it so the panel can
+                # offer them. ``db_ev`` is still attached here, so its position is
+                # readable regardless of expire-on-commit.
+                if (key in RENDERED_TRAIT_FIELDS
+                        and (old_val or "").strip().lower() != (val or "").strip().lower()):
+                    self.note_trait_change(char.id, key, db_ev, val)
             save_project_characters_to_json(self.project_id)
             ui.notify("Trait saved.", type="positive", position="bottom-right", timeout=1000)
             self.trigger_workspace_refresh()
@@ -688,6 +849,23 @@ class QuickCharactersModal:
             value_for=lambda key: getattr(current_ev, key, None) or "",
             save=save_trait,
         )
+
+        # --- Stale renders offer (only after this session edited a trait) ---
+        pending_here = self.pending_for(char.id)
+        self._pending_row = ui.row().classes(
+            'w-full items-center justify-between gap-2 p-2 rounded-lg border '
+            'bg-amber-50 border-amber-200 flex-shrink-0')
+        self._pending_row.set_visibility(bool(pending_here))
+        with self._pending_row:
+            with ui.row().classes('items-center gap-2 flex-1 min-w-0'):
+                ui.icon('auto_delete', size='sm', color='amber-600')
+                self._pending_label = ui.label(
+                    self.pending_text(pending_here) if pending_here else ''
+                ).classes('text-[11px] text-amber-800 font-semibold min-w-0')
+            ui.button('Purge stale renders…',
+                      on_click=lambda: self.open_purge_dialog(char.id)) \
+                .classes('bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold '
+                         'px-3 py-1 rounded-lg flex-shrink-0')
 
         ui.label('Compiled Visual Prompt').classes('text-[10px] font-bold text-slate-400 uppercase tracking-wide mt-1')
 

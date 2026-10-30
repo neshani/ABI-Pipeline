@@ -35,15 +35,6 @@ def clean_quote_text(text: str) -> str:
     return t
 
 
-def format_narrative_context(html_content: str) -> str:
-    """Splits dense paragraphs into highly legible spaced lines on terminal punctuation."""
-    if not html_content:
-        return ""
-    # Split sentences cleanly when followed by a capital letter, quote, or bracket (or tag start)
-    formatted = re.sub(r'(\.|\!|\?)\s+(?=[A-Z“"\'\[<])', r'\1<br><br>', html_content)
-    return formatted
-
-
 def render_prompt_editor_view(
     project_id: int, 
     book_id: int, 
@@ -446,7 +437,7 @@ def render_prompt_editor_view(
             return
         
         # Inline import breaks circular dependencies at module load-time
-        from ui.pages.book_workspace import find_quote_context_paginated
+        from ui.pages.book_workspace import find_quote_context_paginated, HTML_ENTITY_REF
         
         with Session(engine) as session:
             project = session.get(Project, project_id)
@@ -462,7 +453,9 @@ def render_prompt_editor_view(
                     window_after=wa
                 )
                 
-                formatted_html = format_narrative_context(res["html"])
+                # Paragraph/sentence breaks and escaping happen in
+                # find_quote_context_paginated, so both readers show the same text.
+                formatted_html = res["html"]
                 
                 # Resolve character names and aliases for green context highlights
                 chars = session.exec(
@@ -481,11 +474,11 @@ def render_prompt_editor_view(
                     combined_pattern = r'\b(' + '|'.join(re.escape(alias) for alias in unique_aliases) + r')\b'
                     combined_regex = re.compile(combined_pattern, flags=re.IGNORECASE)
                     
-                    tokens = re.split(r'(<[^>]+>)', formatted_html)
+                    tokens = re.split(r'(<[^>]+>|&[a-zA-Z#0-9]+;)', formatted_html)
                     highlighted_tokens = []
                     
                     for token in tokens:
-                        if token.startswith('<') and token.endswith('>'):
+                        if (token.startswith('<') and token.endswith('>')) or HTML_ENTITY_REF.fullmatch(token):
                             highlighted_tokens.append(token)
                         else:
                             text_segment = token
