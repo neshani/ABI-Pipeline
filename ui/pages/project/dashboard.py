@@ -1620,9 +1620,9 @@ def render_project_tabs(
 
     with ui.tabs(on_change=handle_tab_change).classes('w-full border-b') as project_tabs:
         tab_dash = ui.tab('Dashboard', icon='dashboard')
+        tab_src = ui.tab('Source Text', icon='menu_book')
         tab_play = ui.tab('Prompt-Gen Playground', icon='science')
         tab_char = ui.tab('Characters', icon='face')
-        tab_src = ui.tab('Source Text', icon='menu_book')
         tab_style = ui.tab('Style & Workflows', icon='brush')
         tab_pack = ui.tab('OIS Packager', icon='inventory_2')
         

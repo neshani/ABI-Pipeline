@@ -153,6 +153,43 @@ window.addEventListener('focus', () => {
     }
 });
 </script>
+<style>
+  /* Park an element directly beneath the fixed app header.
+     A sticky element needs a pixel `top`, and the header is not a fixed height:
+     its contents wrap at narrower window widths and the telemetry labels change
+     size live, so a hardcoded offset (the sidebars' `top-24`) leaves the
+     element's top edge behind the header. `--app-header-height` is measured
+     from the header itself and kept in sync below. */
+  .sticky-under-header {
+    position: sticky;
+    top: var(--app-header-height, 7.5rem);
+    z-index: 40;
+  }
+</style>
+<script>
+(function () {
+  function syncHeaderHeight() {
+    var header = document.querySelector('.nicegui-header');
+    if (!header) return;
+    document.documentElement.style.setProperty(
+      '--app-header-height', Math.ceil(header.getBoundingClientRect().height) + 'px'
+    );
+  }
+  function start() {
+    syncHeaderHeight();
+    // The header changes height without a resize event: telemetry labels and
+    // the pipeline stepper arrive over the websocket after first paint. A
+    // cheap 2s re-measure beats guessing when it has settled.
+    setInterval(syncHeaderHeight, 2000);
+    window.addEventListener('resize', syncHeaderHeight);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
+})();
+</script>
 ''')
 
 

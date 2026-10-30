@@ -32,6 +32,8 @@ Desktop.ini
 
 # --- Local Scripts / Extras ---
 zExportCodeForLLM.ps1
+change_viewer.py
+strip_marks.py
 
 workspace_temp/
 output/

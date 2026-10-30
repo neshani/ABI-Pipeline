@@ -204,39 +204,48 @@ def save_prompts_csv(project_name: str, book_name: str, rows: List[Dict[str, Any
 # --- High Performance Directory Caching & Parsing ---
 
 def get_book_images_cache(project_name: str, book_name: str) -> Dict[tuple, str]:
-    """Scans directories once. Returns a fast lookup dict mapping {(chapter, scene): static_url}."""
+    """Scans directories once. Returns a fast lookup dict mapping {(chapter, scene): static_url}.
+
+    The ``?t=`` version is the file's own mtime rather than the time the page was
+    built, so an image re-rendered under the same filename still reloads while
+    every untouched image keeps its URL - and therefore its browser cache entry -
+    across page loads.
+    """
     cache = {}
     out_dirs = [
         (Path(f"./output/{project_name}/{book_name}/images"), f"/output_media/{project_name}/{book_name}/images"),
         (Path(f"./output/{project_name}/{book_name}"), f"/output_media/{project_name}/{book_name}")
     ]
-    
-    load_time = getattr(state, 'workspace_load_time', 0)
-    if not load_time:
-        load_time = int(time.time())
-        state.workspace_load_time = load_time
-        
+
     custom_versions = getattr(state, 'custom_image_timestamps', {})
-    
+
     for d, url_prefix in out_dirs:
         if not d.exists():
             continue
         try:
-            for filename in os.listdir(d):
-                if filename.lower().endswith('.png'):
-                    stem, _ = os.path.splitext(filename)
+            with os.scandir(d) as entries:
+                for entry in entries:
+                    if not entry.name.lower().endswith('.png'):
+                        continue
+                    stem, _ = os.path.splitext(entry.name)
                     parts = stem.split('_')
-                    if len(parts) >= 2:
+                    if len(parts) < 2:
+                        continue
+                    try:
+                        ch = int(parts[0])
+                        sc = int(parts[1])
+                    except ValueError:
+                        continue
+                    t_val = custom_versions.get((ch, sc))
+                    if t_val is None:
                         try:
-                            ch = int(parts[0])
-                            sc = int(parts[1])
-                            t_val = custom_versions.get((ch, sc), load_time)
-                            cache[(ch, sc)] = f"{url_prefix}/{filename}?t={t_val}"
-                        except ValueError:
-                            pass
+                            t_val = int(entry.stat().st_mtime * 1000)
+                        except OSError:
+                            t_val = 0
+                    cache[(ch, sc)] = f"{url_prefix}/{entry.name}?t={t_val}"
         except Exception as ex:
             print(f"[Proofreader-Cache] Error indexing folder {d}: {ex}")
-            
+
     return cache
 
 
@@ -274,6 +283,80 @@ def delete_scene_image_file(project_name: str, book_name: str, chapter_str: str,
 
 # --- Stateful Context Finder with Pagination Support ---
 
+# Quote marks that can arrive *with* the passage rather than being added for
+# presentation. ``’`` is in the closing set because curly single quotes are both
+# the closing mark and the apostrophe; a stray outer mark is the lesser evil.
+_QUOTE_MARKS = ('"', "\u201c", "\u201d", "\u2018", "\u2019", "\u00ab", "\u00bb")
+
+
+def quoted_for_display(quote: str) -> str:
+    """Wrap a stored quote in quotation marks, unless it already carries its own.
+
+    The ``quote`` column is the passage as the model copied it, so dialogue
+    arrives already quoted (``“I’ll not let myself be stilled.”``) and wrapping it
+    blindly rendered ``"“I’ll not let myself be stilled.”"``. When *either* end
+    already has a mark the text is left alone: the other end is usually the
+    transcript's own open-ended dialogue (``“Your task? Your task was to seize
+    Almoth Plain!``) and closing it here would invent punctuation the book does
+    not have.
+    """
+    text = (quote or "").strip()
+    if not text:
+        return ""
+    if text[0] in _QUOTE_MARKS or text[-1] in _QUOTE_MARKS:
+        return text
+    return f'"{text}"'
+
+
+# A quote character in a stored quote may face any of the transcript's spellings.
+_LOOSE_CHARS = {
+    "'": "['\u2019]", '"': '["\u201c\u201d]', "-": "[-\u2013\u2014]",
+    "\u2018": "['\u2019]", "\u2019": "['\u2019]",
+    "\u201c": '["\u201c\u201d]', "\u201d": '["\u201c\u201d]',
+    "\u2013": "[-\u2013\u2014]", "\u2014": "[-\u2013\u2014]",
+}
+
+
+def _loose_fragment_pattern(fragment: str) -> str:
+    """Regex for one fragment of a quote, blind to typography rather than to wording."""
+    frag = re.sub(r"\[[^\]]*\]", " ", fragment or "")  # `[Name]` tags are markup, not text
+    frag = " ".join(frag.split()).strip(' .,;:!?"\u2019\u2018\u201c\u201d')
+    if len(frag) < 8:
+        return ""
+    parts = []
+    for word in frag.split(" "):
+        if parts:
+            parts.append(r"\s+")
+        parts.append("".join(_LOOSE_CHARS.get(c, re.escape(c)) for c in word))
+    return "".join(parts)
+
+
+def locate_quote_loosely(text: str, quote: str) -> Optional[tuple]:
+    """``(start, end)`` span of ``quote`` in ``text``, tolerating typography.
+
+    The stored quote is what a model copied out of the passage, so it carries
+    marks the transcript may not repeat: a ``“`` the model reconstructed where the
+    transcript simply continues a paragraph of dialogue, straight quotes against
+    curly ones, an ellipsis joining two fragments, or a ``[Name]`` tag that
+    bracket repair left inside the quote. An exact search then finds nothing and
+    the theater reports "context match could not be found" beside a passage that
+    is right there. Wording is still matched literally - this is a matching
+    tolerance, not a fuzzy search.
+    """
+    spans = []
+    for fragment in re.split(r"\.\.\.|\u2026", quote or ""):
+        pattern = _loose_fragment_pattern(fragment)
+        if not pattern:
+            continue
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            return None
+        spans.append((match.start(), match.end()))
+    if not spans:
+        return None
+    return spans[0][0], spans[-1][1]
+
+
 def find_quote_context(project_name: str, book_name: str, quote: str, char_window: int = 400) -> str:
     """Lazy parses transcript.txt, extracting surrounding paragraphs to highlight narration context."""
     res = find_quote_context_paginated(project_name, book_name, quote, window_before=char_window, window_after=char_window)
@@ -310,6 +393,12 @@ def find_quote_context_paginated(project_name: str, book_name: str, quote: str, 
     if idx == -1 and len(quote_lower) > 25:
         idx = text_lower.find(quote_lower[:25])
         match_len = 25
+
+    if idx == -1:
+        # Typography differs but the wording is there - see locate_quote_loosely.
+        loose = locate_quote_loosely(text, quote)
+        if loose:
+            idx, match_len = loose[0], loose[1] - loose[0]
             
     if idx == -1:
         return {"html": "Narrative segment context match could not be found inside transcript.txt.", "has_prev": False, "has_next": False}
@@ -317,24 +406,24 @@ def find_quote_context_paginated(project_name: str, book_name: str, quote: str, 
     start_idx = max(0, idx - window_before)
     end_idx = min(len(text), idx + match_len + window_after)
     snippet = text[start_idx:end_idx]
-        
-    snippet_lower = snippet.lower()
-    snippet_idx = snippet_lower.find(quote_lower[:match_len])
-    
+
+    # Highlight by offset, not by searching the snippet again: the 25-character
+    # fallback and the loose match both know exactly where the passage is.
+    hit_start = max(0, idx - start_idx)
+    hit_end = min(len(snippet), hit_start + match_len)
+
     has_prev = start_idx > 0
     has_next = end_idx < len(text)
-        
-    if snippet_idx != -1:
-        highlighted = (
-            snippet[:snippet_idx] +
-            '<mark id="quote-target" class="bg-yellow-200 text-slate-900 font-bold px-1 rounded shadow-2xs">' +
-            snippet[snippet_idx:snippet_idx + match_len] +
-            '</mark>' +
-            snippet[snippet_idx + match_len:]
-        )
-        return {"html": f"... {highlighted} ...", "has_prev": has_prev, "has_next": has_next}
-            
-    return {"html": f"... {snippet} ...", "has_prev": has_prev, "has_next": has_next}
+
+    highlighted = (
+        snippet[:hit_start] +
+        '<mark id="quote-target" class="bg-yellow-200 text-slate-900 font-bold px-1 rounded shadow-2xs">' +
+        snippet[hit_start:hit_end] +
+        '</mark>' +
+        snippet[hit_end:]
+    )
+    return {"html": f"... {highlighted} ...", "has_prev": has_prev, "has_next": has_next}
+
 
 
 # --- Main Proofing UI Component ---
@@ -623,6 +712,18 @@ def render_book_tabs(book_id: int):
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
             character_alias_map[char.id] = [clean_character_key(a.alias) for a in aliases] + [clean_character_key(char.name)]
 
+    # Exact-alias -> character ids, inverted once per page render. The gallery
+    # search used to walk every character's alias list for every tag of every
+    # prompt *on every keystroke* (~1,000 prompts x ~1,000 characters on a long
+    # book). That is a third of a second of blocking work per letter typed, which
+    # starves the websocket until the client reconnects and rebuilds the page -
+    # which is why the search box looked like it silently reset itself mid-word.
+    # With the index the tag side of the search is a dictionary lookup.
+    character_ids_by_alias: Dict[str, set] = {}
+    for char_id, aliases in character_alias_map.items():
+        for alias in aliases:
+            character_ids_by_alias.setdefault(alias, set()).add(char_id)
+
     prompts = get_all_prompts_as_dicts()
     images_cache = get_book_images_cache(project_name, book_name)
 
@@ -645,6 +746,39 @@ def render_book_tabs(book_id: int):
     # Fast in-memory search container for keyboard queries
     search_filter_container = [None]
 
+    # Typing debounce. Every keystroke used to rebuild the whole gallery, so a
+    # burst of typing queued one full refresh per character and kept the event
+    # loop blocked long enough for the client to time out and reload the page
+    # (losing the typed query). Filter once the typing pauses instead.
+    search_refresh_task: List[Optional[asyncio.Task]] = [None]
+
+    def cancel_pending_search_refresh() -> None:
+        task = search_refresh_task[0]
+        if task is not None and not task.done():
+            task.cancel()
+        search_refresh_task[0] = None
+
+    async def _refresh_gallery_after_pause() -> None:
+        try:
+            await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            return
+        search_refresh_task[0] = None
+        try:
+            render_content.refresh()
+        except (RuntimeError, AssertionError):
+            # The page (or this client) went away while the timer was pending.
+            pass
+
+    def schedule_search_refresh() -> None:
+        cancel_pending_search_refresh()
+        search_refresh_task[0] = asyncio.create_task(_refresh_gallery_after_pause())
+
+    def flush_search_refresh() -> None:
+        """Apply the pending query now (Enter), instead of waiting out the pause."""
+        cancel_pending_search_refresh()
+        render_content.refresh()
+
     # --- 1. NESTED HANDLERS DEFINED FIRST ---
 
     def open_directory(path: Path):
@@ -660,6 +794,31 @@ def render_book_tabs(book_id: int):
                 subprocess.Popen(["xdg-open", str(abs_path)])
         except Exception as e:
             ui.notify(f"Failed to open directory: {str(e)}", type="negative")
+
+    # Per-prompt normalised text and tagged characters, rebuilt only when the
+    # prompt text itself changes. Keyed by ``id(row)``: ``prompts`` holds the only
+    # reference to each dict for the life of the page, so the id is stable.
+    prompt_search_cache: Dict[int, tuple] = {}
+
+    def prompt_search_facts(row: Dict[str, Any]) -> tuple:
+        """(normalised prompt, normalised quote, tagged character ids) for a row."""
+        raw_prompt = row.get("prompt") or ""
+        cached = prompt_search_cache.get(id(row))
+        if cached is not None and cached[0] == raw_prompt:
+            return cached[1], cached[2], cached[3]
+
+        norm_prompt = normalize_character_key(raw_prompt)
+        tagged_ids: set = set()
+        for tag in re.findall(r"\[(.*?)\]", norm_prompt):
+            tagged_ids.update(character_ids_by_alias.get(clean_character_key(tag), ()))
+        facts = (
+            raw_prompt,
+            norm_prompt,
+            normalize_character_key(row.get("quote") or ""),
+            tagged_ids,
+        )
+        prompt_search_cache[id(row)] = facts
+        return facts[1], facts[2], facts[3]
 
     def get_filtered_prompts():
         query = ""
@@ -681,29 +840,28 @@ def render_book_tabs(book_id: int):
                 if len(terms) > 1:
                     terms = [t for t in terms if t not in ('and', 'or', '&', 'with', 'in')]
 
+        # Resolve each term to the characters it names once for the whole pass,
+        # not once per prompt. Substring matching is deliberate: "mat" is meant to
+        # also find "Mat Cauthon", not only an exact tag.
+        term_character_ids = []
+        for term in terms:
+            term_matched_char_ids = set()
+            for char_id, aliases in character_alias_map.items():
+                if any(term in alias for alias in aliases):
+                    term_matched_char_ids.add(char_id)
+            term_character_ids.append((term, term_matched_char_ids))
+
+        shot_choice = shot_filter.value if shot_filter is not None else "All Roles"
+        mode = filter_mode.value
+
         for p in prompts:
-            if terms:
-                p_prompt = normalize_character_key(p.get("prompt", ""))
-                p_quote = normalize_character_key(p.get("quote", ""))
+            if term_character_ids:
+                p_prompt, p_quote, scene_character_ids = prompt_search_facts(p)
                 ch_str = f"ch {p.get('chapter', '')}"
                 sc_str = f"sc {p.get('shot', '')}"
-                
-                tags_in_prompt = [clean_character_key(t)
-                                  for t in re.findall(r"\[(.*?)\]", p_prompt)]
-                scene_character_ids = set()
-                for tag in tags_in_prompt:
-                    for char_id, aliases in character_alias_map.items():
-                        if tag in aliases:
-                            scene_character_ids.add(char_id)
-                            break
-                
+
                 matched_all_terms = True
-                for term in terms:
-                    term_matched_char_ids = set()
-                    for char_id, aliases in character_alias_map.items():
-                        if any(term in alias for alias in aliases):
-                            term_matched_char_ids.add(char_id)
-                            
+                for term, term_matched_char_ids in term_character_ids:
                     if term_matched_char_ids:
                         if not (term_matched_char_ids & scene_character_ids):
                             matched_all_terms = False
@@ -717,7 +875,6 @@ def render_book_tabs(book_id: int):
                     continue
 
             # Shot-type filter (roles resolved from prompts.csv).
-            shot_choice = shot_filter.value if shot_filter is not None else "All Roles"
             if not shot_role_matches(p, shot_choice):
                 continue
 
@@ -729,10 +886,10 @@ def render_book_tabs(book_id: int):
                 ch, sc = 1, 1
             has_image = (ch, sc) in images_cache
             
-            if filter_mode.value == "Unapproved Only":
+            if mode == "Unapproved Only":
                 if has_image and not is_approved:
                     filtered.append(p)
-            elif filter_mode.value == "Missing Only":
+            elif mode == "Missing Only":
                 if not has_image:
                     filtered.append(p)
             else:
@@ -861,16 +1018,23 @@ def render_book_tabs(book_id: int):
         if modal_badge_review:
             modal_badge_review.visible = bool(img_url and not is_approved)
 
-        for (grid_ch, grid_sc), ref in grid_card_references.items():
-            ref["card"].classes(remove="ring-4 ring-blue-500 ring-offset-2")
+        # Only one card carries the selection ring, so remembering which one it is
+        # avoids sending a class update for every card in the grid on each pass -
+        # the in-place image updates now run on every new render, and the grid can
+        # hold hundreds of cards.
+        previous_ring = ringed_card[0]
+        if previous_ring is not None:
+            previous_ring.classes(remove="ring-4 ring-blue-500 ring-offset-2")
+            ringed_card[0] = None
 
         if (ch, sc) in grid_card_references:
             target_ref = grid_card_references[(ch, sc)]
             target_ref["card"].classes(add="ring-4 ring-blue-500 ring-offset-2")
+            ringed_card[0] = target_ref["card"]
 
         # Always update target narration quote text for the active scene
         if modal_quote_el:
-            modal_quote_el.set_text(f'"{current_scene.get("quote", "")}"')
+            modal_quote_el.set_text(quoted_for_display(current_scene.get("quote", "")))
 
         if loaded_scene_coords[0] != ch or loaded_scene_coords[1] != sc:
             loaded_scene_coords[0] = ch
@@ -884,11 +1048,14 @@ def render_book_tabs(book_id: int):
 
             if modal_context_html[0]:
                 update_theater_context_view()
+
+            # The chips follow the prompt, and the prompt belongs to the scene, so
+            # they are rebuilt with it rather than on every in-place image update.
+            if modal_prompt_input:
+                render_scene_character_chips(modal_prompt_input.value)
         elif modal_prompt_input and not modal_prompt_input.value and current_scene.get("prompt"):
             # Self-heal prompt input if it was cleared by a previous empty state
             modal_prompt_input.set_value(current_scene.get("prompt", ""))
-
-        if modal_prompt_input:
             render_scene_character_chips(modal_prompt_input.value)
 
         # Mirror the scene's shot role into the theater selector (guard the
@@ -1304,6 +1471,41 @@ def render_book_tabs(book_id: int):
         theater_dialog.open()
         update_active_scene_ui()
 
+    def refresh_theater_queue():
+        """Reconcile the open theater's queue with the active filter.
+
+        The queue is a snapshot taken when the modal opened, but the two review
+        filters describe *live* membership: a scene that was missing gains an
+        image and leaves "Missing Only", a scene that gains its first image joins
+        "Unapproved Only". So every scene the renderer finished while the modal
+        was open was invisible - unreachable by Prev/Next, uncounted in "N of M
+        remaining" - until the modal was closed and reopened.
+
+        The rows themselves are shared with ``prompts``, so only the list is
+        rebuilt: the cursor is re-found by (chapter, shot) and the history stack,
+        which holds row references, stays valid.
+        """
+        nonlocal theater_cursor
+        if filter_mode.value == "All":
+            return  # membership is fixed; only the images themselves change
+
+        fresh = get_filtered_prompts()
+        if not fresh:
+            return
+
+        anchor = theater_queue[theater_cursor] if theater_queue else None
+        theater_queue[:] = fresh
+
+        if anchor is not None:
+            anchor_key = _row_key(anchor.get("chapter"), anchor.get("shot"))
+            for idx, row in enumerate(theater_queue):
+                if _row_key(row.get("chapter"), row.get("shot")) == anchor_key:
+                    theater_cursor = idx
+                    return
+        # The anchor has left the filter - it just got an image, or was approved.
+        # The same ordinal now holds the next scene still matching.
+        theater_cursor = min(theater_cursor, len(theater_queue) - 1)
+
     # --- 2. LAYOUT RENDERING COMPONENT DECLARATIONS ---
 
     if not prompts:
@@ -1469,7 +1671,10 @@ def render_book_tabs(book_id: int):
     present_roles = roles_present(prompts)
 
     # --- Optimized Dense One-Line Toolbar Header ---
-    with ui.row().classes('w-full justify-between items-center bg-white py-1.5 px-3 border rounded-xl shadow-2xs mb-3 flex-nowrap gap-2 outline-none focus:outline-none'):
+    # `sticky-under-header` (styles live in main.py's global head block) keeps
+    # the toolbar pinned below the fixed app header while the gallery scrolls,
+    # so Regen/Stop stay reachable without scrolling back up.
+    with ui.row().classes('sticky-under-header w-full justify-between items-center bg-white py-1.5 px-3 border rounded-xl shadow-sm mb-3 flex-nowrap gap-2 outline-none focus:outline-none'):
         
         # Left-aligned toolbar group (Filter switcher, Search bar, Regen & Stop)
         with ui.row().classes('items-center gap-2 flex-nowrap flex-1'):
@@ -1515,11 +1720,14 @@ def render_book_tabs(book_id: int):
              .tooltip('Filter the gallery by shot type')
             shot_filter.set_visibility(len(present_roles) > 1)
 
-            # 2. Expanded text input filter matching the prompt editor search bar
+            # 2. Expanded text input filter matching the prompt editor search bar.
+            # Debounced: the filter is cheap now, but one full gallery rebuild per
+            # keystroke still queues up and fights the typing.
             search_filter_container[0] = ui.input(
                 placeholder="Search chapters, quotes, prompts...",
-                on_change=lambda e: render_content.refresh()
-            ).classes('flex-1 bg-slate-50 rounded-lg').props('outlined dense clearable')
+                on_change=lambda e: schedule_search_refresh()
+            ).classes('flex-1 bg-slate-50 rounded-lg').props('outlined dense clearable') \
+             .on('keydown.enter', lambda: flush_search_refresh())
 
             # 3. Action Buttons (Regen / Stop / Stop After Book Toggle)
             ui.button(
@@ -1686,6 +1894,7 @@ def render_book_tabs(book_id: int):
     
     active_row_ref = [None]
     grid_card_references: Dict[tuple, Dict[str, Any]] = {}
+    ringed_card = [None]  # the one grid card carrying the "this is open" ring
 
     # Pre-cache character vocabulary for autocomplete inside the book workspace tabs
     book_characters_modal: List[Character] = []
@@ -1722,6 +1931,14 @@ def render_book_tabs(book_id: int):
                             modal_title_el = ui.label("").classes('text-base font-bold text-slate-800 leading-none')
                             modal_subtitle_el = ui.label("").classes('text-[11px] text-slate-400 mt-1')
                         with ui.row().classes('items-center gap-1'):
+                            # Regen Images: the workspace toolbar's Regen, reachable
+                            # without closing the modal. Deleted/unapproved scenes
+                            # render in the background and pop into this view.
+                            ui.button(
+                                icon='refresh',
+                                on_click=trigger_batch_restart
+                            ).props('flat round dense').classes('text-slate-400 hover:text-blue-600').tooltip('Regen Images')
+
                             # Jump to Prompt Editor Button
                             ui.button(
                                 icon='edit_note', 
@@ -1927,6 +2144,7 @@ def render_book_tabs(book_id: int):
                 return
                 
             grid_card_references.clear()
+            ringed_card[0] = None  # the ringed card is about to be destroyed
             rendered_count_ref[0] = min(24, len(filtered))
             
             grid_el = ui.grid(columns='repeat(auto-fill, minmax(180px, 1fr))').classes('w-full gap-4')
@@ -1986,50 +2204,59 @@ def render_book_tabs(book_id: int):
     state.book_scroll_timer = ui.timer(0.3, check_scroll)
 
     # --- Real-Time Background Image Pop-in Timer ---
-    last_file_count = [len(images_cache)]
-    
+    last_folder_signature = [None]
+    gallery_stale = [False]
+
+    def repaint_gallery():
+        if filter_mode.value == "All":
+            update_grid_views_in_place()
+        else:
+            render_content.refresh()
+
     async def check_for_image_updates():
         if state.active_book_id is None:
             return
             
         img_dir = Path(f"./output/{project_name}/{book_name}/images")
         parent_dir = Path(f"./output/{project_name}/{book_name}")
-        
-        def count_files():
-            count = 0
-            if img_dir.exists():
+
+        def folder_signature():
+            """(entry count, mtime) per folder: cheap, and a rename or a delete
+            plus a create between two ticks still shows up."""
+            signature = []
+            for d in (img_dir, parent_dir):
+                if not d.exists():
+                    signature.append((0, 0))
+                    continue
                 try:
-                    count += len(os.listdir(img_dir))
+                    signature.append((len(os.listdir(d)), os.stat(d).st_mtime_ns))
                 except Exception:
-                    pass
-            if parent_dir.exists():
-                try:
-                    count += len(os.listdir(parent_dir))
-                except Exception:
-                    pass
-            return count
+                    signature.append((0, 0))
+            return tuple(signature)
             
-        count = await asyncio.to_thread(count_files)
-        
-        if count != last_file_count[0]:
-            last_file_count[0] = count
-            
-            nonlocal images_cache
-            images_cache = await asyncio.to_thread(get_book_images_cache, project_name, book_name)
-            
-            if filter_mode.value == "All":
-                update_grid_views_in_place()
-            else:
-                render_content.refresh()
-                
+        signature = await asyncio.to_thread(folder_signature)
+
+        if signature != last_folder_signature[0]:
+            last_folder_signature[0] = signature
+
+            # Update in place: the prompt editor holds a reference to this dict.
+            fresh = await asyncio.to_thread(get_book_images_cache, project_name, book_name)
+            images_cache.clear()
+            images_cache.update(fresh)
+
             if theater_dialog.value:
-                # If queue was exhausted and a new image regenerated, refresh queue so it becomes live
-                if not theater_queue and filter_mode.value != "All":
-                    refreshed = get_filtered_prompts()
-                    if refreshed:
-                        theater_queue.extend(refreshed)
-                        theater_cursor = 0
-                        history_pointer = -1
+                # The gallery is behind a modal, so rebuilding it now is wasted
+                # work - and it used to throw away every card the user had
+                # scrolled open. Repaint it once, after the modal closes.
+                refresh_theater_queue()
                 update_active_scene_ui()
+                gallery_stale[0] = True
+                return
+
+            repaint_gallery()
+
+        elif gallery_stale[0] and not theater_dialog.value:
+            gallery_stale[0] = False
+            repaint_gallery()
 
     state.book_update_timer = ui.timer(3.0, check_for_image_updates)

@@ -14,6 +14,7 @@ from ui.components.description_lookup_modal import (
     available_lookup_sources,
     open_lookup_dialog,
 )
+from ui.components.trait_grid import render_trait_grid, render_legacy_fields
 from services.character_manager import (
     save_project_characters_to_json,
     run_stateful_character_profiling,
@@ -3390,65 +3391,67 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             "Pinned traits render from Base; select Base to edit the canonical description.")
 
                 # Physical Parameters Grid
-                def make_update_handler(ev_id, key, text_area_el):
-                    async def handler(e):
-                        val = e.sender.value.strip()
-                        with Session(engine) as session:
-                            db_ev = session.get(CharacterTimelineEvent, ev_id)
-                            if db_ev:
-                                old_val = getattr(db_ev, key, None)
-                                setattr(db_ev, key, val if val != "" else None)
-                                if db_ev.source == "extraction":
-                                    db_ev.source = "manual"  # protect the edit from re-analysis
-                                # Sex and species are character-level, not scene-level:
-                                # apply one edit to every event for this character so
-                                # the user does not have to touch 20+ rows.
-                                if key in ("sex", "species") and val:
-                                    for other in session.exec(
-                                            select(CharacterTimelineEvent)
-                                            .where(CharacterTimelineEvent.character_id
-                                                   == db_ev.character_id)).all():
-                                        setattr(other, key, val)
-                                        if other.book_id is None:
-                                            # Character-level traits are canonical:
-                                            # protect the Base from a re-analysis vote.
-                                            other.source = "manual"
-                                        session.add(other)
-                                char_obj = session.get(Character, db_ev.character_id)
-                                if char_obj and key not in ("sex", "species"):
-                                    # Everything else is scene-level, but the user means
-                                    # "from here on": carry it through the events that
-                                    # still repeat the old value and stop where the book
-                                    # changes it. Without this, a Base edit never reaches
-                                    # a position that already has an event.
-                                    propagate_trait_change(
-                                        session, char_obj, key, val, old_val,
-                                        book_id=db_ev.book_id,
-                                        chapter_num=db_ev.chapter_num,
-                                        shot_num=db_ev.shot_num,
-                                        log=state.add_console_log)
-                                if char_obj and not char_obj.locked:
-                                    if event_trait_count(db_ev):
-                                        new_prompt = compile_character_visual_prompt(
-                                            db_ev, name=char_obj.name)
-                                        # Only refresh an override that exists; leave
-                                        # an uncompiled event dynamic for the renderer.
-                                        if db_ev.visual_description:
-                                            db_ev.visual_description = new_prompt
-                                        text_area_el.set_value(new_prompt)
-                                    elif db_ev.visual_description:
-                                        db_ev.visual_description = None
-                                        text_area_el.set_value("")
-                                session.add(db_ev)
-                                session.commit()
-                        save_project_characters_to_json(project.id)
-                        # The status beside each field ("missing" / "1 change") is
-                        # computed at render time, so it has to be re-rendered or it
-                        # keeps describing the state before the edit - and the
-                        # re-render must not move the scroll position.
-                        await refresh_after_trait_save()
-                        ui.notify("Trait saved.", type="positive", position="bottom-right", timeout=1000)
-                    return handler
+                async def save_trait(key, val):
+                    """Write one trait to the event being edited.
+
+                    ``val`` arrives already collapsed to a single line by
+                    trait_grid, so an empty string is the only "no value" case.
+                    """
+                    with Session(engine) as session:
+                        db_ev = session.get(CharacterTimelineEvent, active_event.id)
+                        if db_ev:
+                            old_val = getattr(db_ev, key, None)
+                            setattr(db_ev, key, val if val != "" else None)
+                            if db_ev.source == "extraction":
+                                db_ev.source = "manual"  # protect the edit from re-analysis
+                            # Sex and species are character-level, not scene-level:
+                            # apply one edit to every event for this character so
+                            # the user does not have to touch 20+ rows.
+                            if key in ("sex", "species") and val:
+                                for other in session.exec(
+                                        select(CharacterTimelineEvent)
+                                        .where(CharacterTimelineEvent.character_id
+                                               == db_ev.character_id)).all():
+                                    setattr(other, key, val)
+                                    if other.book_id is None:
+                                        # Character-level traits are canonical:
+                                        # protect the Base from a re-analysis vote.
+                                        other.source = "manual"
+                                    session.add(other)
+                            char_obj = session.get(Character, db_ev.character_id)
+                            if char_obj and key not in ("sex", "species"):
+                                # Everything else is scene-level, but the user means
+                                # "from here on": carry it through the events that
+                                # still repeat the old value and stop where the book
+                                # changes it. Without this, a Base edit never reaches
+                                # a position that already has an event.
+                                propagate_trait_change(
+                                    session, char_obj, key, val, old_val,
+                                    book_id=db_ev.book_id,
+                                    chapter_num=db_ev.chapter_num,
+                                    shot_num=db_ev.shot_num,
+                                    log=state.add_console_log)
+                            if char_obj and not char_obj.locked:
+                                if event_trait_count(db_ev):
+                                    new_prompt = compile_character_visual_prompt(
+                                        db_ev, name=char_obj.name)
+                                    # Only refresh an override that exists; leave
+                                    # an uncompiled event dynamic for the renderer.
+                                    if db_ev.visual_description:
+                                        db_ev.visual_description = new_prompt
+                                    compiled_desc_input.set_value(new_prompt)
+                                elif db_ev.visual_description:
+                                    db_ev.visual_description = None
+                                    compiled_desc_input.set_value("")
+                            session.add(db_ev)
+                            session.commit()
+                    save_project_characters_to_json(project.id)
+                    # The status beside each field ("missing" / "1 change") is
+                    # computed at render time, so it has to be re-rendered or it
+                    # keeps describing the state before the edit - and the
+                    # re-render must not move the scroll position.
+                    await refresh_after_trait_save()
+                    ui.notify("Trait saved.", type="positive", position="bottom-right", timeout=1000)
 
                 # Trait editors: "is it populated?" and "does it change?" are
                 # shown as a status next to the label; the pin keeps the Base
@@ -3528,76 +3531,38 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                     save_project_characters_to_json(project.id)
                     draw_details_panel.refresh()
 
-                inputs_dict = {}
-                trait_fields = [
-                    ("sex", "Sex (male / female)"),
-                    ("species", "Species (human unless stated)"),
-                    ("age", "Age (child / teen / young / adult / middle-aged / old)"),
-                    ("hair_color", "Hair Colour"),
-                    ("hair_style", "Hair Style"),
-                    ("eye_color", "Eye Colour"),
-                    ("face", "Face (shape, complexion)"),
-                    ("build", "Build (Height / Frame)"),
-                    ("distinguishing_marks", "Distinguishing Marks & Key Accessories"),
-                    ("attire", "Attire (Wearing Now)"),
-                    ("carried", "Carried (Held or Worn)"),
-                    ("notes", "Notes (stored, never rendered)"),
-                ]
-                with ui.grid().classes('w-full grid-cols-1 md:grid-cols-2 gap-3'):
-                    for key, label in trait_fields:
-                        is_rendered = key in RENDERED_TRAIT_FIELDS
-                        is_pinned = is_rendered and key in pinned_fields
-                        val = (getattr(base_ev, key, None) if is_pinned and base_ev
-                               else getattr(active_event, key, None)) or ""
-                        with ui.column().classes('w-full gap-0.5'):
-                            with ui.row().classes('w-full items-center gap-1'):
-                                ui.label(label).classes(
-                                    'text-[10px] font-bold text-slate-500 uppercase tracking-wide')
-                                if is_rendered:
-                                    dot, text, color, tip = status_parts(key)
-                                    ui.label(f"{dot} {text}").classes(
-                                        f'text-[9px] font-semibold {color}')\
-                                        .tooltip(tip)
-                                else:
-                                    ui.label('note').classes('text-[9px] text-slate-400')
-                                if is_rendered:
-                                    ui.button(
-                                        icon='push_pin',
-                                        on_click=lambda _, k=key: toggle_pin(k)
-                                    ).props('flat dense round size=sm').classes(
-                                        'ml-auto ' + ('text-blue-600' if is_pinned
-                                                      else 'text-slate-300 hover:text-blue-500'))\
-                                     .tooltip('Pinned to the Base value; click to unpin'
-                                              if is_pinned else
-                                              'Pin this trait to the Base value')
-                            input_el = ui.input(
-                                value=val, placeholder=label
-                            ).classes('w-full bg-white').props('outlined dense')\
-                             .on('blur', make_update_handler(active_event.id, key,
-                                                             compiled_desc_input))
-                            if is_pinned and active_event.book_id is not None:
-                                input_el.props('readonly').tooltip(
-                                    'Pinned to Base; select Base to edit the canonical value.')
-                            inputs_dict[key] = input_el
+                def trait_status(key):
+                    """The badge beside a trait's label, or None to draw none."""
+                    dot, text, color, _tip = status_parts(key)
+                    return (f"{dot} {text}", color)
 
-                legacy_fields = [
-                    ("demographics", "Demographics (Age, Race, Gender)"),
-                    ("hair_and_face", "Hair & Face Details"),
-                    ("physical_build", "Physical Build (Height/Weight/Posture)"),
-                ]
-                with ui.expansion('Legacy description fields', icon='history', value=False)\
-                        .classes('w-full border rounded-xl bg-slate-50/40 text-xs'):
-                    ui.label(
-                        'The remaining fields the older profiler wrote. Kept editable so '
-                        'existing projects lose nothing; new descriptions use the '
-                        'fields above.'
-                    ).classes('text-[10px] text-slate-500 leading-tight')
-                    with ui.grid().classes('w-full grid-cols-1 md:grid-cols-2 gap-3'):
-                        for key, label in legacy_fields:
-                            val = getattr(active_event, key) or ""
-                            inputs_dict[key] = ui.input(label=label, value=val)\
-                                .classes('w-full bg-white').props('outlined dense')\
-                                .on('blur', make_update_handler(active_event.id, key, compiled_desc_input))
+                def readonly_reason(key):
+                    # A pinned trait renders from Base, so editing it here would
+                    # write to a row that is not the one supplying the text.
+                    if key in pinned_fields and active_event.book_id is not None:
+                        return 'Pinned to Base; select Base to edit the canonical value.'
+                    return None
+
+                def pinned_value(key):
+                    if key in RENDERED_TRAIT_FIELDS and key in pinned_fields and base_ev:
+                        return getattr(base_ev, key, None) or ""
+                    return getattr(active_event, key, None) or ""
+
+                render_trait_grid(
+                    value_for=pinned_value,
+                    save=save_trait,
+                    status_for=trait_status,
+                    tooltip_for=lambda key: status_parts(key)[3],
+                    pinned_for=lambda key: key in pinned_fields,
+                    pin_for=toggle_pin,
+                    readonly_for=readonly_reason,
+                )
+                # Kept named for the Hairstyle Helper button above, which writes
+                # the picked style straight into the legacy widget.
+                inputs_dict = render_legacy_fields(
+                    value_for=lambda key: getattr(active_event, key, None) or "",
+                    save=save_trait,
+                )
 
                 # Appearance Map across Series
                 book_mentions = get_character_book_mentions(project.id, char.id)

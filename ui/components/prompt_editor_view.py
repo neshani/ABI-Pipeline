@@ -96,6 +96,42 @@ def render_prompt_editor_view(
     search_filter = ui.input(placeholder="Search scene text...").classes('hidden')
     editor_filter = ui.select(options=["All", "Unapproved Only", "Approved Only"], value="All").classes('hidden')
 
+    # Typing debounce for the sidebar index. Every keystroke used to clear and
+    # rebuild the whole filtered list - up to ~1,000 cards, each with a heading,
+    # quote preview, dot and badges - so a common word ("the") or an empty box
+    # blocked the event loop for half a second per letter, and NiceGUI runs a
+    # sync on_change handler inline while it processes the keystroke. Filter once
+    # the typing pauses instead. The query value itself is still set immediately
+    # by the sidebar input (see below), so the render always reads the latest text.
+    sidebar_refresh_task: List[Optional[asyncio.Task]] = [None]
+
+    def cancel_pending_sidebar_refresh() -> None:
+        task = sidebar_refresh_task[0]
+        if task is not None and not task.done():
+            task.cancel()
+        sidebar_refresh_task[0] = None
+
+    async def _refresh_sidebar_after_pause() -> None:
+        try:
+            await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            return
+        sidebar_refresh_task[0] = None
+        try:
+            render_sidebar_list()
+        except (RuntimeError, AssertionError):
+            # The page (or this client) went away while the timer was pending.
+            pass
+
+    def schedule_sidebar_refresh() -> None:
+        cancel_pending_sidebar_refresh()
+        sidebar_refresh_task[0] = asyncio.create_task(_refresh_sidebar_after_pause())
+
+    def flush_sidebar_refresh() -> None:
+        """Apply the pending query now (Enter), instead of waiting out the pause."""
+        cancel_pending_sidebar_refresh()
+        render_sidebar_list()
+
     def get_filtered_editor_prompts():
         query = (search_filter.value or "").strip().lower()
         status_filter = editor_filter.value
@@ -763,8 +799,12 @@ def render_prompt_editor_view(
         load_active_scene_details()
 
     def render_sidebar_list():
+        # Inline import breaks circular dependencies at module load-time
+        from ui.pages.book_workspace import quoted_for_display
+
         sidebar_container_ref[0].clear()
         filtered = get_filtered_editor_prompts()
+        bracket_regex = re.compile(r"\[(.*?)\]")
         
         with sidebar_container_ref[0]:
             if not filtered:
@@ -792,7 +832,6 @@ def render_prompt_editor_view(
                 elif is_approved:
                     dot_color = "bg-emerald-500"
                     
-                bracket_regex = re.compile(r"\[(.*?)\]")
                 tags = [t.strip() for t in bracket_regex.findall(item.get("prompt", "")) if t.strip()]
 
                 with ui.card().classes(f'p-2 cursor-pointer rounded-lg border flex flex-col gap-1 w-full transition-all {border_style}') as card_el:
@@ -807,7 +846,7 @@ def render_prompt_editor_view(
                     quote_prev = item.get("quote", "")
                     if len(quote_prev) > 55:
                         quote_prev = quote_prev[:52] + "..."
-                    ui.label(f'"{quote_prev}"').classes('text-[10px] text-slate-500 italic font-serif leading-none')
+                    ui.label(quoted_for_display(quote_prev)).classes('text-[10px] text-slate-500 italic font-serif leading-none')
                     
                     if tags:
                         with ui.row().classes('w-full gap-1 flex-wrap mt-0.5'):
@@ -833,8 +872,9 @@ def render_prompt_editor_view(
         with ui.column().classes('w-full h-full gap-2 overflow-hidden flex-nowrap border-r pr-3'):
             ui.input(
                 placeholder='Search chapters, quotes, prompts...', 
-                on_change=lambda e: [search_filter.set_value(e.value), render_sidebar_list()]
-            ).classes('w-full bg-slate-50 rounded-lg').props('outlined dense clearable')
+                on_change=lambda e: [search_filter.set_value(e.value), schedule_sidebar_refresh()]
+            ).classes('w-full bg-slate-50 rounded-lg').props('outlined dense clearable') \
+             .on('keydown.enter', lambda: flush_sidebar_refresh())
             
             # Dynamic approved/unapproved status dropdown filter
             ui.select(
