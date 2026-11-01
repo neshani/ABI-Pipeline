@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+from types import SimpleNamespace
 from typing import List, Dict, Any, Optional
 from nicegui import ui
 from sqlmodel import Session, select
@@ -23,6 +24,7 @@ from services.character_manager import (
 from services.stale_renders import plan_stale_renders, apply_stale_render_purge
 from ui.pages.project.characters_tab import get_character_frequency_map, event_trait_count
 from ui.components.description_lookup_modal import open_lookup_dialog
+from ui.components.clothing_lookup_modal import open_clothing_dialog
 from ui.components.trait_grid import render_trait_grid, render_legacy_fields
 
 try:
@@ -231,6 +233,41 @@ class QuickCharactersModal:
         label = getattr(self, "_pending_label", None)
         if label is not None and pending:
             label.set_text(self.pending_text(pending))
+
+    def note_lookup_changes(self, char_id: int, fields, position=None) -> None:
+        """Record traits written by a lookup dialog, so the purge row appears.
+
+        The dialogs write through ``character_research``/``clothing_lookup``, not
+        this panel's save path, so they have to hand their result back: otherwise
+        the images their new values made stale are never offered for deletion until
+        the user happens to edit a trait by hand.
+        """
+        fields = [field for field in (fields or []) if field]
+        if not fields:
+            return
+        with Session(engine) as session:
+            query = select(CharacterTimelineEvent).where(
+                CharacterTimelineEvent.character_id == char_id)
+            if position:
+                query = query.where(
+                    CharacterTimelineEvent.book_id == position["book_id"]
+                ).where(
+                    CharacterTimelineEvent.chapter_num == int(position["chapter"])
+                ).where(
+                    CharacterTimelineEvent.shot_num == int(position["shot"]))
+            else:
+                query = query.where(CharacterTimelineEvent.book_id == None)  # noqa: E711
+            event = session.exec(query).first()
+            if event is None:
+                return
+            # Copy what the recorder needs while the session is open; the object is
+            # detached afterwards and reading it again would raise.
+            at = SimpleNamespace(book_id=event.book_id,
+                                 chapter_num=event.chapter_num or 0,
+                                 shot_num=event.shot_num or 0)
+            values = {field: (getattr(event, field, None) or "") for field in fields}
+        for field in fields:
+            self.note_trait_change(char_id, field, at, values.get(field, ""))
 
     def build_purge_dialog(self):
         """The confirmation dialog. Built once per modal, contents updated per open."""
@@ -582,7 +619,7 @@ class QuickCharactersModal:
                 The work happens in the dialog, not in a handler inside this grid.
                 That is deliberate: refreshing the grid from a handler *inside* it
                 deletes the element the handler is running on, which is why these
-                two buttons used to leave the form frozen until the modal was
+                buttons used to leave the form frozen until the modal was
                 reopened. The dialog refreshes the host once, when it closes.
                 """
                 if char.locked:
@@ -590,24 +627,54 @@ class QuickCharactersModal:
                     return
                 open_lookup_dialog(self.project, char,
                                    refresh_callback=refresh_after_lookup,
-                                   initial_source=source)
+                                   initial_source=source,
+                                   on_applied=lambda fields, position:
+                                   self.note_lookup_changes(char.id, fields, position))
 
             def refresh_after_lookup():
                 self.draw_left_list.refresh()
                 self.draw_right_details.refresh()
                 self.trigger_workspace_refresh()
 
-            ui.button('Research (LLM)', icon='science',
-                      on_click=lambda: open_find_dialog("book")) \
-                .classes('text-white font-bold text-xs bg-purple-600 hover:bg-purple-700') \
-                .tooltip('Read the book text and keep only what it states. Nothing '
-                         'is invented and nothing you have set is replaced.')
-            ui.button('Deduce Vibe', icon='theater_comedy',
+            ui.button('Find Description…', icon='travel_explore',
                       on_click=lambda: open_find_dialog("deduce")) \
                 .classes('text-white font-bold text-xs bg-indigo-600 hover:bg-indigo-700') \
-                .tooltip('Research first, then give the empty traits a look that '
-                         'fits their role, age and bearing. Values it invents are '
-                         'noted as not coming from the text.')
+                .tooltip('Search the book, the wiki or the web for this look. '
+                         'Nothing is written until you tick the values you want; '
+                         'empty traits start ticked, existing ones do not.')
+
+            def open_clothing() -> None:
+                """Clothing is a position, not a profile: search where the change is.
+
+                The position defaults to the timeline state being edited, because
+                that is the row an attire value would apply from; with the Base
+                selected there is no position, so the scene on screen stands in.
+                """
+                from ui import state
+                if char.locked:
+                    ui.notify("Character is locked from being profiled.",
+                              type="warning")
+                    return
+                active_chapter = int(float(getattr(state, 'book_active_chapter', 1)))
+                active_shot = int(float(getattr(state, 'book_active_scene', 1)))
+                if current_ev is not None and current_ev.book_id is not None:
+                    where = (current_ev.book_id, int(current_ev.chapter_num or 1),
+                             int(current_ev.shot_num or 0))
+                else:
+                    where = (self.book_id, active_chapter, active_shot)
+                open_clothing_dialog(
+                    self.project, char, book_id=where[0], chapter=where[1],
+                    shot=where[2], active_book_id=self.book_id,
+                    active_chapter=active_chapter, active_shot=active_shot,
+                    refresh_callback=refresh_after_lookup,
+                    on_applied=lambda fields, position:
+                    self.note_lookup_changes(char.id, fields, position))
+
+            ui.button('Find Clothing', icon='checkroom', on_click=open_clothing) \
+                .classes('text-white font-bold text-xs bg-teal-600 hover:bg-teal-700') \
+                .tooltip('Read the chunks around a position and list what anyone '
+                         'there is wearing. A value you keep is stored as a change '
+                         'at that chapter and shot, not on the profile.')
 
         # --- PHYSICAL TRAITS INPUT GRID (BOUND TO SELECTED EVENT) ---
         # These are the fields the renderer compiles, at this scene's position. The

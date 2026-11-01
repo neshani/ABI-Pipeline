@@ -3129,7 +3129,8 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                 # Lookup row: one character, one source, on demand. This replaces
                 # the old "Research (LLM)" / "Deduce Vibe" pair, which ran the
                 # whole-book profiler per character and is the path the import
-                # workstream exists to retire.
+                # workstream exists to retire. Nothing is written until the user
+                # ticks the values they keep in the dialog's Results tab.
                 lookup_sources = available_lookup_sources(project)
                 with ui.row().classes('w-full items-center gap-2 flex-wrap '
                                       'bg-slate-50 border p-2.5 rounded-xl'):
@@ -3142,7 +3143,7 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                             ("web", "Search Web", "cloud"),
                             ("wiki", "Search Wiki", "travel_explore"),
                             ("book", "Search Book", "auto_stories"),
-                            ("deduce", "Deduce Vibe", "theater_comedy")):
+                            ("deduce", "Best Guess", "theater_comedy")):
                         reason = lookup_sources.get(source, "")
                         # color=None: a Quasar colour sets the text colour too,
                         # so the default 'primary' turned a white button into
@@ -3168,9 +3169,10 @@ def render_characters_tab(project: Project, books: List[Book], refresh_parent: O
                                 "book": "Find the paragraphs in your own "
                                         "transcripts that describe this "
                                         "character.",
-                                "deduce": "Research the book first, then cast a "
-                                          "look for the traits it leaves empty. "
-                                          "Deduced values are marked in notes.",
+                                "deduce": "Read the book for facts first, then "
+                                          "propose a look for the traits it "
+                                          "leaves open. Guesses are marked and "
+                                          "recorded in notes when applied.",
                             }[source])
 
                     ui.element('div').classes('flex-1 min-w-0')

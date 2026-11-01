@@ -10,7 +10,9 @@ Two rules the code enforces rather than documents:
 * **Fill empty, never overwrite.** A source that disagrees with an existing value
   produces a *conflict* that is reported and not written. Both directions of
   error happen in practice - a wiki says "brown hair" where the book says "dark",
-  and the reverse - so the decision belongs to the user.
+  and the reverse - so the decision belongs to the user. The one exception is
+  ``apply_fields(overwrite=True)``, which the lookup dialog reaches only when the
+  user ticks a box whose row showed the existing value next to the found one.
 * **Base only.** Nothing here writes per-book events. Positional change tracking
   is left for manual edits; automated extraction writes the profile.
 
@@ -170,8 +172,10 @@ _NOTE_FIELDS = ("notes", "marks")
 # Asked for by a source but impossible to store: saying so beats showing a value
 # in the results and then dropping it in silence.
 _UNSTORED_FIELDS = {
-    "attire": "clothing is a scene prop, not a profile field",
-    "carried": "a carried object is a scene prop, not a profile field",
+    "attire": ("clothing belongs to a timeline position, not the Base profile - "
+               "use Find Clothing in the theater"),
+    "carried": ("a carried object belongs to a timeline position, not the Base "
+                "profile"),
 }
 
 
@@ -219,7 +223,69 @@ def _merge_notes(event, additions: List[tuple]) -> List[Dict[str, str]]:
     return added
 
 
-def apply_fields(event, fields: Dict[str, str]) -> Dict:
+def _normalise_input(fields: Dict[str, str]):
+    """``(raw, values, rewrites)`` - the single place a source's values are cleaned.
+
+    Shared by the write and the preview so the two cannot disagree about what a
+    value will become. This is what folds a separate ``height`` into ``build`` and
+    canonicalises the frame wording; a hand edit in the Character tab never passes
+    through here.
+    """
+    raw: Dict[str, str] = {}
+    for field, value in (fields or {}).items():
+        text = str(value or "").strip()
+        if text:
+            raw[str(field)] = text
+    changes: List[tuple] = []
+    values = trait_vocab.normalise_traits(raw, changes)
+    return raw, values, changes
+
+
+def preview_fields(fields: Dict[str, str]) -> Dict:
+    """What ``apply_fields`` would store, computed without an event.
+
+    The lookup dialog shows each value before the user accepts it, and the value
+    it has to show is the *normalised* one: "gray-haired" is stored as "gray", so
+    a checkbox promising the source's wording would look like a lie the moment it
+    was ticked. Same field order, same drop reasons, same rewrite reporting as
+    ``apply_fields`` - a preview that drifts from the write is worse than none.
+    """
+    raw, values, changes = _normalise_input(fields)
+    rewritten_by_field = {field: after for field, _before, after in changes}
+    out = {"values": {}, "raw": raw, "rewritten": [], "dropped": [],
+           "notes": [], "unknown": []}
+    for field in APPLIED_FIELDS:
+        before = raw.get(field)
+        if not before:
+            continue
+        value = (values.get(field) or "").strip()
+        if not value:
+            out["dropped"].append({"field": field, "found": before,
+                                   "reason": _drop_reason(field, before)})
+            continue
+        out["values"][field] = value
+        if field in rewritten_by_field and value != before:
+            out["rewritten"].append({"field": field, "was": before, "now": value})
+    height = raw.get("height")
+    if height and not raw.get("build") and not (values.get("build") or "").strip():
+        out["dropped"].append({
+            "field": "height", "found": height,
+            "reason": ("folded into build, and this height is either average "
+                       "(dropped as uninformative) or not readable as a height")})
+    for field in _NOTE_FIELDS:
+        if raw.get(field) and not trait_vocab.is_non_answer(raw[field]):
+            out["notes"].append({"field": field, "value": raw[field]})
+    for field, value in raw.items():
+        if field in APPLIED_FIELDS or field in _NOTE_FIELDS or field == "height":
+            continue
+        out["unknown"].append({"field": field, "found": value,
+                               "reason": _UNSTORED_FIELDS.get(
+                                   field, "there is no such field in the profile")})
+    return out
+
+
+def apply_fields(event, fields: Dict[str, str], *,
+                 overwrite: bool = False) -> Dict:
     """Merge ``fields`` into ``event`` in memory; return what happened.
 
     Not committed here: the caller owns the session, which keeps the dry run and
@@ -231,21 +297,19 @@ def apply_fields(event, fields: Dict[str, str]) -> Dict:
     threw it away", which is indistinguishable from nothing having been found.
     ``notes`` and ``marks`` are appended to the notes field and reported in
     ``noted``: kept for reference, never compiled into the prompt.
-    """
-    raw: Dict[str, str] = {}
-    for field, value in (fields or {}).items():
-        text = str(value or "").strip()
-        if text:
-            raw[str(field)] = text
 
-    # Normalise once, on the way in, exactly as the reference/wiki/book paths do:
-    # this is what folds a separate ``height`` into ``build`` and canonicalises the
-    # frame wording. A hand edit in the Character tab never passes through here.
-    changes: List[tuple] = []
-    values = trait_vocab.normalise_traits(raw, changes)
+    ``overwrite`` is the *only* exception to fill-empty-never-overwrite, and it is
+    never the default: the lookup dialog offers it per field, because the user
+    checked a box whose row showed both values. A replaced value is reported in
+    ``replaced`` as well as ``filled`` so the caller can carry it forward through
+    the events that still assert the old one - without that, a book event holding
+    the old value keeps winning and the replacement appears to do nothing.
+    """
+    raw, values, changes = _normalise_input(fields)
     rewritten_by_field = {field: after for field, _before, after in changes}
 
-    filled, conflicts, unchanged, dropped, rewritten = [], [], [], [], []
+    filled, conflicts, unchanged, dropped, rewritten, replaced = (
+        [], [], [], [], [], [])
     for field in APPLIED_FIELDS:
         before = raw.get(field)
         if not before:
@@ -263,6 +327,10 @@ def apply_fields(event, fields: Dict[str, str]) -> Dict:
             filled.append(field)
         elif current.lower() == value.lower():
             unchanged.append(field)
+        elif overwrite:
+            setattr(event, field, value)
+            filled.append(field)
+            replaced.append({"field": field, "was": current, "now": value})
         else:
             # ``found`` is the stored shape, ``source`` the source's own wording,
             # so the "kept X (source said Y)" line quotes what was actually read.
@@ -297,7 +365,8 @@ def apply_fields(event, fields: Dict[str, str]) -> Dict:
                             field, "there is no such field in the profile")})
 
     return {"filled": filled, "conflicts": conflicts, "unchanged": unchanged,
-            "dropped": dropped, "rewritten": rewritten, "noted": noted}
+            "dropped": dropped, "rewritten": rewritten, "noted": noted,
+            "replaced": replaced}
 
 
 def ensure_base_event(session: Session, character_id: int):

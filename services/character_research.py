@@ -58,7 +58,7 @@ _CAST_PROMPT = (
     "Also called: {aliases}\n"
     "Project: {project}\n"
     "How the text refers to them: {titles}\n"
-    "Traits already decided (never change or contradict these):\n{known}\n\n"
+    "Traits already decided:\n{known}\n\n"
     "Passages where the character appears:\n{passages}\n\n"
     "Task: decide every trait listed in the schema. This is a casting decision, not "
     "an extraction: a walk-on with two lines still needs one face, one head of hair "
@@ -67,7 +67,9 @@ _CAST_PROMPT = (
     "others treat them, what they do, their age cues, and the world the passages "
     "imply. Where a passage does state one of these traits, use its wording.\n"
     "Rules:\n"
-    "- Do not repeat a decided trait, and do not contradict it.\n"
+    "- A trait already decided above is context, not a binding answer. Keep it "
+    "unless the evidence clearly supports a different value, and then state the "
+    "different value: the user is shown both and chooses.\n"
     "- Be concrete and specific, never a judgement: \"long narrow face, deeply lined\" "
     "rather than \"handsome\" or \"menacing\"; \"close-cropped grey\" rather than "
     "\"short hair\". A painter must be able to draw the value.\n"
@@ -166,12 +168,23 @@ def base_values(character_id: int) -> Dict[str, str]:
     return values
 
 
-def apply_source_fields(project_id: int, character_id: int, fields: Dict[str, str]) -> Dict:
-    """Write one set of fields to the Base event; return ``apply_fields``' outcome."""
+def apply_source_fields(project_id: int, character_id: int, fields: Dict[str, str],
+                        *, overwrite: Sequence[str] = ()) -> Dict:
+    """Write one set of fields to the Base event; return ``apply_fields``' outcome.
+
+    ``overwrite`` names the fields the user chose to replace. Only the dialog's
+    checkbox list passes it, and only for a row that showed the existing value, so
+    the "fill empty" rule is not weakened for any other caller. A replacement is
+    carried forward with ``propagate_trait_change``: later events hold complete
+    snapshots, so without it a book event that repeated the old value keeps
+    asserting it and the user's choice never reaches a rendered prompt.
+    """
     written = False
     with Session(engine) as session:
         event = description_runner.ensure_base_event(session, character_id)
-        outcome = description_runner.apply_fields(event, fields)
+        char = session.get(Character, character_id)
+        outcome = description_runner.apply_fields(
+            event, fields, overwrite=bool(overwrite))
         if outcome["filled"]:
             # A no-trait placeholder stamped at creation would keep hiding them.
             if description_runner.is_placeholder_description(event.visual_description):
@@ -179,6 +192,12 @@ def apply_source_fields(project_id: int, character_id: int, fields: Dict[str, st
             if event.source != "manual":
                 event.source = "manual"  # a curated import stays put
             session.add(event)
+            if outcome.get("replaced") and char is not None and not char.locked:
+                from services.character_manager import propagate_trait_change
+                for change in outcome["replaced"]:
+                    propagate_trait_change(
+                        session, char, change["field"], change["now"],
+                        change["was"], book_id=None)
             session.commit()
             written = True
         else:
@@ -264,12 +283,18 @@ def _merge(outcomes: Sequence[Dict]) -> Dict:
 
 async def research(project_id: int, character_id: int, *,
                    speculate: bool = False,
+                   write: bool = True,
                    log: Optional[Callable[[str], None]] = None) -> Dict:
     """Research one character, and optionally deduce what the books leave out.
 
-    ``speculate=False`` is the "Research (LLM)" button: facts only, nothing invented.
-    ``speculate=True`` is "Deduce Vibe": the same factual pass, then a casting pass
+    ``speculate=False`` is the dialog's Book text tab: facts only, nothing invented.
+    ``speculate=True`` is "Best guess": the same factual pass, then a casting pass
     that fills the remaining traits from role evidence.
+
+    ``write=False`` is the dialog's normal mode now: it returns the same fields
+    without touching the profile, because the user picks what to keep. The values
+    are still normalised where they are written, not here - ``preview_fields``
+    shows the stored shape, and applying it goes through the same code either way.
 
     Returns ``ok`` plus what happened, in the same shape the bulk runner reports:
     every value is filled, kept, rewritten or dropped, and ``invented`` names the
@@ -320,7 +345,7 @@ async def research(project_id: int, character_id: int, *,
                                      attribute=False, other_names=other_names,
                                      log=log)
     fields = found.get("fields") or {}
-    if fields:
+    if fields and write:
         outcome = apply_source_fields(project_id, character_id, fields)
     else:
         outcome = {"filled": [], "conflicts": [], "dropped": [], "rewritten": [],
@@ -334,8 +359,14 @@ async def research(project_id: int, character_id: int, *,
         reasons.append(found.get("error") or "the text states nothing about them")
     if speculate:
         known = base_values(character_id)
+        # When the caller writes, only the empty traits are asked for: there is
+        # nowhere to put a replacement. When the caller collects a choice, a trait
+        # the source did not supply is worth a proposal even where a value exists -
+        # an existing value the search disagrees with is exactly the case the user
+        # wants to see side by side.
         missing = [field for field in description_runner.APPLIED_FIELDS
-                   if not known.get(field)]
+                   if not known.get(field)
+                   or (not write and field not in fields)]
         if not missing:
             reasons.append("every rendered trait is already set")
         else:
@@ -346,8 +377,8 @@ async def research(project_id: int, character_id: int, *,
                     reasons.append("no passage names this character, so there is "
                                    "nothing to deduce from")
             else:
-                say(f"[Vibe] {name}: {len(paragraphs)} passages, "
-                    f"{len(missing)} trait(s) missing")
+                say(f"[Guess] {name}: {len(paragraphs)} passages, "
+                    f"{len(missing)} trait(s) to cast")
                 try:
                     guessed = await _deduce_fields(
                         name=name, aliases=[name, *aliases],
@@ -357,8 +388,8 @@ async def research(project_id: int, character_id: int, *,
                 except Exception as ex:
                     guessed = {}
                     reasons.append(f"the casting call failed: {ex}")
-                    say(f"[Vibe] {name}: casting call failed: {ex}")
-                if guessed:
+                    say(f"[Guess] {name}: casting call failed: {ex}")
+                if guessed and write:
                     invented_outcome = apply_source_fields(project_id, character_id,
                                                            guessed)
                     invented = list(invented_outcome["filled"])
@@ -370,11 +401,18 @@ async def research(project_id: int, character_id: int, *,
                         apply_source_fields(project_id, character_id, {
                             "notes": "look deduced, not stated in the text: "
                                      + ", ".join(sorted(invented))})
+                elif guessed:
+                    # Collected, not written: the whole set is a proposal, and a
+                    # proposal that contradicts an existing value is still a
+                    # proposal the user can accept. The notes line only makes
+                    # sense once something is stored, so the dialog adds it to the
+                    # applied set instead.
+                    invented_values = dict(guessed)
                 elif not reasons:
                     reasons.append("the casting pass had nothing to add")
 
     merged = _merge([outcome] + ([invented_outcome] if invented_outcome else []))
-    ok = bool(merged["filled"])
+    ok = bool(merged["filled"]) or bool(write is False and (fields or invented_values))
     if not ok and not reasons:
         reasons.append("nothing new: every value this source could supply is "
                        "already set")
@@ -383,8 +421,9 @@ async def research(project_id: int, character_id: int, *,
         "error": "" if ok else "; ".join(reasons),
         "fields": fields,
         "used": found.get("used") or [],
-        "invented": sorted(invented),
+        "invented": sorted(invented) if write else sorted(invented_values),
         "invented_values": invented_values,
+        "written": bool(write),
         **merged,
         "seconds": round(time.time() - started, 1),
     }
