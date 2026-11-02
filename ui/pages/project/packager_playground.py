@@ -28,6 +28,7 @@ class PackagerPlayground:
         self.curation_type = "light-curation"
         self.art_type = "ai-generated"
         self.use_cover = True
+        self.chapter_bound_images = False
         self.max_dimension = 1024
         self.webp_quality = 85
         self.global_pack_description = ""
@@ -78,6 +79,7 @@ class PackagerPlayground:
                     self.curation_type = data.get("curation_type", self.curation_type)
                     self.art_type = data.get("art_type", self.art_type)
                     self.use_cover = data.get("use_cover", self.use_cover)
+                    self.chapter_bound_images = data.get("chapter_bound_images", self.chapter_bound_images)
                     self.max_dimension = data.get("max_dimension", self.max_dimension)
                     self.webp_quality = data.get("webp_quality", self.webp_quality)
                     self.global_pack_description = data.get("global_pack_description", self.global_pack_description)
@@ -123,6 +125,7 @@ class PackagerPlayground:
             "curation_type": self.curation_type,
             "art_type": self.art_type,
             "use_cover": self.use_cover,
+            "chapter_bound_images": self.chapter_bound_images,
             "max_dimension": self.max_dimension,
             "webp_quality": self.webp_quality,
             "global_pack_description": self.global_pack_description
@@ -301,6 +304,7 @@ class PackagerPlayground:
             "content_rating": self.rating,
             "tags": parsed_tags,
             "use_cover": self.use_cover,
+            "chapter_bound_images": self.chapter_bound_images,
             "max_dimension": int(self.max_dimension),
             "webp_quality": int(self.webp_quality),
             "pack_creation_date": time.strftime("%Y-%m-%d")
@@ -701,6 +705,15 @@ class PackagerPlayground:
                         ).classes('text-xs font-medium text-slate-700')
                         
                         ui.label('If enabled, the cover image found next to your project volume is compressed as 0000_cover.webp and injected dynamically with gentle zoom transitions.').classes('text-[10px] text-slate-400 pl-8 leading-snug')
+
+                    with ui.column().classes('w-full gap-2'):
+                        ui.checkbox(
+                            'Keep images bound by chapter (first image of each chapter starts when the chapter starts)',
+                            value=self.chapter_bound_images,
+                            on_change=lambda e: setattr(self, 'chapter_bound_images', e.value)
+                        ).classes('text-xs font-medium text-slate-700')
+
+                        ui.label('Image timing still comes from the timing file, but each chapter opens on its first image instead of holding the previous chapter\'s picture until that image\'s quote. Use it when a chapter changes location before the first image is quoted.').classes('text-[10px] text-slate-400 pl-8 leading-snug')
 
                     ui.separator()
 

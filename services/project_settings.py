@@ -28,7 +28,20 @@ def save_project_settings_to_disk(project_id: int) -> None:
         project_name = project.name
 
     settings_path = get_project_settings_path(project_name)
-    data = {
+    # Start from what is already on disk: the Packager tab keeps its own keys in
+    # this file (pack_author, use_cover, chapter_bound_images, ...), and a style
+    # or character save must not wipe them.
+    data = {}
+    if settings_path.exists():
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict):
+                data = existing
+        except Exception:
+            data = {}
+
+    data.update({
         "active_template": state.playground_selected_template,
         "active_style_preset": state.style_selected_preset,
         "style_use_random_image_seed": state.style_use_random_image_seed,
@@ -41,7 +54,7 @@ def save_project_settings_to_disk(project_id: int) -> None:
         "wiki_url": str(state.wiki_url or ""),
         "wiki_term": str(state.wiki_term or ""),
         "mcp_series_name": str(state.mcp_series_name or ""),
-    }
+    })
     
     try:
         with open(settings_path, "w", encoding="utf-8") as f:

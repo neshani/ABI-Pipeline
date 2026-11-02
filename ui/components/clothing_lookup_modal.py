@@ -237,12 +237,17 @@ def open_clothing_dialog(project: Project, char: Character, *,
         try:
             _render_mentions()
         except Exception as ex:                              # noqa: BLE001
-            results.clear()
-            with results:
-                ui.label(f"Could not show the results: {type(ex).__name__}: {ex}") \
-                    .classes('text-[11px] text-red-600')
             state.add_console_log(
                 f"[Clothing] render failed: {type(ex).__name__}: {ex}")
+            try:
+                results.clear()
+                with results:
+                    ui.label(f"Could not show the results: {type(ex).__name__}: {ex}") \
+                        .classes('text-[11px] text-red-600')
+            except RuntimeError:
+                # The page is gone, so there is nothing left to draw into. Trying
+                # anyway raised a second exception that buried the first one.
+                pass
 
     def _render_mentions() -> None:
         row_marks.clear()
@@ -349,6 +354,15 @@ def open_clothing_dialog(project: Project, char: Character, *,
             found = {"ok": False, "error": f"{type(ex).__name__}: {ex}",
                      "mentions": [], "position": {}}
         run_state["running"] = False
+        if results.is_deleted:
+            # The page was reloaded or closed while the model was thinking, so
+            # every element this dialog owns is gone. Say it in the console and
+            # stop: touching the UI here raises "The client this element belongs
+            # to has been deleted", which reads as the search having crashed.
+            state.add_console_log(
+                f"[Clothing] {char.name}: the page went away before the search "
+                f"finished; the result was dropped.")
+            return
         run_button.enable()
         run_state["mentions"] = found.get("mentions") or []
         run_state["empty_note"] = ("" if run_state["mentions"]

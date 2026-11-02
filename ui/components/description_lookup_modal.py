@@ -509,6 +509,18 @@ def open_lookup_dialog(project: Project, char: Character,
             state.add_console_log(
                 f"[Lookup] {char.name}: applied {len(applied)} field(s) - "
                 + ", ".join(applied))
+            # Applied means decided: there is nothing left to review, so the dialog
+            # closes and the host rebuilds the panel it was opened from. The summary
+            # has to outlive the dialog, so it arrives as a toast - and it is sent
+            # before closing, because closing is what tears the panel down.
+            text = f"Applied {len(applied)} field(s): " + ", ".join(applied)
+            if outcome.get("replaced"):
+                text += f" · replaced {len(outcome['replaced'])}"
+            if outcome.get("dropped"):
+                text += f" · {len(outcome['dropped'])} not storable"
+            ui.notify(text, type="positive", timeout=6000)
+            close_dialog()
+            return
         unchanged = [field for field in fields
                      if field in values and field not in applied]
         cart.clear()
@@ -518,17 +530,8 @@ def open_lookup_dialog(project: Project, char: Character,
         results_button.set_text("Results")
         cart_status.clear()
         with cart_status:
-            if applied:
-                ui.label(f"Applied {len(applied)} field(s): " + ", ".join(applied)) \
-                    .classes('text-[11px] text-emerald-700 font-semibold '
-                             'leading-tight')
-                for change in outcome.get("replaced") or []:
-                    ui.label(f"replaced {change['field']}: {change['was']} -> "
-                             f"{change['now']}").classes(
-                        'text-[10px] text-slate-500 leading-tight')
-            else:
-                ui.label("Nothing was written.").classes(
-                    'text-[11px] text-slate-600')
+            ui.label("Nothing was written.").classes(
+                'text-[11px] text-slate-600')
             for field in unchanged:
                 ui.label(f"{FIELD_LABELS.get(field, field)}: already "
                          f"{current.get(field)} - nothing to change").classes(

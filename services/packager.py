@@ -73,6 +73,14 @@ def parse_timestamp_to_seconds(ts_str: str) -> float:
         return 0.0
 
 
+def parse_int_field(value: Any, fallback: int) -> int:
+    """Reads an integer out of a CSV cell that may be '3', '3.0' or empty."""
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return fallback
+
+
 def format_seconds_to_timestamp(seconds: float) -> str:
     """Converts float seconds to compliant 'HH:MM:SS.ss' format."""
     h = int(seconds // 3600)
@@ -361,6 +369,7 @@ def build_illumination_pack(
     
     original_book_path = None
     db_cover_path = None
+    chapter_starts: Dict[int, float] = {}
     
     with Session(engine) as session:
         project_db = session.exec(select(Project).where(Project.name == project_name)).first()
@@ -371,6 +380,14 @@ def build_illumination_pack(
                     original_book_path = Path(book_db.path)
                 if book_db.cover_path:
                     db_cover_path = Path(book_db.cover_path)
+                # Chapter openings, keyed by the same chapter number prompts.csv
+                # uses. Only needed when the pack binds the first image of every
+                # chapter to the chapter's own start.
+                from database.models import Chapter
+                chapters_db = session.exec(select(Chapter).where(Chapter.book_id == book_db.id)).all()
+                for ch in chapters_db:
+                    if ch.start_time is not None:
+                        chapter_starts[ch.chapter_num] = float(ch.start_time)
 
     # Get Natural Cumulative Duration
     duration = get_book_total_duration(project_name, book_name)
@@ -449,14 +466,8 @@ def build_illumination_pack(
         ch_str = scene.get("chapter", "1")
         sc_str = scene.get("shot", str(idx + 1))
         
-        try:
-            ch = int(float(ch_str))
-        except ValueError:
-            ch = 1
-        try:
-            sc = int(float(sc_str))
-        except ValueError:
-            sc = idx + 1
+        ch = parse_int_field(ch_str, 1)
+        sc = parse_int_field(sc_str, idx + 1)
 
         src_img = rendered_images.get((ch, sc))
         if src_img and src_img.exists():
@@ -552,13 +563,48 @@ def build_illumination_pack(
         if img_name:
             valid_scenes.append((scene, img_name))
 
+    # Resolve each kept scene's effective start time.
+    #
+    # Timestamps come from the timing file, where each image begins at its
+    # quote. A chapter's first image is often quoted minutes in, so the chapter
+    # opens on the previous chapter's last picture - right when the story has
+    # already moved somewhere else. With chapter binding on, the first kept
+    # image of a chapter starts at the chapter's own start instead. The starts
+    # stay monotonic so the keyframe list remains ordered, and because the
+    # previous chapter now ends where this one starts, no image can bleed across
+    # a chapter boundary.
+    chapter_bound = bool(metadata.get("chapter_bound_images", False))
+    scene_starts: List[float] = []
+    # An injected cover owns the opening of the book, so the first image cannot
+    # start before the cover's last keyframe even when chapter 1 begins at 0.
+    previous_start = first_scene_start_sec if (cover_dest_filename and first_scene_start_sec > 0) else 0.0
+    previous_chapter = None
+    repinned = 0
+    for scene, _img_name in valid_scenes:
+        start_sec = parse_timestamp_to_seconds(scene.get("timestamp", "00:00:00"))
+        chapter_num = parse_int_field(scene.get("chapter", "1"), 1)
+
+        if chapter_bound and chapter_num != previous_chapter:
+            chapter_start = chapter_starts.get(chapter_num)
+            if chapter_start is not None:
+                if chapter_start < start_sec:
+                    repinned += 1
+                start_sec = chapter_start
+
+        start_sec = max(previous_start, start_sec)
+        scene_starts.append(start_sec)
+        previous_start = start_sec
+        previous_chapter = chapter_num
+
+    if chapter_bound:
+        log(0.72, f"Chapter binding: {repinned} chapter-opening image(s) moved to their chapter start.")
+
     # Compile OIS Timeline Keyframes
     for idx, (scene, img_name) in enumerate(valid_scenes):
-        start_sec = parse_timestamp_to_seconds(scene.get("timestamp", "00:00:00"))
+        start_sec = scene_starts[idx]
         
         if idx < len(valid_scenes) - 1:
-            next_scene, _ = valid_scenes[idx + 1]
-            end_sec = parse_timestamp_to_seconds(next_scene.get("timestamp", "00:00:00"))
+            end_sec = scene_starts[idx + 1]
         else:
             end_sec = duration
 

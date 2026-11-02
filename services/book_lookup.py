@@ -32,6 +32,7 @@ is cheaper, more accurate, and cannot put one character's description on another
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -143,14 +144,38 @@ def json_object(raw: str) -> Dict:
     return data if isinstance(data, dict) else {}
 
 
+def _fold_apostrophes(text: str) -> str:
+    """Transcript-side folding. Imported lazily: ``character_manager`` pulls in
+    the prompt engine, and this module is also used by headless probes."""
+    from services.character_manager import fold_apostrophes
+    return fold_apostrophes(text)
+
+
+def _canonical_name(text: str) -> str:
+    """The stored half of the same rule (quotes and whitespace)."""
+    from services.character_manager import normalize_character_text
+    return normalize_character_text(text)
+
+
 def paragraphs_of(transcript: str) -> List[str]:
-    text = (transcript or "").replace("\r\n", "\n")
+    # Folded before the split, so every paragraph scan below sees the ASCII
+    # apostrophe that names are stored with.
+    text = _fold_apostrophes(transcript).replace("\r\n", "\n")
     return [_clean(p) for p in re.split(r"\n\s*\n", text) if p.strip()]
 
 
-def _name_patterns(aliases: Sequence[str]) -> List["re.Pattern"]:
-    return [re.compile(r"\b" + re.escape(a) + r"\b", re.I)
-            for a in aliases if a.strip()]
+def name_patterns(aliases: Sequence[str]) -> List["re.Pattern"]:
+    """One word-boundary regex per alias, built from the canonical spelling.
+
+    The apostrophe is why this is a function rather than a comprehension. A name
+    is stored as ``Osan'gar`` and typeset as ``Osan\u2019gar``; escaping the stored
+    spelling and searching the prose matches nothing at all, which reads as "no
+    paragraph names this character" for a character the book names 31 times.
+    Both sides fold to the ASCII apostrophe first - see
+    ``character_manager._APOSTROPHE_MAP``, which owns the variant list.
+    """
+    return [re.compile(r"\b" + re.escape(_canonical_name(alias)) + r"\b", re.I)
+            for alias in aliases if (alias or "").strip()]
 
 
 def _first_mention(paragraph: str, patterns: Sequence["re.Pattern"],
@@ -198,7 +223,7 @@ def excerpt(paragraph: str, at: Optional[int],
 def excerpt_for(paragraph: str, names: Sequence[str],
                 limit: int = MAX_PARAGRAPH_CHARS) -> str:
     """``excerpt`` for callers that only have a paragraph and some names."""
-    first = _first_mention(paragraph, _name_patterns(names))
+    first = _first_mention(paragraph, name_patterns(names))
     return excerpt(paragraph, first, limit)
 
 
@@ -213,7 +238,7 @@ def cue_paragraphs(books: Sequence[Tuple[str, str]], aliases: Sequence[str],
     makes the attribution pass cheap, and it is also what loses a description
     phrased without one - see ``mention_paragraphs``.
     """
-    patterns = _name_patterns(aliases)
+    patterns = name_patterns(aliases)
     if not patterns:
         return []
     found: List[Dict] = []
@@ -241,10 +266,10 @@ def _shadow_pattern(aliases: Sequence[str],
     own alias table knows both names, so the fix needs no vocabulary: a match of
     this character's name *inside* another character's longer name is not a mention.
     """
-    own = [alias for alias in aliases if alias.strip()]
+    own = [_canonical_name(alias) for alias in aliases if alias.strip()]
     shadows = set()
     for name in other_names:
-        name = (name or "").strip()
+        name = _canonical_name(name)
         if not name:
             continue
         lowered = name.lower()
@@ -275,7 +300,7 @@ def mention_paragraphs(books: Sequence[Tuple[str, str]], aliases: Sequence[str],
     used to reject a mention that only appears inside someone else's longer name,
     which is the one mis-attribution code can see without asking a model.
     """
-    patterns = _name_patterns(aliases)
+    patterns = name_patterns(aliases)
     if not patterns:
         return []
     shadows = _shadow_pattern(aliases, other_names)
@@ -301,12 +326,16 @@ def _mentions(answer: str, aliases: Sequence[str]) -> bool:
     "none of the candidate paragraphs describe this character" while the model had
     named them correctly. ``\\b`` is what keeps "Mat" out of "Math" without
     refusing the name itself.
+
+    The answer is folded to the ASCII apostrophe like the prose is, because a
+    model quoting a typeset passage answers ``Osan\u2019gar`` while the alias table
+    holds ``Osan'gar``.
     """
-    text = _clean(answer)
+    text = _canonical_name(answer)
     if not text or text.lower().startswith(("none", "no one", "nobody")):
         return False
     for alias in aliases:
-        alias = (alias or "").strip()
+        alias = _canonical_name(alias)
         if alias and re.search(r"\b" + re.escape(alias) + r"\b", text, re.I):
             return True
     return False
@@ -355,13 +384,21 @@ async def lookup(
         if log:
             log(message)
 
+    # Both candidate scans split every transcript in the project into paragraphs
+    # and regex-search each one - about 1.5s of pure CPU for a 24 MB project, and
+    # it grows with the number of books and aliases. On the event loop that is a
+    # window where the browser gets no websocket ping (NiceGUI pings every 4s and
+    # the client allows 2s more), so the page can reload out from under the search.
+    # Keep the scan off the loop; it touches no UI and owns no session.
     if attribute:
-        candidates = cue_paragraphs(books, aliases, limit=limit)
+        candidates = await asyncio.to_thread(
+            cue_paragraphs, books, aliases, limit=limit)
         empty_error = ("no paragraph in this book mentions the character alongside "
                        "an appearance word")
     else:
-        candidates = mention_paragraphs(books, aliases, limit=limit,
-                                        other_names=other_names)
+        candidates = await asyncio.to_thread(
+            mention_paragraphs, books, aliases, limit=limit,
+            other_names=other_names)
         empty_error = "no paragraph in these books names the character"
     if not candidates:
         return {"ok": False, "error": empty_error, "fields": {}, "used": [],

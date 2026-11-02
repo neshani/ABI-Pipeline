@@ -30,6 +30,7 @@ both in one pass produced "wearing a silver goblet of wine" often enough to matt
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -245,7 +246,14 @@ async def find(project_id: int, book_id: int, character_id: int, chapter: int,
         return {"ok": False, "error": "book not found", "mentions": [],
                 "passages": [], "seconds": 0.0, "position": {}}
 
-    window = chunk_window(project_id, book_id, int(chapter), int(shot or 1))
+    # Re-chunking is real CPU work - reading the transcript and re-splitting it
+    # takes about 6s for a 400k-word volume - and it used to run on the event
+    # loop, before this coroutine's first await. That is long enough for the
+    # browser to give up on the websocket (NiceGUI pings every 4s and the client
+    # allows 2s more), so the page reloaded mid-search and the dialog's render
+    # landed on a deleted client. Keep it off the loop.
+    window = await asyncio.to_thread(
+        chunk_window, project_id, book_id, int(chapter), int(shot or 1))
     if not window["ok"]:
         return {"ok": False, "error": window["error"], "mentions": [],
                 "passages": [], "seconds": 0.0, "position": {}}

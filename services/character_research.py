@@ -130,9 +130,8 @@ def passages_for(name: str, aliases: Sequence[str],
     returns them in reading order so the model reads the character as the book
     reveals them.
     """
-    patterns = [re.compile(r"\b" + re.escape(alias) + r"\b", re.I)
-                for alias in dict.fromkeys([name, *(aliases or [])])
-                if alias and alias.strip()]
+    patterns = book_lookup.name_patterns(
+        list(dict.fromkeys([name, *(aliases or [])])))
     if not patterns:
         return []
     hits: List[Dict] = []

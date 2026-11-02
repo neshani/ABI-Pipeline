@@ -19,11 +19,22 @@ _APOSTROPHE_MAP = str.maketrans({
 })
 
 
+def fold_apostrophes(text: str) -> str:
+    """Canonical ASCII apostrophes, leaving the layout alone.
+
+    ``normalize_character_text`` also collapses whitespace, which is wrong for a
+    whole transcript: the paragraph split needs its line breaks. This is the
+    transcript half of the same rule - a name is stored as ``Osan'gar`` and
+    typeset as ``Osan\u2019gar``, so prose has to fold too before the two can meet.
+    """
+    return (text or "").translate(_APOSTROPHE_MAP)
+
+
 def normalize_character_text(text: str) -> str:
     """Canonical single quotes and whitespace for a name, alias, or tag."""
     if not text:
         return ""
-    cleaned = str(text).translate(_APOSTROPHE_MAP).replace("\u00a0", " ")
+    cleaned = fold_apostrophes(text).replace("\u00a0", " ")
     return " ".join(cleaned.split())
 
 
@@ -1340,6 +1351,19 @@ def propagate_trait_change(session: Session, character: Character, field: str,
     value (or holds nothing) is rewritten; the first snapshot that holds a
     different value is a real change in the book, and propagation stops there.
 
+    Two further stops, both about rows that are not "the same value repeated":
+
+    * A row a human wrote (``source == "manual"``) is an assertion, not a
+      carried-forward snapshot. Placing a change at a later scene and then
+      editing an earlier one must not rewrite the later change point just
+      because it happens to repeat the value being replaced - that is how a
+      deliberately bookmarked outfit gets destroyed by an unrelated edit
+      before it. This applies to position edits only; a Base edit (``book_id``
+      is ``None``) still means "the whole series follows".
+    * A side story's events are invisible outside it (``resolve_event_at``
+      skips them for every other book), so an edit made inside one never
+      reaches another volume.
+
     Re-saving an unchanged Base value re-asserts it, which is how an edit made
     before this existed is pushed through: with no new value to compare against,
     the change points are inferred from the book's own chain - the first event
@@ -1386,6 +1410,7 @@ def propagate_trait_change(session: Session, character: Character, field: str,
     events = session.exec(
         select(CharacterTimelineEvent)
         .where(CharacterTimelineEvent.character_id == character.id)).all()
+    edit_inside_side_story = book_id is not None and book_id in side_stories
     changed = 0
     previous_norm = None
     for event in sorted(events, key=sort_key):
@@ -1398,6 +1423,11 @@ def propagate_trait_change(session: Session, character: Character, field: str,
         # - or interrupt - a change that carries forward.
         if event.book_id in side_stories and event.book_id != book_id:
             continue
+        # And the reverse: an edit made *inside* a side story cannot leave it.
+        # The resolver skips a side story's events for every other book, so
+        # writing them here would only change images that never used this value.
+        if edit_inside_side_story and event.book_id != book_id:
+            continue
         current = (getattr(event, field, None) or "").strip()
         current_norm = current.lower()
         if not force:
@@ -1408,6 +1438,14 @@ def propagate_trait_change(session: Session, character: Character, field: str,
                     break
             elif current and current_norm != old_norm:
                 break  # the book changes it here; from this point it is the book's
+            elif book_id is not None and current and event.source == "manual":
+                # A row a human wrote asserts a look; it is not a snapshot that
+                # carried the old value forward. Rewriting it because it happens
+                # to repeat the value being replaced is how setting scene 16 to a
+                # nightgown also overwrote the dress the user had deliberately
+                # bookmarked at scene 17. Base edits are unaffected: ``book_id``
+                # is None there, and the whole series is meant to follow.
+                break
         if current_norm:
             previous_norm = current_norm
         if current_norm == new_norm:

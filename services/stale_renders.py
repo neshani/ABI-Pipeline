@@ -18,6 +18,8 @@ The rule is field-dependent, mirroring what actually renders:
 * a pinned trait always renders from Base, so the whole project changes.
 * a Base edit propagates across volumes (and side stories resolve Base directly),
   so it reaches every book.
+* an edit made **inside a side story** never leaves that book: the resolver ignores
+  its events everywhere else, so no other volume can be showing the value.
 * ``carried`` in ``scene`` mode renders only at the position the text recorded.
 * everything else: from the edited position until the book changes the value.
 
@@ -130,12 +132,19 @@ def change_scope(change: Dict[str, Any], *, events: Sequence[CharacterTimelineEv
                  for b in books}
     side_books = {b.id for b in books if getattr(b, "is_side_story", False)}
     start = _reading_key(order_map, change["book_id"], change["chapter"], change["shot"])
+    # A side story is self-contained: ``resolve_event_at`` ignores its events in
+    # every other book, so nothing it says can reach another volume. Its span is
+    # therefore clamped to the book it was made in - without this, an edit in a
+    # prequel (which sits early in reading order) offered to purge images from
+    # every later book, and those images never used the value.
+    only_book = change["book_id"] if change["book_id"] in side_books else None
 
     if field == "carried" and carried_mode == "scene":
         # Rendered only at the position the text recorded, so only that shot moved.
         return {"kind": "range", "start": start,
                 "end": (start[0], start[1], start[2] + 1),
-                "edit_book": change["book_id"], "side_books": side_books}
+                "edit_book": change["book_id"], "side_books": side_books,
+                "only_book": only_book}
 
     new_norm = (change.get("value") or "").strip().lower()
     end = None
@@ -152,12 +161,15 @@ def change_scope(change: Dict[str, Any], *, events: Sequence[CharacterTimelineEv
             end = key
             break
     return {"kind": "range", "start": start, "end": end,
-            "edit_book": change["book_id"], "side_books": side_books}
+            "edit_book": change["book_id"], "side_books": side_books,
+            "only_book": only_book}
 
 
 def _book_may_match(scope: dict, order_map: Dict[int, int], book_id: int) -> bool:
     if scope["kind"] == "all":
         return True
+    if scope.get("only_book") is not None and book_id != scope["only_book"]:
+        return False
     if book_id in scope.get("side_books", ()) and book_id != scope.get("edit_book"):
         return False
     order = order_map.get(book_id, 10 ** 6)
