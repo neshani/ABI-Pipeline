@@ -1442,7 +1442,12 @@ async def check_for_active_transcriptions():
                     return None
                     
                 books = session.exec(select(Book).where(Book.project_id == state.active_project_id)).all()
-                
+
+                # Resolve the output directory once per tick. Each book used to
+                # open its own session and query this setting, so a 16-volume
+                # project ran 16 extra queries every two seconds.
+                base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
+
                 # Pre-fetch and assemble stats off-thread
                 updates = {
                     "project_status": project.status,
@@ -1464,7 +1469,7 @@ async def check_for_active_transcriptions():
                                 session.add(b)
                                 db_updated = True
 
-                    stats = get_book_stats_cached(project.name, b.name)
+                    stats = get_book_stats_cached(project.name, b.name, base_output_dir=base_output_dir)
                     updates["books"].append({
                         "id": b.id,
                         "progress": b.progress or 0.0,
@@ -1497,7 +1502,7 @@ async def check_for_active_transcriptions():
                 state.action_buttons_refresh()
             except Exception:
                 pass
-        
+
         try:
             header_controls.refresh()
         except Exception:
@@ -1773,16 +1778,20 @@ def render_split_panel_shell(project_id: int):
 
                     book_bg = 'bg-blue-50/70 border border-blue-100/50 text-blue-700 font-bold' if state.active_book_id == book.id else 'hover:bg-slate-50 text-slate-700'
                     
-                    # Use items-start to allow the row card to expand vertically for multi-line content
-                    with ui.row().classes(f'w-full p-2 rounded-lg cursor-pointer items-start justify-between transition-colors {book_bg}') \
-                            .on('click', lambda b_id=book.id: select_book(b_id)):
+                    # The cover doubles as the click acknowledgement: opening a
+                    # book rebuilds the whole workspace, which takes a couple of
+                    # seconds, so without this the row looks dead until it lands.
+                    book_row = ui.row().classes(f'w-full p-2 rounded-lg cursor-pointer items-start justify-between transition-colors {book_bg}')
+                    with book_row:
                         with ui.row().classes('items-start gap-3 flex-1 min-w-0'):
                             # Upgrade cover sizes to standard 2:3 aspect ratio (w-10 h-14)
-                            if book.cover_path:
-                                ui.image(book.cover_path).classes('w-10 h-14 rounded object-cover shadow-sm border flex-shrink-0')
-                            else:
-                                with ui.column().classes('w-10 h-14 bg-slate-50 border border-dashed rounded items-center justify-center flex-shrink-0 text-slate-400'):
-                                    ui.icon('library_books', size='16px')
+                            with ui.element('div').classes('w-10 h-14 flex-shrink-0 relative'):
+                                if book.cover_path:
+                                    ui.image(book.cover_path).classes('w-full h-full rounded object-cover shadow-sm border')
+                                else:
+                                    with ui.column().classes('w-full h-full bg-slate-50 border border-dashed rounded items-center justify-center text-slate-400'):
+                                        ui.icon('library_books', size='16px')
+                                book_busy = ui.spinner(size='md').classes('absolute inset-0 m-auto text-blue-600 hidden')
                             
                             # Multi-line column container: allows subtitles and wrapped titles to flow downwards naturally
                             with ui.column().classes('gap-0.5 flex-1 min-w-0'):
@@ -1790,6 +1799,15 @@ def render_split_panel_shell(project_id: int):
                                 # BIND TEXT REACTIVELY (Supports multi-line wraps cleanly)
                                 ui.label('').classes('text-[9px] font-medium text-slate-500 leading-normal break-words whitespace-normal') \
                                     .bind_text_from(state.books_subtitle, book.id)
+
+                    async def open_book(b_id=book.id, spinner=book_busy):
+                        spinner.classes(remove='hidden')
+                        # Yield so the spinner reaches the browser before the
+                        # workspace rebuild blocks the event loop.
+                        await asyncio.sleep(0.1)
+                        select_book(b_id)
+
+                    book_row.on('click', open_book)
                                 
 
         # RIGHT WORKSPACE ROUTER

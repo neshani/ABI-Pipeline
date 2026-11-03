@@ -59,30 +59,67 @@ class SettingsModal:
         self.model_status = False
         self.installing = False
         self.download_progress = 0.0
-        self.subtitles_online = False
-        
+        # None means "not checked yet". The ABI-Subtitles probe is an HTTP
+        # round-trip that costs the client's full timeout when the server is
+        # down (~2s measured), so it is never run at construction: this modal is
+        # built once at startup and nothing outside these labels reads the result.
+        self.subtitles_online = None
+
         # Build the Dialog UI element
         with ui.dialog() as self.dialog, ui.card().classes('w-full max-w-xl p-6 rounded-xl'):
             self.build_ui()
-            
-        # Run a status check as soon as we initialize
-        self.update_installation_statuses()
 
-    def update_installation_statuses(self) -> None:
-        """Query backend to check if chosen engine is fully installed and ready."""
+        # Local dependency checks only - never the network probe.
+        self.update_installation_statuses(probe=False)
+
+    def _compute_statuses(self) -> tuple:
+        """Probes the chosen engine. No UI calls, so it is safe in a worker thread."""
         engine = self.settings.get("stt_engine", "ABI-Subtitles")
         device = self.settings.get("stt_device", "GPU/CUDA")
-        
+
         if engine == "ABI-Subtitles":
             from services.subtitles_client import SubtitlesClient
             client = SubtitlesClient(self.settings.get("subtitles_server_url", "http://127.0.0.1:5050"))
-            self.subtitles_online = client.is_alive()
-            self.dep_status = {"status": True, "missing": []}
-            self.model_status = self.subtitles_online
-        else:
+            online = client.is_alive()
+            return online, {"status": True, "missing": []}, online
+        return None, check_dependencies(engine, device), check_model_downloaded(engine, device)
+
+    def _apply_statuses(self, online, dep_status, model_status) -> None:
+        if online is not None:
+            self.subtitles_online = online
+        self.dep_status = dep_status
+        self.model_status = model_status
+        self.update_ui_elements()
+
+    async def probe_statuses_async(self) -> None:
+        """Runs the reachability check off the event loop, then updates the labels."""
+        try:
+            online, dep_status, model_status = await asyncio.to_thread(self._compute_statuses)
+        except Exception:
+            return
+        self._apply_statuses(online, dep_status, model_status)
+
+    def update_installation_statuses(self, probe: bool = True) -> None:
+        """Query backend to check if chosen engine is fully installed and ready.
+
+        ``probe=False`` runs only the cheap, local checks. The ABI-Subtitles
+        branch is an HTTP round-trip that costs the client's full timeout when
+        the server is stopped - which is the normal state whenever no
+        transcription is running - so it is only made on demand.
+        """
+        engine = self.settings.get("stt_engine", "ABI-Subtitles")
+
+        if engine != "ABI-Subtitles":
+            device = self.settings.get("stt_device", "GPU/CUDA")
             self.dep_status = check_dependencies(engine, device)
             self.model_status = check_model_downloaded(engine, device)
-            
+        elif probe:
+            self._apply_statuses(*self._compute_statuses())
+            return
+        else:
+            self.dep_status = {"status": True, "missing": []}
+            self.model_status = False
+
         self.update_ui_elements()
 
     def update_ui_elements(self) -> None:
@@ -90,6 +127,15 @@ class SettingsModal:
         engine = self.settings.get("stt_engine", "ABI-Subtitles")
         
         if engine == "ABI-Subtitles":
+            if self.subtitles_online is None:
+                self.dep_label.set_text("— ABI-Subtitles connection not checked yet.")
+                self.dep_label.classes('text-slate-500', remove='text-emerald-600 text-rose-500')
+                self.model_label.set_text("— Open Settings or press Refresh Connection to test it.")
+                self.model_label.classes('text-slate-500', remove='text-emerald-600 text-rose-500')
+                self.action_btn.set_text("Refresh Connection")
+                self.action_btn.enable()
+                self.action_btn.classes('bg-blue-600', remove='bg-emerald-600 bg-amber-600')
+                return
             if self.subtitles_online:
                 self.dep_label.set_text("✓ ABI-Subtitles Server is ONLINE and reachable.")
                 self.dep_label.classes('text-emerald-600', remove='text-rose-500 text-slate-500')
@@ -369,8 +415,13 @@ class SettingsModal:
         else:
             self._mcp_status("")
 
-        self.update_installation_statuses()
         self.dialog.open()
+        # Probe after the panel is visible and off the event loop: a stopped
+        # server costs the client's full timeout (~2s) and must not freeze the UI.
+        try:
+            asyncio.create_task(self.probe_statuses_async())
+        except RuntimeError:
+            pass
 
     async def shutdown_application(self) -> None:
         """Performs a clean shutdown sequence, allowing launchers to exit cleanly."""

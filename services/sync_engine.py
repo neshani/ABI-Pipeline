@@ -1016,14 +1016,21 @@ def get_book_summary(project_name: str, book: Book,
     return stats
 
 
-def get_book_stats_cached(project_name: str, book_name: str) -> dict:
-    """Checks timestamps on disk before parsing, preventing I/O overhead on polling ticks."""
+def get_book_stats_cached(project_name: str, book_name: str, base_output_dir: Optional[Path] = None) -> dict:
+    """Checks timestamps on disk before parsing, preventing I/O overhead on polling ticks.
+
+    ``base_output_dir`` lets a caller that polls several books resolve the output
+    directory once, instead of opening a session and querying the setting per
+    book on every tick.
+    """
     from ui import state
-    
-    # Establish a safe local session to guarantee correct resolution of the output directory
-    with Session(engine) as session:
-        base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
-        
+
+    if base_output_dir is None:
+        # Establish a safe local session to guarantee correct resolution of the output directory
+        with Session(engine) as session:
+            base_output_dir = Path(get_setting("output_dir", "./output", session)).resolve()
+    base_output_dir = Path(base_output_dir)
+
     book_dir = base_output_dir / project_name / book_name
     transcript_path = book_dir / "transcript.txt"
     prompts_path = book_dir / "prompts.csv"

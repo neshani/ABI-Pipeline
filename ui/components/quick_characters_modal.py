@@ -98,11 +98,15 @@ def delete_timeline_event(event_id: int) -> bool:
 class QuickCharactersModal:
     # ui/components/quick_characters_modal.py
 
-    def __init__(self, project_id: int, book_id: int, initial_char_id: Optional[int] = None, on_change_callback: Optional[callable] = None, on_purge_done: Optional[callable] = None):
+    def __init__(self, project_id: int, book_id: int, initial_char_id: Optional[int] = None, on_change_callback: Optional[callable] = None, on_purge_done: Optional[callable] = None, show_list: bool = True):
         self.project_id = project_id
         self.book_id = book_id
         self.on_change_callback = on_change_callback
         self.on_purge_done = on_purge_done
+        # The cast list is opt-in: opening from a character chip only needs that
+        # character, and building 1,056 rows for it was the bulk of the open.
+        self.show_list = show_list
+        self._ui_built = False
         
         # State tracking
         self.selected_char_id: Optional[int] = initial_char_id
@@ -131,7 +135,21 @@ class QuickCharactersModal:
             self.dialog = ui.dialog()
             self.purge_dialog = ui.dialog()
 
-    def open(self):
+    def open(self, char_id: Optional[int] = None):
+        if char_id is not None:
+            self.selected_char_id = char_id
+            self.selected_event_id = None
+
+        if self._ui_built:
+            # Re-open the element tree that already exists. Building a fresh
+            # dialog per click left every previous one in the page, which is why
+            # the workspace got heavier the more chips you opened.
+            self.draw_right_details.refresh()
+            if self.show_list:
+                self.draw_left_list.refresh()
+            self.dialog.open()
+            return
+
         with self.dialog, ui.card().classes('w-full max-w-[95vw] lg:max-w-5xl h-[650px] p-5 rounded-xl flex flex-col gap-3 outline-none bg-white'):
             # --- MODAL HEADER ---
             with ui.row().classes('w-full justify-between items-center border-b pb-2 flex-shrink-0'):
@@ -140,25 +158,26 @@ class QuickCharactersModal:
                     ui.label('Project Characters Quick Manager').classes('text-sm font-bold text-slate-800')
                 ui.button(icon='close', on_click=self.dialog.close).props('flat round dense').classes('text-slate-400')
 
-            # --- SPLIT BODY CONTAINER ---
-            with ui.grid(columns='300px 1fr').classes('w-full flex-1 overflow-hidden gap-4 h-full min-h-0'):
-                
-                # --- LEFT COLUMN (SEARCH & LIST) ---
-                with ui.column().classes('h-full flex flex-col gap-2 overflow-hidden border-r pr-3'):
-                    search_in = ui.input(
-                        placeholder='Search name or alias...',
-                        on_change=lambda e: self.update_search(e.value)
-                    ).classes('w-full text-xs').props('outlined dense clearable')
-                    
-                    self.left_list_container = ui.scroll_area().classes('w-full flex-1')
-                    with self.left_list_container:
-                        self.draw_left_list()
+            # --- BODY CONTAINER ---
+            with ui.grid(columns=('300px 1fr' if self.show_list else '1fr')).classes('w-full flex-1 overflow-hidden gap-4 h-full min-h-0'):
 
-                    ui.button(
-                        'Add Character', 
-                        icon='person_add', 
-                        on_click=self.quick_add_new_character
-                    ).classes('bg-blue-600 text-white font-bold text-xs w-full py-2 shrink-0')
+                if self.show_list:
+                    # --- LEFT COLUMN (SEARCH & LIST) ---
+                    with ui.column().classes('h-full flex flex-col gap-2 overflow-hidden border-r pr-3'):
+                        search_in = ui.input(
+                            placeholder='Search name or alias...',
+                            on_change=lambda e: self.update_search(e.value)
+                        ).classes('w-full text-xs').props('outlined dense clearable')
+
+                        self.left_list_container = ui.scroll_area().classes('w-full flex-1')
+                        with self.left_list_container:
+                            self.draw_left_list()
+
+                        ui.button(
+                            'Add Character',
+                            icon='person_add',
+                            on_click=self.quick_add_new_character
+                        ).classes('bg-blue-600 text-white font-bold text-xs w-full py-2 shrink-0')
 
                 # --- RIGHT COLUMN (DETAILS) ---
                 self.right_details_container = ui.column().classes('h-full flex-1 overflow-y-auto pr-1 gap-4 min-h-0')
@@ -166,13 +185,15 @@ class QuickCharactersModal:
                     self.draw_right_details()
 
         self.build_purge_dialog()
+        self._ui_built = True
         self.dialog.open()
 
-        # Smooth auto-scroll viewport adjustment after client connection settled
-        async def initial_scroll():
-            await asyncio.sleep(0.2)
-            self.scroll_to_active()
-        asyncio.create_task(initial_scroll())
+        if self.show_list:
+            # Smooth auto-scroll viewport adjustment after client connection settled
+            async def initial_scroll():
+                await asyncio.sleep(0.2)
+                self.scroll_to_active()
+            asyncio.create_task(initial_scroll())
 
     def scroll_to_active(self):
         """Dispatches a micro-task client query to scroll the highlighted card into viewport context."""
@@ -409,43 +430,68 @@ class QuickCharactersModal:
                 session, char, self.book_id, target_ch, target_sc, events=events)
         return effective
 
+    # Rendering every row of a large cast cost most of a second per open: this
+    # list is a 300px scroll pane, so only this many rows are built when no
+    # search is active. The search box still filters the whole cast, and the
+    # selected character is always included, so a chip click on a minor
+    # character still lands on them.
+    VISIBLE_ROWS = 100
+
     @ui.refreshable
     def draw_left_list(self):
+        # One query for the aliases, not one session per character: a
+        # ~1,000-character cast meant ~1,000 connection checkouts per open.
         with Session(engine) as session:
             chars = session.exec(
                 select(Character).where(Character.project_id == self.project_id)
             ).all()
-            
+            ids = [c.id for c in chars if c.id is not None]
+            aliases_by_character: Dict[int, List[str]] = {}
+            for start in range(0, len(ids), 500):
+                rows = session.exec(
+                    select(CharacterAlias).where(
+                        CharacterAlias.character_id.in_(ids[start:start + 500])
+                    )
+                ).all()
+                for row in rows:
+                    aliases_by_character.setdefault(row.character_id, []).append(row.alias)
+
         char_data = []
         for c in chars:
-            with Session(engine) as session:
-                aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == c.id)).all()
-            
-            c_mentions = sum(self.frequencies.get(a.alias.lower(), 0) for a in aliases)
+            aliases = aliases_by_character.get(c.id, [])
+
+            c_mentions = sum(self.frequencies.get(a.lower(), 0) for a in aliases)
             if not aliases:
                 c_mentions = self.frequencies.get(c.name.lower(), 0)
-                
+
             if self.search_query:
-                alias_texts = [a.alias.lower() for a in aliases]
+                alias_texts = [a.lower() for a in aliases]
                 if self.search_query not in c.name.lower() and not any(self.search_query in t for t in alias_texts):
                     continue
-                    
+
             char_data.append((c, len(aliases), c_mentions))
-            
+
         char_data.sort(key=lambda x: x[2], reverse=True)
-        
+
         valid_ids = [item[0].id for item in char_data]
         if self.selected_char_id not in valid_ids:
             self.selected_char_id = valid_ids[0] if valid_ids else None
             self.selected_event_id = None  # Reset state tracking on selection drift
             self.draw_right_details.refresh()
-            
+
         if not char_data:
             ui.label('No characters found.').classes('text-xs text-slate-400 italic p-4 text-center')
             return
-            
+
+        visible = char_data
+        if not self.search_query and len(char_data) > self.VISIBLE_ROWS:
+            visible = char_data[:self.VISIBLE_ROWS]
+            selected = [row for row in char_data if row[0].id == self.selected_char_id]
+            if selected and selected[0] not in visible:
+                visible.insert(0, selected[0])
+
         self.active_row_id = None
-        for c, alias_count, c_mentions in char_data:
+        for c, alias_count, c_mentions in visible:
             is_selected = c.id == self.selected_char_id
             bg_class = "bg-blue-50 border-l-4 border-blue-600 font-semibold text-blue-900" if is_selected else "hover:bg-slate-50 text-slate-700"
             
@@ -468,6 +514,11 @@ class QuickCharactersModal:
                 
             row_el.on('click', select_this)
 
+        if len(visible) < len(char_data):
+            ui.label(
+                f"Showing {len(visible)} of {len(char_data)} by hits - type above to search the rest."
+            ).classes('text-[10px] text-slate-400 italic px-2 py-1 text-center w-full')
+
     @ui.refreshable
     def draw_right_details(self):
         cid = self.selected_char_id
@@ -483,11 +534,6 @@ class QuickCharactersModal:
                 return
             
             aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-            all_project_chars = session.exec(
-                select(Character)
-                .where(Character.project_id == self.project_id)
-                .where(Character.id != char.id)
-            ).all()
 
         # Load chronologically sorted list of states
         sorted_evs = self.get_sorted_events(char.id)
@@ -1006,11 +1052,26 @@ class QuickCharactersModal:
                         
                         ui.icon('cancel', size='14px', color='slate-400').classes('cursor-pointer hover:text-red-500 transition-colors').on('click', lambda _, x=a: remove_alias_and_spin_off(x))
 
-            if all_project_chars:
-                with ui.row().classes('w-full items-center gap-2 mt-1'):
-                    merge_opts = {c.id: c.name for c in all_project_chars}
-                    merge_select = ui.select(options=merge_opts, label='Merge another character into this...', with_input=True).classes('flex-1 bg-white').props('dense outlined clearable')
-                    
+            # Merge is a rare, deliberate action - the Characters tab is where
+            # bulk merging belongs - but this used to build a 1,055-entry search
+            # select on every render of the panel. Build it when asked for.
+            merge_host = ui.column().classes('w-full')
+            merge_state = {"built": False}
+
+            def reveal_merge():
+                if merge_state["built"]:
+                    return
+                merge_state["built"] = True
+                with Session(engine) as session:
+                    others = session.exec(
+                        select(Character)
+                        .where(Character.project_id == self.project_id)
+                        .where(Character.id != char.id)
+                    ).all()
+                with merge_host:
+                    merge_opts = {c.id: c.name for c in others}
+                    merge_select = ui.select(options=merge_opts, label='Merge another character into this...', with_input=True).classes('w-full bg-white').props('dense outlined clearable')
+
                     async def handle_merge_quick_click():
                         src_id = merge_select.value
                         if not src_id:
@@ -1039,6 +1100,10 @@ class QuickCharactersModal:
                         self.trigger_workspace_refresh()
                         
                     ui.button('Merge', icon='call_merge', on_click=handle_merge_quick_click).classes('bg-blue-600 text-white font-bold text-xs px-3 py-1.5 rounded-lg')
+
+            ui.button('Merge another character into this…', icon='call_merge',
+                      on_click=reveal_merge).props('flat dense') \
+                .classes('text-xs text-slate-500 self-start')
 
     def open_alias_explorer_dialog(self, alias: CharacterAlias, parent_char_id: int):
         occurrences = get_alias_occurrences(self.project_id, alias.alias)

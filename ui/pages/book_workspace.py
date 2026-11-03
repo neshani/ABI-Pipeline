@@ -250,6 +250,40 @@ def get_book_images_cache(project_name: str, book_name: str) -> Dict[tuple, str]
     return cache
 
 
+def load_character_alias_map(project_id: int) -> tuple:
+    """Loads a project's characters and their alias lists in two queries.
+
+    This used to be one query per character, run twice per page build (once for
+    the gallery's tag resolution and once for the theater's autocomplete
+    vocabulary). On a long series that is thousands of round-trips before the
+    first render, and the ORM overhead dominates the query time itself.
+    """
+    with Session(engine) as session:
+        characters = session.exec(
+            select(Character).where(Character.project_id == project_id)
+        ).all()
+        ids = [c.id for c in characters if c.id is not None]
+        aliases_by_character: Dict[int, List[str]] = {}
+        # SQLite caps the number of bound parameters, so ask in batches rather
+        # than assume the cast stays under the limit.
+        for start in range(0, len(ids), 500):
+            rows = session.exec(
+                select(CharacterAlias).where(
+                    CharacterAlias.character_id.in_(ids[start:start + 500])
+                )
+            ).all()
+            for row in rows:
+                aliases_by_character.setdefault(row.character_id, []).append(row.alias)
+
+    alias_map: Dict[int, List[str]] = {}
+    for char in characters:
+        alias_map[char.id] = (
+            [clean_character_key(a) for a in aliases_by_character.get(char.id, [])]
+            + [clean_character_key(char.name)]
+        )
+    return characters, alias_map
+
+
 def delete_scene_image_file(project_name: str, book_name: str, chapter_str: str, scene_str: str) -> bool:
     """Removes standard image patterns from disk, preparing the scene for ComfyUI regenerations."""
     try:
@@ -557,36 +591,35 @@ def render_book_tabs(book_id: int):
             if _row_key(p.get("chapter"), p.get("shot")) in keys:
                 p["approved"] = "False"
 
-    def open_character_edit_dialog(char_id: int):
-        """Spawns the quick characters manager modal pre-selected to a specific character."""
+    # One modal per kind, built on first use and re-opened after that. A fresh
+    # modal per click left a hidden dialog in the page every time.
+    quick_chars_modals: Dict[bool, Any] = {}
+
+    def _open_quick_chars(char_id: Optional[int], show_list: bool):
         def after_change():
             forget_character_cache()
             if modal_prompt_input:
                 render_scene_character_chips(modal_prompt_input.value)
 
-        modal = QuickCharactersModal(
-            project_id=project.id,
-            book_id=book_id,
-            initial_char_id=char_id,
-            on_change_callback=after_change,
-            on_purge_done=after_stale_purge
-        )
-        modal.open()
+        modal = quick_chars_modals.get(show_list)
+        if modal is None:
+            modal = QuickCharactersModal(
+                project_id=project.id,
+                book_id=book_id,
+                show_list=show_list,
+                on_change_callback=after_change,
+                on_purge_done=after_stale_purge,
+            )
+            quick_chars_modals[show_list] = modal
+        modal.open(char_id)
+
+    def open_character_edit_dialog(char_id: int):
+        """Opens the character editor on one character, without the cast list."""
+        _open_quick_chars(char_id, show_list=False)
 
     def open_quick_characters_dialog():
-        """Spawns an interactive split-screen project characters quick manager dialog."""
-        def after_change():
-            forget_character_cache()
-            if modal_prompt_input:
-                render_scene_character_chips(modal_prompt_input.value)
-
-        modal = QuickCharactersModal(
-            project_id=project.id, 
-            book_id=book_id,
-            on_change_callback=after_change,
-            on_purge_done=after_stale_purge
-        )
-        modal.open()
+        """Opens the full quick manager, cast list included."""
+        _open_quick_chars(None, show_list=True)
 
     def render_scene_character_chips(prompt_text: str):
         """Safely clears and populates matched character tags on the scene with descriptive hover tooltips."""
@@ -732,6 +765,10 @@ def render_book_tabs(book_id: int):
     from services.sync_engine import sync_prompts_csv_to_db_cache
     with Session(engine) as session:
         sync_prompts_csv_to_db_cache(book_id, session)
+        # Without this the session closes and rolls back, so ``prompts_mtime``
+        # is never persisted: the "already up to date" guard never fires and
+        # every open re-deletes and re-inserts the whole prompts.csv.
+        session.commit()
         session.commit()
 
     def get_all_prompts_as_dicts() -> List[Dict[str, Any]]:
@@ -753,15 +790,9 @@ def render_book_tabs(book_id: int):
             for r in results
         ]
 
-    # Pre-cache character names and aliases for robust tag search & resolution
-    character_alias_map: Dict[int, List[str]] = {}
-    with Session(engine) as session:
-        book_characters = session.exec(
-            select(Character).where(Character.project_id == project.id)
-        ).all()
-        for char in book_characters:
-            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-            character_alias_map[char.id] = [clean_character_key(a.alias) for a in aliases] + [clean_character_key(char.name)]
+    # Pre-cache character names and aliases for robust tag search & resolution.
+    # Two queries, not one per character - see load_character_alias_map.
+    book_characters, character_alias_map = load_character_alias_map(project.id)
 
     # Exact-alias -> character ids, inverted once per page render. The gallery
     # search used to walk every character's alias list for every tag of every
@@ -1845,6 +1876,8 @@ def render_book_tabs(book_id: int):
             def swap_view_mode(mode: str):
                 state.book_view_mode = mode
                 update_view_mode_styles(mode)
+                if mode == 'Editor':
+                    ensure_editor_built()
                 
             btn_view_gallery.on('click', lambda: swap_view_mode('Gallery'))
             btn_view_editor.on('click', lambda: swap_view_mode('Editor'))
@@ -1947,16 +1980,9 @@ def render_book_tabs(book_id: int):
     grid_card_references: Dict[tuple, Dict[str, Any]] = {}
     ringed_card = [None]  # the one grid card carrying the "this is open" ring
 
-    # Pre-cache character vocabulary for autocomplete inside the book workspace tabs
-    book_characters_modal: List[Character] = []
-    character_alias_map_modal: Dict[int, List[str]] = {}
-    with Session(engine) as session:
-        book_characters_modal = session.exec(
-            select(Character).where(Character.project_id == project.id)
-        ).all()
-        for char in book_characters_modal:
-            aliases = session.exec(select(CharacterAlias).where(CharacterAlias.character_id == char.id)).all()
-            character_alias_map_modal[char.id] = [clean_character_key(a.alias) for a in aliases] + [clean_character_key(char.name)]
+    # Pre-cache character vocabulary for autocomplete inside the book workspace tabs.
+    # Same two-query load as the gallery above; this was a duplicate of it.
+    book_characters_modal, character_alias_map_modal = load_character_alias_map(project.id)
 
 
     # --- High Performance Theater Modal ---
@@ -2214,17 +2240,29 @@ def render_book_tabs(book_id: int):
     # Initial paint call
     render_content()
 
-    with editor_view_container:
-        render_prompt_editor_view(
-            project_id=project.id,
-            book_id=book_id,
-            images_cache=images_cache,
-            prompts_list=prompts,
-            on_refresh_grid=lambda: [render_content.refresh()],
-            open_character_edit_dialog_fn=open_character_edit_dialog,
-            open_theater_modal_fn=launch_theater_from_coordinate,
-            open_quick_characters_dialog_fn=open_quick_characters_dialog
-        )
+    # The editor is invisible by default (Gallery is the default view) and costs
+    # about a second to build, so it is created the first time it is shown.
+    editor_built = [False]
+
+    def ensure_editor_built() -> None:
+        if editor_built[0]:
+            return
+        editor_built[0] = True
+        editor_view_container.clear()
+        with editor_view_container:
+            render_prompt_editor_view(
+                project_id=project.id,
+                book_id=book_id,
+                images_cache=images_cache,
+                prompts_list=prompts,
+                on_refresh_grid=lambda: [render_content.refresh()],
+                open_character_edit_dialog_fn=open_character_edit_dialog,
+                open_theater_modal_fn=launch_theater_from_coordinate,
+                open_quick_characters_dialog_fn=open_quick_characters_dialog
+            )
+
+    if state.book_view_mode == 'Editor':
+        ensure_editor_built()
 
     # --- Viewport-Aware Scroll Listener ---
     async def check_scroll():
