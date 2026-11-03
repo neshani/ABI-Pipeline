@@ -7,51 +7,285 @@ import zipfile
 import subprocess
 from pathlib import Path
 from PIL import Image
-from typing import Optional, List, Dict, Any, Callable
+from typing import Optional, List, Dict, Any, Callable, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 from services import compat
 
 # --- Ken Burns Animation Presets ---
-PORTRAIT_PRESETS = [
+#
+# These are the preset values held by the desktop app, kept verbatim (to three
+# decimals) so the two tools stop disagreeing about them. There is one table per
+# (image shape, screen shape) pair, because that pair is what decides how much
+# room a pan actually has.
+#
+# OIS `scale` is relative to the screen: 1.0 fits the whole image, larger crops.
+# `pan_x`/`pan_y` are the point of the IMAGE the camera centres, so moving them
+# off 0.5 slides the picture and uncovers the screen edge unless the image has
+# that much to spare. The budget:
+#
+#   disp_w = scale * fit_w,  disp_h = scale * fit_h
+#   fit is width-limited when image_aspect >= 1/container_aspect, else height
+#   pan_x in 0.5 +- (disp_w - 1)/(2*disp_w)
+#   pan_y in 0.5 +- (disp_h - container_aspect)/(2*disp_h)
+#
+# For a square image on a 2.25 portrait screen that is +-0.23 horizontally at
+# scale 1.85 but ~0 vertically until scale passes 2.25 - which is why the
+# authored vertical drift in presets 23/24/25 shows up as a bar along one edge
+# on a phone. `fit_preset` below clamps every animated value into that band, so
+# the authored numbers stay the source of truth while the geometry stays honest.
+SQUARE_PORTRAIT_PRESETS = [
     # 21: MS Pan Left
     [{"position": 0.0, "scale": 1.85, "pan_x": 0.71, "pan_y": 0.5},
      {"position": 1.0, "scale": 1.85, "pan_x": 0.29, "pan_y": 0.5}],
     # 22: MS Pan Right
-    [{"position": 0.0, "scale": 1.85, "pan_x": 0.29, "pan_y": 0.5},
-     {"position": 1.0, "scale": 1.85, "pan_x": 0.71, "pan_y": 0.5}],
+    [{"position": 0.0, "scale": 1.85, "pan_x": 0.29, "pan_y": 0.506},
+     {"position": 1.0, "scale": 1.85, "pan_x": 0.71, "pan_y": 0.494}],
     # 23: MS Zoom Pan Down
-    [{"position": 0.0, "scale": 1.31, "pan_x": 0.43, "pan_y": 0.5},
-     {"position": 0.5, "scale": 1.90, "pan_x": 0.30, "pan_y": 0.5},
-     {"position": 1.0, "scale": 2.23, "pan_x": 0.71, "pan_y": 0.6}],
+    [{"position": 0.0, "scale": 1.31, "pan_x": 0.432, "pan_y": 0.5},
+     {"position": 0.5, "scale": 1.905, "pan_x": 0.301, "pan_y": 0.489},
+     {"position": 1.0, "scale": 2.23, "pan_x": 0.719, "pan_y": 0.598}],
     # 24: MS Zoom Pan Up
     [{"position": 0.0, "scale": 1.16, "pan_x": 0.5, "pan_y": 0.5},
-     {"position": 0.5, "scale": 2.12, "pan_x": 0.69, "pan_y": 0.54},
-     {"position": 1.0, "scale": 2.18, "pan_x": 0.27, "pan_y": 0.44}],
+     {"position": 0.5, "scale": 2.12, "pan_x": 0.694, "pan_y": 0.542},
+     {"position": 1.0, "scale": 2.18, "pan_x": 0.276, "pan_y": 0.444}],
     # 25: MS Zoom Out
-    [{"position": 0.0, "scale": 2.25, "pan_x": 0.5, "pan_y": 0.43},
+    [{"position": 0.0, "scale": 2.25, "pan_x": 0.5, "pan_y": 0.431},
      {"position": 1.0, "scale": 1.24, "pan_x": 0.5, "pan_y": 0.5}]
 ]
 
-LANDSCAPE_PRESETS = [
+SQUARE_LANDSCAPE_PRESETS = [
     # 26: DS Pan Up
-    [{"position": 0.0, "scale": 1.85, "pan_x": 0.5, "pan_y": 0.71},
-     {"position": 1.0, "scale": 1.85, "pan_x": 0.5, "pan_y": 0.31}],
+    [{"position": 0.0, "scale": 1.85, "pan_x": 0.497, "pan_y": 0.716},
+     {"position": 1.0, "scale": 1.85, "pan_x": 0.5, "pan_y": 0.311}],
     # 27: DS Pan Down
-    [{"position": 0.0, "scale": 1.85, "pan_x": 0.5, "pan_y": 0.29},
-     {"position": 1.0, "scale": 1.85, "pan_x": 0.5, "pan_y": 0.71}],
+    [{"position": 0.0, "scale": 1.85, "pan_x": 0.493, "pan_y": 0.287},
+     {"position": 1.0, "scale": 1.85, "pan_x": 0.5, "pan_y": 0.713}],
     # 28: DS Zoom In pan down
     [{"position": 0.0, "scale": 1.2, "pan_x": 0.5, "pan_y": 0.5},
-     {"position": 0.5, "scale": 2.0, "pan_x": 0.5, "pan_y": 0.32},
+     {"position": 0.5, "scale": 2.0, "pan_x": 0.5, "pan_y": 0.319},
      {"position": 1.0, "scale": 1.8, "pan_x": 0.5, "pan_y": 0.7}],
     # 29: DS Zoom In Pan Up
     [{"position": 0.0, "scale": 1.2, "pan_x": 0.5, "pan_y": 0.5},
-     {"position": 0.5, "scale": 2.0, "pan_x": 0.5, "pan_y": 0.71},
-     {"position": 1.0, "scale": 1.8, "pan_x": 0.5, "pan_y": 0.32}],
+     {"position": 0.5, "scale": 2.0, "pan_x": 0.497, "pan_y": 0.706},
+     {"position": 1.0, "scale": 1.8, "pan_x": 0.5, "pan_y": 0.319}],
     # 30: DS Zoom Out
-    [{"position": 0.0, "scale": 2.0, "pan_x": 0.5, "pan_y": 0.31},
-     {"position": 1.0, "scale": 1.2, "pan_x": 0.5, "pan_y": 0.54}]
+    [{"position": 0.0, "scale": 2.0, "pan_x": 0.503, "pan_y": 0.306},
+     {"position": 1.0, "scale": 1.2, "pan_x": 0.505, "pan_y": 0.542}]
 ]
+
+# Landscape IMAGES. 31-35 are the desktop-viewer set; the desktop app marked them
+# "unsure about target screen", but they are authored for a landscape screen and
+# 44-49 are the portrait-screen counterparts, so the two manifests no longer
+# share a table. A landscape image cannot cover the height of a phone at either
+# set's scales (a 3:2 image needs ~3.4), so a phone letterboxes it evenly; the
+# horizontal pans are what those shots are built around.
+LANDSCAPE_IMAGE_LANDSCAPE_PRESETS = [
+    # 31: Landscape Left to right
+    [{"position": 0.0, "scale": 1.86, "pan_x": 0.275, "pan_y": 0.456},
+     {"position": 1.0, "scale": 1.07, "pan_x": 0.5, "pan_y": 0.5}],
+    # 32: Landscape Right to Left
+    [{"position": 0.0, "scale": 1.69, "pan_x": 0.696, "pan_y": 0.393},
+     {"position": 1.0, "scale": 1.06, "pan_x": 0.5, "pan_y": 0.5}],
+    # 33: Landscape Zoom out
+    [{"position": 0.0, "scale": 1.98, "pan_x": 0.505, "pan_y": 0.38},
+     {"position": 1.0, "scale": 1.06, "pan_x": 0.5, "pan_y": 0.5}],
+    # 34: Landscape Zoom in
+    [{"position": 0.0, "scale": 1.1, "pan_x": 0.5, "pan_y": 0.5},
+     {"position": 1.0, "scale": 1.95, "pan_x": 0.502, "pan_y": 0.313}],
+    # 35: Landscape Zoom and pan
+    [{"position": 0.0, "scale": 1.0, "pan_x": 0.5, "pan_y": 0.5},
+     {"position": 0.66, "scale": 1.6, "pan_x": 0.65, "pan_y": 0.365},
+     {"position": 1.0, "scale": 1.5, "pan_x": 0.35, "pan_y": 0.389}]
+]
+
+LANDSCAPE_IMAGE_PORTRAIT_PRESETS = [
+    # 44: Landscape-P Zoom In
+    [{"position": 0.0, "scale": 1.38, "pan_x": 0.5, "pan_y": 0.5},
+     {"position": 1.0, "scale": 2.5, "pan_x": 0.5, "pan_y": 0.5}],
+    # 45: Landscape-P Zoom Out
+    [{"position": 0.0, "scale": 2.79, "pan_x": 0.5, "pan_y": 0.5},
+     {"position": 1.0, "scale": 1.2, "pan_x": 0.5, "pan_y": 0.5}],
+    # 46: Landscape-P Left to right
+    [{"position": 0.0, "scale": 2.3, "pan_x": 0.24, "pan_y": 0.5},
+     {"position": 1.0, "scale": 2.3, "pan_x": 0.76, "pan_y": 0.5}],
+    # 47: Landscape-P Right to left
+    [{"position": 0.0, "scale": 2.3, "pan_x": 0.76, "pan_y": 0.5},
+     {"position": 1.0, "scale": 2.3, "pan_x": 0.24, "pan_y": 0.5}],
+    # 48: Landscape-P Zoom and pan right
+    [{"position": 0.0, "scale": 1.2, "pan_x": 0.5, "pan_y": 0.5},
+     {"position": 0.3, "scale": 2.7, "pan_x": 0.22, "pan_y": 0.5},
+     {"position": 1.0, "scale": 2.7, "pan_x": 0.78, "pan_y": 0.5}],
+    # 49: Landscape-P Zoom Pan Left
+    [{"position": 0.0, "scale": 1.2, "pan_x": 0.5, "pan_y": 0.5},
+     {"position": 0.3, "scale": 2.7, "pan_x": 0.78, "pan_y": 0.5},
+     {"position": 1.0, "scale": 2.7, "pan_x": 0.22, "pan_y": 0.5}]
+]
+
+PORTRAIT_IMAGE_PORTRAIT_PRESETS = [
+    # 36: P-P Zoom in Pan Right
+    [{"position": 0.0, "scale": 1.1, "pan_x": 0.5, "pan_y": 0.5},
+     {"position": 0.5, "scale": 1.8, "pan_x": 0.33, "pan_y": 0.42},
+     {"position": 1.0, "scale": 1.8, "pan_x": 0.667, "pan_y": 0.43}],
+    # 37: P-P Zoom in Pan Left
+    [{"position": 0.0, "scale": 1.11, "pan_x": 0.5, "pan_y": 0.5},
+     {"position": 0.5, "scale": 1.8, "pan_x": 0.67, "pan_y": 0.43},
+     {"position": 1.0, "scale": 1.8, "pan_x": 0.32, "pan_y": 0.43}],
+    # 38: P-P Zoom Out
+    [{"position": 0.0, "scale": 2.0, "pan_x": 0.488, "pan_y": 0.379},
+     {"position": 1.0, "scale": 1.1, "pan_x": 0.5, "pan_y": 0.5}],
+    # 39: P-P Zoom In
+    [{"position": 0.0, "scale": 1.1, "pan_x": 0.5, "pan_y": 0.5},
+     {"position": 1.0, "scale": 1.8, "pan_x": 0.5, "pan_y": 0.4}]
+]
+
+PORTRAIT_IMAGE_LANDSCAPE_PRESETS = [
+    # 40: P-L Pan Down
+    [{"position": 0.0, "scale": 1.5, "pan_x": 0.5, "pan_y": 0.35},
+     {"position": 1.0, "scale": 1.5, "pan_x": 0.5, "pan_y": 0.64}],
+    # 41: P-L Pan Up
+    [{"position": 0.0, "scale": 1.5, "pan_x": 0.5, "pan_y": 0.65},
+     {"position": 1.0, "scale": 1.5, "pan_x": 0.5, "pan_y": 0.35}],
+    # 42: P-L Zoom pan down
+    [{"position": 0.0, "scale": 1.04, "pan_x": 0.5, "pan_y": 0.5},
+     {"position": 0.5, "scale": 2.34, "pan_x": 0.5, "pan_y": 0.24},
+     {"position": 1.0, "scale": 2.34, "pan_x": 0.5, "pan_y": 0.77}],
+    # 43: P-L Zoom Pan Up
+    [{"position": 0.0, "scale": 1.0, "pan_x": 0.5, "pan_y": 0.5},
+     {"position": 0.5, "scale": 2.2, "pan_x": 0.5, "pan_y": 0.75},
+     {"position": 1.0, "scale": 2.2, "pan_x": 0.5, "pan_y": 0.25}]
+]
+
+# Container shapes the two manifests are kept safe against, as height/width.
+# The mobile manifest is judged at 2.25 (a 9:19.5 phone is 2.17, 21:9 is 2.33).
+# The desktop manifest is judged at 4:3 = 0.75, the narrowest landscape window we
+# target; a wider window only ever gains room. (A near-square window is
+# marginally stricter vertically, and the measured values clear that too.)
+MOBILE_CONTAINER_ASPECT = 2.25
+DESKTOP_CONTAINER_ASPECT = 3.0 / 4.0
+
+# An image is classified by its own w/h, not by the book: a mixed pack animates
+# each shot for the frame it actually is.
+PORTRAIT_IMAGE_MAX_ASPECT = 0.85        # 2:3, 3:4, 9:16 ...
+LANDSCAPE_IMAGE_MIN_ASPECT = 1.2        # 3:2, 16:9 ...
+IMAGE_SQUARE = "square"
+IMAGE_PORTRAIT = "portrait"
+IMAGE_LANDSCAPE = "landscape"
+
+PRESET_SETS = {
+    (IMAGE_SQUARE, "portrait"): SQUARE_PORTRAIT_PRESETS,
+    (IMAGE_SQUARE, "landscape"): SQUARE_LANDSCAPE_PRESETS,
+    (IMAGE_LANDSCAPE, "portrait"): LANDSCAPE_IMAGE_PORTRAIT_PRESETS,
+    (IMAGE_LANDSCAPE, "landscape"): LANDSCAPE_IMAGE_LANDSCAPE_PRESETS,
+    (IMAGE_PORTRAIT, "portrait"): PORTRAIT_IMAGE_PORTRAIT_PRESETS,
+    (IMAGE_PORTRAIT, "landscape"): PORTRAIT_IMAGE_LANDSCAPE_PRESETS,
+}
+
+
+def image_aspect_class(aspect: float) -> str:
+    """Which preset table an image of this w/h belongs to."""
+    if aspect <= PORTRAIT_IMAGE_MAX_ASPECT:
+        return IMAGE_PORTRAIT
+    if aspect >= LANDSCAPE_IMAGE_MIN_ASPECT:
+        return IMAGE_LANDSCAPE
+    return IMAGE_SQUARE
+
+
+def safe_pan_band(scale: float, image_aspect: float,
+                  container_aspect: float) -> Tuple[float, float]:
+    """How far pan_x/pan_y may drift from 0.5 before an edge is uncovered.
+
+    Returns (half_x, half_y) in image units; 0.0 on an axis means the image only
+    just covers the screen there and any drift would show as a bar.
+    """
+    container_w, container_h = 1.0, container_aspect
+    if image_aspect >= container_w / container_h:
+        # Width-limited fit: the image fills the width, its height falls short.
+        fit_w, fit_h = container_w, container_w / image_aspect
+    else:
+        # Height-limited fit: the image fills the height and is narrower.
+        fit_h, fit_w = container_h, container_h * image_aspect
+    disp_w, disp_h = scale * fit_w, scale * fit_h
+    half_x = max(0.0, (disp_w - container_w) / (2.0 * disp_w))
+    half_y = max(0.0, (disp_h - container_h) / (2.0 * disp_h))
+    return half_x, half_y
+
+
+def fit_preset(preset: List[Dict[str, float]], image_aspect: float,
+               container_aspect: float, samples: int = 24) -> List[Dict[str, float]]:
+    """A copy of `preset` with every pan clamped so no frame uncovers an edge.
+
+    A player interpolates linearly between keyframes, so checking the keyframes
+    alone is not enough: a drift toward an edge while the image is still small
+    leaves a lopsided bar *between* two legal keyframes. Each segment is sampled
+    and, where it does leave the band, both of its endpoints are clamped to the
+    band at the segment's smallest scale - the tightest point of that segment,
+    because the band only widens as the image grows.
+
+    Scale is never touched: a zoomed-out keyframe is allowed to letterbox when
+    the author asked for one, and the clamp keeps that letterbox symmetric
+    instead of letting it pile up along one edge.
+    """
+    fitted = [
+        {"position": kp["position"], "scale": kp["scale"],
+         "pan_x": kp["pan_x"], "pan_y": kp["pan_y"]}
+        for kp in preset
+    ]
+
+    for _ in range(6):
+        changed = False
+        for i in range(len(fitted) - 1):
+            a, b = fitted[i], fitted[i + 1]
+            bad_x = bad_y = False
+            for step in range(samples + 1):
+                t = step / samples
+                scale = a["scale"] + (b["scale"] - a["scale"]) * t
+                half_x, half_y = safe_pan_band(scale, image_aspect, container_aspect)
+                if abs((a["pan_x"] + (b["pan_x"] - a["pan_x"]) * t) - 0.5) > half_x:
+                    bad_x = True
+                if abs((a["pan_y"] + (b["pan_y"] - a["pan_y"]) * t) - 0.5) > half_y:
+                    bad_y = True
+                if bad_x and bad_y:
+                    break
+            if bad_x or bad_y:
+                half_x, half_y = safe_pan_band(min(a["scale"], b["scale"]),
+                                               image_aspect, container_aspect)
+                for kp in (a, b):
+                    if bad_x:
+                        kp["pan_x"] = 0.5 + max(-half_x, min(half_x, kp["pan_x"] - 0.5))
+                    if bad_y:
+                        kp["pan_y"] = 0.5 + max(-half_y, min(half_y, kp["pan_y"] - 0.5))
+                changed = True
+        if not changed:
+            break
+
+    # Belt and braces: if a preset still cannot be made safe segment by segment
+    # (it should not happen), fall back to the tightest band for the whole move.
+    if len(fitted) > 1:
+        half_x, half_y = safe_pan_band(min(kp["scale"] for kp in fitted),
+                                       image_aspect, container_aspect)
+        still_bad = False
+        for i in range(len(fitted) - 1):
+            a, b = fitted[i], fitted[i + 1]
+            for step in range(samples + 1):
+                t = step / samples
+                scale = a["scale"] + (b["scale"] - a["scale"]) * t
+                hx, hy = safe_pan_band(scale, image_aspect, container_aspect)
+                if (abs((a["pan_x"] + (b["pan_x"] - a["pan_x"]) * t) - 0.5) > hx
+                        or abs((a["pan_y"] + (b["pan_y"] - a["pan_y"]) * t) - 0.5) > hy):
+                    still_bad = True
+                    break
+            if still_bad:
+                break
+        if still_bad:
+            for kp in fitted:
+                kp["pan_x"] = 0.5 + max(-half_x, min(half_x, kp["pan_x"] - 0.5))
+                kp["pan_y"] = 0.5 + max(-half_y, min(half_y, kp["pan_y"] - 0.5))
+
+    for kp in fitted:
+        kp["pan_x"] = round(kp["pan_x"], 4)
+        kp["pan_y"] = round(kp["pan_y"], 4)
+    return fitted
 
 
 # --- Timing Formatting Utilities ---
@@ -254,10 +488,15 @@ def get_book_total_duration(project_name: str, book_name: str) -> float:
 
 # --- Multithreaded Image Processor ---
 
-def process_and_compress_image(src_path: Path, dest_path: Path, max_dim: int, quality: int) -> bool:
-    """Downscales and compresses a single PNG image into a highly-optimized WebP asset."""
+def process_and_compress_image(src_path: Path, dest_path: Path, max_dim: int, quality: int) -> Optional[float]:
+    """Downscales and compresses a single PNG image into a highly-optimized WebP asset.
+
+    Returns the source image's width/height, because the packer already has every
+    frame decoded here and the animation presets depend on the image's shape.
+    """
     try:
         with Image.open(src_path) as img:
+            aspect = img.width / img.height if img.height else 1.0
             # Convert to RGB mode if transparency exists to avoid compression failures
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
@@ -267,9 +506,9 @@ def process_and_compress_image(src_path: Path, dest_path: Path, max_dim: int, qu
             
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             img.save(dest_path, "WEBP", quality=quality)
-        return True
+        return aspect
     except Exception:
-        return False
+        return None
 
 
 # --- Local Timing CSV Utilities to prevent importing main.py ---
@@ -421,6 +660,7 @@ def build_illumination_pack(
 
     # Cover injection handling
     cover_dest_filename = None
+    cover_aspect = None
     first_scene_start_sec = parse_timestamp_to_seconds(scenes[0].get("timestamp", "00:00:00"))
     
     if metadata.get("use_cover", True) and first_scene_start_sec > 0:
@@ -448,7 +688,7 @@ def build_illumination_pack(
         if found_cover:
             log(0.25, f"Cover artwork detected: '{found_cover.name}'. Copying to zip root...")
             cover_dest_filename = "0000_cover.webp"
-            process_and_compress_image(
+            cover_aspect = process_and_compress_image(
                 found_cover, 
                 staging_dir / cover_dest_filename, 
                 metadata.get("max_dimension", 1024), 
@@ -478,6 +718,7 @@ def build_illumination_pack(
             scene_image_mappings[idx] = dest_filename
             
             compression_tasks.append((
+                idx,
                 src_img, 
                 staging_dir / dest_filename, 
                 metadata.get("max_dimension", 1024), 
@@ -490,32 +731,73 @@ def build_illumination_pack(
     # operations, bypassing Python's GIL block and avoiding spawning system process overhead.
     processed_count = 0
     total_tasks = len(compression_tasks)
+    scene_aspects: Dict[int, float] = {}
     
     if total_tasks > 0:
         from concurrent.futures import as_completed
         # Limit worker thread allocation dynamically to preserve UI responsiveness
         max_workers = min(32, (os.cpu_count() or 4) * 2)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(process_and_compress_image, *t) for t in compression_tasks]
+            futures = {
+                executor.submit(process_and_compress_image, *t[1:]): t[0]
+                for t in compression_tasks
+            }
             for f in as_completed(futures):
                 try:
-                    f.result()
+                    aspect = f.result()
+                    if aspect:
+                        scene_aspects[futures[f]] = aspect
                 except Exception as ex:
                     log(0.30, f"Warning: Individual compression thread failed: {str(ex)}")
                 processed_count += 1
                 progress_step = 0.30 + (0.40 * (processed_count / total_tasks))
                 log(progress_step, f"Processing scene frames: {processed_count}/{total_tasks} processed...")
 
-    log(0.70, "Building Open Illuminations manifest variations...")
+    # One aspect covers the whole book in practice, so the dominant one stands in
+    # for frames whose header could not be read.
+    default_aspect = 1.0
+    if scene_aspects:
+        counts: Dict[float, int] = {}
+        for a in scene_aspects.values():
+            key = round(a, 2)
+            counts[key] = counts.get(key, 0) + 1
+        default_aspect = max(counts, key=counts.get)
+    if cover_aspect is None:
+        cover_aspect = default_aspect
+
+    if scene_aspects:
+        class_counts: Dict[str, int] = {}
+        for a in scene_aspects.values():
+            cls = image_aspect_class(a)
+            class_counts[cls] = class_counts.get(cls, 0) + 1
+        summary = ", ".join(f"{n} {cls}" for cls, n in sorted(class_counts.items()))
+        log(0.70, f"Animation presets: {len(scene_aspects)} measured frame(s) -> {summary}.")
 
     # --- Generate Keyframe Lists ---
     mobile_keyframes = []
     desktop_keyframes = []
     static_keyframes = []
+    preset_cursor: Dict[tuple, int] = {}
+
+    def next_preset(variant: str, aspect: float, container_aspect: float) -> List[Dict[str, float]]:
+        """Pick the next preset for this variant and clamp it to the visible band."""
+        screen = "portrait" if variant == "mobile" else "landscape"
+        cls = image_aspect_class(aspect)
+        table = PRESET_SETS[(cls, screen)]
+        cursor_key = (variant, cls)
+        index = preset_cursor.get(cursor_key, 0)
+        preset_cursor[cursor_key] = index + 1
+        return fit_preset(table[index % len(table)], aspect, container_aspect)
+
 
     # Insert optional intro cover scenes
     if cover_dest_filename and first_scene_start_sec > 0:
-        m_preset = PORTRAIT_PRESETS[0]
+        # The cover has its own shape, so it gets the first preset of its own
+        # class rather than the scene table's.
+        m_preset = fit_preset(
+            PRESET_SETS[(image_aspect_class(cover_aspect), "portrait")][0],
+            cover_aspect, MOBILE_CONTAINER_ASPECT
+        )
         for p in m_preset:
             p_time = p["position"] * first_scene_start_sec
             mobile_keyframes.append({
@@ -531,7 +813,10 @@ def build_illumination_pack(
                 }
             })
 
-        d_preset = LANDSCAPE_PRESETS[0]
+        d_preset = fit_preset(
+            PRESET_SETS[(image_aspect_class(cover_aspect), "landscape")][0],
+            cover_aspect, DESKTOP_CONTAINER_ASPECT
+        )
         for p in d_preset:
             p_time = p["position"] * first_scene_start_sec
             desktop_keyframes.append({
@@ -561,7 +846,7 @@ def build_illumination_pack(
     for idx, scene in enumerate(scenes):
         img_name = scene_image_mappings[idx]
         if img_name:
-            valid_scenes.append((scene, img_name))
+            valid_scenes.append((idx, scene, img_name))
 
     # Resolve each kept scene's effective start time.
     #
@@ -580,7 +865,7 @@ def build_illumination_pack(
     previous_start = first_scene_start_sec if (cover_dest_filename and first_scene_start_sec > 0) else 0.0
     previous_chapter = None
     repinned = 0
-    for scene, _img_name in valid_scenes:
+    for _idx, scene, _img_name in valid_scenes:
         start_sec = parse_timestamp_to_seconds(scene.get("timestamp", "00:00:00"))
         chapter_num = parse_int_field(scene.get("chapter", "1"), 1)
 
@@ -600,11 +885,11 @@ def build_illumination_pack(
         log(0.72, f"Chapter binding: {repinned} chapter-opening image(s) moved to their chapter start.")
 
     # Compile OIS Timeline Keyframes
-    for idx, (scene, img_name) in enumerate(valid_scenes):
-        start_sec = scene_starts[idx]
+    for position_idx, (scene_idx, scene, img_name) in enumerate(valid_scenes):
+        start_sec = scene_starts[position_idx]
         
-        if idx < len(valid_scenes) - 1:
-            end_sec = scene_starts[idx + 1]
+        if position_idx < len(valid_scenes) - 1:
+            end_sec = scene_starts[position_idx + 1]
         else:
             end_sec = duration
 
@@ -616,8 +901,12 @@ def build_illumination_pack(
             raw_quote = raw_quote.replace("[", "").replace("]", "")
         quote_text = raw_quote if raw_quote else None
 
+        # Each shot animates for the shape of its own frame, and each variant for
+        # the shape of the screen it will be shown on.
+        aspect = scene_aspects.get(scene_idx, default_aspect)
+
         # A. Compile PORTRAIT / MOBILE timeline variations
-        m_preset = PORTRAIT_PRESETS[idx % len(PORTRAIT_PRESETS)]
+        m_preset = next_preset("mobile", aspect, MOBILE_CONTAINER_ASPECT)
         for kp_idx, pt in enumerate(m_preset):
             kp_time = start_sec + (pt["position"] * scene_duration)
             mobile_keyframes.append({
@@ -634,7 +923,7 @@ def build_illumination_pack(
             })
 
         # B. Compile LANDSCAPE / DESKTOP timeline variations
-        d_preset = LANDSCAPE_PRESETS[idx % len(LANDSCAPE_PRESETS)]
+        d_preset = next_preset("desktop", aspect, DESKTOP_CONTAINER_ASPECT)
         for kp_idx, pt in enumerate(d_preset):
             kp_time = start_sec + (pt["position"] * scene_duration)
             desktop_keyframes.append({

@@ -458,6 +458,11 @@ During the transcription and alignment phases, the pipeline estimates where each
 
 Because these timestamps correspond to actual narration, the first scene's quote rarely lands exactly at `00:00:00`. To prevent a blank screen during early-chapter silence or intro sequences, the **Inject audiobook cover art as first index keyframe** option is enabled by default. This compresses the local audiobook cover as `0000_cover.webp` and anchors it dynamically at `00:00:00.00` with smooth zoom transitions until the first narrative scene is reached.
 
+#### Chapter Framing & Animation
+
+* **Keep images bound by chapter:** the timing file still decides when each image starts, except that the first image of every chapter starts at the chapter's own opening instead of its quote's timestamp. This stops a new chapter from holding the previous chapter's picture for the first few minutes, when the story has already moved somewhere else. Chapter openings come from the audiobook's existing chapter timings in the project database.
+* **Animation presets follow the image:** each scene is animated with the preset written for the shape of that frame (square, portrait or landscape) and for the screen the variant targets (portrait phone or landscape desktop). Frame shape is read while images are compressed, so a book with mixed shapes animates each shot for the frame it actually is. Every animated value is also checked against the visible area of the screen, and a pan that would uncover an edge is pulled back toward the centre — so when a zoomed-out preset does leave black bars, they stay equal on opposite edges rather than piling up along one of them.
+
 ### Step 2: Pre-Flight Integrity Check
 
 Before packaging begins, the studio runs a validation check on all project volumes in the **Project Volumes Telemetry** panel.
