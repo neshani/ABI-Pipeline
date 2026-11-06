@@ -9,10 +9,12 @@ where you are looking.
 
 Results arrive as mentions, not as one answer, because the passages around a scene
 usually dress several people: the character you opened this for, and whoever else
-the text mentions. The mention that gets ticked is the one about your character,
-and a mention that only says "he" is left for the user to decide - the model is
-asked to name who it means, and the quote is checked against the character's own
-name before anything is ticked on the user's behalf.
+the text mentions. The mentions shown for your character are **checkboxes**, and
+every ticked one is stored together as one outfit ("a coat of matching silk and a
+cream-colored blouse") - the book often describes a look as a jacket here and
+breeches three lines down. A mention that only says "he" is left unticked for the
+user to decide: the model is asked to name who it means, and the quote is checked
+against the character's own name before anything is ticked on the user's behalf.
 """
 from __future__ import annotations
 
@@ -32,6 +34,31 @@ def _book_names(project_id: int) -> Dict[int, str]:
     return {book.id: book.name for book in clothing_lookup.project_books(project_id)}
 
 
+# Three shots is this dialog's idea of "basically here": within it the banner stops
+# warning that the searched position has drifted, and the change a stored outfit
+# would land on is the look already on screen rather than one from another scene.
+NEAR_SHOT_SPAN = 3
+
+
+def _change_is_here(target: Dict) -> bool:
+    """Does the change this position resolves to sit at, or just before, it?
+
+    ``attire_target``'s distance is a signed delta of the searched position minus
+    the change, so "just before" is zero chapters and a small non-negative shot
+    gap. Anything else - an earlier chapter, an earlier volume, the Base profile,
+    no change at all - is far enough away that a change of its own is worth
+    offering.
+    """
+    if target.get("at_position"):
+        return True
+    distance = target.get("distance") or {}
+    if distance.get("kind") != "same_book":
+        return False
+    chapters = int(distance.get("chapters") or 0)
+    shots = int(distance.get("shots") or 0)
+    return chapters == 0 and 0 <= shots <= NEAR_SHOT_SPAN
+
+
 def _distance_text(book_id: int, chapter: int, shot: int, *, active_book_id: int,
                    active_chapter: int, active_shot: int,
                    names: Dict[int, str]) -> str:
@@ -42,7 +69,7 @@ def _distance_text(book_id: int, chapter: int, shot: int, *, active_book_id: int
                 f"screen.")
     chapters = chapter - active_chapter
     shots = shot - active_shot
-    if not chapters and abs(shots) <= 3:
+    if not chapters and abs(shots) <= NEAR_SHOT_SPAN:
         return ""
     direction = "after" if (chapters > 0 or (not chapters and shots > 0)) else "before"
     parts: List[str] = []
@@ -62,12 +89,17 @@ def open_clothing_dialog(project: Project, char: Character, *,
                          refresh_callback: Optional[Callable[[], Any]] = None,
                          on_applied: Optional[Callable[[List[str], Optional[Dict]],
                                                        None]] = None,
-                         initial_search: bool = False) -> None:
+                         initial_search: bool = False,
+                         auto_search: bool = True) -> None:
     """Search the passages around one position for what they are wearing.
 
     ``on_applied(fields, position)`` reports the write to the host, which owns the
     stale-render offer: an attire change strands every image rendered with the old
     one, and this dialog knows nothing about images.
+
+    ``auto_search`` starts the search without a click when the change in force is
+    at this shot or within a few of it - the case where the outfit being looked for
+    is the one already on screen. ``initial_search`` forces it either way.
     """
     llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
     model = get_setting("llm_model", "local-model")
@@ -77,8 +109,7 @@ def open_clothing_dialog(project: Project, char: Character, *,
         book_id = next(iter(names), 0) or book_id
 
     run_state: Dict[str, Any] = {"running": False, "changed": False,
-                                 "mentions": [], "selected": None,
-                                 "target": None}
+                                 "mentions": [], "target": None}
 
     def position() -> Dict[str, int]:
         return {"book_id": int(book_select.value or book_id),
@@ -111,12 +142,23 @@ def open_clothing_dialog(project: Project, char: Character, *,
 
     def refresh_position_text() -> None:
         here = position()
+        at_scene = (here["book_id"] == active_book_id
+                    and here["chapter"] == active_chapter
+                    and here["shot"] == active_shot)
         text = _distance_text(here["book_id"], here["chapter"], here["shot"],
                               active_book_id=active_book_id,
                               active_chapter=active_chapter,
                               active_shot=active_shot, names=names)
+        if not text and at_scene:
+            # Say it out loud rather than leaving the line blank: the position
+            # otherwise only exists as two numbers in inputs, and "which scene am I
+            # actually searching" was the question this dialog kept leaving open.
+            text = (f"Searching the scene on screen: chapter {here['chapter']}, "
+                    f"shot {here['shot']}.")
         banner_label.set_text(text)
         banner_label.visible = bool(text)
+        # Moving the search back is only an offer while it has moved.
+        use_scene_button.visible = not at_scene
 
         target = clothing_lookup.attire_target(
             char.id, here["book_id"], here["chapter"], here["shot"])
@@ -136,11 +178,15 @@ def open_clothing_dialog(project: Project, char: Character, *,
         else:
             where = (f"{target.get('book_name')} · chapter {target.get('chapter')}, "
                      f"shot {target.get('shot')}")
-            target_label.set_text(
-                f"Last change is {_distance_words(target.get('distance') or {})} "
-                f"({where}). Storing updates that change, so every image from there "
-                f"on changes with it.")
-        create_button.visible = bool(target.get("ok")) and not target.get("at_position")
+            note = (f"Last change is {_distance_words(target.get('distance') or {})} "
+                    f"({where}). Storing updates that change, so every image from "
+                    f"there on changes with it.")
+            if _change_is_here(target):
+                # Say why the button is missing: an absent button with no reason
+                # reads as a broken dialog, not as "this is close enough".
+                note += " No new change is offered this close to it."
+            target_label.set_text(note)
+        create_button.visible = bool(target.get("ok")) and not _change_is_here(target)
         banner.visible = bool(text) or bool(target_label.text) or create_button.visible
 
         worn = (target or {}).get("attire") or ""
@@ -185,8 +231,7 @@ def open_clothing_dialog(project: Project, char: Character, *,
             return
         run_state["searched"] = None
         run_state["mentions"] = []
-        run_state["selected"] = None
-        row_marks.clear()
+        row_checks.clear()
         results.clear()
         position_label.set_text("")
         apply_button.disable()
@@ -199,33 +244,49 @@ def open_clothing_dialog(project: Project, char: Character, *,
         shot_input.value = active_shot
         invalidate()
 
-    # One outfit per position, so the rows are a pick-one list. Selection is a
-    # click on the row and a restyle of its marker: nothing here writes a widget's
-    # `value`. Assigning a checkbox's value from the server runs its own on_change
-    # in this NiceGUI, so a "tick one, untick the rest" checkbox group re-enters
-    # itself and the state it leaves behind is not trustworthy - which showed up as
-    # a ticked row with a dead Store button.
-    row_marks: Dict[int, Any] = {}
+    # The mention rows are checkboxes, and their ticks are never written from the
+    # server after construction: the pre-tick is passed as the checkbox's initial
+    # ``value`` while it is built, and from then on only the user (and the Store
+    # read at apply time) touches it. Assigning a checkbox's ``value`` from the
+    # server runs its own ``on_change`` in this NiceGUI, which is what made an
+    # earlier "tick one, untick the rest" group here re-enter itself and leave a
+    # ticked row with a dead Store button. A change handler that only refreshes
+    # the button's text cannot cascade, so it is safe to attach.
+    row_checks: Dict[int, Any] = {}
 
-    def select(index: Optional[int]) -> None:
-        run_state["selected"] = index
-        for row_index, mark in row_marks.items():
-            chosen = row_index == index
-            try:
-                mark.set_text("check_circle" if chosen
-                              else "radio_button_unchecked")
-                mark.classes(add='text-emerald-600' if chosen else 'text-slate-300',
-                             remove='text-slate-300' if chosen else 'text-emerald-600')
-            except RuntimeError:
-                pass        # a row rebuilt underneath us; the next render restyles
-        apply_button.set_text("Store this attire" if index is not None
+    def ticked_mentions() -> List[Dict]:
+        """The mentions the user ticked, in row (passage) order.
+
+        Read at store time, never cached: the checkbox ``value`` is the truth,
+        however it came to be set.
+        """
+        selectable = [item for item in run_state["mentions"] if item["selectable"]]
+        return [selectable[index] for index in sorted(row_checks)
+                if row_checks[index].value and index < len(selectable)]
+
+    def refresh_store_button() -> None:
+        ticked = len(ticked_mentions())
+        apply_button.set_text(f"Store attire ({ticked})" if ticked
                               else "Store attire")
-        # Enabled whenever there are rows: a greyed-out button reads as "this
-        # cannot be done", which is how a lost selection used to look.
-        if row_marks:
+        # Enabled whenever rows exist - "Store" with none ticked asks before it
+        # acts, so a greyed-out button would only read as "this cannot be done",
+        # which is how a lost selection used to look.
+        if row_checks:
             apply_button.enable()
         else:
             apply_button.disable()
+
+    def describe_storage(items: List[Dict]) -> str:
+        """One outfit out of one or more mentions: joined with ' and '.
+
+        The phrases are kept whole - grammar games with leading articles turn
+        'a wrinkled coat and breeches of brocaded green silk' into something
+        worse than the duplicate article they avoid.
+        """
+        if len(items) == 1:
+            return items[0]["attire"]
+        head = ", ".join(item["attire"] for item in items[:-1])
+        return f"{head} and {items[-1]['attire']}"
 
     def render_mentions() -> None:
         """Draw the list, and say so out loud if drawing fails.
@@ -239,6 +300,9 @@ def open_clothing_dialog(project: Project, char: Character, *,
         except Exception as ex:                              # noqa: BLE001
             state.add_console_log(
                 f"[Clothing] render failed: {type(ex).__name__}: {ex}")
+            # The rows died with the failed render; a half-built checkbox list
+            # left behind here could store a mention the user never saw.
+            row_checks.clear()
             try:
                 results.clear()
                 with results:
@@ -250,13 +314,12 @@ def open_clothing_dialog(project: Project, char: Character, *,
                 pass
 
     def _render_mentions() -> None:
-        row_marks.clear()
+        row_checks.clear()
         results.clear()
         mentions: List[Dict] = run_state["mentions"]
         target = [item for item in mentions if item["selectable"]]
         others = [item for item in mentions if not item["selectable"]]
         if not mentions:
-            run_state["selected"] = None
             apply_button.disable()
             apply_button.set_text("Store attire")
             with results:
@@ -272,13 +335,21 @@ def open_clothing_dialog(project: Project, char: Character, *,
                     'text-[11px] text-slate-500 py-1')
             for index, item in enumerate(target):
                 with ui.column().classes('w-full gap-0.5 border-b border-slate-100 '
-                                         'pb-1 pt-1 cursor-pointer '
-                                         'hover:bg-slate-50 rounded px-1') \
-                        .on('click', lambda _, i=index: select(i)):
+                                         'pb-1 pt-1 rounded px-1'):
                     with ui.row().classes('w-full items-start gap-1.5 flex-nowrap'):
-                        mark = ui.label('radio_button_unchecked').classes(
-                            'material-icons text-base shrink-0 text-slate-300')
-                        row_marks[index] = mark
+                        # The attire text is the checkbox's own label, so the whole
+                        # phrase is the click target and the row needs no click
+                        # handler of its own. `min-w-0` is what keeps this on
+                        # screen: without it the label's min-content width pushes
+                        # the checkbox past the card edge - the "checkboxes render
+                        # offscreen" failure this dialog had before.
+                        row_checks[index] = \
+                            ui.checkbox(item["attire"], value=item["pre_tick"]) \
+                            .props('dense') \
+                            .classes('flex-1 min-w-0 text-xs font-semibold '
+                                     'text-slate-800 leading-tight '
+                                     'whitespace-normal') \
+                            .on_value_change(lambda _: refresh_store_button())
                         if item["unnamed"]:
                             ui.label('unnamed').classes(
                                 'text-[9px] font-bold uppercase tracking-wider '
@@ -287,11 +358,6 @@ def open_clothing_dialog(project: Project, char: Character, *,
                         else:
                             ui.label(item["character"]).classes(
                                 'text-[11px] font-bold text-slate-600 shrink-0 mt-0.5')
-                        # Wraps rather than truncates: a cut-off outfit is the one
-                        # thing on this row the user has to be able to read in full.
-                        ui.label(item["attire"]).classes(
-                            'text-xs text-slate-800 font-semibold min-w-0 leading-tight')
-                        ui.element('div').classes('flex-1 min-w-0')
                         ui.label(f'ch {item["chapter"]} · sh {item["shot"]}').classes(
                             'text-[9px] text-slate-400 shrink-0 mt-1')
                         if item["when"] == "earlier":
@@ -306,6 +372,7 @@ def open_clothing_dialog(project: Project, char: Character, *,
                                 'rounded px-1 shrink-0 mt-0.5')
                     ui.label(f'"{item["quote"]}"').classes(
                         'text-[10px] text-slate-500 leading-snug pl-6')
+        refresh_store_button()
         if others:
             # One heading per person. The flat list read as "Nynaeve appears three
             # times", which looks like a bug rather than three different items.
@@ -327,9 +394,6 @@ def open_clothing_dialog(project: Project, char: Character, *,
                             'text-[10px] text-slate-500 leading-snug pl-2')
                         ui.label(f'"{item["quote"]}"').classes(
                             'text-[9px] text-slate-400 leading-snug pl-4')
-        preselect = next((index for index, item in enumerate(target)
-                          if item["pre_tick"]), None)
-        select(preselect)
 
     async def do_search() -> None:
         if run_state["running"]:
@@ -339,6 +403,7 @@ def open_clothing_dialog(project: Project, char: Character, *,
         run_state["searched"] = dict(here)
         run_button.disable()
         apply_button.disable()
+        row_checks.clear()
         results.clear()
         with results:
             ui.label('Searching the passages around this position…').classes(
@@ -389,33 +454,28 @@ def open_clothing_dialog(project: Project, char: Character, *,
             f"{offered} offered for this character.")
         render_mentions()
         position_label.set_text(
-            position_label.text + f" {len(row_marks)} row(s) drawn.")
+            position_label.text + f" {len(row_checks)} row(s) drawn.")
         state.add_console_log(
             f"[Clothing] {char.name} at ch {searched[0]} / sh {searched[1]}: "
             f"{len(run_state['mentions'])} mention(s)")
 
-    def ticked_index() -> Optional[int]:
-        """The row the user picked, or None. Nothing but select() writes this."""
-        return run_state.get("selected")
-
     async def do_apply() -> None:
-        index = ticked_index()
-        if index is None:
-            if run_state["mentions"]:
-                ui.notify("Pick the outfit you want to store first.", type="info")
-            return
         if run_state["running"]:
             return
-        target = [item for item in run_state["mentions"] if item["selectable"]]
-        if index >= len(target):
+        chosen = ticked_mentions()
+        if not chosen:
+            if run_state["mentions"]:
+                ui.notify("Tick at least one of the outfits above.", type="info")
             return
-        item = target[index]
+        # Every ticked mention is stored as one outfit at the same position: the
+        # passages often split a single look ("a coat" here, "breeches" there).
+        attire = describe_storage(chosen)
         target_row = run_state.get("target") or {}
         run_state["running"] = True
         apply_button.disable()
         try:
             outcome = clothing_lookup.apply_attire(
-                project.id, char.id, target_row.get("event_id"), item["attire"])
+                project.id, char.id, target_row.get("event_id"), attire)
         except Exception as ex:                              # noqa: BLE001
             run_state["running"] = False
             apply_button.enable()
@@ -437,7 +497,7 @@ def open_clothing_dialog(project: Project, char: Character, *,
         else:
             verb = (f"updated the change at chapter {where.get('chapter')}, "
                     f"shot {where.get('shot')}, {_distance_words(where.get('distance') or {})}")
-        text = f"{verb}: {item['attire']}"
+        text = f"{verb}: {attire}"
         if outcome.get("replaced"):
             text += f" (was: {outcome['replaced']})"
         if outcome.get("events"):
@@ -479,8 +539,9 @@ def open_clothing_dialog(project: Project, char: Character, *,
             with banner:
                 banner_label = ui.label('').classes(
                     'text-[10px] text-amber-800 leading-tight')
-                ui.button('Search from the scene on screen instead', color=None,
-                          on_click=use_active_scene) \
+                use_scene_button = ui.button(
+                    'Search from the scene on screen instead', color=None,
+                    on_click=use_active_scene) \
                     .props('flat dense no-caps') \
                     .classes('text-[10px] font-bold text-amber-800 px-0 py-0')
                 # What storing will actually touch. A change point is data the user
@@ -527,11 +588,17 @@ def open_clothing_dialog(project: Project, char: Character, *,
             with ui.column().classes('gap-0 flex-1 min-w-0'):
                 progress = ui.label('Ready.').classes(
                     'text-[11px] text-slate-600 leading-tight truncate')
-                ui.label('One outfit per position. A stored value holds until the '
-                         'next change.').classes(
+                ui.label('One outfit per position: every ticked mention is stored '
+                         'together as one look. It holds until the next change.').classes(
                     'text-[10px] text-slate-400 leading-tight')
 
         refresh_position_text()
     dialog.open()
-    if initial_search:
+    # Search on its own when the change in force is right here. That is the case
+    # where the user has already decided - they just added the change, or the outfit
+    # they want is the one on screen - and only needs the passages read. Further back
+    # the dialog waits for a click, because a search is a model call and its answer
+    # may belong at a change that does not exist yet.
+    if initial_search or (auto_search
+                          and _change_is_here(run_state.get("target") or {})):
         asyncio.create_task(do_search())

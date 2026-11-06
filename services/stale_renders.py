@@ -147,10 +147,18 @@ def change_scope(change: Dict[str, Any], *, events: Sequence[CharacterTimelineEv
                 "only_book": only_book}
 
     new_norm = (change.get("value") or "").strip().lower()
+    # The boundary is the *earliest* later event that disagrees, so the events
+    # have to be walked in reading order. The query returns them roughly by id,
+    # which is insertion order and has nothing to do with the story: scanning
+    # that raw list stopped at whichever later volume happened to be inserted
+    # first, so an edit in a prequel was ended by a chapter in a book several
+    # volumes on and offered every image in between.
+    ordered = sorted(
+        (event for event in events if event.book_id is not None),
+        key=lambda event: _reading_key(order_map, event.book_id,
+                                       event.chapter_num, event.shot_num))
     end = None
-    for event in events:
-        if event.book_id is None:
-            continue
+    for event in ordered:
         if event.book_id in side_books and event.book_id != change["book_id"]:
             continue            # invisible to this book, so it cannot end the span
         key = _reading_key(order_map, event.book_id, event.chapter_num, event.shot_num)

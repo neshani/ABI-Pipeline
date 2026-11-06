@@ -690,11 +690,14 @@ class QuickCharactersModal:
                          'empty traits start ticked, existing ones do not.')
 
             def open_clothing() -> None:
-                """Clothing is a position, not a profile: search where the change is.
+                """Clothing is a position, not a profile: search the scene on screen.
 
-                The position defaults to the timeline state being edited, because
-                that is the row an attire value would apply from; with the Base
-                selected there is no position, so the scene on screen stands in.
+                The position defaults to the scene on screen, because that is what
+                the user is looking at and what they came here to dress. It used to
+                default to the selected timeline state - which is the last change at
+                or before this scene, so a different chapter and shot, and a value
+                nobody chose or could see. Storing still goes into the change the
+                position resolves to; the scene is only where the search starts.
                 """
                 from ui import state
                 if char.locked:
@@ -703,14 +706,10 @@ class QuickCharactersModal:
                     return
                 active_chapter = int(float(getattr(state, 'book_active_chapter', 1)))
                 active_shot = int(float(getattr(state, 'book_active_scene', 1)))
-                if current_ev is not None and current_ev.book_id is not None:
-                    where = (current_ev.book_id, int(current_ev.chapter_num or 1),
-                             int(current_ev.shot_num or 0))
-                else:
-                    where = (self.book_id, active_chapter, active_shot)
                 open_clothing_dialog(
-                    self.project, char, book_id=where[0], chapter=where[1],
-                    shot=where[2], active_book_id=self.book_id,
+                    self.project, char, book_id=self.book_id,
+                    chapter=active_chapter,
+                    shot=active_shot, active_book_id=self.book_id,
                     active_chapter=active_chapter, active_shot=active_shot,
                     refresh_callback=refresh_after_lookup,
                     on_applied=lambda fields, position:
