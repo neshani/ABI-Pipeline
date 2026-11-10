@@ -1089,9 +1089,9 @@ def render_book_tabs(book_id: int):
         if modal_subtitle_el:
             if is_history:
                 step_str = f"{history_offset} step back" if history_offset == 1 else f"{history_offset} steps back"
-                modal_subtitle_el.set_text(f"Viewing History ({step_str}) • Press [F] to return to review queue")
+                modal_subtitle_el.set_text(f"Viewing history ({step_str}) • [F] to return")
             else:
-                modal_subtitle_el.set_text(f"Review Scene: {theater_cursor + 1} of {len(theater_queue)} remaining")
+                modal_subtitle_el.set_text(f"{theater_cursor + 1} of {len(theater_queue)} in queue")
 
         if modal_badge_missing:
             modal_badge_missing.visible = not img_url
@@ -2003,11 +2003,15 @@ def render_book_tabs(book_id: int):
                         modal_badge_review = ui.badge("Needs Review", color="amber").classes('absolute top-4 left-4 font-bold text-xs')
                         
                 with ui.column().classes('w-full h-full gap-4 overflow-y-auto min-h-0 flex-nowrap pr-1'):
-                    with ui.row().classes('w-full items-center justify-between border-b pb-2 flex-shrink-0'):
-                        with ui.column().classes('gap-0'):
-                            modal_title_el = ui.label("").classes('text-base font-bold text-slate-800 leading-none')
-                            modal_subtitle_el = ui.label("").classes('text-[11px] text-slate-400 mt-1')
-                        with ui.row().classes('items-center gap-1'):
+                    # The header is one line by design: flex-nowrap plus min-w-0 on the
+                    # text block means a long "Chapter N, Scene N" / queue line truncates
+                    # instead of wrapping the icon row onto a second line, which used to
+                    # push every control below it down.
+                    with ui.row().classes('w-full items-center justify-between gap-2 border-b pb-2 flex-shrink-0 flex-nowrap min-w-0'):
+                        with ui.column().classes('gap-0 min-w-0 flex-1'):
+                            modal_title_el = ui.label("").classes('w-full text-base font-bold text-slate-800 leading-none truncate')
+                            modal_subtitle_el = ui.label("").classes('w-full text-[11px] text-slate-400 mt-1 truncate')
+                        with ui.row().classes('items-center gap-1 flex-shrink-0 flex-nowrap'):
                             # Regen Images: the workspace toolbar's Regen, reachable
                             # without closing the modal. Deleted/unapproved scenes
                             # render in the background and pop into this view.
