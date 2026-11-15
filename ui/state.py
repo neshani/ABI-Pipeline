@@ -16,6 +16,12 @@ needs_restart: bool = False  # Set to True when native binaries are installed on
 active_project_tab: str = 'Dashboard'
 active_book_tab: str = 'Dashboard'
 
+# Opening a volume's workspace rebuilds the whole layout and needs the browser
+# client as well as a header refresh, so the router stays in ``main.py``. It
+# registers itself here at import time: the project dashboard needs to open a
+# book from a row, and ``ui/`` must not import ``main``.
+select_book_cb: Optional[Any] = None
+
 # Directory filters / sorting
 search_query: str = ""
 selected_sort: str = "Most Recent"

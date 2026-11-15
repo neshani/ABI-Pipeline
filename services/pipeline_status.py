@@ -19,6 +19,7 @@ stage, it is planned inline by prompt generation.
 """
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -40,10 +41,18 @@ def _state(state: str, detail: str = "", **extra) -> Dict:
 
 
 def _count_rows(path: Path) -> int:
-    """Data rows in a pipe-delimited csv, without parsing it."""
+    """Data records in a pipe-delimited csv.
+
+    Counted as csv records, not physical lines. ``prompt`` is free text, and a
+    model that answered with an error message writes its newlines into the
+    column, so a line count reports one row too many - which then reads as an
+    image that will never render ("349/350" for a volume whose images are
+    complete).
+    """
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-            return max(0, sum(1 for line in fh if line.strip()) - 1)
+        with open(path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
+            reader = csv.reader(fh, delimiter="|")
+            return max(0, sum(1 for row in reader if row) - 1)
     except Exception:
         return 0
 

@@ -1429,6 +1429,7 @@ def start_image_generation(project_id: int):
 # Register global pipeline control callbacks onto state to prevent circular imports
 state.start_image_generation_cb = start_image_generation
 state.stop_image_generation_cb = stop_transcribing
+state.select_book_cb = select_book
 
 
 # --- Dynamic WebSocket State-Updater (No full page refreshes!) ---

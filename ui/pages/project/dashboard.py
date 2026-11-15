@@ -486,6 +486,14 @@ def render_pipeline_table(project, ordered_books, rows_by_id, dirs_by_id,
     """
     from services import pipeline_status
 
+    def open_book_workspace(book_id: int) -> None:
+        """Open this volume's workspace, the same way the sidebar does."""
+        callback = getattr(state, "select_book_cb", None)
+        if callback is None:
+            ui.notify("Book workspace navigation is unavailable.", type="warning")
+            return
+        callback(book_id)
+
     def move_book(book_id: int, delta: int) -> None:
         ids = [b.id for b in ordered_books]
         index = ids.index(book_id)
@@ -567,7 +575,11 @@ def render_pipeline_table(project, ordered_books, rows_by_id, dirs_by_id,
 
                 with ui.row().classes('flex-1 items-center gap-2 min-w-0'):
                     ui.label(f"{position}.").classes('text-[9px] text-slate-400 w-4 text-right')
-                    ui.label(b.name).classes('text-[11px] font-medium text-slate-700 truncate')
+                    ui.label(b.name).classes(
+                        'text-[11px] font-medium text-slate-700 truncate cursor-pointer '
+                        'hover:text-blue-700 hover:underline') \
+                        .tooltip("Open this volume's workspace") \
+                        .on('click', lambda _, bid=b.id: open_book_workspace(bid))
                     if getattr(b, "is_side_story", False):
                         ui.label('side').classes(
                             'text-[8px] font-bold uppercase tracking-wide bg-violet-100 '
