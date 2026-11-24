@@ -1463,7 +1463,8 @@ def render_book_tabs(book_id: int):
             ui.notify("Could not re-derive this scene's passage from transcript.txt.", type="negative")
             return
 
-        request_text = prompt_library.render_with_selection(role, chunk, prompt_library.active_selection())
+        request_text = prompt_library.render_with_selection(
+            role, chunk, prompt_library.active_selection(project_name, book_name))
         llm_url = get_setting("llm_url", "http://127.0.0.1:11434")
         model_name = get_setting("llm_model", "local-model")
 

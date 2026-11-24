@@ -783,7 +783,7 @@ async def start_project_prompt_gen(project_id: int,
             from services import prompt_library as prompt_lib
             from services import shot_planner
             shot_mode = prompt_lib.get_shot_mode(project_name, book_name)
-            selection = prompt_lib.active_selection()
+            selection = prompt_lib.active_selection(project_name, book_name)
             shot_map = {}
             focus_map = {}
             place_map = {}

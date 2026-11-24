@@ -19,6 +19,7 @@ selected from its own active variant, like the roles.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -260,16 +261,81 @@ def clear_shot_mode(project_name: str, book_name: str) -> None:
         marker.unlink()
 
 
+# --- per-book variant pins -------------------------------------------------
+
+# A volume may pin its own variant for any slot: a first-person narrator that
+# only one book has, or a house style that does not belong to the others. The
+# global setting stays the project-wide default; this file is the exception. It
+# lives beside the book's other per-book markers (``.shot_mode``) rather than in
+# the database, because it describes this one transcript's prose.
+VARIANTS_FILENAME = "prompt_variants.json"
+
+
+def variants_path(project_name: str, book_name: str) -> Path:
+    base = Path(get_setting("output_dir", "./output")).resolve()
+    return base / project_name / book_name / VARIANTS_FILENAME
+
+
+def get_book_variants(project_name: str, book_name: str) -> Dict[str, str]:
+    """``{slot: variant}`` pinned for this book; empty when it inherits.
+
+    An unknown slot or a variant that does not exist is ignored rather than
+    raised. ``read_variant`` returns "" for a missing file, so a typo would
+    otherwise produce a prompt with no role fragment at all - a shared block
+    with no shot rules - and nothing would say why. This is the only place that
+    mistake can be caught before it reaches the model.
+    """
+    path = variants_path(project_name, book_name)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    pinned: Dict[str, str] = {}
+    for slot, variant in data.items():
+        variant = str(variant or "").strip()
+        if slot in EDIT_SLOTS and variant in list_variants(slot):
+            pinned[slot] = variant
+    return pinned
+
+
+def set_book_variants(project_name: str, book_name: str,
+                      variants: Dict[str, str]) -> Path:
+    """Pin variants for one book. An empty mapping drops the file."""
+    path = variants_path(project_name, book_name)
+    pinned = {slot: str(v).strip() for slot, v in variants.items()
+              if slot in EDIT_SLOTS and str(v).strip() in list_variants(slot)}
+    if not pinned:
+        if path.exists():
+            path.unlink()
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(pinned, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8")
+    return path
+
+
 # --- run-time selection snapshot -------------------------------------------
 
-def active_selection() -> Dict[str, str]:
+def active_selection(project_name: Optional[str] = None,
+                     book_name: Optional[str] = None) -> Dict[str, str]:
     """Snapshot of the active variant for every slot.
 
     Taken once at the start of a book's run so a variant change made mid-run
     cannot split that book between two prompt versions. Nothing is persisted -
     the next run picks up whatever is active then.
+
+    A book's own ``prompt_variants.json`` overrides the global choice for the
+    slots it pins, so a prompt written for one book's prose belongs to that book
+    instead of to every book until someone remembers to switch it back.
     """
-    return {slot: get_active_variant(slot) for slot in EDIT_SLOTS}
+    selection = {slot: get_active_variant(slot) for slot in EDIT_SLOTS}
+    if project_name and book_name:
+        selection.update(get_book_variants(project_name, book_name))
+    return selection
 
 
 _FOCUS_FALLBACK = "the most memorable moment in the passage"

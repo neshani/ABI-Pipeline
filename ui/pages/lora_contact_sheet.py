@@ -103,7 +103,17 @@ def init_lora_library():
             if "favorite" not in row:
                 row["favorite"] = "False"
                 needs_migration = True
-                
+
+            # Migration: rows written before multi-LoRA workflows existed carry no
+            # target node at all; one written while the choice was per-entry carries
+            # it in a `lora_node` column. The choice belongs to the workflow, so fold
+            # any such value into that setting and drop the column.
+            if "lora_node" in row:
+                legacy_node = str(row.pop("lora_node") or "").strip()
+                if legacy_node and not workflow_targets().get(row.get("workflow", "")):
+                    set_workflow_target(row.get("workflow", ""), legacy_node)
+                needs_migration = True
+
             rows.append(row)
             
     state.lora_library = rows
@@ -135,6 +145,11 @@ def parse_and_add_loras(raw_text: str, default_strength: float, dialog: Any):
     workflow = state.lora_tool_selected_workflow
     if workflow == "None":
         ui.notify("Error: No base workflow selected.", type="negative")
+        return
+
+    # Adding is pointless before the workflow says which LoRA its benchmarks replace.
+    if not resolve_lora_node(workflow):
+        ui.notify(lora_target_warning(workflow) or f"No LoRA loader found in {workflow}.", type="warning")
         return
 
     new_entries = []
@@ -191,6 +206,106 @@ def get_lora_workflows() -> list[str]:
     return sorted(list(set(valid_workflows)))
 
 
+# --- LoRA TARGET RESOLUTION ---
+# A workflow can stack several LoRA loaders (a helper/adapter LoRA plus the style
+# LoRA being benchmarked). Which one this tool replaces is not guessable from the
+# filename, and it is a property of the workflow - every entry benchmarked through
+# it swaps out the same node - so it is stored once per workflow, not per entry.
+WORKFLOW_TARGETS_PATH = LORA_LIB_DIR / "workflow_targets.json"
+_WORKFLOW_LORA_CACHE: Dict[str, Any] = {}
+_workflow_targets: Optional[Dict[str, str]] = None
+
+
+def workflow_lora_nodes(workflow_name: str) -> List[Dict[str, Any]]:
+    """Every LoRA loader in a workflow, in file order, with the settings it currently holds."""
+    if not workflow_name or workflow_name == "None":
+        return []
+    for folder in ["./workflows", "./Comfy_Workflows"]:
+        wf_path = Path(folder) / workflow_name
+        if not wf_path.exists():
+            continue
+        try:
+            mtime = wf_path.stat().st_mtime
+            cached = _WORKFLOW_LORA_CACHE.get(workflow_name)
+            if cached and cached[0] == mtime:
+                return cached[1]
+
+            with open(wf_path, "r", encoding="utf-8") as f:
+                wf_json = json.load(f)
+            discovered = ComfyClient("").analyze_workflow(wf_json)
+            nodes = [
+                {
+                    "id": node_id,
+                    "lora_name": data["params"].get("lora_name", ""),
+                    "strength": data["params"].get("strength_model", 1.0),
+                }
+                for node_id, data in discovered.items()
+                if data.get("type") == "lora_loader"
+            ]
+            _WORKFLOW_LORA_CACHE[workflow_name] = (mtime, nodes)
+            return nodes
+        except Exception:
+            return []
+    return []
+
+
+def lora_node_label(node: Dict[str, Any]) -> str:
+    name = Path(node["lora_name"]).name or "(nothing loaded)"
+    return f"{name}  ·  strength {float(node['strength']):.2f}  ·  node {node['id']}"
+
+
+def workflow_targets() -> Dict[str, str]:
+    """The loader node each workflow's benchmarks replace, keyed by workflow filename."""
+    global _workflow_targets
+    if _workflow_targets is None:
+        _workflow_targets = {}
+        try:
+            if WORKFLOW_TARGETS_PATH.exists():
+                raw = json.loads(WORKFLOW_TARGETS_PATH.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    _workflow_targets = {str(k): str(v) for k, v in raw.items() if v}
+        except Exception:
+            _workflow_targets = {}
+    return _workflow_targets
+
+
+def set_workflow_target(workflow_name: str, node_id: str) -> None:
+    workflow_targets()[workflow_name] = node_id
+    try:
+        WORKFLOW_TARGETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        WORKFLOW_TARGETS_PATH.write_text(
+            json.dumps(workflow_targets(), indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except Exception as e:
+        state.add_console_log(f"[LoRA-Library] Could not save workflow target: {str(e)}")
+
+
+def resolve_lora_node(workflow_name: str) -> Optional[str]:
+    """The loader node this workflow's benchmarks replace, or None when it is not decided."""
+    candidate_ids = [n["id"] for n in workflow_lora_nodes(workflow_name)]
+    if not candidate_ids:
+        return None
+
+    stored = (workflow_targets().get(workflow_name) or "").strip()
+    if stored and stored in candidate_ids:
+        return stored
+    if len(candidate_ids) == 1:
+        return candidate_ids[0]
+    return None
+
+
+def lora_target_warning(workflow_name: str) -> str:
+    """Empty string when the workflow's target is unambiguous, otherwise what to do about it."""
+    nodes = workflow_lora_nodes(workflow_name)
+    if len(nodes) < 2 or resolve_lora_node(workflow_name):
+        return ""
+    stored = (workflow_targets().get(workflow_name) or "").strip()
+    if stored:
+        return (f"Node {stored} is no longer in {workflow_name}, which has {len(nodes)} LoRA "
+                f"loaders — choose which one to replace.")
+    return f"{workflow_name} has {len(nodes)} LoRA loaders — choose which one to replace."
+
+
 # --- ASYNC EXECUTION ENGINE ---
 async def run_benchmark_task(lora_ids: List[str]):
     state.lora_tool_generating = True
@@ -230,11 +345,22 @@ async def run_benchmark_task(lora_ids: List[str]):
                 continue
                 
             discovered = client.analyze_workflow(wf_json)
-            lora_node_id = next((n_id for n_id, data in discovered.items() if data["type"] == "lora_loader"), None)
-            
-            if not lora_node_id:
+            candidate_ids = [n_id for n_id, data in discovered.items() if data.get("type") == "lora_loader"]
+
+            if not candidate_ids:
                 ui.notify(f"No LoRA loader found in {lora['workflow']}!", type="negative")
                 lora["status"] = "Pending"
+                continue
+
+            lora_node_id = resolve_lora_node(lora["workflow"])
+            if lora_node_id not in candidate_ids:
+                # Replacing "whichever node came first" is how the wrong LoRA used to be
+                # overwritten, so an undecided workflow stops the run instead of guessing.
+                ui.notify(lora_target_warning(lora["workflow"]), type="negative")
+                lora["status"] = "Pending"
+                save_lora_library_full()
+                render_lora_sidebar.refresh()
+                render_lora_workspace.refresh()
                 continue
                 
             out_dir = LORA_LIB_DIR / lora_id
@@ -637,10 +763,45 @@ def render_lora_sidebar():
         render_lora_workspace.refresh()
 
     ui.select(options=workflows, value=state.lora_tool_selected_workflow, on_change=on_workflow_change).classes('w-full mb-2')
+
+    # One decision for the whole workflow: every entry benchmarked through it swaps
+    # out the same loader, so the picker sits here rather than on each LoRA row.
+    workflow_nodes = workflow_lora_nodes(state.lora_tool_selected_workflow)
+    workflow_target = resolve_lora_node(state.lora_tool_selected_workflow)
+    workflow_target_warning = lora_target_warning(state.lora_tool_selected_workflow)
+
+    if workflow_nodes and state.lora_tool_selected_workflow != "None":
+        if len(workflow_nodes) > 1:
+            def on_target_change(e):
+                if state.lora_tool_generating:
+                    ui.notify("Cannot change the replacement while generating.", type="warning")
+                    e.sender.value = workflow_target
+                    return
+                if e.value:
+                    set_workflow_target(state.lora_tool_selected_workflow, e.value)
+                render_lora_sidebar.refresh()
+                render_lora_workspace.refresh()
+
+            with ui.column().classes('w-full gap-0 mt-1 mb-2'):
+                ui.label('LoRA to Replace').classes('text-xs font-bold text-slate-400 uppercase tracking-wider')
+                # Shown as radios rather than a dropdown so both candidates are readable
+                # without opening anything - this is the one choice you make per workflow.
+                ui.radio(
+                    {n["id"]: lora_node_label(n) for n in workflow_nodes},
+                    value=workflow_target,
+                    on_change=on_target_change,
+                ).props('dense').classes('w-full text-xs gap-0')
+                if workflow_target_warning:
+                    with ui.row().classes('w-full items-start gap-1 mt-1 flex-nowrap'):
+                        ui.icon('warning', size='xs').classes('text-amber-600 mt-0.5 flex-shrink-0')
+                        ui.label(workflow_target_warning).classes('text-xs text-amber-700 min-w-0')
+        else:
+            ui.label(f'Replaces the only LoRA: {Path(workflow_nodes[0]["lora_name"]).name or "(nothing loaded)"}').classes('text-xs text-slate-400 mb-2 truncate w-full')
     
     with ui.dialog() as add_lora_dialog, ui.card().classes('w-full max-w-2xl p-6 rounded-xl'):
         ui.label('Add LoRAs to Benchmark').classes('text-xl font-bold text-slate-800 mb-2')
         ui.label('Paste your LoRA paths and triggers. Format: path | trigger_words | [optional_strength]').classes('text-sm text-slate-500 mb-4')
+
         raw_text = ui.textarea(placeholder='SDXL\\zyd232.safetensors | zydink, ink sketch\nSDXL\\50sNoir.safetensors | 50s Noir, detective | 0.8').classes('w-full h-48')
         with ui.row().classes('w-full items-center gap-4 mt-4 bg-slate-50 p-4 rounded-lg border'):
             ui.icon('tune', size='sm').classes('text-slate-400')
@@ -652,7 +813,10 @@ def render_lora_sidebar():
             
         with ui.row().classes('w-full justify-end gap-3 mt-4'):
             ui.button('Cancel', on_click=add_lora_dialog.close).props('flat color=slate')
-            ui.button('Parse & Add', on_click=lambda: parse_and_add_loras(raw_text.value, default_strength.value, add_lora_dialog)).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold px-6')
+            ui.button(
+                'Parse & Add',
+                on_click=lambda: parse_and_add_loras(raw_text.value, default_strength.value, add_lora_dialog)
+            ).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold px-6')
 
     if state.lora_tool_selected_workflow != "None" and not state.lora_tool_generating:
         ui.button('Add LoRAs', icon='add', on_click=add_lora_dialog.open).classes('w-full bg-blue-600 hover:bg-blue-700 text-white font-bold mb-2')
@@ -733,6 +897,10 @@ def render_lora_workspace():
     if clean_triggers == "." or not clean_triggers:
         clean_triggers = "(No trigger words)"
 
+    target_nodes = workflow_lora_nodes(active_lora["workflow"])
+    target_node_id = resolve_lora_node(active_lora["workflow"])
+    target_node = next((n for n in target_nodes if n["id"] == target_node_id), None)
+
     with ui.column().classes('w-full gap-4'):
         with ui.card().classes('w-full bg-white border rounded-xl p-4 shadow-sm gap-2'):
             # Beautiful flex layout utilizing flex-nowrap to prevent the right action cluster wrapping below
@@ -744,6 +912,17 @@ def render_lora_workspace():
                         ui.label(f'Triggers: {clean_triggers}').classes('truncate max-w-md')
                         ui.label('•')
                         ui.label(f'Strength: {float(active_lora["strength"]):.2f}').classes('flex-shrink-0')
+                    with ui.row().classes('items-center gap-2 text-xs text-slate-500 flex-wrap'):
+                        ui.icon('swap_horiz', size='xs').classes('flex-shrink-0')
+                        if target_node:
+                            ui.label(
+                                f'Replaces node {target_node["id"]}: '
+                                f'{Path(target_node["lora_name"]).name or "(nothing loaded)"}'
+                            ).classes('truncate max-w-md')
+                        elif target_nodes:
+                            ui.label('No replacement chosen for this workflow — set it under the workflow picker').classes('text-amber-700 font-bold')
+                        else:
+                            ui.label('No LoRA loader found in this workflow').classes('text-rose-600 font-bold')
                 
                 with ui.row().classes('items-center gap-2 flex-shrink-0'):
                     if not state.lora_tool_generating:
