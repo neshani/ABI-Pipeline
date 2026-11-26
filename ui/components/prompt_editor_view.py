@@ -780,8 +780,24 @@ def render_prompt_editor_view(
                 return
                 
         scene["prompt"] = prompt_val
+        quote_changed = quote_val != original_loaded_values["quote"]
         scene["quote"] = quote_val
-        
+
+        # A quote anchors its row in the audio, so a new quote needs its own
+        # timestamp. Without this the row keeps the old quote's time and the
+        # image lands wherever the previous passage was.
+        if quote_changed:
+            from services.timing_sync import retime_quote
+            stamp, how = retime_quote(
+                project.name, book.name, scene.get("chapter", "1"), quote_val)
+            if stamp:
+                scene["timestamp"] = stamp
+                if how == "chapter":
+                    state.add_console_log(
+                        f"[Editor] Edited quote for Ch {scene.get('chapter')}, "
+                        f"Scene {scene.get('shot')} could not be located in the "
+                        f"transcript; timing fell back to chapter position {stamp}.")
+
         save_prompts_csv(project.name, book.name, prompts_list)
         register_new_tags_from_text(prompt_val)
         

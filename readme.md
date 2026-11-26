@@ -115,7 +115,7 @@ ABI-Pipeline acts as an orchestrator. It does not need to run on the same physic
    * **Windows:** Run `start.bat` to launch the NiceGUI interface.
    * **Linux/macOS:** Run `start.sh`.
 
-Once launched, open your web browser and navigate to `http://127.0.0.1:8910` to access the pipeline interface.
+Once launched, open your web browser and navigate to `http://127.0.0.1:8910` to access the pipeline interface. The port is printed in the console window at startup, and can be changed under **Settings → Web Interface** if something else on your machine already occupies 8910 — restart the app to apply it.
 
 ---
 

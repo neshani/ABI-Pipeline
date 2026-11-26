@@ -842,7 +842,18 @@ def save_prompt_occurrence(project_name: str, book_name: str, global_row_index: 
             
             rows[global_row_index][quote_key] = new_quote
             rows[global_row_index][prompt_key] = new_prompt
-            
+
+            # The quote is the row's anchor in the audio: retime it, or the row
+            # keeps a timestamp belonging to a passage it no longer shows. A
+            # missing timestamp column is left alone rather than added here.
+            if new_quote and "timestamp" in fieldnames:
+                from services.timing_sync import retime_quote
+                stamp, _how = retime_quote(
+                    project_name, book_name,
+                    rows[global_row_index].get("chapter", "1"), new_quote)
+                if stamp:
+                    rows[global_row_index]["timestamp"] = stamp
+
             with open(csv_path, "w", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="|")
                 writer.writeheader()

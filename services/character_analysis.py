@@ -51,7 +51,6 @@ from database.models import (Book, Character, CharacterAlias, CharacterBookLink,
 from services import scene_map
 from services import checkpoints
 from services import pipeline_manifest
-from services import llm_config
 from services import trait_vocab
 from services.character_manager import (NEW_TRAIT_FIELDS, RENDERED_TRAIT_FIELDS,
                                         normalize_character_text,
@@ -1457,15 +1456,11 @@ async def analyse_book_text(book_name: str, sentences: Sequence[str],
     re-extract cheap - and, more importantly, keeps the quotes the new facts are
     allowed to cite the same ones the old facts cited.
 
-    Per-stage model overrides (``llm_config``) apply on top of ``model``, which
-    stays the fallback so a caller can still pin one model for everything.
+    ``model`` serves every stage of the analysis; the caller pins one model for
+    the whole run.
     """
     say = log or (lambda *_a, **_k: None)
     stages = set(stages) if stages is not None else {"gather", "refname", "extract"}
-    chosen = llm_config.overrides()
-
-    def model_for(stage: str) -> str:
-        return chosen.get(stage) or model
 
     chapters = scene_map.chapter_of_unit(sentences)
     groups = scene_map.group_scenes(scenes, sentences, chapters=chapters)
@@ -1476,14 +1471,14 @@ async def analyse_book_text(book_name: str, sentences: Sequence[str],
         if book_dir and scene_map_sha:
             checkpoints.reset_if_stale(book_dir, "gather", scene_map_sha)
         gather = await gather_book(book_name, sentences, scenes, groups, chapters,
-                                   llm_url, model_for("gather"), window_words, log,
+                                   llm_url, model, window_words, log,
                                    book_dir=book_dir, checkpoint_sha=scene_map_sha,
                                    should_cancel=should_cancel)
     if "refname" in stages:
         if book_dir and scene_map_sha:
             checkpoints.reset_if_stale(book_dir, "refname", scene_map_sha)
         gather = await resolve_references(book_name, gather, groups, sentences,
-                                          chapters, llm_url, model_for("refname"), log,
+                                          chapters, llm_url, model, log,
                                           book_dir=book_dir,
                                           checkpoint_sha=scene_map_sha,
                                           should_cancel=should_cancel)
@@ -1503,8 +1498,8 @@ async def analyse_book_text(book_name: str, sentences: Sequence[str],
     if book_dir:
         checkpoints.reset_if_stale(book_dir, "extract", gather_sha)
     extracted = await extract_book(book_name, gather, groups, chapters, sentences,
-                                   llm_url, model_for("extract"), log,
-                                   sex_model=model_for("sex"),
+                                   llm_url, model, log,
+                                   sex_model=model,
                                    book_dir=book_dir, checkpoint_sha=gather_sha,
                                    should_cancel=should_cancel)
     result.update({
@@ -2205,10 +2200,6 @@ async def run_book_analysis(project_id: int, book_id: int, llm_url: str,
     """
     say = log or (lambda *_a, **_k: None)
     stages = set(stages) if stages is not None else {"gather", "refname", "extract"}
-    chosen = llm_config.overrides()
-
-    def model_for(stage: str) -> str:
-        return chosen.get(stage) or model
 
     with Session(engine) as session:
         project = session.get(Project, project_id)
@@ -2291,13 +2282,13 @@ async def run_book_analysis(project_id: int, book_id: int, llm_url: str,
                 inputs={"transcript_sha": transcript_sha,
                         "scene_map_sha": scene_map_sha,
                         "window_words": window},
-                model=model_for("gather"),
+                model=model,
                 prompt_sha=pipeline_manifest.digest(GATHER_PROMPT))
         if "refname" in stages:
             pipeline_manifest.record_stage(
                 book_path, "refname", version=1,
                 inputs={"gather_sha": gather_sha},
-                model=model_for("refname"),
+                model=model,
                 prompt_sha=pipeline_manifest.digest(REFNAME_PROMPT))
     except Exception as ex:  # provenance must never fail a run
         say(f"[Analysis] {book_name}: provenance not recorded ({ex})")
@@ -2320,7 +2311,7 @@ async def run_book_analysis(project_id: int, book_id: int, llm_url: str,
             inputs={"gather_sha": gather_sha,
                     "scene_map_sha": scene_map_sha,
                     "quote_cap": EXTRACT_QUOTE_CAP},
-            model=model_for("extract"),
+            model=model,
             prompt_sha=pipeline_manifest.digest(
                 EXTRACT_PROMPT + FIELDS_BLOCK + SINK_BLOCK))
         if (payload.get("counts", {}).get("sex-llm")
@@ -2328,7 +2319,7 @@ async def run_book_analysis(project_id: int, book_id: int, llm_url: str,
             pipeline_manifest.record_stage(
                 book_path, "sex", version=1,
                 inputs={"gather_sha": gather_sha},
-                model=model_for("sex"),
+                model=model,
                 prompt_sha=pipeline_manifest.digest(SEX_PROMPT))
     except Exception as ex:
         say(f"[Analysis] {book_name}: provenance not recorded ({ex})")

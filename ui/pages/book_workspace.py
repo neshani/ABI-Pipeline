@@ -1511,12 +1511,26 @@ def render_book_tabs(book_id: int):
         new_quote = (parsed.get("quote") or "").strip()
         if new_quote:
             row["quote"] = new_quote
+            # The quote is what anchors this row in the audio, so it has to take
+            # its timestamp with it. Saving the quote alone is what left a
+            # regenerated shot showing one passage while another was narrated.
+            from services.timing_sync import retime_quote
+            stamp, how = await asyncio.to_thread(
+                retime_quote, project_name, book_name, ch, new_quote)
+            if stamp:
+                row["timestamp"] = stamp
+                if how == "chapter":
+                    state.add_console_log(
+                        f"[Theater] New quote for Ch {ch}, Scene {sc} could not be "
+                        f"located in the transcript; timing fell back to chapter "
+                        f"position {stamp}.")
 
         save_prompts_csv(project_name, book_name, prompts)
 
         if (ch, sc) in grid_card_references:
             grid_card_references[(ch, sc)]["item"]["prompt"] = row["prompt"]
             grid_card_references[(ch, sc)]["item"]["quote"] = row.get("quote", "")
+            grid_card_references[(ch, sc)]["item"]["timestamp"] = row.get("timestamp", "")
 
         # Force the modal to reload the scene's text and narration context.
         loaded_scene_coords[0] = -1

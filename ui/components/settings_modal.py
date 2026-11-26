@@ -3,7 +3,6 @@ import asyncio
 import httpx
 import sys
 from database.connection import set_setting
-from services import llm_config
 from services.installer import (
     check_dependencies, 
     check_model_downloaded, 
@@ -11,6 +10,21 @@ from services.installer import (
     download_model_weights
 )
 from ui import state
+
+
+def _port_or_default(raw) -> int:
+    """A usable port from a stored value, or 8910 when it is not one.
+
+    The settings field is a number, but the stored value is JSON text, and a
+    hand-edited or half-written one must not break the settings dialog - which is
+    the only place the value can be fixed.
+    """
+    try:
+        port = int(float(raw))
+    except (TypeError, ValueError):
+        return 8910
+    return port if 1024 <= port <= 65535 else 8910
+
 
 async def fetch_llm_models(url: str, api_key: str = "") -> list[str]:
     """Queries standard local or remote endpoints for available model IDs."""
@@ -374,6 +388,9 @@ class SettingsModal:
 
     def save_and_close(self) -> None:
         """Saves values to DB and closes."""
+        # ui.number hands back a float, and the port is an integer everywhere
+        # else; an unusable value would keep the app from binding at all.
+        self.settings['app_port'] = _port_or_default(self.settings.get('app_port'))
         for k, v in self.settings.items():
             set_setting(k, v)
         ui.notify("Settings saved.", type="positive")
@@ -478,23 +495,6 @@ class SettingsModal:
                             on_click=self.refresh_llm_models
                         ).props('flat dense').classes('h-10 text-blue-600').tooltip('Scan Connection for Models')
 
-                    with ui.expansion('Per-stage model overrides', icon='tune')\
-                            .classes('w-full border rounded-lg'):
-                        with ui.column().classes('w-full p-2 gap-2'):
-                            ui.label(
-                                'Leave a stage blank to use the Target LLM Model above. '
-                                'Point the expensive stages at a larger or remote model '
-                                'and keep the rest local.'
-                            ).classes('text-[11px] text-slate-500 leading-normal')
-                            overrides = self.settings.setdefault('llm_stage_models', {})
-                            if not isinstance(overrides, dict):
-                                overrides = {}
-                                self.settings['llm_stage_models'] = overrides
-                            for stage, stage_label in llm_config.STAGES:
-                                overrides.setdefault(stage, '')
-                                ui.input(stage_label).bind_value(overrides, stage)\
-                                    .classes('w-full')
-
                     # How much text one analysis call may read. The word budget is
                     # the measured value; the context is a hard cap, because users
                     # bring their own model and a 12,000-word window does not fit
@@ -527,6 +527,24 @@ class SettingsModal:
                     ).bind_value(self.settings, 'vram_auto_switch').tooltip(
                         'Sends the ComfyUI cache-clear before an LLM request, and unloads the LLM before rendering.'
                     )
+
+            # The app is a local web server. These machines already run ComfyUI,
+            # an LLM host and a transcription server, so the port is a choice
+            # rather than a constant - but it is read once at startup, which
+            # makes it a restart-to-apply value, not a live one.
+            with ui.expansion('Web Interface', icon='web').classes('w-full border rounded-lg bg-slate-50/50'):
+                with ui.column().classes('w-full p-4 gap-2 bg-white'):
+                    ui.number(
+                        'Application Port',
+                        value=_port_or_default(self.settings.get('app_port', 8910)),
+                        min=1024, max=65535, step=1
+                    ).bind_value(self.settings, 'app_port').classes('w-full').tooltip(
+                        'The interface opens at http://127.0.0.1:<port>. '
+                        'Pick a port that is free on this machine.'
+                    )
+                    ui.label(
+                        'Takes effect after a restart: quit the app, then run start.bat again.'
+                    ).classes('text-[10px] text-slate-500 leading-normal')
 
             # Character research through a user-supplied MCP server. The app is the
             # MCP client, so the search provider is whatever server is added here

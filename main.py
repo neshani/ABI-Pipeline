@@ -233,14 +233,15 @@ app.on_shutdown(lambda: os._exit(123) if should_restart else os._exit(0))
 
 # --- Default App Configurations ---
 DEFAULT_SETTINGS = {
+    # Port the local web interface binds to. A setting rather than a constant
+    # because these machines already run ComfyUI, an LLM host and a
+    # transcription server. Read once at launch, so a change needs a restart.
+    "app_port": 8910,
     "comfy_url": "http://127.0.0.1:8188",
     "comfy_path": "",
     "llm_url": "http://127.0.0.1:11434",
     "llm_api_key": "",
     "llm_model": "unsloth/gemma-4-e4b-it",
-    # Per-stage model overrides: {stage: model}. A blank or missing stage uses
-    # llm_model, so an install with no overrides behaves exactly as before.
-    "llm_stage_models": {},
     "llm_launch_path": "",
     "llm_launch_args": "",
     # How much text one analysis call may read. The word budget is the measured
@@ -2341,11 +2342,30 @@ ui.timer(2.0, check_for_active_transcriptions)
 ui.timer(3.0, update_gpu_telemetry)
 
 # Launch our app
+def launch_port() -> int:
+    """The port the web interface binds to, from ``app_port`` in settings.
+
+    ``ui.run`` is called once, at startup, so a bad value here is the difference
+    between a working app and a bind error the user cannot act on. Anything that
+    is not a usable port is reported and replaced, never raised.
+    """
+    raw = get_setting("app_port", 8910)
+    try:
+        port = int(float(raw))
+    except (TypeError, ValueError):
+        port = 0
+    if 1024 <= port <= 65535:
+        return port
+    print(f"[Settings] app_port {raw!r} is not a port between 1024 and 65535; "
+          f"using 8910 instead.")
+    return 8910
+
+
 if __name__ in {"__main__", "__mp_main__"}:
     ui.run(
         title="ABI-Pipeline", 
         favicon="static/favicon.png", 
-        port=8910,
+        port=launch_port(),
         # Restricts the reload watcher to monitor only active code directories.
         # This completely ignores the .venv folder, keeping startup under 3 seconds.
         uvicorn_reload_dirs="services, ui, static",

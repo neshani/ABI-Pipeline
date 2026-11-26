@@ -476,15 +476,21 @@ def transcribe_book_with_subtitles_server(book_id: int, client: SubtitlesClient,
             with open(chapter_txt, "w", encoding="utf-8") as f:
                 f.write(ch_text)
 
-            # Build timing map for chapter
+            # Build timing map for chapter.
+            #
+            # `seg["start"]`/`["end"]` are whole-file seconds here: this is the single-file branch,
+            # where every chapter is a slice of one decode. `transcript_timing.json` is read by
+            # `timing_sync` as chapter-relative and has the chapter's own start added to it, so
+            # storing whole-file seconds counts that start twice. Rebase to the chapter now; the
+            # multi-file branch gets relative times from the server for free.
             timing_map = []
             char_offset = 0
             for seg in ch_segments:
                 txt = seg["text"].strip()
                 t_len = len(txt)
                 timing_map.append({
-                    "start": seg["start"],
-                    "end": seg["end"],
+                    "start": seg["start"] - ch_start,
+                    "end": seg["end"] - ch_start,
                     "char_start": char_offset,
                     "char_end": char_offset + t_len
                 })
